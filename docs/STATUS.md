@@ -65,6 +65,11 @@
   `scripts/copilot_auto.py`）：角色标签由厂商名改为“继承当前会话模型”的模型中立表述。
   同步前备份 `~/.zcode/backups/copilot-presync-20261103-121056`；写后 `--check` 0/0，
   三对文件 SHA-256 与源码一致。
+- 新会话验证（2026-11-03 12:13，headless 新进程）：项目 `AGENTS.md` 已加载，模型能原样
+  引用第 2、3 节内容；Skill 列表发现 `copilot`，入口
+  `/home/ctyun/.zcode/skills/copilot/SKILL.md`；调用 Skill 工具加载正文后引用到
+  “ZCode 主代理（继承当前会话模型）”等更新后原文。Skill 正文为按需加载，启动时只发现
+  description 属正常行为。
 
 ## Reviewer 模型路由（2026-11-03）
 
