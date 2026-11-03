@@ -1,0 +1,48 @@
+# Python 运行产物
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+.venv/
+venv/
+
+# 凭据与环境
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+*.keystore
+
+# 运行时状态、审计与数据库
+.audit/
+state.json
+*.state.json
+dispatch.json
+dry-run.json
+*.lock
+*.sqlite
+*.sqlite3
+*.db
+*.log
+*.jsonl
+backups/
+round-*-evidence.json
+round-*-evidence.md
+round-*-prompt.md
+round-*-reply.md
+
+# 临时与本地备份
+*.tmp
+*.bak
+*.orig
+*.rej
+*.swp
+*~
+.sync-*
+.DS_Store
