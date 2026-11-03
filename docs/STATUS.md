@@ -34,7 +34,7 @@
 ## 测试基线
 
 - 源码仓库：**630 tests OK**（`python3 -B -m unittest discover -s tests -p 'test_*.py'`，
-  57.4s，2026-11-03 12:06 CST；仓库正式化与文档治理后复跑）。
+  56.2s，2026-11-03 12:12 CST；角色模型表述调整后复跑）。
 - 迁移前运行时基线：561 tests OK；新增 `tests/test_sync_runtime.py` 19 项。
 - 迁移适配：7 个测试原先从自身文件位置推断宿主目录，源码移出 `~/.zcode` 后失败；
   已改为显式 `~/.zcode/references`、`~/.zcode/skills`，并断言导入模块来自当前 checkout。
