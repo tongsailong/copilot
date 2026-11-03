@@ -61,6 +61,10 @@
   当前状态 → 本文件；Skill 用法与触发 → `SKILL.md`；协议细节 → `references/`。
 - 同步复查：`--check` 缺失 0、不同 0、Reviewer `same`；基线 13 个文件 SHA-256 全部匹配。
   `AGENTS.md`、`docs/`、`tests/` 不参与分发，根 `AGENTS.md` 未复制进运行时 Skill。
+- 2026-11-03 12:10 再次同步 3 个文件（`SKILL.md`、`references/role.md`、
+  `scripts/copilot_auto.py`）：角色标签由厂商名改为“继承当前会话模型”的模型中立表述。
+  同步前备份 `~/.zcode/backups/copilot-presync-20261103-121056`；写后 `--check` 0/0，
+  三对文件 SHA-256 与源码一致。
 
 ## Reviewer 模型路由（2026-11-03）
 
