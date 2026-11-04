@@ -1,6 +1,6 @@
 # STATUS
 
-更新：2026-11-04 14:23 CST。本文件只记录现场可核实的事实；规划与未完成事项单独标注。
+更新：2026-11-04 22:57 CST。本文件只记录现场可核实的事实；规划与未完成事项单独标注。
 
 ## 当前阶段
 
@@ -33,8 +33,8 @@
 
 ## 测试基线
 
-- 源码仓库：**689 tests OK**（`python3 -B -m unittest discover -s tests -p 'test_*.py'`，
-  61.6s，2026-11-04；Security REVIEW 预算收口及新增针对性测试后全量复跑）。
+- 源码仓库：**700 tests OK**（`python3 -B -m unittest discover -s tests -p 'test_*.py'`，
+  59.9s，2026-11-04；证据完整性收口后全量复跑）。此前基线 689。
 - 迁移前运行时基线：561 tests OK；新增 `tests/test_sync_runtime.py` 19 项。
 - 迁移适配：7 个测试原先从自身文件位置推断宿主目录，源码移出 `~/.zcode` 后失败；
   已改为显式 `~/.zcode/references`、`~/.zcode/skills`，并断言导入模块来自当前 checkout。
@@ -163,6 +163,30 @@
 - **未改变**：普通默认预算与普通追加额度、G1–G4 fail-closed、Reviewer 独立性与身份验证、
   SOL 模型（`gpt-6.1-sol` + `reasoning.effort=high`）与 CPA 路由；未发起真实 SOL 调用。
 - **已本地提交（四阶段优化合并提交），未推送、未部署**；仓库无远端。
+
+## 证据完整性收口（2026-11-04）
+
+- **触发（只看历史日志的只读复盘）**：荣耀买量 ACTIVATION 任务
+  `honor-multi-ad-activation-20261104`（`/tmp/copilot/honor-v1`）。R2 E21 正文被截断
+  6214 字符仍送审，SOL 据此给出无法闭合的缺证裁决；4/4 轮都在追问「被审的是哪份代码」，
+  执行方只能用文字自述。证据包 66.8k → 252.3k 字符、SOL 输入 36.9k → 97.7k tokens。
+- **截断闸门**：`review_ledger.py` 只从条目元数据区（围栏之前）解析「- 截断：省略 N 字符」，
+  围栏内同名行按正文处理；`call_gpt.py` 在自检表列出截断条目、dry-run 汇总显示，
+  本轮**新提交**的截断条目在 REVIEW 前失败关闭（退出码 2，未发请求、未计轮次）。
+  确需放行时用 `--accept-evidence-truncation <理由>`：理由写入台账
+  `evidence_truncation_accept_reason` 与审计 `review_truncation_accept_reason`。
+  已入账轮次沿用的截断条目只提示并标注，不永久锁死后续复核。
+- **代码绑定证据**：`bridge_evidence.py --attest REPO[::标签]` 由 git 机器生成 HEAD、分支、
+  `status --porcelain=v1 -z`、逐文件 sha256 与 `diff --stat HEAD`；非 git 工作区或读取失败
+  直接退出 2，不降级为文件清单。采集端同一改动把截断计数写进 stderr 与 manifest
+  （`items_truncated` / `omitted_chars`）。
+- **有意未做**：不改 SOL 预算、模型与 CPA 路由，不动 G1–G4 与证据 SHA/审计绑定，
+  不新增 Agent 或状态机。「每改一处就重采整包、重跑全量」的重复劳动属于工程习惯，
+  写进 `SKILL.md` 的验证效率建议（批量整改 + 定向证据 + 最终全量），不在代码里强制。
+- **测试**：全量 **700 tests OK**（新增 `tests/test_evidence_integrity.py` 11 项：截断解析、
+  合并元数据、REVIEW 拦截与放行留痕、采集端汇总、attest 干净/脏工作区/子目录/非 git）。
+- **未验证**：未发起真实 SOL 端到端复测（无付费授权）；节省以历史日志推算，不是实测；
+  对「历史截断条目在后续轮次仍被沿用」只验证了元数据与提示，未做真实多轮调用。
 
 ## 未验证 / 未完成
 

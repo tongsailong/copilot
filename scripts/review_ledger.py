@@ -87,6 +87,9 @@ VERDICT_LINE_RE = re.compile(
     + r"\s*\**\s*[：:]\s*(?P<value>.*)$", re.I)
 ITEM_RE = re.compile(r"^### (E\d+) — (.+)$")
 OMITTED_RE = re.compile(r"^- (E\d+) `([^`]+)`：(.+)$")
+# 采集器在条目元数据区写「- 截断：省略 N 字符（见正文标注）」。这是唯一可靠的
+# 机器可读截断信号：正文里的省略标记只是文本，可能被引用或改写。
+TRUNCATED_RE = re.compile(r"^-\s*截断：省略\s*(\d+)\s*字符")
 # 现行标记 + 更名前的历史标记：旧台账里的图片引用必须继续被识别，
 # 否则历史图片证据会在合并时静默降级为纯文本元数据。
 IMAGE_MARKER_PREFIXES = ("<!-- copilot-image ", "<!-- gpt-assist-image ")
@@ -365,6 +368,19 @@ def split_pack(text: str) -> tuple[list[dict], list[dict]]:
         it["sources"] = [it.get("kind_source", "")]
         it["digest"] = sha256_text(payload.strip())
         it["content_key"] = _content_key(payload, is_image)
+        # 截断只认条目元数据区（正文围栏之前）的采集器标注；围栏内的同名行是证据
+        # 正文，不是控制信息。未标注的包按完整处理，但结构校验仍独立执行。
+        truncated_chars = 0
+        for raw_line in it["lines"]:
+            stripped_line = raw_line.strip()
+            if re.match(r"^(`{3,}|~{3,})", stripped_line):
+                break
+            m = TRUNCATED_RE.match(stripped_line)
+            if m:
+                truncated_chars = int(m.group(1))
+                break
+        it["truncated"] = truncated_chars > 0
+        it["omitted_chars"] = truncated_chars
         # 结构完整性：包裹围栏必须由同字符、长度不短于开启围栏的裸围栏收尾，
         # 中途不能再出现长度 ≥ 包裹围栏的纯围栏（`### E<n>` 断点与 `## ` 断点都在这里挡住），
         # 且之后没有非空内容；被 `## ` 小节标题截断（leaked）同样判为不完整。
@@ -1107,6 +1123,13 @@ def merge_and_guard(
         )
 
     merged_text = _render_merged(merged, merged_omitted, current_round, new_items, duplicate_current)
+    truncated = [
+        {"id": f"E{idx}", "source": _kind_source(it)[1],
+         "omitted_chars": it.get("omitted_chars", 0),
+         "origin_round": it.get("origin_round", 0),
+         "is_new": bool(it.get("is_new"))}
+        for idx, it in enumerate(merged, 1) if it.get("truncated")
+    ]
     meta = {
         "round": current_round,
         "used": used,
@@ -1169,6 +1192,16 @@ def merge_and_guard(
         "carried_count": len(merged) - len(new_items),
         "duplicate_count": duplicate_current,
         "merged_chars": len(merged_text),
+        # 被采集器截断的条目：正文不完整，SOL 据此得出的“缺证”结论不可靠。
+        # 只做机器可读登记，是否放行由调用方（call_gpt）按显式理由决定。
+        # `truncated_new` 只含本轮新提交的条目：拦的是“明知不完整还送审”，
+        # 已入账轮次的截断条目继续沿用，不能让一次历史截断永久锁死后续复核。
+        "truncated": truncated,
+        "truncated_count": len(truncated),
+        "truncated_chars": sum(t["omitted_chars"] for t in truncated),
+        "truncated_new": [t for t in truncated if t["is_new"]],
+        "truncated_new_count": sum(1 for t in truncated if t["is_new"]),
+        "truncated_new_chars": sum(t["omitted_chars"] for t in truncated if t["is_new"]),
         "all_item_hashes": [it["digest"] for it in merged] + [om["digest"] for om in merged_omitted],
         "extra_reason": extra_reason.strip(),
         "extra_basis": extra_basis,
@@ -1470,6 +1503,10 @@ def record_round(
         "new_count": meta["new_count"],
         "carried_count": meta["carried_count"],
         "merged_chars": meta["merged_chars"],
+        # 截断留痕：本轮新提交条目是否被采集器截断、是否带理由放行。
+        "evidence_truncated_items": [t["id"] for t in (meta.get("truncated") or [])],
+        "evidence_truncated_new": meta.get("truncated_new_count", 0),
+        "evidence_truncation_accept_reason": meta.get("truncation_accept_reason", ""),
         "all_item_hashes": meta["all_item_hashes"],
         **identity_fields,
         **attribution_fields,

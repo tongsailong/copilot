@@ -419,6 +419,108 @@ def collect_cmd(args, spec: str) -> Item:
     return it
 
 
+def _git_out(repo: str, args: list[str], timeout: int = 60) -> str:
+    try:
+        proc = subprocess.run(["git", "-C", repo, *args], capture_output=True,
+                              text=True, timeout=timeout)
+    except FileNotFoundError:
+        raise SystemExit("copilot: --attest 需要 git，但当前环境找不到 git 可执行文件")
+    except subprocess.TimeoutExpired:
+        raise SystemExit(f"copilot: --attest 读取 {repo} 超时（git {' '.join(args)}）")
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout).strip()
+        raise SystemExit(f"copilot: --attest 读取 {repo} 失败"
+                         f"（git {' '.join(args)}）：{detail}")
+    return proc.stdout
+
+
+def _is_git_worktree(repo: str) -> bool:
+    try:
+        proc = subprocess.run(["git", "-C", repo, "rev-parse", "--is-inside-work-tree"],
+                              capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return proc.returncode == 0 and proc.stdout.strip() == "true"
+
+
+def collect_attest(args, spec: str) -> Item:
+    """机器生成代码绑定证据：HEAD、工作区状态、diff --stat 与逐文件 sha256。
+
+    复核反复卡在「被审的是哪份代码」：执行方用文字自述 commit 与改动，审方无法核对。
+    这里直接调用 git 采集绑定事实。非 git 工作区或 git 不可用时失败关闭——没有绑定
+    证据的复核会退化成对自述的信任，而自述不是证据。
+    """
+    repo, _, label = spec.partition("::")
+    repo = os.path.abspath(repo)
+    if not os.path.isdir(repo):
+        raise SystemExit(f"copilot: --attest 目标不是目录：{repo}")
+    if not _is_git_worktree(repo):
+        raise SystemExit(f"copilot: --attest 要求 git 工作区，但 {repo} 不是；"
+                         "代码绑定证据不能用文件清单或文字自述替代")
+    toplevel = _git_out(repo, ["rev-parse", "--show-toplevel"]).strip()
+    head = _git_out(repo, ["rev-parse", "HEAD"]).strip()
+    branch = _git_out(repo, ["rev-parse", "--abbrev-ref", "HEAD"]).strip()
+    commit = _git_out(repo, ["log", "-1", "--format=%h %ad %an", "--date=iso"]).strip()
+    subject = _git_out(repo, ["log", "-1", "--format=%s"]).strip()
+    porcelain = _git_out(toplevel, ["-c", "status.relativePaths=false",
+                                    "status", "--porcelain=v1", "-z"])
+    tokens = [t for t in porcelain.split("\0") if t]
+    own = label.strip() or toplevel
+
+    changed: list[tuple[str, str]] = []
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        i += 1
+        if len(tok) >= 4 and tok[2] == " ":
+            code, path = tok[:2], tok[3:]
+            # rename/copy 的目标路径是紧随其后的独立条目（-z 不做引号转义）。
+            if code[0] in "RC" and i < len(tokens):
+                path = tokens[i]
+                i += 1
+        else:
+            code, path = "??", tok
+        changed.append((code, path))
+
+    state_text = ("clean（无未提交改动）" if not changed
+                  else f"{len(changed)} 项未提交改动")
+    lines = [
+        f"- 工作区：`{toplevel}`（git 工作区，由 git 直接读取）",
+        f"- HEAD：`{head}`",
+        f"- 分支：`{branch or '（游离 HEAD）'}`",
+        f"- HEAD 提交：{commit}",
+        f"- HEAD 提交说明：{subject}",
+        f"- 工作区状态：{state_text}",
+        "- status --porcelain=v1 -z（NUL 分隔已展开为换行；rename 记录目标路径）：",
+    ]
+    lines += [f"  {code} {path}" for code, path in changed] or ["  （无）"]
+    lines.append("- 逐文件 sha256（工作区当前内容）：")
+    seen: set[str] = set()
+    for code, path in changed:
+        if path in seen:
+            continue
+        seen.add(path)
+        full = os.path.join(toplevel, path)
+        if os.path.isfile(full):
+            lines.append(f"  - {code} `{path}`：`{sha256_file(full)}`")
+        else:
+            lines.append(f"  - {code} `{path}`：（不是普通文件：目录或已删除）")
+    if not seen:
+        lines.append("  （无，工作区与 HEAD 一致）")
+    stat = _git_out(toplevel, ["diff", "--stat", "HEAD"]).strip()
+    lines += ["- diff --stat HEAD（已跟踪文件的未提交改动）：", "  " + (stat or "（无）")]
+
+    body = "\n".join(lines) + "\n"
+    it = Item("git-attest", own,
+              "机器生成：git rev-parse / status --porcelain=v1 -z / diff --stat / "
+              "逐文件 sha256（非执行方转述）")
+    it.text = body
+    it.lines = body.count("\n")
+    it.bytes = len(body.encode("utf-8"))
+    it.digest = sha256_text(body)
+    return it
+
+
 def collect_dir(args, spec: str) -> Item:
     root = spec
     if not os.path.isdir(root):
@@ -599,6 +701,9 @@ def main() -> int:
     ap.add_argument("--dir", action="append", default=[], metavar="PATH", help="目录文件清单")
     ap.add_argument("--json", action="append", default=[], metavar="PATH::dot.path",
                     help="从 JSON 提取子结构")
+    ap.add_argument("--attest", action="append", default=[], metavar="REPO[::LABEL]",
+                    help="机器生成代码绑定证据：HEAD、工作区状态、未提交 diff --stat 与"
+                         "逐文件 sha256（复核需要确认被审代码时使用；非 git 工作区直接失败）")
     ap.add_argument("--stdin", action="store_true", help="把 stdin 作为一份内联证据")
     ap.add_argument("--goal-file", default="", help="本轮目标/待决问题文本，附在证据包顶部")
     ap.add_argument("--goal", default="", help="同上，直接给文本")
@@ -635,11 +740,14 @@ def main() -> int:
         items.append(collect_dir(args, spec))
     for spec in args.json:
         items.append(collect_json(args, spec))
+    for spec in args.attest:
+        items.append(collect_attest(args, spec))
     if args.stdin:
         items.append(collect_stdin(args, "stdin"))
 
     if not items:
-        print("copilot: 未指定任何证据源（--file/--image/--cmd/--dir/--json/--stdin）。", file=sys.stderr)
+        print("copilot: 未指定任何证据源"
+              "（--file/--image/--cmd/--dir/--json/--attest/--stdin）。", file=sys.stderr)
         return EXIT_USAGE
 
     # 脱敏 → 单源裁剪
@@ -662,12 +770,26 @@ def main() -> int:
 
     body, manifest = render(items, goal, args.note, cwd)
 
+    # 截断必须显式可见：包内条目正文不完整时，复核会把「没看到」当成「没有」。
+    # 这里在采集端就给出计数与告警，避免一路静默到复核裁决。
+    truncated = [it for it in items if it.included and it.truncated]
+    omitted_total = sum(it.omitted_chars for it in truncated)
+    if truncated:
+        truncated_ids = {id(it) for it in truncated}
+        names = "、".join(f"E{idx}（{it.source}）"
+                         for idx, it in enumerate(items, 1) if id(it) in truncated_ids)
+        print(f"copilot: 警告：{len(truncated)} 条证据被截断，共省略 {omitted_total} 字符："
+              f"{names}。这些条目只能作为线索；REVIEW 前需重新采集或显式放行。",
+              file=sys.stderr)
+
     manifest_doc = {
         "generated_at": now_iso(),
         "cwd": cwd,
         "evidence_chars": total,
         "items_total": len(items),
         "items_included": sum(1 for i in items if i.included),
+        "items_truncated": len(truncated),
+        "omitted_chars": omitted_total,
         "images_included": sum(1 for i in items if i.included and i.kind == "image"),
         "items": manifest,
     }
@@ -679,8 +801,10 @@ def main() -> int:
     if args.out:
         with open(args.out, "w", encoding="utf-8") as fh:
             fh.write(body)
+        suffix = f"，{len(truncated)} 条被截断" if truncated else ""
         print(f"copilot: 证据包已写入 {args.out}"
-              f"（纳入 {manifest_doc['items_included']}/{len(items)} 条，{total} 字符）", file=sys.stderr)
+              f"（纳入 {manifest_doc['items_included']}/{len(items)} 条，{total} 字符{suffix}）",
+              file=sys.stderr)
     else:
         print(body)
     return EXIT_OK

@@ -201,6 +201,10 @@ def _review_round_meta(merged_meta: dict) -> dict:
         "review_security_remaining": merged_meta.get("security_remaining_after"),
         "review_basis": merged_meta.get("extra_basis") or "",
         "review_reason": merged_meta.get("extra_reason") or "",
+        # 证据完整性留痕：哪些条目正文不完整、是否带理由放行。
+        "review_truncated_items": [t["id"] for t in (merged_meta.get("truncated") or [])],
+        "review_truncated_chars": merged_meta.get("truncated_chars", 0),
+        "review_truncation_accept_reason": merged_meta.get("truncation_accept_reason") or "",
     }
     if meta["review_kind"] == "security":
         new_ids = set(merged_meta.get("new_ids") or [])
@@ -395,6 +399,11 @@ def evidence_selfcheck_text(text: str, display_path: str) -> tuple[str, dict]:
     refused = [(om["old_id"], om["source"], om["reason"]) for om in omitted]
     image_refs = parse_image_refs(text, display_path)
     image_ids = [str(r.get("id", "?")) for r in image_refs]
+    truncated = [
+        {"id": it["old_id"], "source": it["kind_source"],
+         "omitted_chars": it.get("omitted_chars", 0)}
+        for it in items if it.get("truncated")
+    ]
     stats = {
         "path": display_path,
         "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
@@ -404,6 +413,7 @@ def evidence_selfcheck_text(text: str, display_path: str) -> tuple[str, dict]:
         "entry_map": [{"id": i, "source": s} for i, s in entry_map],
         "images": image_ids,
         "unincluded": [{"id": i, "source": s, "reason": r} for i, s, r in refused],
+        "truncated": truncated,
     }
     lines = [
         "",
@@ -421,6 +431,13 @@ def evidence_selfcheck_text(text: str, display_path: str) -> tuple[str, dict]:
             f"- 图片证据：{len(image_ids)} 条（{', '.join(image_ids)}）——真实像素已作为 `input_image` "
             "内联在本消息中；视觉判断只能依据这些图像本身，文件名、路径与本表元数据都不构成视觉证据。"
         )
+    if truncated:
+        lines.append(
+            f"- **证据被截断 {len(truncated)} 条**（采集器按上限保留头尾，正文不完整）：")
+        lines += [f"  - {t['id']} `{t['source']}`：省略 {t['omitted_chars']} 字符" for t in truncated]
+        lines.append(
+            "  - 对这些条目，「没看到」不等于「没有」：不得据此判定缺证或已满足；"
+            "需要全文时按「需补取的最小证据」列出，由执行方重新采集。")
     if refused:
         lines.append(f"- **未纳入证据 {len(refused)} 条**（不得据此推断为通过）：")
         lines += [f"  - {i} `{s}`：{r}" for i, s, r in refused]
@@ -893,6 +910,10 @@ def main() -> int:
                          "new-evidence 与 remediation 可在默认预算用尽后弹性追加，普通最多 +2 / "
                          "高风险 +3；security 只能在此后使用独立额度（普通 +1 / 高风险 +2），"
                          "用尽后需用户明确授权；任何依据都不允许没有新证据的重复复核")
+    ap.add_argument("--accept-evidence-truncation", default="", metavar="REASON",
+                    help="显式放行被采集器截断的 REVIEW 证据，并写明理由"
+                         "（为什么无法重新采集、省略的是哪部分、结论如何不受影响）；"
+                         "放行理由随轮次入账，审计可追溯")
     ap.add_argument("--dry-run", action="store_true",
                     help="只构建并检查 prompt/证据/台账，不调用 GPT（不写审计）；"
                          "但会读取或创建复核台账，并可能写入 subject/audit_log 绑定，"
@@ -1030,6 +1051,46 @@ def main() -> int:
             image_refs.extend(parse_image_refs(text, path))
             evidence_block += (f"\n<!-- 证据包 {os.path.abspath(path)} -->\n" + text.strip() + "\n")
 
+    # 截断闸门：采集器按上限保留头尾时，条目正文并不完整。让 GPT 在不完整证据上做
+    # 复核，会把「没看到」当成「没有」，产出无法闭环的缺证裁决——这正是复核反复的直接
+    # 来源。本轮新提交的截断条目在 REVIEW 前失败关闭，要求重新采集或显式放行；已入账
+    # 轮次沿用的截断只提示，不能让一次历史截断永久锁死后续复核。
+    accept_reason = args.accept_evidence_truncation.strip()
+    if merged_meta is not None:
+        truncated_new = list(merged_meta.get("truncated_new") or [])
+        truncated_carried = [t for t in (merged_meta.get("truncated") or [])
+                             if not t.get("is_new")]
+    else:
+        truncated_new = [t for s in stats_all for t in (s.get("truncated") or [])]
+        truncated_carried = []
+    if truncated_carried:
+        names = "、".join(f"{t['id']}（{t['source']}）" for t in truncated_carried[:3])
+        print(f"copilot: 提示：合并证据包内有 {len(truncated_carried)} 条沿用条目曾被截断"
+              f"（如 {names}），已在自检表中标注为「正文不完整」；"
+              "不得据其缺失内容判定缺证。", file=sys.stderr)
+    if truncated_new and mode == "REVIEW":
+        detail = "；".join(f"{t['id']} `{t['source']}` 省略 {t['omitted_chars']} 字符"
+                          for t in truncated_new[:3])
+        if not accept_reason:
+            die(EXIT_USAGE,
+                f"本轮证据有 {len(truncated_new)} 条被截断，正文不完整，不能用于 REVIEW"
+                f"（{detail}）。被截断的条目只能作为线索，不能支撑 PASS/缺证结论。"
+                "请重新采集：提高 `bridge_evidence.py --per-source-chars` / `--max-chars`，"
+                "或用 `--file::A/B`、`--file::/正则/`、`--json` 精确取需要的片段；"
+                "确因单条证据超过模型可承载规模而必须截断时，用 "
+                "`--accept-evidence-truncation <理由>` 显式放行并留痕。")
+        print(f"copilot: 警告：本轮有 {len(truncated_new)} 条证据被截断，已按显式理由放行"
+              f"（{accept_reason}）；复核结论不得把被省略的内容当作不存在。", file=sys.stderr)
+    elif truncated_new and not args.dry_run:
+        # CONSULT/PLAN 不做硬门（证据仍可作线索），但必须让调用方知道正文不完整。
+        names = "、".join(f"{t['id']}（{t['source']}）" for t in truncated_new[:3])
+        print(f"copilot: 提示：本轮证据有 {len(truncated_new)} 条被截断（如 {names}），"
+              "自检表已标注；结论不得把被省略的内容当作不存在。", file=sys.stderr)
+    if merged_meta is not None:
+        # 放行理由随轮次入账：事后能区分「当时证据完整」与「带截断放行」。
+        merged_meta["truncation_accept_reason"] = (
+            accept_reason if (truncated_new and mode == "REVIEW") else "")
+
     if mode == "REVIEW":
         if not args.evidence:
             die(EXIT_USAGE, "REVIEW 必须提供 --evidence 证据包；没有证据时不要调用 GPT，"
@@ -1159,6 +1220,14 @@ def main() -> int:
                 round_note = f"默认预算 {merged_meta['round']}/{merged_meta['max_rounds']} 轮"
             ledger_note = (f"；复核第 {merged_meta['round']} 轮，{round_note}"
                            f"（新增 {merged_meta['new_count']} 条，沿用 {merged_meta['carried_count']} 条）")
+        if truncated_new or truncated_carried:
+            parts = []
+            if truncated_new:
+                parts.append(f"本轮 {len(truncated_new)} 条（省略 "
+                             f"{sum(t['omitted_chars'] for t in truncated_new)} 字符）")
+            if truncated_carried:
+                parts.append(f"沿用 {len(truncated_carried)} 条")
+            ledger_note += "；证据被截断：" + "，".join(parts)
         print(f"copilot: dry-run（未调用 GPT）：mode={mode or '-'}；channel={channel}；"
               f"model={args.model}；reasoning.effort={effort_sent or '-'}；"
               f"证据包 {len(args.evidence)} 个；"
