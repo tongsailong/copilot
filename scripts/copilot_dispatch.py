@@ -81,6 +81,11 @@ EXECUTION_BACKENDS = ("legacy", "native")
 # 同时拥有复核权威；原生结果回填遇到 gpt_review 时失败关闭。
 REVIEW_CHANNELS = (None, "native", "gpt_review")
 VERDICTS = ("pass", "partial", "blocked")
+# 复核对象类型：native 保持原有 execution_result_sha256 语义；legacy 明确区分
+# 「执行报告摘要」与「已登记证据摘要」，不把两者混成同一个 review_of。
+REVIEW_OF_KINDS = ("execution-report", "evidence")
+NATIVE_REVIEW_OF_KIND = "native-execution-result"
+REVIEW_SOURCES = ("native", "legacy")
 VERDICT_DECISION = {"pass": "stop", "partial": "continue", "blocked": "blocked"}
 DECISION_VERDICT = {"stop": "pass", "continue": "partial", "blocked": "blocked"}
 CRITERION_ID_RE = re.compile(r"^C[1-9][0-9]{0,2}$")
@@ -1800,18 +1805,176 @@ def drop_evidence(state: dict, eid: str, reason: str) -> dict:
     raise DispatchError(f"不存在证据 {eid}。")
 
 
+def _find_evidence_by_id(state: dict, eid: str) -> dict | None:
+    for entry in state.get("evidence") or []:
+        if isinstance(entry, dict) and str(entry.get("id") or "") == eid:
+            return entry
+    return None
+
+
+def _next_evidence_id(state: dict) -> str:
+    used = {str(entry.get("id") or "") for entry in state.get("evidence") or []
+            if isinstance(entry, dict)}
+    for number in range(1, 10000):
+        candidate = f"E{number}"
+        if candidate not in used:
+            return candidate
+    raise DispatchError("证据 id 已用尽（E1–E9999）；请先归档不再使用的证据。")
+
+
+def _verify_review_target(state: dict, sha: str, review_of_kind: str,
+                          review_source: str) -> None:
+    """复核对象必须真实存在，且类型与来源声明一致。"""
+    if review_of_kind == NATIVE_REVIEW_OF_KIND:
+        if review_source != "native":
+            raise DispatchError("native-execution-result 只能用于 native 复核报告。")
+        for entry in state.get("native_results") or []:
+            if (isinstance(entry, dict)
+                    and str(entry.get("kind") or "execution") == "execution"
+                    and str(entry.get("result_sha256") or "") == sha):
+                return
+        raise DispatchError(
+            f"复核对象 {sha} 不是本任务已入账的 native 执行结果；不能凭空复核。")
+    if review_source != "legacy":
+        raise DispatchError(
+            f"{review_of_kind} 只能用于 legacy 复核报告；native 复核必须绑定 "
+            "execution_result_sha256。")
+    if review_of_kind == "execution-report":
+        for entry in state.get("reports") or []:
+            if (isinstance(entry, dict)
+                    and str(entry.get("kind") or "execution") == "execution"
+                    and str(entry.get("report_sha256") or "") == sha):
+                return
+        raise DispatchError(
+            f"复核对象 {sha} 不是本任务已登记的执行报告摘要（execution-report）。")
+    if review_of_kind == "evidence":
+        for entry in state.get("evidence") or []:
+            if (isinstance(entry, dict) and not entry.get("dropped")
+                    and str(entry.get("sha256") or "") == sha
+                    and str(entry.get("task_id") or "") == str(state.get("task_id") or "")):
+                return
+        raise DispatchError(f"复核对象 {sha} 不是本任务已登记且未归档的证据。")
+    raise DispatchError(
+        f"review_of_kind={review_of_kind!r} 非法；只能是 "
+        f"{NATIVE_REVIEW_OF_KIND} / {' / '.join(REVIEW_OF_KINDS)}。")
+
+
+def register_review_evidence(state: dict, *, file_path: str, review_of: str,
+                             review_of_kind: str, review_source: str,
+                             verdict: str, round_id: str = "",
+                             eid: str = "", note: str = "") -> dict:
+    """登记 Reviewer 原始报告为证据，并绑定复核对象与来源。
+
+    只接受真实文件；正文不进入状态，证据包按登记时的 SHA-256 重新校验。
+    同一原始文件 + 同一复核对象重复登记是幂等的；同一证据 id 摘要不同、
+    或同一复核对象已有不同原始报告时拒绝，避免静默覆盖历史。
+    """
+    _assert_open(state, "登记复核报告证据")
+    review_of = (review_of or "").strip().lower()
+    review_of_kind = (review_of_kind or "").strip().lower()
+    review_source = (review_source or "").strip().lower()
+    verdict = (verdict or "").strip().lower()
+    round_id = (round_id or "").strip()
+    eid = (eid or "").strip()
+    if not re.fullmatch(r"[0-9a-f]{64}", review_of):
+        raise DispatchError("复核证据必须绑定 64 位 review_of SHA-256。")
+    if review_of_kind not in (NATIVE_REVIEW_OF_KIND, *REVIEW_OF_KINDS):
+        raise DispatchError(
+            f"review_of_kind={review_of_kind!r} 非法；只能是 "
+            f"{NATIVE_REVIEW_OF_KIND} / {' / '.join(REVIEW_OF_KINDS)}。")
+    if review_source not in REVIEW_SOURCES:
+        raise DispatchError(
+            f"review_source={review_source!r} 非法；只能是 {' / '.join(REVIEW_SOURCES)}。")
+    if verdict not in VERDICTS:
+        raise DispatchError(
+            f"复核证据 verdict={verdict!r} 非法；只能是 {' / '.join(VERDICTS)}。")
+    if review_source == "native" and review_of_kind != NATIVE_REVIEW_OF_KIND:
+        raise DispatchError("native 复核证据必须使用 native-execution-result 绑定。")
+    if review_source == "legacy" and review_of_kind == NATIVE_REVIEW_OF_KIND:
+        raise DispatchError("legacy 复核证据不得冒用 native 执行结果绑定。")
+    if review_source == "native":
+        if state.get("execution_backend") != "native":
+            raise DispatchError("只有 native 任务可以登记 native 复核证据。")
+        channel = state.get("review_channel")
+        if channel not in (None, "native"):
+            raise DispatchError(
+                f"当前 review_channel={channel!r}，与原生复核证据冲突。")
+    elif state.get("execution_backend") == "native":
+        raise DispatchError(
+            "native 任务必须回填 native 复核信封；不得用 legacy 报告混入"
+            "同一复核权威与 G4 判定。")
+    elif state.get("review_channel") == "native":
+        raise DispatchError(
+            "当前任务已有原生复核权威（review_channel=native）；"
+            "不得再以 legacy 报告混入同一复核结论。")
+    _verify_review_target(state, review_of, review_of_kind, review_source)
+    if not file_path:
+        raise DispatchError("复核证据必须提供原始报告文件（--file）。")
+    path = os.path.abspath(file_path)
+    if not os.path.isfile(path):
+        raise DispatchError(f"复核报告文件不存在：{path}")
+    digest = sha256_file(path)
+    if eid and not EVIDENCE_ID_RE.match(eid):
+        raise DispatchError(f"证据 id {eid!r} 非法（应形如 E1）。")
+    existing = _find_evidence_by_id(state, eid) if eid else None
+    if existing is not None:
+        if existing.get("dropped"):
+            raise DispatchError(f"证据 {eid} 已归档（dropped）；请使用新的 id。")
+        if str(existing.get("task_id") or "") != str(state.get("task_id") or ""):
+            raise DispatchError(f"证据 {eid} 不属于当前任务；不能作为复核原始报告。")
+        if str(existing.get("sha256") or "") != digest:
+            raise DispatchError(
+                f"证据 {eid} 已登记且摘要不同：不得静默替换复核原始报告。")
+        if existing.get("origin") == "review-report" and (
+                str(existing.get("review_of") or "") != review_of
+                or str(existing.get("review_of_kind") or "") != review_of_kind
+                or str(existing.get("review_source") or "") != review_source):
+            raise DispatchError(
+                f"证据 {eid} 已绑定到其他复核对象或来源；不能改绑。")
+    if existing is None:
+        for entry in state.get("evidence") or []:
+            if (isinstance(entry, dict)
+                    and entry.get("origin") == "review-report"
+                    and str(entry.get("task_id") or "") == str(state.get("task_id") or "")
+                    and str(entry.get("sha256") or "") == digest
+                    and str(entry.get("review_of") or "") == review_of
+                    and str(entry.get("review_of_kind") or "") == review_of_kind
+                    and str(entry.get("review_source") or "") == review_source):
+                if entry.get("dropped"):
+                    raise DispatchError("该复核报告证据已归档；不能继续引用。")
+                existing = entry
+                break
+    if existing is None:
+        existing = register_evidence(
+            state, eid or _next_evidence_id(state),
+            kind=f"{review_source}-review-report", file_path=path, note=note)
+    existing["kind"] = f"{review_source}-review-report"
+    existing["origin"] = "review-report"
+    existing["review_of"] = review_of
+    existing["review_of_kind"] = review_of_kind
+    existing["review_source"] = review_source
+    existing["verdict"] = verdict
+    existing["round_id"] = round_id
+    existing["raw_report_sha256"] = digest
+    existing["review_task_id"] = str(state.get("task_id") or "")
+    if note and not existing.get("note"):
+        existing["note"] = note[:500]
+    return existing
+
+
 def add_report(state: dict, summary: str, round_id: str = "", *,
                blocked: bool = False, reason: str = "",
                kind: str = "execution", work_item_id: str = "",
                dispatch_id: str = "", result_sha256: str = "",
                review_of: str = "", verdict: str = "",
-               g4_eligible: bool = False) -> dict:
+               g4_eligible: bool = False, review_of_kind: str = "",
+               evidence_id: str = "", raw_report_sha256: str = "",
+               review_source: str = "") -> dict:
     """登记执行或独立复核报告，绑定到已验证轮次。
 
     `kind=execution` 与 `kind=review` 必须分开登记：执行方自报不能替代复核，
-    复核报告也不能混进执行报告。复核必须绑定 `review_of`（被执行结果的
-    SHA-256）和 verdict；`g4_eligible` 只能为 false，避免把普通原生复核
-    冒充 G4 可信凭证。
+    复核报告也不能混进执行报告。复核必须绑定 `review_of` 和 verdict，并通过
+    `evidence_id` 指向已登记的原始报告证据；`g4_eligible` 只能为 false。
     """
     _assert_open(state, "写入执行/复核报告")
     verified = _verified_round_ids(state)
@@ -1831,21 +1994,98 @@ def add_report(state: dict, summary: str, round_id: str = "", *,
         raise DispatchError("报告内容为空。")
     if len(summary) > 8000:
         raise DispatchError(f"报告 {len(summary)} 字，超出上限 8000；请精简。")
-    review_of = (review_of or "").strip()
+    review_of = (review_of or "").strip().lower()
     verdict = (verdict or "").strip().lower()
     result_sha256 = (result_sha256 or "").strip().lower()
+    review_of_kind = (review_of_kind or "").strip().lower()
+    evidence_id = (evidence_id or "").strip()
+    raw_report_sha256 = (raw_report_sha256 or "").strip().lower()
+    review_source = (review_source or "").strip().lower()
     if g4_eligible:
         raise DispatchError(
             "普通报告不得声明 g4_eligible=true；G4 目前仍 fail-closed，"
             "原生 Reviewer 的 PASS 不是宿主可信复核凭证。")
     if kind == "review":
         if not review_of or not re.fullmatch(r"[0-9a-f]{64}", review_of):
-            raise DispatchError("复核报告必须绑定 64 位 execution result SHA-256（review_of）。")
+            raise DispatchError("复核报告必须绑定 64 位 review_of SHA-256。")
         if verdict not in VERDICTS:
             raise DispatchError(
                 f"复核报告 verdict={verdict!r} 非法；只能是 {' / '.join(VERDICTS)}。")
-    elif review_of or verdict:
-        raise DispatchError("执行报告不得携带 review_of / verdict；复核必须单独登记。")
+        review_source = review_source or "legacy"
+        if review_source not in REVIEW_SOURCES:
+            raise DispatchError(
+                f"复核报告 review_source={review_source!r} 非法；"
+                f"只能是 {' / '.join(REVIEW_SOURCES)}。")
+        if review_source == "native" and state.get("execution_backend") != "native":
+            raise DispatchError("只有 native 任务可以写入 native 复核报告。")
+        if (review_source == "legacy"
+                and state.get("execution_backend") == "native"):
+            raise DispatchError(
+                "native 任务不得用 legacy 复核报告混入复核权威；"
+                "请回填 native 复核信封。")
+        review_of_kind = review_of_kind or (
+            NATIVE_REVIEW_OF_KIND if review_source == "native" else "")
+        if review_of_kind not in (NATIVE_REVIEW_OF_KIND, *REVIEW_OF_KINDS):
+            raise DispatchError(
+                "复核报告必须明确 review_of_kind：legacy 使用 "
+                "execution-report / evidence，native 使用 "
+                f"{NATIVE_REVIEW_OF_KIND}。")
+        if review_source == "native" and review_of_kind != NATIVE_REVIEW_OF_KIND:
+            raise DispatchError("native 复核报告必须使用 native-execution-result 绑定。")
+        if review_source == "legacy" and review_of_kind == NATIVE_REVIEW_OF_KIND:
+            raise DispatchError("legacy 复核报告不得冒用 native 执行结果绑定。")
+        _verify_review_target(state, review_of, review_of_kind, review_source)
+        if not evidence_id or not EVIDENCE_ID_RE.match(evidence_id):
+            raise DispatchError(
+                "复核报告必须用 evidence_id 指向已登记的原始报告证据（形如 E7）。")
+        evidence = _find_evidence_by_id(state, evidence_id)
+        if evidence is None:
+            raise DispatchError(f"复核报告引用的证据 {evidence_id} 不存在。")
+        if evidence.get("dropped"):
+            raise DispatchError(f"复核报告引用的证据 {evidence_id} 已归档。")
+        if str(evidence.get("task_id") or "") != str(state.get("task_id") or ""):
+            raise DispatchError(f"复核报告引用的证据 {evidence_id} 不属于当前任务。")
+        if not raw_report_sha256 or not re.fullmatch(r"[0-9a-f]{64}",
+                                                    raw_report_sha256):
+            raise DispatchError("复核报告必须提供原始报告 64 位 SHA-256。")
+        if (evidence.get("origin") != "review-report"
+                or str(evidence.get("sha256") or "") != raw_report_sha256
+                or str(evidence.get("review_of") or "") != review_of
+                or str(evidence.get("review_of_kind") or "") != review_of_kind
+                or str(evidence.get("review_source") or "") != review_source):
+            raise DispatchError(
+                f"证据 {evidence_id} 不是该复核对象/来源的原始报告证据；拒绝绑定。")
+        for existing in state.get("reports") or []:
+            if not isinstance(existing, dict) or existing.get("kind") != "review":
+                continue
+            if str(existing.get("raw_report_sha256") or "") != raw_report_sha256:
+                continue
+            same = (
+                str(existing.get("round_id") or "") == rid
+                and str(existing.get("review_of") or "") == review_of
+                and str(existing.get("review_of_kind") or "") == review_of_kind
+                and str(existing.get("review_source") or "") == review_source
+                and str(existing.get("verdict") or "") == verdict
+                and str(existing.get("evidence_id") or "") == evidence_id)
+            if same:
+                return {**existing, "duplicate": True}
+            raise DispatchError(
+                "同一原始复核报告已登记，但轮次/复核对象/结论/证据绑定不同；"
+                "不得静默改写历史复核。")
+        for existing in state.get("reports") or []:
+            if (isinstance(existing, dict)
+                    and existing.get("kind") == "review"
+                    and str(existing.get("review_of") or "") == review_of
+                    and str(existing.get("review_of_kind") or "") == review_of_kind
+                    and str(existing.get("review_source") or "") == review_source
+                    and existing.get("raw_report_sha256")
+                    and str(existing.get("raw_report_sha256")) != raw_report_sha256):
+                raise DispatchError(
+                    "同一复核对象已登记不同原始报告；复核结论不得被后一份替换。")
+    elif (review_of or verdict or review_of_kind or evidence_id
+          or raw_report_sha256 or review_source):
+        raise DispatchError(
+            "执行报告不得携带 review_of / verdict / 复核证据字段；复核必须单独登记。")
     entry = {"round_id": rid, "ts": now_iso(), "summary": summary,
              "report_sha256": sha256_text(summary),
              "blocked": bool(blocked), "reason": reason,
@@ -1858,7 +2098,11 @@ def add_report(state: dict, summary: str, round_id: str = "", *,
         entry["result_sha256"] = str(result_sha256).strip()
     if kind == "review":
         entry["review_of"] = review_of
+        entry["review_of_kind"] = review_of_kind
+        entry["review_source"] = review_source
         entry["verdict"] = verdict
+        entry["evidence_id"] = evidence_id
+        entry["raw_report_sha256"] = raw_report_sha256
     state["reports"].append(entry)
     return entry
 
@@ -3841,13 +4085,25 @@ def main(argv: list[str] | None = None) -> int:
     p_evidence.add_argument("--drop", action="store_true")
     p_evidence.add_argument("--reason", default="")
 
-    p_report = sub.add_parser("report", help="登记本轮执行报告（绑定已验证轮次）")
+    p_report = sub.add_parser(
+        "report", help="登记本轮执行报告或 legacy 复核报告（绑定已验证轮次）")
     p_report.add_argument("--state", required=True)
+    p_report.add_argument("--kind", choices=("execution", "review"),
+                          default="execution")
     p_report.add_argument("--summary", default="")
     p_report.add_argument("--summary-file", default="")
     p_report.add_argument("--round-id", default="")
     p_report.add_argument("--blocked", action="store_true")
     p_report.add_argument("--reason", default="")
+    p_report.add_argument("--file", default="",
+                          help="复核原始报告文件（kind=review 时必填；登记为证据）")
+    p_report.add_argument("--evidence-id", default="",
+                          help="复核原始报告证据 id（可选；默认自动分配）")
+    p_report.add_argument("--review-of", default="",
+                          help="被复核对象的 SHA-256（执行报告摘要或证据摘要）")
+    p_report.add_argument("--review-of-kind", choices=REVIEW_OF_KINDS, default="",
+                          help="复核对象类型：execution-report / evidence")
+    p_report.add_argument("--verdict", choices=VERDICTS, default="")
 
     p_quota = sub.add_parser("quota", help="查看/清除配额冷却状态")
     p_quota.add_argument("--state", required=True)
@@ -4208,6 +4464,49 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.cmd == "report":
+            if args.kind == "review":
+                if not args.file:
+                    raise DispatchError(
+                        "kind=review 必须用 --file 提供 Reviewer 原始报告；"
+                        "未登记原文的复核不能作为证据。")
+                if not args.review_of or not args.review_of_kind:
+                    raise DispatchError(
+                        "kind=review 必须同时给出 --review-of 与 --review-of-kind。")
+                if not args.verdict:
+                    raise DispatchError("kind=review 必须给出 --verdict。")
+                evidence = register_review_evidence(
+                    state, file_path=args.file, review_of=args.review_of,
+                    review_of_kind=args.review_of_kind,
+                    review_source="legacy", verdict=args.verdict,
+                    round_id=args.round_id, eid=args.evidence_id,
+                    note=args.reason)
+                summary = args.summary
+                if args.summary_file:
+                    summary = _read_text_arg(args.summary_file)
+                if not summary:
+                    summary = (
+                        "Legacy Reviewer 原始报告（未经 native 身份校验；"
+                        f"verdict={args.verdict}；复核对象 {args.review_of}"
+                        f"（{args.review_of_kind}）；原始证据 {evidence['id']}，"
+                        f"SHA-256 {evidence['sha256']}）")
+                entry = add_report(
+                    state, summary, args.round_id, blocked=args.blocked,
+                    reason=args.reason, kind="review",
+                    review_of=args.review_of,
+                    verdict=args.verdict,
+                    review_of_kind=args.review_of_kind,
+                    evidence_id=evidence["id"],
+                    raw_report_sha256=evidence["sha256"],
+                    review_source="legacy")
+                if not evidence.get("round_id"):
+                    evidence["round_id"] = entry["round_id"]
+                save_state(args.state, state, expect=state_snapshot)
+                suffix = "（重复登记，未新增）" if entry.get("duplicate") else ""
+                print(f"copilot: legacy 复核报告已登记{suffix}（轮次 {entry['round_id']}，"
+                      f"原始证据 {entry['evidence_id']}，"
+                      f"结论 {entry['verdict']}，摘要 {entry['report_sha256'][:12]}）。",
+                      file=sys.stderr)
+                return 0
             summary = args.summary
             if args.summary_file:
                 summary = _read_text_arg(args.summary_file)

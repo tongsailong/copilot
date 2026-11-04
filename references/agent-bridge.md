@@ -52,7 +52,7 @@ python3 ~/.zcode/skills/copilot/scripts/copilot_dispatch.py start \
 | `execution_backend` | `legacy`（默认）或 `native` |
 | `native_dispatch` | 当前已验证轮次的 dispatch 状态，含 `items`、批次 `dispatch_id` 和计划绑定 |
 | `native_results` | 已入账执行结果索引（含 `result_sha256`、证据 id、执行方元数据、报告摘要） |
-| `native_reviews` | 已入账复核索引（绑定 `execution_result_sha256`，含 verdict/findings/元数据） |
+| `native_reviews` | 已入账复核索引（绑定 `execution_result_sha256`，含 verdict/findings/元数据、原始报告证据 id 与 SHA-256） |
 | `review_channel` | `null` / `native` / `gpt_review`；同一轮不得让两个渠道同时拥有复核权威 |
 | `review_round` | 原生复核所属轮次 |
 | `review_consumed` | 已被原生复核消费的执行结果 SHA 列表；每个执行结果只允许一份原生复核 |
@@ -60,7 +60,13 @@ python3 ~/.zcode/skills/copilot/scripts/copilot_dispatch.py start \
 | `budget.usage` | 从审计重建的用量快照（输入/输出/总量/请求数/未知 usage 调用数）；权威来源仍是审计 |
 
 执行报告和复核报告分别写入 `reports`，通过 `kind=execution` / `kind=review` 区分；
-复核报告还带 `review_of`、`verdict`、`g4_eligible=false`。执行方自评不会被合并进复核报告。
+复核报告还带 `review_of`、`review_of_kind`、`review_source`、`evidence_id`、
+`raw_report_sha256`、`verdict`、`g4_eligible=false`。执行方自评不会被合并进复核报告。
+
+原始复核报告单独登记为 `evidence`（`origin=review-report`），保存文件、SHA-256、任务归属、
+轮次与复核对象绑定；`review_source=native` 只来自通过 native 信封校验的 Reviewer，
+`legacy` 报告永不写入 `native_reviews`。自动证据包会纳入最近复核轮次及完成条件显式引用的
+复核原文；原文缺失、摘要不符、被截断或因预算未纳入时失败关闭，不退化为摘要。
 
 ## 4. 信封
 

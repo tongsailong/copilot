@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""copilot — REVIEW 复核台账：跨轮状态、证据合并与轮次上限。
+"""copilot — REVIEW 复核台账：跨轮状态、证据合并与默认预算 + 弹性追加额度。
 
 为什么需要这个模块（2026-10-17 Reasonix 2.43.0 升级复核复盘）：
 
@@ -14,11 +14,18 @@
 
 1. **合并**：把此前各轮证据包与本轮证据按内容去重、统一重编号，形成本轮唯一编号空间；
 2. **携带**：把此前裁决、回复原文、已提交证据指纹注入本轮 prompt，让 GPT 只重判变化项；
-3. **限轮**：普通任务最多 2 次 REVIEW，高风险最多 3 次；达到上限即停止自动复核，
-   按 PARTIAL/BLOCKED 汇报。两个例外：新发现的重大安全问题（security，不设次数），
-   以及**执行方已按上一轮裁决完成整改后的定向复核（remediation，每个台账只有一次）**——
-   后者必须携带新增证据，避免「整改完却没有复核出口」迫使执行方新建台账绕过上限
-   （2026-10-19 pedometer 长任务复盘的实际问题）。
+3. **限轮**：普通任务默认 2 次 REVIEW，高风险默认 3 次；默认预算用尽后，若确有
+   **新增实质证据 / 整改进展**，可在普通弹性追加额度内继续定向复核（普通 +2、高风险 +3，
+   普通预算合计普通 4 / 高风险 6），必须携带新增/变化证据并写明理由。
+   **Security 是普通预算全部用尽后的独立安全例外**：只有默认预算与普通追加都用尽后，
+   才可在 Security 独立额度（普通 +1、高风险 +2）内继续；同样必须携带此前未用于 REVIEW 的
+   新增证据并说明具体安全风险。Security 额度用尽即停止自动调用，等待用户针对该任务明确授权
+   （自由文本理由或自声明参数不算授权）。
+   追加 REVIEW 复用同一 subject 与台账，审计与台账保留追加理由、证据和裁决，
+   不能通过新建 subject、换台账或换日志重置轮次（2026-11-03 万年历广告对齐任务的实际缺口：
+   2/2 轮后仍有未闭合项，但 remediation 名额已用，最终 Diff 失去定向复核出口）。
+   无论普通、追加还是 Security 轮次，**没有新增实质证据时一律拒绝重复复核**——
+   额度不是续轮后门，Security 也不例外。
 
 台账是本地 JSON，只存证据包路径、指纹、裁决与回复文本；证据正文仍来自原始证据包文件。
 历史证据包必须保留到复核结束——删除或改写会被明确拒绝，而不是静默丢失证据。
@@ -54,9 +61,18 @@ PACK_FORMAT_FIELD = "证据包格式"
 PACK_FORMAT_VERSION = 2
 PACK_FORMAT_RE = re.compile(r"^\s*[-*]\s*" + PACK_FORMAT_FIELD + r"\s*[：:]\s*(\d+)\s*$", re.M)
 RISK_MAX_ROUNDS = {"normal": 2, "high": 3}
-# remediation：执行方已按上一轮裁决完成整改后的**一次性**定向复核，可越过轮次上限一次。
-# 它不是「再跑一遍完整复核」：必须携带新增证据，且整份台账只允许出现一次。
-EXTRA_BASES = ("new-evidence", "security", "remediation")
+# 默认预算之上的普通弹性追加额度。它不是「必须用完的配额」，而是防无限循环的硬顶：
+# 只有存在新增/变化证据（整改产物、验证输出、新风险证据）并写明理由时才可追加；
+# 追加额度用尽即停止自动复核，按 PARTIAL/BLOCKED 汇报。
+EXTRA_ROUND_ALLOWANCE = {"normal": 2, "high": 3}
+# Security 独立追加额度：只在普通默认预算与普通追加额度全部用尽后生效，
+# 仍要求新增证据与安全风险说明；用尽后停止自动调用，等待用户明确授权。
+# 它不叠加到普通额度上，也不能在普通预算内提前使用。
+SECURITY_EXTRA_ALLOWANCE = {"normal": 1, "high": 2}
+SECURITY_BASIS = "security"
+# new-evidence / remediation：默认预算用尽后的普通弹性追加依据，必须携带新增/变化证据；
+# security：普通预算全部用尽后的独立安全例外，必须携带新增证据并写明安全风险。
+EXTRA_BASES = ("new-evidence", SECURITY_BASIS, "remediation")
 REMEDIATION_BASIS = "remediation"
 
 # 正式 REVIEW 的裁决行。`裁决：` 是默认写法；`最终裁决：` 与 `整体结论：`
@@ -443,7 +459,7 @@ def acquire_ledger_lock(path: str) -> None:
             pass
         raise LedgerError(
             f"同一复核台账正在进行另一轮 REVIEW：{key}。"
-            "并发复核会绕过轮次上限，并可能产生两次付费调用；本次未发起请求。"
+            "并发复核会绕过默认预算与追加额度，并可能产生两次付费调用；本次未发起请求。"
             "请等前一次调用结束后再继续（同一交付物不要并行复核）。") from exc
     # 故意不主动释放：整个进程生命周期就是一次复核的范围，退出时内核自动解锁。
     _LEDGER_LOCKS[key] = fd
@@ -762,6 +778,91 @@ def _remediation_used(ledger: dict, pending: list[dict]) -> bool:
         or any(str(rec.get("review_basis") or "") == REMEDIATION_BASIS for rec in pending))
 
 
+def _extra_allowance(ledger: dict) -> int:
+    """该台账可用的普通弹性追加轮数；风险级别在创建时固定，额度随之固定。"""
+    risk = str(ledger.get("risk") or "normal")
+    return int(EXTRA_ROUND_ALLOWANCE.get(risk, EXTRA_ROUND_ALLOWANCE["normal"]))
+
+
+def _security_allowance(ledger: dict) -> int:
+    """该台账可用的 Security 独立追加轮数；与普通弹性额度互不占用。"""
+    risk = str(ledger.get("risk") or "normal")
+    return int(SECURITY_EXTRA_ALLOWANCE.get(risk, SECURITY_EXTRA_ALLOWANCE["normal"]))
+
+
+def _record_is_security(rec: dict, *, where: str) -> bool:
+    """把台账轮次/审计记录归类为 security 或 ordinary；分类冲突即失败关闭。
+
+    旧版本记录的 `review_kind` 可能缺失，只能看 `extra_basis`/`review_basis`。
+    两者同时存在且不一致，说明台账或审计被手工改写、或新旧口径混写，
+    继续计数会把 Security 额度算错——因此拒绝新增调用，而不是猜一个。
+    """
+    kind = str(rec.get("review_kind") or "").strip()
+    basis = str(rec.get("extra_basis") or rec.get("review_basis") or "").strip()
+    if kind == SECURITY_BASIS and basis and basis != SECURITY_BASIS:
+        raise LedgerError(
+            f"{where} 的复核类型不一致：review_kind=security 但 basis={basis!r}。"
+            "无法确定它是否占用 Security 独立额度；请先修复台账/审计记录，再继续复核。")
+    if basis == SECURITY_BASIS and kind and kind != SECURITY_BASIS:
+        raise LedgerError(
+            f"{where} 的复核类型不一致：basis=security 但 review_kind={kind!r}。"
+            "无法确定它是否占用 Security 独立额度；请先修复台账/审计记录，再继续复核。")
+    return kind == SECURITY_BASIS or basis == SECURITY_BASIS
+
+
+def _split_usage(ledger: dict, pending: list[dict]) -> dict:
+    """按普通 / Security 两条额度分别计数；历史记录同样计入，不清零。"""
+    ordinary_rounds = security_rounds = 0
+    seen_ids: set[str] = set()
+    for idx, rnd in enumerate(ledger.get("rounds", []), 1):
+        call_id = str(rnd.get("call_id") or "")
+        if call_id:
+            if call_id in seen_ids:
+                raise LedgerError(
+                    f"复核台账中 call_id={call_id} 重复出现（第 {idx} 轮）。"
+                    "同一调用不得重复计账；请先修复台账，再继续复核。")
+            seen_ids.add(call_id)
+        if _record_is_security(rnd, where=f"台账第 {rnd.get('n', idx)} 轮"):
+            security_rounds += 1
+        else:
+            ordinary_rounds += 1
+    ordinary_pending: list[dict] = []
+    security_pending: list[dict] = []
+    for rec in pending:
+        if _record_is_security(rec, where=f"审计调用 {rec.get('call_id') or '<无 call_id>'}"):
+            security_pending.append(rec)
+        else:
+            ordinary_pending.append(rec)
+    return {
+        "ordinary_rounds": ordinary_rounds,
+        "security_rounds": security_rounds,
+        "ordinary_pending": ordinary_pending,
+        "security_pending": security_pending,
+        "ordinary_used": ordinary_rounds + len(ordinary_pending),
+        "security_used": security_rounds + len(security_pending),
+        "used": ordinary_rounds + security_rounds + len(pending),
+    }
+
+
+def _pending_calls(ledger: dict, ledger_path: str,
+                   audit_log: str) -> list[dict]:
+    """审计中成功但尚未入账的 REVIEW 调用；这些调用仍占用轮次。"""
+    recorded_ids = {str(r.get("call_id")) for r in ledger.get("rounds", [])
+                    if r.get("call_id")}
+    pending: list[dict] = []
+    seen_ids: set[str] = set()
+    if audit_log:
+        for rec in review_calls(audit_log,
+                                subject=str(ledger.get("subject") or ""),
+                                ledger_path=ledger_path):
+            call_id = str(rec.get("call_id") or "")
+            # 同一 call_id 在审计里出现多次（重复写结果/恢复重放）只计一次。
+            if call_id and call_id not in recorded_ids and call_id not in seen_ids:
+                seen_ids.add(call_id)
+                pending.append(rec)
+    return pending
+
+
 def merge_and_guard(
     ledger: dict,
     current_paths: list[str],
@@ -770,7 +871,7 @@ def merge_and_guard(
     audit_log: str = "",
     ledger_path: str = "",
 ) -> tuple[str, dict]:
-    """合并历史与本轮证据，并执行轮次上限/重复证据闸门。
+    """合并历史与本轮证据，并执行默认预算/弹性追加额度/重复证据闸门。
 
     返回 (合并后的证据包 Markdown, 元数据)。任何不满足纪律的情况抛 LedgerError。
 
@@ -793,14 +894,7 @@ def merge_and_guard(
             "请改回绑定日志。")
 
     # 已入账的调用按 call_id 记账；审计里成功但未入账的调用同样占用轮次。
-    recorded_ids = {str(r.get("call_id")) for r in ledger.get("rounds", []) if r.get("call_id")}
-    pending: list[dict] = []
-    if audit_log:
-        for rec in review_calls(audit_log, subject=str(ledger.get("subject") or ""),
-                                ledger_path=ledger_path):
-            call_id = str(rec.get("call_id") or "")
-            if call_id and call_id not in recorded_ids:
-                pending.append(rec)
+    pending = _pending_calls(ledger, ledger_path, audit_log)
     used = len(ledger.get("rounds", [])) + len(pending)
     current_round = used + 1
 
@@ -913,50 +1007,94 @@ def merge_and_guard(
             merged_omitted.append({**om, "origin_round": current_round})
 
     # 闸门 1：第 2 轮起必须有新的/变化的证据，不能拿同一组证据重复复核。
-    if (ledger.get("rounds") or pending) and not new_items and extra_basis != "security":
+    # Security 不再例外：换文件名、换路径、换理由文字都不算新证据。
+    if (ledger.get("rounds") or pending) and not new_items:
         raise LedgerError(
             "本轮证据与已提交证据内容相同（新增/变化 0 条）。"
-            "不得用同一组证据重复发起 REVIEW；仅调整措辞、补充背景或复核者重复同一要求时，"
-            "直接修正并记录，不重新调用。若确有新的实质证据，请先把它放进本轮证据包。"
+            "不得用同一组证据重复发起 REVIEW（包括 security）；"
+            "仅调整措辞、补充背景或更换文件名/路径不构成新证据。"
+            "若确有新的实质证据，请先把它放进本轮证据包；"
+            "没有新证据时直接修正并记录，不重新调用。"
         )
 
-    # 闸门 2：轮次上限。达到上限即停止自动复核；两个例外：
-    #  - security：新发现的重大安全问题，不设次数（安全优先）；
-    #  - remediation：执行方已按上一轮裁决完成整改后的一次定向复核，每个台账只允许一次，
-    #    且必须有新增/变化证据（整改产出的实际产物与验证输出）。它存在的理由是：
-    #    「整改完却没有复核出口」会迫使执行方新建台账，从而事实上绕过轮次上限
-    #    （2026-10-19 pedometer 长任务即如此做了 3 次「首轮」）。
+    # 闸门 2：普通预算（默认 + 普通追加）优先，Security 是普通预算全部用尽后的
+    # **独立**安全例外，不能用 basis 提前切到 security 通道，也不与普通额度互相占用：
+    #  - 普通：默认（普通 2 / 高风险 3）+ 普通追加（+2 / +3），必须有新增证据与理由；
+    #  - Security：普通默认与普通追加全部用尽后，才可用独立额度（普通 +1 / 高风险 +2），
+    #    同样必须有新增证据与明确的安全风险说明；
+    #  - Security 额度用尽：停止自动调用并请求用户针对具体任务、风险、追加范围授权，
+    #    不接受自由文本或自声明 CLI 参数代替用户授权。
     max_rounds = int(ledger.get("max_rounds", RISK_MAX_ROUNDS["normal"]))
-    remediation_used = _remediation_used(ledger, pending)
-    if extra_basis == REMEDIATION_BASIS:
-        if remediation_used:
+    extra_allowance = _extra_allowance(ledger)
+    security_allowance = _security_allowance(ledger)
+    split = _split_usage(ledger, pending)
+    ordinary_used = split["ordinary_used"]
+    security_used = split["security_used"]
+    used = split["used"]
+    current_round = used + 1
+    ordinary_extra_used = max(0, ordinary_used - max_rounds)
+    ordinary_extra_remaining = max(0, extra_allowance - ordinary_extra_used)
+    ordinary_default_remaining = max(0, max_rounds - ordinary_used)
+    ordinary_capacity = max_rounds + extra_allowance
+    ordinary_exhausted = ordinary_used >= ordinary_capacity
+    security_remaining = max(0, security_allowance - security_used)
+    current_extra_index = (ordinary_extra_used + 1) if ordinary_used >= max_rounds else 0
+    if extra_basis == REMEDIATION_BASIS and not new_items:
+        raise LedgerError(
+            "整改后定向复核（remediation）必须携带整改产生的新增/变化证据："
+            "本轮证据与已提交证据内容相同（新增 0 条）。"
+            "只改措辞或重复同一组证据时不要重新调用，直接记录修正。"
+        )
+    if extra_basis == SECURITY_BASIS:
+        if not ordinary_exhausted:
             raise LedgerError(
-                "本台账已使用过一次整改后定向复核（remediation），不能再用第二次。"
-                "若整改后仍有未闭合项，按 PARTIAL/BLOCKED 汇报并写明缺口与责任方；"
-                "仅当出现新发现的重大安全问题才可用 --extra-round-basis security 越限。"
-            )
-        if not new_items:
+                f"Security 复核只能在普通预算全部用尽后使用：普通已用 {ordinary_used} 轮"
+                f"（默认 {max_rounds} 轮 + 普通追加 {extra_allowance} 轮 = {ordinary_capacity} 轮），"
+                f"还剩 {ordinary_capacity - ordinary_used} 轮。"
+                "普通预算内有新增证据时请用 --extra-round-basis new-evidence 或 remediation；"
+                "不得用 security 提前进入例外通道。")
+        if security_remaining <= 0:
             raise LedgerError(
-                "整改后定向复核（remediation）必须携带整改产生的新增/变化证据："
-                "本轮证据与已提交证据内容相同（新增 0 条）。"
-                "只改措辞或重复同一组证据时不要重新调用，直接记录修正。"
-            )
-    if used >= max_rounds:
-        if extra_basis not in ("security", REMEDIATION_BASIS):
+                f"Security 独立追加额度已用尽（{security_used}/{security_allowance} 轮）。"
+                "停止自动调用：按 PARTIAL（缺证）或 BLOCKED 汇报，写明仍缺什么。"
+                "继续复核需要用户针对该任务、具体风险和追加范围明确授权；"
+                "不得用自由文本理由或自声明参数代替用户授权，也不得新建台账或换 subject 重置轮次。"
+                + (f"（另有 {len(pending)} 次未入账调用，已按已用轮次计入。）" if pending else ""))
+        if not extra_reason.strip():
             raise LedgerError(
-                f"复核轮次已达上限（{used}/{max_rounds}），停止自动复核。"
-                "请按 PARTIAL（缺证）或 BLOCKED 汇报，写明仍缺什么、由谁决定下一步；"
-                "不要为了得到 PASS 继续复核，也不要重复提交已经提交过的证据。"
-                "两个例外：新发现的重大安全问题用 --extra-round-basis security；"
-                "已按上一轮裁决完成整改、需要一次定向复核时用 --extra-round-basis "
-                "remediation（每份台账仅限一次，且必须带新增证据）。"
+                "Security 复核必须用 --extra-round-reason 说明具体安全风险："
+                "是什么风险、对应哪条未闭合项、本轮新增证据是哪几条。")
+    elif ordinary_used >= max_rounds:
+        if extra_basis not in (REMEDIATION_BASIS, "new-evidence"):
+            raise LedgerError(
+                f"默认复核预算已用尽（普通已用 {ordinary_used} 轮；默认 {max_rounds} 轮）。"
+                "继续复核必须使用 --extra-round-basis new-evidence（新增实质证据）或 "
+                "remediation（按裁决完成整改后的定向复核），并用 --extra-round-reason "
+                "写明实际整改内容、对应的未闭合项与新增证据。"
+                f"本台账普通弹性追加额度 {extra_allowance} 轮，已用 {ordinary_extra_used} 轮。"
+                "没有新增实质证据、没有新的风险发现或整改进展时不得重复复核。"
                 + (f"（另有 {len(pending)} 次 GPT 已返回但未入账的调用，已按已用轮次计入；"
                    "先修复台账，不要靠重试重置轮次。）" if pending else "")
             )
+        if ordinary_extra_remaining <= 0:
+            security_hint = (
+                f" 仅当存在新的实质安全风险、提供此前未用于 REVIEW 的新增证据时，"
+                f"才可用 --extra-round-basis security（独立额度剩余 {security_remaining} 轮）。"
+                if security_remaining > 0 else
+                " Security 独立额度也已用尽，继续复核需要用户明确授权，不得自行续轮。")
+            raise LedgerError(
+                f"默认预算与普通弹性追加额度均已用尽（默认 {max_rounds} 轮 + 普通追加 "
+                f"{extra_allowance} 轮）。停止自动复核：按 PARTIAL（缺证）或 BLOCKED 汇报，"
+                "写明仍缺什么、由谁决定下一步；不要为了得到 PASS 继续复核，"
+                "也不得新建台账或换 subject 重置轮次。" + security_hint
+                + (f"另有 {len(pending)} 次 GPT 已返回但未入账的调用，已按已用轮次计入；"
+                   "先修复台账，不要靠重试重置轮次。" if pending else "")
+            )
         if not extra_reason.strip():
             raise LedgerError(
-                "以 security / remediation 越过轮次上限时，仍需 --extra-round-reason "
-                "说明安全风险或整改内容（改了什么、对应哪条裁决、新增证据是哪几条）。"
+                "弹性追加复核仍需 --extra-round-reason 说明追加理由："
+                "实际改了什么、对应哪条未闭合裁决、新增证据是哪几条。"
+                "没有实质整改进展时不要追加复核。"
             )
 
     # 闸门 3：首轮之外，每次复核都必须说明“为什么还需要一轮”。
@@ -975,6 +1113,34 @@ def merge_and_guard(
         "pending_calls": len(pending),
         "pending_call_ids": [str(rec.get("call_id") or "") for rec in pending],
         "max_rounds": max_rounds,
+        "default_rounds": max_rounds,
+        "extra_allowance": extra_allowance,
+        # 本轮属于第几轮普通弹性追加（0 表示仍在默认预算内或本轮是 security）。
+        "extra_index": current_extra_index if extra_basis != SECURITY_BASIS else 0,
+        "extra_used": ordinary_extra_used,
+        "extra_remaining": ordinary_extra_remaining,
+        "extra_remaining_after": max(
+            0, ordinary_extra_remaining - (1 if ordinary_used >= max_rounds
+                                           and extra_basis != SECURITY_BASIS else 0)),
+        # 普通 / Security 两条额度的独立计数；pending 已分别计入。
+        "ordinary_used": ordinary_used,
+        "ordinary_pending": len(split["ordinary_pending"]),
+        "ordinary_remaining": ordinary_default_remaining,
+        "ordinary_extra_used": ordinary_extra_used,
+        "ordinary_extra_allowance": extra_allowance,
+        "ordinary_extra_remaining": ordinary_extra_remaining,
+        "ordinary_exhausted": ordinary_exhausted,
+        "total_remaining": ordinary_default_remaining + ordinary_extra_remaining,
+        "security_used": security_used,
+        "security_pending": len(split["security_pending"]),
+        "security_allowance": security_allowance,
+        "security_remaining": security_remaining,
+        "security_available": ordinary_exhausted and security_remaining > 0,
+        "security_index": (security_used + 1) if extra_basis == SECURITY_BASIS else 0,
+        "security_remaining_after": max(
+            0, security_remaining - (1 if extra_basis == SECURITY_BASIS else 0)),
+        "review_kind": (SECURITY_BASIS if extra_basis == SECURITY_BASIS
+                        else "extra" if ordinary_used >= max_rounds else "normal"),
         "risk": ledger.get("risk"),
         "current_packs": [{"path": p["path"], "sha256": p["sha256"]} for p in current_packs],
         "items": [
@@ -1096,20 +1262,32 @@ def render_ledger(ledger: dict, meta: dict) -> str:
     """把跨轮状态渲染成一段直接注入 prompt 的 Markdown。"""
     used = int(meta.get("used", len(ledger.get("rounds", []))))
     max_rounds = int(ledger.get("max_rounds", RISK_MAX_ROUNDS["normal"]))
-    over_limit = used >= max_rounds
+    extra_allowance = int(meta.get("extra_allowance", _extra_allowance(ledger)))
+    extra_index = int(meta.get("extra_index", 0))
+    extra_remaining_after = meta.get("extra_remaining_after")
+    ordinary_used = int(meta.get("ordinary_used", used))
+    security_used = int(meta.get("security_used", 0))
+    security_allowance = int(meta.get("security_allowance", _security_allowance(ledger)))
+    security_index = int(meta.get("security_index", 0))
+    security_remaining_after = meta.get("security_remaining_after")
+    over_limit = ordinary_used >= max_rounds
     basis = meta.get("extra_basis") or ""
-    if over_limit and basis == "security":
-        over_note = "（超限复核：安全事件）"
-    elif over_limit and basis == REMEDIATION_BASIS:
-        over_note = "（超限复核：整改后定向复核，一次性）"
+    if basis == SECURITY_BASIS:
+        over_note = (f"（Security 独立追加第 {security_index}/{security_allowance} 轮"
+                     + (f"，剩余 {security_remaining_after} 轮"
+                        if security_remaining_after is not None else "")
+                     + "）")
     elif over_limit:
-        over_note = "（超限复核）"
+        over_note = (f"（普通弹性追加第 {extra_index}/{extra_allowance} 轮"
+                     + (f"，剩余 {extra_remaining_after} 轮" if extra_remaining_after is not None else "")
+                     + "）")
     else:
-        over_note = ""
+        over_note = f"（默认预算剩余 {max(0, max_rounds - ordinary_used - 1)} 轮）"
     lines = [
         "=== 复核台账（copilot 自动注入，不是执行方结论）===",
         "",
-        f"- 风险级别：{ledger.get('risk')}；已用 REVIEW 轮次：{used} / {max_rounds}；"
+        f"- 风险级别：{ledger.get('risk')}；默认预算：{max_rounds} 轮；"
+        f"普通已用 {ordinary_used} 轮；Security 已用 {security_used}/{security_allowance} 轮；"
         f"本次为第 {used + 1} 轮{over_note}。",
         f"- 本轮证据：新增/变化 {meta['new_count']} 条；沿用此前 {meta['carried_count']} 条；"
         f"当前包内与历史重复去重 {meta['duplicate_count']} 条。",
@@ -1120,10 +1298,10 @@ def render_ledger(ledger: dict, meta: dict) -> str:
             "已按已用轮次计入，不得靠重试重置）。"
         )
     if meta.get("extra_reason"):
-        if basis == "security":
-            label = "超限复核理由（安全事件）" if over_limit else "复核理由"
+        if basis == SECURITY_BASIS:
+            label = "Security 追加理由（安全风险）"
         elif basis == REMEDIATION_BASIS:
-            label = "整改后定向复核理由（一次性，不安排下一轮）" if over_limit else "复核理由"
+            label = "整改后定向复核理由（不安排下一轮）" if over_limit else "复核理由"
         else:
             label = "超限复核理由" if over_limit else "复核理由"
         lines.append(f"- {label}（`{basis or '未指定'}`）：{meta['extra_reason']}")
@@ -1203,16 +1381,24 @@ def render_ledger(ledger: dict, meta: dict) -> str:
         "由执行方记录为延后项或交付后观察。",
         "5. 只有关键验收条件缺证或已确认不符合才判 PARTIAL；只有执行方不能自主解除的"
         "授权、资源或用户裁定才判 BLOCKED。不得因“存在任何未验证项”就拒绝 PASS。",
-        (f"6. 本轮是第 {used + 1}/{max_rounds} 轮。"
-         + ("本轮已越过轮次上限（仅限新发现的重大安全问题）：只给最终裁决，"
-            "不再要求下一轮复核；未解决项写明缺口与责任方。"
-            if over_limit and basis == "security" else
-            "本轮是整改后的一次性定向复核（已越过轮次上限）：只判断整改证据是否关闭此前的"
-            "阻塞项、以及整改是否引入新的实质问题；只给最终裁决，不安排下一轮自动复核。"
-            if over_limit and basis == REMEDIATION_BASIS else
-            "若达到上限，只给最终裁决，不再要求下一轮复核；未解决项写明缺口与责任方。")),
-        "7. 新发现的重大安全问题不受轮次上限限制：立即判 BLOCKED 或要求停止受影响操作，"
-        "并说明需要用户裁定的事项。",
+        (f"6. 本轮是第 {used + 1} 次正式 REVIEW（默认预算 {max_rounds} 轮；"
+         f"本次标记：{meta.get('review_kind', 'normal')}）。"
+         + (f"本轮是 Security 独立追加复核（第 {security_index}/{security_allowance} 轮，"
+            "依据 `security`）：只判断本轮新增的安全风险证据是否关闭此前明确未闭合的阻塞项；"
+            "同一问题、同一组证据不得重复声明为新的安全风险；不重复判定已确认项，"
+            "也不重做全量审计。只给最终裁决，本轮不自动安排下一轮复核；"
+            "Security 额度用尽后必须停下，等待用户明确授权。"
+            if basis == SECURITY_BASIS else
+            f"本轮是默认预算用尽后的普通弹性追加定向复核（第 {extra_index}/{extra_allowance} 轮，"
+            f"依据 `{basis or '未指定'}`）：只判断本轮新增/变化证据是否关闭此前明确未闭合的"
+            "阻塞项、整改是否引入新的实质问题；不重复判定已确认项，也不重做全量审计。"
+            "只给最终裁决，本轮不自动安排下一轮复核；若仍有关键项未闭合，写明缺口与责任方——"
+            "后续只有在本轮裁决指出的未闭合项有新证据、且台账仍有追加额度时才继续。"
+            if over_limit else
+            "本轮仍在默认预算内：只复核新增/变化证据与此前未闭合项，不重做全量审计。")),
+        "7. 新发现的重大安全问题：立即判 BLOCKED 或要求停止受影响操作，"
+        "并说明需要用户裁定的事项；继续复核仍受 Security 独立额度约束，"
+        "额度用尽后必须停下等待用户授权，不得把同一问题重复当成本轮新风险。",
         "8. 引用证据一律用本轮合并包编号；往轮回复中的编号只作历史参考。",
         "",
     ]
@@ -1292,6 +1478,17 @@ def record_round(
         "prompt_sha256": prompt_sha256,
         "extra_reason": meta.get("extra_reason", ""),
         "extra_basis": meta.get("extra_basis", ""),
+        # 弹性追加留痕：本轮是否越过默认预算、属于第几轮追加、追加额度与剩余。
+        "review_kind": meta.get("review_kind", "normal"),
+        "default_rounds": meta.get("default_rounds"),
+        "extra_index": meta.get("extra_index", 0),
+        "extra_allowance": meta.get("extra_allowance"),
+        "extra_remaining_after": meta.get("extra_remaining_after"),
+        # Security 独立额度留痕：普通预算不因 Security 轮次变化，反之亦然。
+        "security_index": meta.get("security_index", 0),
+        "security_allowance": meta.get("security_allowance"),
+        "security_remaining_after": meta.get("security_remaining_after"),
+        "risk": ledger.get("risk"),
     }
     previous_updated = ledger.get("updated_at")
     ledger.setdefault("rounds", []).append(record)
@@ -1306,11 +1503,201 @@ def record_round(
     return record
 
 
+def budget_status(path: str, *, audit_log: str = "", risk: str = "normal",
+                  subject: str = "") -> dict:
+    """只读预算查询；台账不存在时只报告默认值，不创建台账。
+
+    ``pending`` 是审计中成功但未入账的 REVIEW 调用，和 ``merge_and_guard`` 使用
+    同一套口径，因此会占用对应额度。本函数不写台账、不写审计、不发起调用。
+
+    普通预算与 Security 独立额度分别核算：``used`` 仍是全部 REVIEW 轮次（含 pending），
+    ``remaining``/``extra_*``/``total_remaining`` 只描述普通预算；Security 只看
+    ``security_*``。``next_action`` 与 ``merge_and_guard`` 的准入条件逐条对应。
+    """
+    requested = normalize_path(audit_log)
+    security_reasons: list[dict] = []
+    if os.path.exists(path):
+        ledger = load_or_init(path, risk=None)
+        actual_risk = str(ledger.get("risk") or "normal")
+        max_rounds = int(ledger.get("max_rounds",
+                                    RISK_MAX_ROUNDS.get(actual_risk, 2)))
+        bound = normalize_path(str(ledger.get("audit_log") or ""))
+        if bound and requested and bound != requested:
+            raise LedgerError(
+                f"复核台账绑定的审计日志是 {bound}，本次传入的是 {requested}。"
+                "预算核对必须使用同一份日志，不能靠换日志重置轮次。")
+        audit = requested or bound
+        pending = _pending_calls(ledger, path, audit)
+        split = _split_usage(ledger, pending)
+        status = "active"
+        out_subject = str(ledger.get("subject") or subject or "")
+        out_risk = actual_risk
+        for rnd in ledger.get("rounds", []):
+            if _record_is_security(rnd, where=f"台账第 {rnd.get('n')} 轮"):
+                security_reasons.append({
+                    "round": rnd.get("n"),
+                    "basis": rnd.get("extra_basis") or "",
+                    "reason": rnd.get("extra_reason") or "",
+                    "state": "recorded",
+                })
+        for rec in split["security_pending"]:
+            security_reasons.append({
+                "round": rec.get("review_round"),
+                "basis": rec.get("review_basis") or rec.get("review_kind") or "",
+                "reason": rec.get("review_reason") or "",
+                "state": "pending",
+            })
+        extra_reasons = [
+            {"round": rnd.get("n"),
+             "basis": rnd.get("extra_basis") or "",
+             "reason": rnd.get("extra_reason") or ""}
+            for rnd in ledger.get("rounds", [])
+            if int(rnd.get("n") or 0) > max_rounds
+            and not _record_is_security(rnd, where=f"台账第 {rnd.get('n')} 轮")
+        ]
+        remediation_used = _remediation_used(ledger, pending)
+    else:
+        risk = (risk or "normal").strip()
+        if risk not in RISK_MAX_ROUNDS:
+            raise LedgerError(f"risk 只能是 {', '.join(RISK_MAX_ROUNDS)}，收到 {risk!r}")
+        max_rounds = RISK_MAX_ROUNDS[risk]
+        pending = []
+        split = {"ordinary_used": 0, "security_used": 0, "used": 0,
+                 "ordinary_pending": [], "security_pending": []}
+        remediation_used = False
+        status = "not_created"
+        out_subject = (subject or "").strip()
+        out_risk = risk
+        extra_reasons = []
+
+    extra_allowance = int(EXTRA_ROUND_ALLOWANCE.get(out_risk,
+                                                    EXTRA_ROUND_ALLOWANCE["normal"]))
+    security_allowance = int(SECURITY_EXTRA_ALLOWANCE.get(out_risk,
+                                                          SECURITY_EXTRA_ALLOWANCE["normal"]))
+    ordinary_used = int(split["ordinary_used"])
+    security_used = int(split["security_used"])
+    used = int(split["used"])
+    # remaining 只表示「默认普通预算」剩余；普通追加与 Security 额度单列，
+    # 避免把追加额度误读成默认配额，或把 Security 额度算进普通预算。
+    remaining = max(0, max_rounds - ordinary_used)
+    extra_used = max(0, ordinary_used - max_rounds)
+    extra_remaining = max(0, extra_allowance - extra_used)
+    ordinary_capacity = max_rounds + extra_allowance
+    ordinary_exhausted = ordinary_used >= ordinary_capacity
+    security_remaining = max(0, security_allowance - security_used)
+    security_available = ordinary_exhausted and security_remaining > 0
+    pending_note = ""
+    if pending:
+        pending_note = (f"；另有 {len(pending)} 次未入账调用已计入相应额度"
+                        "（先补录/修复台账，不得重复发起）")
+    if status == "not_created":
+        next_action = (f"台账未创建；默认预算 {max_rounds} 轮、普通追加 {extra_allowance} 轮，"
+                       f"Security 独立额度 {security_allowance} 轮（仅普通预算全部用尽后、"
+                       "有新增安全风险证据时可用）；首次正式 REVIEW 时按计划风险创建")
+    elif ordinary_used < max_rounds:
+        next_action = (f"还可进行 {remaining} 轮普通复核；默认用尽后如有新增实质证据/"
+                       f"整改进展可普通弹性追加最多 {extra_allowance} 轮（不是无条件续轮）"
+                       + pending_note)
+    elif extra_remaining > 0:
+        next_action = (f"默认预算已用尽；如有新增实质证据/整改进展可普通弹性追加"
+                       f"（剩余 {extra_remaining} 轮），否则按 PARTIAL/BLOCKED 汇报"
+                       + pending_note)
+    elif security_remaining > 0:
+        next_action = (f"普通预算与普通追加均已用尽；仅当存在新的实质安全风险、"
+                       f"且提供此前未用于 REVIEW 的新增证据并说明风险时，"
+                       f"可用 security 独立额度（剩余 {security_remaining} 轮），否则按 "
+                       f"PARTIAL/BLOCKED 汇报；不新建台账或换 subject 重置轮次" + pending_note)
+    else:
+        next_action = ("普通预算、普通追加与 Security 独立额度均已用尽；停止自动调用，"
+                       "按 PARTIAL/BLOCKED 汇报，并请用户针对具体任务、风险与追加范围明确授权；"
+                       "不得用自由文本或自声明参数代替用户授权，也不新建台账或换 subject"
+                       + pending_note)
+    return {
+        "status": status,
+        "subject": out_subject,
+        "risk": out_risk,
+        # max_rounds 保留旧字段名，含义是「默认普通预算」，不含任何追加额度。
+        "max_rounds": max_rounds,
+        "default_rounds": max_rounds,
+        "used": used,
+        # 兼容字段：remaining 只表示默认普通预算剩余。
+        "remaining": remaining,
+        "extra_used": extra_used,
+        "extra_allowance": extra_allowance,
+        "extra_remaining": extra_remaining,
+        # 兼容字段：total_remaining 只描述普通预算（默认 + 普通追加），不含 Security。
+        "total_remaining": remaining + extra_remaining,
+        "extra_reasons": extra_reasons,
+        # 新增显式字段：普通 / Security 两条额度分开报告。
+        "ordinary_used": ordinary_used,
+        "ordinary_pending": len(split["ordinary_pending"]),
+        "ordinary_remaining": remaining,
+        "ordinary_extra_used": extra_used,
+        "ordinary_extra_allowance": extra_allowance,
+        "ordinary_extra_remaining": extra_remaining,
+        "ordinary_exhausted": ordinary_exhausted,
+        "security_used": security_used,
+        "security_pending": len(split["security_pending"]),
+        "security_allowance": security_allowance,
+        "security_remaining": security_remaining,
+        "security_available": security_available,
+        "security_reasons": security_reasons,
+        "pending": len(pending),
+        "pending_call_ids": [str(rec.get("call_id") or "") for rec in pending],
+        "remediation_available": not remediation_used,
+        "remediation_used": remediation_used,
+        "next_action": next_action,
+    }
+
+
 # ── 只读 CLI（排查台账用）────────────────────────────────────────────────────
 def main() -> int:
     ap = argparse.ArgumentParser(description="查看 copilot REVIEW 复核台账（只读）")
     ap.add_argument("--file", required=True, help="台账 JSON 路径")
+    ap.add_argument("--budget", action="store_true",
+                    help="只读预算预检：普通/Security 已用、pending、剩余与下一步；不创建台账")
+    ap.add_argument("--json", action="store_true", help="预算预检输出 JSON")
+    ap.add_argument("--audit-log", default="",
+                    help="预算预检用审计日志；默认使用台账绑定值")
+    ap.add_argument("--risk", choices=tuple(RISK_MAX_ROUNDS), default="normal",
+                    help="台账不存在时的计划风险（默认 normal）")
+    ap.add_argument("--subject", default="",
+                    help="台账不存在时的交付物标识（仅显示，不建账）")
     args = ap.parse_args()
+    if args.budget:
+        try:
+            info = budget_status(args.file, audit_log=args.audit_log,
+                                 risk=args.risk, subject=args.subject)
+        except LedgerError as exc:
+            print(f"copilot: {exc}", file=sys.stderr)
+            return 2
+        if args.json:
+            print(json.dumps(info, ensure_ascii=False, indent=2))
+        else:
+            print(f"交付物：{info['subject'] or '（未声明）'}；"
+                  f"风险级别：{info['risk']}；默认预算：{info['default_rounds']} 轮；"
+                  f"已用：{info['used']} 轮；默认剩余：{info['remaining']} 轮")
+            print(f"普通追加：已用 {info['extra_used']} 轮 / 额度 {info['extra_allowance']} 轮，"
+                  f"剩余 {info['extra_remaining']} 轮")
+            print(f"Security 独立额度：已用 {info['security_used']} 轮 "
+                  f"（未入账 {info['security_pending']}）/ 额度 {info['security_allowance']} 轮，"
+                  f"剩余 {info['security_remaining']} 轮；"
+                  f"当前可用：{'是' if info['security_available'] else '否'}"
+                  "（仅普通预算全部用尽后才可用）")
+            if info["extra_reasons"]:
+                for item in info["extra_reasons"]:
+                    print(f"- 普通追加第{item['round']}轮 [{item['basis'] or '未指定'}]："
+                          f"{item['reason'] or '（未记录理由）'}")
+            if info["security_reasons"]:
+                for item in info["security_reasons"]:
+                    print(f"- Security 第{item['round']}轮 [{item['basis'] or '未指定'}"
+                          f"/{item['state']}]：{item['reason'] or '（未记录理由）'}")
+            print(f"未入账调用：{info['pending']}（已按类型计入已用额度）")
+            print("remediation 标签：" + ("未使用" if info["remediation_available"] else "已使用")
+                  + "（仅用于区分追加类型，不再限制次数）")
+            print("口径：仅 REVIEW 计入预算；CONSULT/PLAN 不计入。")
+            print(f"下一步：{info['next_action']}")
+        return 0
     try:
         ledger = load_or_init(args.file, risk=None)
     except LedgerError as exc:

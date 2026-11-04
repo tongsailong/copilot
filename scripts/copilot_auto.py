@@ -52,6 +52,7 @@ sys.path.insert(0, HERE)
 
 import copilot_dispatch as D  # noqa: E402
 import native_bridge as NB  # noqa: E402
+from lib_common import sha256_file, sha256_text  # noqa: E402
 
 CALL = os.path.join(HERE, "call_gpt.py")
 BRIDGE = os.path.join(HERE, "bridge_evidence.py")
@@ -199,7 +200,7 @@ def _execution_report_text(result: dict) -> str:
     return _clip("\n".join(lines), MAX_REPORT_CHARS - 120)
 
 
-def _review_report_text(review: dict) -> str:
+def _review_report_text(review: dict, evidence: dict | None = None) -> str:
     reviewer = review.get("reviewer") or {}
     findings = []
     for item in review.get("findings") or []:
@@ -213,6 +214,14 @@ def _review_report_text(review: dict) -> str:
         "原生独立复核报告（Reviewer 独立报告；普通 PASS 不等于 G4；"
         "g4_eligible=false）",
         "",
+    ]
+    if evidence:
+        lines += [
+            f"- 原始报告证据：{evidence['id']}（SHA-256 {evidence['sha256']}）",
+            f"- 原始报告文件：{evidence.get('path_hint') or '<inline>'}",
+            "",
+        ]
+    lines += [
         f"- 工作项：{review['work_item_id']}",
         f"- 复核对象 execution_result_sha256：{review['execution_result_sha256']}",
         f"- Reviewer：{reviewer.get('profile_id') or '-'}；"
@@ -228,6 +237,37 @@ def _review_report_text(review: dict) -> str:
     ]
     lines += findings or ["- （无 finding）"]
     return _clip("\n".join(lines), MAX_REPORT_CHARS - 120)
+
+
+def _stage_native_review_raw(path: str, review: dict, envelope: dict,
+                             source_file: str = "") -> str:
+    """保留 Reviewer 原始报告文件。
+
+    优先使用调用方给出的原始文件；直接调用 API（没有来源文件）时，在状态目录下
+    写一份内容确定、可复核的信封快照。快照已存在但内容不同则失败关闭，不覆盖。
+    """
+    if source_file:
+        raw_path = os.path.abspath(source_file)
+        if not os.path.isfile(raw_path):
+            raise AutoError(f"复核原始报告文件不存在：{raw_path}")
+        return raw_path
+    root = os.path.join(os.path.dirname(os.path.abspath(path)), "review-evidence")
+    os.makedirs(root, exist_ok=True)
+    raw = json.dumps(envelope, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
+    digest = sha256_text(raw)
+    target = os.path.join(root, f"{review['result_sha256']}.json")
+    if os.path.exists(target):
+        if sha256_file(target) != digest:
+            raise AutoError(
+                f"复核快照 {target} 已存在但内容与本次信封不同；拒绝覆盖历史原始报告。")
+        return target
+    tmp = target + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(raw)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, target)
+    return target
 
 
 def _apply_native_execution(path: str, state: dict, envelope: dict) -> dict:
@@ -294,7 +334,8 @@ def _apply_native_execution(path: str, state: dict, envelope: dict) -> dict:
             "action": {"id": action["id"], "status": action["status"]}}
 
 
-def _apply_native_review(path: str, state: dict, envelope: dict) -> dict:
+def _apply_native_review(path: str, state: dict, envelope: dict, *,
+                         source_file: str = "") -> dict:
     dispatch = state.get("native_dispatch")
     if not isinstance(dispatch, dict):
         raise AutoError("状态没有 native_dispatch：复核不能先于执行出现。")
@@ -323,19 +364,32 @@ def _apply_native_review(path: str, state: dict, envelope: dict) -> dict:
         raise AutoError(
             f"当前 review_channel={channel!r}，与原生 Reviewer 冲突；"
             "同一轮不得同时使用原生与 GPT REVIEW 复核权威。")
+    raw_path = _stage_native_review_raw(path, review, envelope, source_file)
     snapshot = _snapshot(state)
     blocked = review["verdict"] != "pass"
     reason = "native Review verdict=" + review["verdict"]
     if blocked and review.get("unverified"):
         reason += "；未验证：" + "；".join(review["unverified"])
     try:
+        evidence = D.register_review_evidence(
+            state, file_path=raw_path,
+            review_of=review["execution_result_sha256"],
+            review_of_kind=D.NATIVE_REVIEW_OF_KIND,
+            review_source="native", verdict=review["verdict"],
+            round_id=review["round_id"],
+            note=f"native Reviewer 原始报告（{review['work_item_id']}）")
         entry = D.add_report(
-            state, _review_report_text(review), round_id=review["round_id"],
+            state, _review_report_text(review, evidence),
+            round_id=review["round_id"],
             blocked=blocked, reason=reason if blocked else "",
             kind="review", work_item_id=review["work_item_id"],
             dispatch_id=review["dispatch_id"],
             result_sha256=review["result_sha256"],
             review_of=review["execution_result_sha256"],
+            review_of_kind=D.NATIVE_REVIEW_OF_KIND,
+            evidence_id=evidence["id"],
+            raw_report_sha256=evidence["sha256"],
+            review_source="native",
             verdict=review["verdict"], g4_eligible=False)
         state["native_reviews"].append({
             "ts": D.now_iso(), "kind": "review",
@@ -344,6 +398,11 @@ def _apply_native_review(path: str, state: dict, envelope: dict) -> dict:
             "dispatch_id": review["dispatch_id"],
             "work_item_id": review["work_item_id"],
             "execution_result_sha256": review["execution_result_sha256"],
+            "review_of_kind": D.NATIVE_REVIEW_OF_KIND,
+            "review_source": "native",
+            "evidence_id": evidence["id"],
+            "raw_report_path": evidence.get("path_hint") or raw_path,
+            "raw_report_sha256": evidence["sha256"],
             "verdict": review["verdict"],
             "findings": review["findings"],
             "files_inspected": review["files_inspected"],
@@ -374,6 +433,8 @@ def _apply_native_review(path: str, state: dict, envelope: dict) -> dict:
             "execution_result_sha256": review["execution_result_sha256"],
             "result_sha256": review["result_sha256"],
             "report_sha256": entry["report_sha256"],
+            "evidence_id": evidence["id"],
+            "raw_report_sha256": evidence["sha256"],
             "g4_eligible": False}
 
 
@@ -402,14 +463,15 @@ def _validate_native_result(state: dict, envelope: dict) -> dict:
         raise AutoError(f"原生结果校验失败 [{exc.code}]：{exc}") from None
 
 
-def _apply_native_result(path: str, state: dict, envelope: dict) -> dict:
+def _apply_native_result(path: str, state: dict, envelope: dict, *,
+                         source_file: str = "") -> dict:
     try:
         kind = NB.classify_native_result(envelope)
     except NB.BridgeError as exc:
         raise AutoError(f"原生结果校验失败 [{exc.code}]：{exc}") from None
     if kind == "execution":
         return _apply_native_execution(path, state, envelope)
-    return _apply_native_review(path, state, envelope)
+    return _apply_native_review(path, state, envelope, source_file=source_file)
 
 
 # ── manifest 校验与回填 ────────────────────────────────────────────────────
@@ -571,47 +633,181 @@ def _apply_manifest(path: str, state: dict, manifest: dict) -> dict:
 
 # ── 证据包 ─────────────────────────────────────────────────────────────────
 
+def _review_handoff_entries(state: dict, *, verify_files: bool) -> list[dict]:
+    """选出本轮明确相关的复核原始报告。
+
+    默认只取最近一次复核轮次（同一轮可有多条工作项复核）以及完成条件显式引用的
+    复核证据；不把全部历史复核塞进上下文。verify_files=True 时重新核对文件存在
+    与 SHA-256，正文包必须按登记时的原文进入，不能悄悄用摘要替代。
+    """
+    reports = [r for r in state.get("reports") or []
+               if isinstance(r, dict) and r.get("kind") == "review"]
+    if not reports:
+        return []
+    latest_round = str(reports[-1].get("round_id") or "")
+    wanted = {str(r.get("evidence_id")) for r in reports
+              if str(r.get("round_id") or "") == latest_round
+              and r.get("evidence_id")}
+    for criterion in (state.get("contract") or {}).get("criteria") or []:
+        for ref in criterion.get("evidence_refs") or []:
+            eid = str(ref.get("id") or "") if isinstance(ref, dict) else ""
+            if eid:
+                wanted.add(eid)
+    by_id = {str(e.get("id") or ""): e for e in state.get("evidence") or []
+             if isinstance(e, dict)}
+    out: list[dict] = []
+    seen_sha: set[str] = set()
+    for report in reports:
+        eid = str(report.get("evidence_id") or "")
+        if eid not in wanted:
+            continue
+        evidence = by_id.get(eid)
+        if evidence is None:
+            raise AutoError(f"复核报告引用的原始证据 {eid} 不存在；拒绝用摘要替代。")
+        if evidence.get("dropped"):
+            raise AutoError(f"复核原始证据 {eid} 已归档；不能作为本轮证据。")
+        if str(evidence.get("task_id") or "") != str(state.get("task_id") or ""):
+            raise AutoError(f"复核原始证据 {eid} 不属于当前任务；拒绝跨任务引用。")
+        sha = str(evidence.get("sha256") or "")
+        if (evidence.get("origin") != "review-report"
+                or sha != str(report.get("raw_report_sha256") or "")
+                or str(evidence.get("review_of") or "") != str(report.get("review_of") or "")
+                or str(evidence.get("review_of_kind") or "")
+                != str(report.get("review_of_kind") or "")
+                or str(evidence.get("review_source") or "")
+                != str(report.get("review_source") or "")):
+            raise AutoError(
+                f"复核原始证据 {eid} 与报告绑定不一致；拒绝用不可信摘要替代原文。")
+        path = str(evidence.get("path_hint") or "")
+        if verify_files:
+            if not path or path == "<inline>":
+                raise AutoError(f"复核原始证据 {eid} 没有可读文件；不能进入证据包。")
+            if not os.path.isfile(path):
+                raise AutoError(f"复核原始报告文件不存在：{path}（证据 {eid}）。")
+            actual = sha256_file(path)
+            if actual != sha:
+                raise AutoError(
+                    f"复核原始报告摘要不一致：证据 {eid} 登记 {sha[:12]}，"
+                    f"当前文件 {actual[:12]}；拒绝把被改动的内容当作原文。")
+        if sha in seen_sha:
+            continue
+        seen_sha.add(sha)
+        out.append({
+            "id": eid,
+            "sha256": sha,
+            "file": path,
+            "review_of": str(report.get("review_of") or ""),
+            "review_of_kind": str(report.get("review_of_kind") or ""),
+            "review_source": str(report.get("review_source") or ""),
+            "verdict": str(report.get("verdict") or ""),
+            "round_id": str(report.get("round_id") or ""),
+        })
+    return out
+
+
 def _build_auto_pack(workdir: str, state: dict, manifest_evidence: list[dict],
                      question: str) -> str | None:
-    """把 manifest 中 include=true 的证据整理成 call_gpt 可读的证据包。
+    """把 manifest 证据与相关复核原文整理成 call_gpt 可读的证据包。
 
-    复用 bridge_evidence 的脱敏、指纹、预算与省略标注；不在驱动层重新实现。
+    复用 bridge_evidence 的脱敏、指纹、预算与省略标注；复核原文被截断、整体
+    未纳入或摘要不符时失败关闭，绝不退化成只用摘要。
     """
-    selected = [e for e in manifest_evidence if e.get("include", True)]
-    if not selected:
+    manifest_selected = [e for e in manifest_evidence if e.get("include", True)]
+    review_selected = _review_handoff_entries(state, verify_files=True)
+    if not manifest_selected and not review_selected:
         return None
     os.makedirs(workdir, exist_ok=True)
     round_no = int(state.get("round_seq") or 0) + 1
     pack = os.path.join(workdir, f"round-{round_no}-evidence.md")
     manifest_path = os.path.join(workdir, f"round-{round_no}-evidence.json")
-    cmd = [sys.executable, "-B", BRIDGE,
-           "--goal", f"第 {round_no} 轮执行证据（自动驱动；任务 {state.get('task_id')}）"
-                     + (f"\n本轮问题：{_clip(question, 1200)}" if question else ""),
-           "--out", pack, "--manifest", manifest_path,
-           "--max-chars", "60000"]
-    mapping = []
-    for entry in selected:
+
+    sources: list[dict] = []
+    for entry in manifest_selected:
         if "text" in entry:
-            tmp = os.path.join(workdir, f"evidence-{entry['id']}.txt")
-            with open(tmp, "w", encoding="utf-8") as fh:
-                fh.write(entry["text"])
-            spec = tmp
+            digest = sha256_text(entry["text"])
+            spec = None
+            text = entry["text"]
         else:
-            spec = entry["file"]
-            if entry.get("range"):
-                spec += "::" + entry["range"]
-        cmd += ["--file", spec]
+            path = entry["file"]
+            try:
+                digest = sha256_file(path)
+            except OSError as exc:
+                raise AutoError(f"自动证据包读取失败：{path}：{exc}") from None
+            text = None
+            spec = path + ("::" + entry["range"] if entry.get("range") else "")
         label = f"{entry['id']}={entry.get('file') or '<inline>'}"
         if entry.get("note"):
             # 证据用途说明随包带给 GPT；否则只有路径/编号，无法判断该证据对应哪项工作。
             label += f"（{_clip(entry['note'], 200)}）"
-        mapping.append(label)
+        sources.append({"digest": digest, "spec": spec, "text": text,
+                        "range": entry.get("range") or "", "labels": [label],
+                        "critical": False})
+    for entry in review_selected:
+        attached = None
+        for source in sources:
+            if source["digest"] != entry["sha256"]:
+                continue
+            if source["range"]:
+                raise AutoError(
+                    f"复核原始报告 {entry['id']} 与 manifest 中同摘要的行区间证据"
+                    "无法同时保证完整原文；请改用整文件证据或去掉区间。")
+            attached = source
+            break
+        label = (f"{entry['id']}={entry['file']}（{entry['review_source']} 复核原文；"
+                 f"review_of_kind={entry['review_of_kind']}；结论={entry['verdict']}；"
+                 f"SHA-256={entry['sha256']}）")
+        if attached is not None:
+            attached["labels"].append(label)
+            attached["critical"] = True
+            continue
+        sources.append({"digest": entry["sha256"], "spec": entry["file"],
+                        "text": None, "range": "", "labels": [label],
+                        "critical": True})
+
+    cmd = [sys.executable, "-B", BRIDGE,
+           "--goal", f"第 {round_no} 轮执行与复核证据（自动驱动；任务 {state.get('task_id')}）"
+                     + (f"\n本轮问题：{_clip(question, 1200)}" if question else ""),
+           "--out", pack, "--manifest", manifest_path,
+           "--max-chars", "60000"]
+    mapping = []
+    for index, source in enumerate(sources, 1):
+        if source["text"] is not None:
+            tmp = os.path.join(workdir, f"evidence-{round_no}-{index}.txt")
+            with open(tmp, "w", encoding="utf-8") as fh:
+                fh.write(source["text"])
+            spec = tmp
+        else:
+            spec = source["spec"]
+        cmd += ["--file", spec]
+        mapping.append("；".join(source["labels"]))
     cmd += ["--note", "自动证据包编号与任务状态证据索引是两套编号；"
                       "任务状态编号对应关系：" + "；".join(mapping)]
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
     if proc.returncode != 0:
         raise AutoError("自动证据包生成失败（bridge_evidence.py）："
                         + (proc.stderr.strip() or proc.stdout.strip())[-1500:])
+    manifest = _load_json(manifest_path)
+    items = manifest.get("items") if isinstance(manifest, dict) else None
+    if not isinstance(items, list):
+        raise AutoError("自动证据包清单缺少 items；无法确认复核原文是否完整。")
+    for source in sources:
+        if not source["critical"]:
+            continue
+        matches = [item for item in items
+                   if isinstance(item, dict)
+                   and str(item.get("sha256") or "") == source["digest"]]
+        complete = [item for item in matches
+                    if item.get("included") and not item.get("truncated")
+                    and not int(item.get("omitted_chars") or 0)]
+        if complete:
+            continue
+        detail = "；".join(
+            f"{item.get('reason') or item.get('method') or '未纳入'}"
+            for item in matches) or "清单中没有对应来源"
+        raise AutoError(
+            "复核原始报告未能完整进入证据包（"
+            + "；".join(source["labels"]) + "）：" + detail
+            + "。拒绝用摘要或截断内容代替原文。")
     return pack
 
 
@@ -680,12 +876,34 @@ def _build_prompt(state: dict, loop: dict, question: str) -> str:
                   _clip(str(latest.get("summary") or ""), 5000), ""]
     if review_reports:
         latest = review_reports[-1]
-        lines += ["### 最近一次原生独立复核报告（独立报告；PASS 不等于 G4）", "",
+        source = str(latest.get("review_source") or "")
+        if source == "native":
+            title = "### 最近一次原生独立复核报告（Reviewer 独立报告；PASS 不等于 G4）"
+        elif source == "legacy":
+            title = ("### 最近一次 legacy 复核报告（未经 native 身份校验；"
+                     "PASS 不等于 G4）")
+        else:
+            title = "### 最近一次复核报告（独立报告；PASS 不等于 G4）"
+        lines += [title, "",
                   f"- 绑定轮次：{latest.get('round_id') or '-'}；"
-                  f"复核对象 SHA-256：{latest.get('review_of') or '-'}",
-                  f"- g4_eligible：{latest.get('g4_eligible')}（固定为 false）",
-                  "",
-                  _clip(str(latest.get("summary") or ""), 5000), ""]
+                  f"复核对象 SHA-256：{latest.get('review_of') or '-'}"
+                  f"（{latest.get('review_of_kind') or '类型未记录'}）",
+                  f"- 复核来源：{source or '未记录'}；"
+                  f"结论：{latest.get('verdict') or '-'}",
+                  f"- g4_eligible：{latest.get('g4_eligible')}（固定为 false）"]
+        handoff = _review_handoff_entries(state, verify_files=False)
+        if handoff:
+            lines += ["", "已登记的复核原始证据（自动证据包启用时会随包发送；"
+                          "摘要仅辅助，判定以原文为准）："]
+            for entry in handoff:
+                lines.append(
+                    f"- {entry['id']}：SHA-256 {entry['sha256']}；"
+                    f"来源 {entry['review_source'] or '未记录'}；"
+                    f"review_of_kind {entry['review_of_kind'] or '未记录'}；"
+                    f"结论 {entry['verdict'] or '-'}；轮次 {entry['round_id'] or '-'}")
+            lines += ["- 自动证据包启用且原文未能完整进入时，驱动会失败关闭，"
+                      "不会把摘要或截断内容当成已核验原文。"]
+        lines += ["", _clip(str(latest.get("summary") or ""), 5000), ""]
     lines += [
         "### 输出要求（自动驱动契约）",
         "",
@@ -770,6 +988,86 @@ def _run_recover(args) -> None:
 
 
 # ── 结果包装 ───────────────────────────────────────────────────────────────
+
+def _latest_post_failure(audit_log: str) -> dict | None:
+    """取审计里最后一条 call_post_failure；读不到时返回 None。"""
+    try:
+        records = D._audit_records(audit_log)
+    except D.DispatchError:
+        return None
+    for record in reversed(records):
+        if record.get("event") == "call_post_failure":
+            return record
+    return None
+
+
+def _auto_recover_rejected(args, path: str, state: dict,
+                           call: dict) -> dict:
+    """对刚发生的 dispatch_plan_rejected 尝试恢复原回复；不新增模型调用。
+
+    只处理「最后一个轮次已是 rejected、审计最后一条失败正是该轮
+    dispatch_plan_rejected」的情形。先 dry-run 验证，再正式应用；任何
+    语义错误、字段冲突、身份/凭证不符都由 recover_consumed_reply 抛错，
+    此处原样返回失败原因，不猜测、不重试。
+    """
+    rounds = state.get("rounds") or []
+    if not rounds:
+        return {"status": "skipped", "reason": "状态没有轮次记录"}
+    target = rounds[-1]
+    if not isinstance(target, dict) or not target.get("rejected"):
+        return {"status": "skipped", "reason": "最后一个轮次不是拒绝轮次"}
+    call_id = str(target.get("call_id") or "").strip()
+    round_id = str(target.get("round_id") or "").strip()
+    if not call_id or not round_id:
+        return {"status": "skipped", "reason": "拒绝轮次缺少 call_id/round_id"}
+    failure = _latest_post_failure(args.audit_log)
+    if failure is None:
+        return {"status": "skipped", "reason": "审计中没有 call_post_failure 记录"}
+    # 必须是「这一次」失败，而不是历史遗留的拒绝轮次；否则一个无关的
+    # 凭证失败可能顺手恢复更早的回复。
+    if failure.get("error") != "dispatch_plan_rejected":
+        return {"status": "skipped",
+                "reason": f"最近一次失败不是 dispatch_plan_rejected："
+                          f"{failure.get('error') or 'unknown'}"}
+    if (str(failure.get("call_id") or "") != call_id
+            or str(failure.get("round_id") or "") != round_id):
+        return {"status": "skipped",
+                "reason": "最近一次拒绝与状态中的最后轮次不匹配"}
+
+    reply_path = str(call.get("reply_file") or "")
+    if not reply_path or not os.path.isfile(reply_path):
+        return {"status": "rejected", "reason": "回复文件不存在，无法恢复"}
+    try:
+        reply = _read_text(reply_path)
+    except AutoError as exc:
+        return {"status": "rejected", "reason": str(exc)}
+
+    try:
+        preview = D.recover_consumed_reply(
+            path, state, args.audit_log, call_id=call_id, reply=reply,
+            dry_run=True)
+    except D.DispatchError as exc:
+        return {"status": "rejected", "reason": f"dry-run 未通过：{exc}"}
+    if preview.get("status") == "already_applied":
+        return {"status": "already_applied",
+                "round_id": preview.get("round_id") or round_id,
+                "call_id": call_id}
+    if preview.get("status") != "preview":
+        return {"status": "rejected",
+                "reason": f"dry-run 返回未知状态：{preview.get('status')!r}"}
+
+    try:
+        applied = D.recover_consumed_reply(
+            path, state, args.audit_log, call_id=call_id, reply=reply,
+            dry_run=False)
+    except D.DispatchError as exc:
+        return {"status": "rejected", "reason": f"恢复失败：{exc}"}
+    return {"status": "applied", "round_id": round_id, "call_id": call_id,
+            "mapping": applied.get("mapping") or [],
+            "normalizer_version": applied.get("normalizer_version"),
+            "before_state_sha256": applied.get("before_state_sha256"),
+            "after_state_sha256": applied.get("after_state_sha256")}
+
 
 def _result(status: str, state: dict, loop: dict, **extra) -> dict:
     out = {
@@ -996,18 +1294,35 @@ def drive(args) -> int:
                  "reply_file": call["reply_file"], "evidence": evidence}
     if call["exit"] != 0:
         state = D.load_state(path)
-        loop = D.loop_step(path, persist=True)
         pending = state.get("pending_call")
         if call["exit"] == 12:
+            loop = D.loop_step(path, persist=True)
             return _emit(_result(
                 "budget_exhausted", state, loop, **common, call=call_info,
                 reason="call_gpt 拒绝出站：请求数/Token 预算已耗尽"),
                 EXIT_WAIT)
-        return _emit(_result(
-            "failed", state, loop, **common, call=call_info,
-            reason=f"GPT 调用失败（退出码 {call['exit']}）；"
-                   + ("存在 pending，下一轮先 recover。" if isinstance(pending, dict)
-                      else "未写入任务状态。")), call["exit"])
+        recovery = None
+        if call["exit"] == 2:
+            # 只对「回复已取得、轮次已消费、但 plan 解析/应用失败」的拒绝轮次
+            # 自动尝试恢复；凭证/归属失败没有可恢复回复，仍走失败关闭路径。
+            recovery = _auto_recover_rejected(args, path, state, call)
+            call_info["recovery"] = recovery
+        if recovery and recovery.get("status") in ("applied", "already_applied"):
+            # 恢复已复用原 call_id 完成入账；继续走与成功调用相同的阶段求值，
+            # 但本次 drive 不会再发起任何 GPT 请求。
+            common["auto_recovered"] = recovery.get("status")
+        else:
+            loop = D.loop_step(path, persist=True)
+            reason = f"GPT 调用失败（退出码 {call['exit']}）；"
+            if recovery and recovery.get("status") == "rejected":
+                reason += "自动恢复未通过：" + str(recovery.get("reason") or "-")
+            elif isinstance(pending, dict):
+                reason += "存在 pending，下一轮先 recover。"
+            else:
+                reason += "未写入任务状态。"
+            return _emit(_result(
+                "failed", state, loop, **common, call=call_info,
+                reason=reason), call["exit"])
 
     state = D.load_state(path)
     loop = D.loop_step(path, persist=True)
@@ -1091,7 +1406,8 @@ def ingest(args) -> int:
                 "round_seq": round_before, "state_path": path,
                 "http_requests": 0,
             }, EXIT_OK)
-        info = _apply_native_result(path, state, envelope)
+        info = _apply_native_result(path, state, envelope,
+                                    source_file=args.native_result)
     else:
         if state.get("execution_backend") == "native":
             raise AutoError(

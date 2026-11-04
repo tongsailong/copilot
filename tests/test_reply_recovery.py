@@ -14,6 +14,7 @@ SCRIPTS = os.path.join(os.path.dirname(HERE), "scripts")
 sys.path.insert(0, SCRIPTS)
 
 import copilot_dispatch  # noqa: E402
+import reply_protocol  # noqa: E402
 from lib_common import sha256_text  # noqa: E402
 
 FIXTURE = os.path.join(HERE, "fixtures", "third-reply-old-fields.md")
@@ -212,7 +213,7 @@ class RecoverOldFieldsTests(RecoveryFixture):
         self.assertEqual(target["decision"], "stop")
         self.assertEqual(target["verdict"], "pass")
         self.assertEqual(target["recovery"]["normalizer_version"],
-                         "reply-protocol/v1")
+                         reply_protocol.NORMALIZER_VERSION)
         self.assertIn("id 非法", target["recovery"]["previous_note"])
         self.assertEqual(target["recovery"]["audit_reply_sha256"],
                          sha256_text(reply.rstrip("\n")))
@@ -236,6 +237,29 @@ class RecoverOldFieldsTests(RecoveryFixture):
                          result["after_state_sha256"])
         self.assertEqual(len(records[1]["mapping"]), 6)
         self.assertEqual(records[1]["call_id"], "call-recovery-1")
+
+    def test_evidence_ids_reply_is_recovered_without_new_request(self):
+        reply = self.reply({
+            "decision": "stop", "verdict": "pass", "summary": "按 evidence_ids 核销",
+            "criteria": [
+                {"id": "C1", "status": "met", "evidence_ids": ["E1"]},
+                {"id": "C2", "status": "met", "evidence_ids": ["E2"]},
+                {"id": "C3", "status": "met", "evidence_ids": ["E3"]},
+            ],
+        })
+        self.rejected_round(reply)
+        before = self.state_digest()
+        result = self.recover(reply=reply)
+        self.assertEqual(result["status"], "applied")
+        self.assertEqual(result["normalizer_version"],
+                         reply_protocol.NORMALIZER_VERSION)
+        self.assertNotEqual(before, result["after_state_sha256"])
+        self.assertIn(("evidence_ids", "evidence_refs"),
+                      [(m["from"], m["to"]) for m in result["mapping"]])
+        self.assertEqual(self.criterion("C1")["status"], "met")
+        self.assertEqual([r["id"] for r in self.criterion("C1")["evidence_refs"]],
+                         ["E1"])
+        self.assertTrue(copilot_dispatch.pass_pending(self.state))
 
     def test_normal_gate_closure_after_recovery(self):
         reply = self.real_plan()

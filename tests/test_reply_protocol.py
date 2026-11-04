@@ -40,6 +40,47 @@ class NormalizePlanTests(unittest.TestCase):
         # 入参不能被修改（纯函数）。
         self.assertNotIn("criterion_id", raw["criteria"][0])
 
+    def test_evidence_ids_is_mapped(self):
+        raw = plan_with([{"id": "C1", "status": "met",
+                          "evidence_ids": ["E1", "E2"]}])
+        result = reply_protocol.normalize_plan(raw)
+        criterion = result["plan"]["criteria"][0]
+        self.assertEqual(criterion["evidence_refs"], ["E1", "E2"])
+        self.assertEqual(criterion["evidence_ids"], ["E1", "E2"])
+        self.assertEqual([(m["from"], m["to"]) for m in result["mapping"]],
+                         [("id", "criterion_id"),
+                          ("evidence_ids", "evidence_refs")])
+
+    def test_evidence_and_evidence_ids_equal_is_normal(self):
+        raw = plan_with([{"criterion_id": "C1", "status": "met",
+                          "evidence": ["E1"], "evidence_ids": ["E1"]}])
+        result = reply_protocol.normalize_plan(raw)
+        self.assertEqual(result["plan"]["criteria"][0]["evidence_refs"], ["E1"])
+        # 两个别名等值：只记录一次映射（取别名表中靠前者），不重复补字段。
+        self.assertEqual([(m["from"], m["to"]) for m in result["mapping"]],
+                         [("evidence", "evidence_refs")])
+
+    def test_evidence_and_evidence_ids_conflict_is_rejected(self):
+        raw = plan_with([{"criterion_id": "C1", "status": "met",
+                          "evidence": ["E1"], "evidence_ids": ["E2"]}])
+        with self.assertRaises(reply_protocol.ProtocolError) as ctx:
+            reply_protocol.normalize_plan(raw)
+        self.assertEqual(ctx.exception.code, "field_conflict")
+
+    def test_canonical_and_evidence_ids_conflict_is_rejected(self):
+        raw = plan_with([{"criterion_id": "C1", "status": "met",
+                          "evidence_refs": ["E1"], "evidence_ids": ["E2"]}])
+        with self.assertRaises(reply_protocol.ProtocolError) as ctx:
+            reply_protocol.normalize_plan(raw)
+        self.assertEqual(ctx.exception.code, "field_conflict")
+
+    def test_evidence_ids_type_error_is_rejected(self):
+        raw = plan_with([{"id": "C1", "status": "met",
+                          "evidence_ids": "E1"}])
+        with self.assertRaises(reply_protocol.ProtocolError) as ctx:
+            reply_protocol.normalize_plan(raw)
+        self.assertEqual(ctx.exception.code, "field_type_invalid")
+
     def test_canonical_only_is_normal(self):
         raw = plan_with([{"criterion_id": "C1", "status": "met",
                           "evidence_refs": ["E1"]}])
@@ -151,6 +192,12 @@ class NormalizePlanTests(unittest.TestCase):
         original = copy.deepcopy(raw)
         reply_protocol.normalize_plan(raw)
         self.assertEqual(raw, original)
+
+
+class ProtocolVersionTests(unittest.TestCase):
+    def test_evidence_ids_rule_bumps_normalizer_version(self):
+        # v2 是对外可见的恢复审计字段；规则变化必须同步升级版本。
+        self.assertEqual(reply_protocol.NORMALIZER_VERSION, "reply-protocol/v2")
 
 
 class ParsePlanCompatibilityTests(unittest.TestCase):

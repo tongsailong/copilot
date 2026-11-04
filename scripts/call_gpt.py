@@ -52,7 +52,9 @@ copilot 相对旧实现的增量：
     （有图时 `input` 从字符串切换为 content 数组）；像素绝不能以路径、文字描述或 base64 文本代替。
     证据包声明了图片却读不到同一份像素 → 明确失败。请求体 dump / 审计只留图片元数据，不落 base64。
   * **REVIEW 复核台账**（`--review-ledger`）：合并历史证据并按内容去重/重编号，注入往轮裁决，
-    执行轮次上限（普通 2 轮 / 高风险 3 轮）；首轮之外的复核必须说明理由。
+    执行默认复核预算（普通 2 轮 / 高风险 3 轮）、普通弹性追加额度（普通 +2 / 高风险 +3）
+    与 Security 独立额度（普通 +1 / 高风险 +2，仅普通预算全部用尽后可用）；
+    首轮之外的复核必须说明理由，任何追加都必须携带新增证据。
     `--dry-run` 只构建并检查 prompt/证据/台账，不调用 GPT、不写审计；但可能创建/更新
     复核台账（subject/audit 绑定），不是完全无副作用。
 
@@ -175,6 +177,38 @@ REVIEW_OUTPUT_CONTRACT = (
 NEVER_SENT_HINTS = ("refused", "getaddrinfo", "name or service not known",
                     "temporary failure in name resolution", "no route to host",
                     "network is unreachable")
+
+
+def _review_round_meta(merged_meta: dict) -> dict:
+    """REVIEW 轮次审计字段：普通预算、Security 独立额度与新增证据留痕。
+
+    审计是预算与追加理由的权威留痕；这里只写元数据，裁决仍在结果记录里。
+    Security 轮次额外记录新增证据编号与 SHA-256，便于事后还原证据变化。
+    """
+    meta = {
+        "review_round": merged_meta["round"],
+        "review_max_rounds": merged_meta["max_rounds"],
+        "review_default_rounds": merged_meta.get("default_rounds", merged_meta["max_rounds"]),
+        "review_kind": merged_meta.get("review_kind", "normal"),
+        "review_risk": merged_meta.get("risk"),
+        "review_extra_index": merged_meta.get("extra_index", 0),
+        "review_extra_allowance": merged_meta.get("extra_allowance"),
+        "review_extra_remaining_after": merged_meta.get("extra_remaining_after"),
+        "review_ordinary_used": merged_meta.get("ordinary_used"),
+        "review_security_used": merged_meta.get("security_used"),
+        "review_security_index": merged_meta.get("security_index", 0),
+        "review_security_allowance": merged_meta.get("security_allowance"),
+        "review_security_remaining": merged_meta.get("security_remaining_after"),
+        "review_basis": merged_meta.get("extra_basis") or "",
+        "review_reason": merged_meta.get("extra_reason") or "",
+    }
+    if meta["review_kind"] == "security":
+        new_ids = set(merged_meta.get("new_ids") or [])
+        meta["review_new_evidence"] = [
+            {"id": it["id"], "sha256": it["digest"]}
+            for it in merged_meta.get("items", []) if it["id"] in new_ids
+        ]
+    return meta
 
 
 def request_result_unknown(exc: Exception) -> bool:
@@ -839,8 +873,9 @@ def main() -> int:
                     help="GPT 的角色/规则文件（默认 copilot/references/role.md）")
     ap.add_argument("--mode", default="", help="CONSULT/PLAN/REVIEW（留痕 + 证据纪律注入）")
     ap.add_argument("--review-ledger", default="",
-                    help="REVIEW 复核台账 JSON：自动合并历史证据、注入往轮裁决，并执行轮次上限"
-                         "（普通 2 轮 / 高风险 3 轮）")
+                    help="REVIEW 复核台账 JSON：自动合并历史证据、注入往轮裁决，并执行轮次预算"
+                         "（默认普通 2 轮 / 高风险 3 轮；默认用尽后普通追加 +2 / +3；"
+                         "普通预算全部用尽后 Security 独立额度 +1 / +2；任何追加都要新增证据）")
     ap.add_argument("--one-shot-visual-review", action="store_true",
                     help="显式声明一次性视觉评审（无台账）：要求证据包至少含 1 张图片，"
                          "不携带跨轮状态；普通带图续轮仍必须使用 --review-ledger")
@@ -848,12 +883,16 @@ def main() -> int:
                     help="创建台账时的风险级别（默认 normal）；台账已存在时不得改变")
     ap.add_argument("--extra-round-reason", default="",
                     help="首轮之外每次复核的理由（新增证据 / 未解决的关键缺陷 / 新矛盾）；"
-                         "越过轮次上限时还必须同时指定 security 或 remediation")
+                         "默认预算用尽后的普通追加轮次必须写明实际整改内容、对应的未闭合项"
+                         "与新增证据是哪几条；Security 追加必须写明具体安全风险")
     ap.add_argument("--extra-round-basis", default="",
                     choices=("new-evidence", "security", "remediation"),
-                    help="复核依据记录：new-evidence（新增实质证据）/ security（新发现的重大安全问题，"
-                         "不设次数）/ remediation（已按上一轮裁决完成整改后的一次定向复核，"
-                         "每份台账仅一次且必须带新增证据）")
+                    help="复核依据记录：new-evidence（新增实质证据）/ security（普通预算全部用尽后的"
+                         "独立安全例外，必须带此前未用于 REVIEW 的新增证据与安全风险说明）"
+                         "/ remediation（已按上一轮裁决完成整改后的定向复核）。"
+                         "new-evidence 与 remediation 可在默认预算用尽后弹性追加，普通最多 +2 / "
+                         "高风险 +3；security 只能在此后使用独立额度（普通 +1 / 高风险 +2），"
+                         "用尽后需用户明确授权；任何依据都不允许没有新证据的重复复核")
     ap.add_argument("--dry-run", action="store_true",
                     help="只构建并检查 prompt/证据/台账，不调用 GPT（不写审计）；"
                          "但会读取或创建复核台账，并可能写入 subject/audit_log 绑定，"
@@ -1109,7 +1148,16 @@ def main() -> int:
     if args.dry_run:
         ledger_note = ""
         if merged_meta:
-            ledger_note = (f"；复核第 {merged_meta['round']}/{merged_meta['max_rounds']} 轮"
+            kind = merged_meta.get("review_kind", "normal")
+            if kind == "extra":
+                round_note = (f"弹性追加第 {merged_meta.get('extra_index')}"
+                              f"/{merged_meta.get('extra_allowance')} 轮")
+            elif kind == "security":
+                round_note = (f"Security 独立追加第 {merged_meta.get('security_index')}"
+                              f"/{merged_meta.get('security_allowance')} 轮")
+            else:
+                round_note = f"默认预算 {merged_meta['round']}/{merged_meta['max_rounds']} 轮"
+            ledger_note = (f"；复核第 {merged_meta['round']} 轮，{round_note}"
                            f"（新增 {merged_meta['new_count']} 条，沿用 {merged_meta['carried_count']} 条）")
         print(f"copilot: dry-run（未调用 GPT）：mode={mode or '-'}；channel={channel}；"
               f"model={args.model}；reasoning.effort={effort_sent or '-'}；"
@@ -1272,11 +1320,7 @@ def main() -> int:
     }
     if merged_meta:
         # 只记轮次元数据；裁决在结果记录里，开始记录不带结论。
-        start_record.update({
-            "review_round": merged_meta["round"],
-            "review_max_rounds": merged_meta["max_rounds"],
-            "review_basis": merged_meta.get("extra_basis") or "",
-        })
+        start_record.update(_review_round_meta(merged_meta))
     try:
         append_audit(args.audit_log, {"channel": channel, **start_record})
     except AuditError as exc:
@@ -1375,11 +1419,9 @@ def main() -> int:
                 review_meta = {}
                 if merged_meta:
                     review_meta = {
-                        "review_round": merged_meta["round"],
-                        "review_max_rounds": merged_meta["max_rounds"],
+                        **_review_round_meta(merged_meta),
                         "review_new_items": merged_meta["new_count"],
                         "review_verdict": verdict or "UNPARSED",
-                        "review_basis": merged_meta.get("extra_basis") or "",
                     }
 
                 # 模型身份门（安全边界）：请求名与上游回显名必须完全一致。

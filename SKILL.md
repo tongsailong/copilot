@@ -209,6 +209,44 @@ python3 ~/.zcode/skills/copilot/scripts/call_gpt.py \
 `--dry-run` 不出站、不写审计，但会读取或**创建/更新 GPT REVIEW 台账**，并可能写入 `subject` / `audit_log`
 绑定；它不是完全无副作用的沙盒，正式复核前不要把它当成「只读预检」。
 
+**REVIEW 轮次预算只读预检**：正式准备证据包前，可先用 `review_ledger.py --budget` 查看
+`subject / risk / default_rounds / used / remaining / extra_used / extra_allowance /
+extra_remaining / extra_reasons / pending`，以及普通 / Security 两条额度的显式字段：
+`ordinary_used / ordinary_pending / ordinary_remaining / ordinary_extra_used /
+ordinary_extra_allowance / ordinary_extra_remaining / ordinary_exhausted`、
+`security_used / security_pending / security_allowance / security_remaining /
+security_available / security_reasons`，和与 `merge_and_guard` 准入条件逐条对应的
+`next_action`，避免证据准备完成后才发现额度不足：
+
+```bash
+python3 ~/.zcode/skills/copilot/scripts/review_ledger.py \
+  --file /tmp/copilot/review-<交付物标识>.json --budget --json
+```
+
+`pending`（审计中成功但尚未入账的 REVIEW 调用）计入 `used`，与 `merge_and_guard` 同口径；
+台账不存在时只按 `--risk` / `--subject` 报告默认值，**不创建台账**。预检只提示可用额度，
+不改变任何门禁或关闭语义。
+
+**预算口径**：默认预算为普通 2 轮 / 高风险 3 轮；`remaining` 只表示默认预算剩余。
+默认用尽后，若确有**新增实质证据 / 整改进展 / 新风险证据**，可用
+`--extra-round-basis new-evidence|remediation` 在普通弹性追加额度内继续定向复核
+（普通 +2、高风险 +3，合计普通 4 / 高风险 6），并用 `--extra-round-reason` 写明
+实际改了什么、对应哪条未闭合项、新增证据是哪几条。没有新增实质证据时一律拒绝重复复核；
+普通追加额度用尽即按 PARTIAL/BLOCKED 汇报，不新建台账或换 subject 重置轮次。
+
+`security` 是**普通预算（默认 + 普通追加）全部用尽后**才可用的独立安全例外，额度固定为
+普通 1 轮 / 高风险 2 轮（`security_allowance`），与普通额度互不占用，也不能提前切换到该
+通道。进入该通道必须同时满足：普通预算已用尽；确有**新的实质安全风险**；提供**此前未用于
+任何一轮 REVIEW（普通或 Security）的新增有效证据**；用 `--extra-round-reason` 写明具体
+风险、对应未闭合项与新增证据。Security 与普通追加共用同一套内容哈希去重：换文件名 / 路径、
+改理由措辞、把同一内容重新打包都不算新证据；仅凭理由文字也不能替代新证据。Security 额度
+用尽后停止自动调用，按 PARTIAL/BLOCKED 汇报，并请求用户针对该任务、具体风险与追加范围
+**明确授权**；自由文本理由、自声明 CLI 参数、新建 subject 或换台账都不构成用户授权。
+
+`remediation` 只是追加类型标签，不再限制为一次；追加轮次仍复用原 subject / 台账 / 审计日志，
+不能靠新建 subject、换台账或换日志扩容。简单任务一轮能闭合就只做一轮——追加额度不是
+必须用完的配额，也不是默认的第三轮终检。
+
 **模型身份是消费前提（硬约束）。** 只有退出码 0 **且**审计 `call_result` 里
 `model_identity_ok=true` 的回复，才能作为有效 GPT 指导。请求模型与上游回显 `model` 必须一致
 （只容忍回显两端空白）；
@@ -335,6 +373,26 @@ python3 ~/.zcode/skills/copilot/scripts/copilot_dispatch.py recover \
   --state /tmp/copilot/dispatch.json --call-id <call_id> --abandon
 ```
 
+**已消费但 plan 被拒的回复**（审计 `call_post_failure.error=dispatch_plan_rejected`，
+轮次已记 rejected，回复可能已扣费）不要重新调用模型；用 `recover-reply` 复用原
+`call_id` 和原回复重新解析：
+
+```bash
+# 先 dry-run 只看预览，不写状态、不写恢复审计
+python3 ~/.zcode/skills/copilot/scripts/copilot_dispatch.py recover-reply \
+  --state /tmp/copilot/dispatch.json --call-id <原 call_id> \
+  --reply-file /tmp/copilot/copilot-reply.md --dry-run
+# 预览通过后去掉 --dry-run 正式应用
+```
+
+恢复会重新校验任务凭证、原调用审计、模型身份与回复内容，然后以原子写盘应用安排；
+成功后复用原 `call_id`，**不会新增 SOL 请求或 REVIEW 轮次**，原回复文件、审计记录与
+回复摘要保持不变，重复执行按 `already_applied` 幂等处理。以下情况仍 fail-closed：
+字段含义冲突（如 `evidence` 与 `evidence_ids` 同时出现且不等）、空 `id`、语义错误、
+未知字段冲突、任务/轮次/合同/身份校验失败。`copilot_auto.py drive` 在 `call_gpt.py`
+返回退出码 2 且最近失败确为本次 `dispatch_plan_rejected` 时，会自动先 dry-run 再应用；
+恢复失败仍按原退出码失败关闭，不猜测、不重发。
+
 copilot 需要推进时输出一个 `copilot-plan` 块，`call_gpt.py` 自动写回交接状态：
 
 ````markdown
@@ -396,6 +454,12 @@ expected_evidence / depends_on**；每个工作项已有稳定的 `dispatch_id` 
   Reviewer 必须是独立子代理、`profile_id=reviewer`，只读检查真实文件/diff/日志/证据，
   `changed_files=[]`，`g4_eligible=false`；Reviewer 身份、实际模型和复核摘要同样由
   `native_agent.py review` 从运行记录填入。用 `ingest --native-result <review.json>` 回填。
+- native 复核回填时，原始 `review.json` 会登记为证据（保存文件路径、SHA-256、任务归属、
+  轮次与 `review_of_kind=native-execution-result`）；`review_source=native`，不会与
+  legacy 报告混用。自动驱动会把**最近复核轮次**和完成条件显式引用的复核原文放进证据包，
+  SOL 同时拿到证据编号、SHA-256、复核对象和结论；摘要只作辅助。
+- 复核原文被截断、因总预算未纳入、文件缺失或 SHA-256 不符时，自动驱动失败关闭，
+  不会退化成只用摘要，也不会用不完整内容继续调用 SOL。
 - `ingest` 是**纯本地**回填：不调用 `call_gpt.py`、不产生 HTTP、不递增轮次、不创建
   `pending_call`；重复信封按结果 SHA 幂等；CLOSED 或存在 pending 时拒绝写入。
   SOL 的最终判断只能由随后**显式**运行的 `drive` 发起（`drive --native-result` 已停用）。
@@ -482,9 +546,18 @@ copilot_dispatch.py evidence --state S --id E1 --drop --reason '被新证据取�
 # 执行报告：必须绑定已验证轮次；blocked 必须给原因
 copilot_dispatch.py report --state S --summary-file r.md [--round-id <rid>]
 copilot_dispatch.py report --state S --blocked --reason '<缺口或阻塞>'
+
+# legacy 复核报告：原始报告文件必填；review_of 必须指向真实已存在的对象
+copilot_dispatch.py report --state S --kind review --file reviewer-report.md \
+  --review-of <execution-report/report_sha256 或 evidence/sha256> \
+  --review-of-kind execution-report|evidence --verdict pass|partial|blocked
 ```
 
 - `decide` 单条上限 2000 字；`report` 上限 8000 字；报告是执行方反馈，不替代现场证据。
+- 复核报告必须提供原始报告文件，登记为 `legacy-review-report` 证据并保存 SHA-256、任务归属、
+  轮次和 `review_of_kind`；`review_source=legacy`，**不冒充** native Reviewer。同一文件与
+  绑定重复登记幂等；缺失文件、摘要不符、跨任务、错误绑定或同一对象换报告都被拒绝。
+- native 任务不得用 legacy 报告混入复核权威；native 复核必须走 `ingest --native-result`。
 - `record --evidence-id` 只能引用**已登记、属于当前任务、未被归档**的证据；文件型证据会重读
   并校验摘要。任一引用无效时整次回填失败，工作项状态、产出与证据列表都不改变。
 - 证据 id 已登记但摘要不同时拒绝静默替换；需要新 id 或先 `--drop`（保留归档记录）。
@@ -721,6 +794,9 @@ ready_actions、stalled、criteria 计数、gate、notes 与 next_commands；按
   在**出站前**停止，不靠「先调用再检查」多刷一轮。
 - REJUDGE 先自动 `report --blocked` 留痕失败码，再发起一次重判；不在同一进程连续重判。
 - 真实调用失败时保留 `pending_call`；下一次 `drive` 只报告 `recover`，绝不自动重发。
+- 回复已取得但 plan 被拒（`dispatch_plan_rejected`）时，`drive` 对本次拒绝先 dry-run
+  再尝试 `recover-reply`；成功时复用原 `call_id` 继续求值，**不发起新的 GPT 请求**，
+  失败时仍按原退出码失败关闭。
 
 ### 6. 测试边界
 
@@ -747,8 +823,9 @@ ready_actions、stalled、criteria 计数、gate、notes 与 next_commands；按
 REVIEW 的目标是用证据收敛到一个可交付裁决，不是无限补证。CPA 调用无状态，跨轮依据只能来自台账。
 
 - 首轮前建立验收条件清单，逐条映射到证据 ID；一次覆盖所有可取得的关键条件，取不到的写明原因。
-- `--review-ledger` 自动合并历史证据、按内容去重并统一重编号、注入往轮裁决、检查轮次上限与
-  本轮是否真有新增/变化证据、记录本轮裁决与指纹。历史证据包必须保留到复核结束。
+- `--review-ledger` 自动合并历史证据、按内容去重并统一重编号、注入往轮裁决、检查默认预算与
+  弹性追加额度、核验本轮是否真有新增/变化证据、记录本轮裁决、追加理由与指纹。
+  历史证据包必须保留到复核结束。
 - **台账绑定交付物与审计日志**：新建台账必须用 `--subject` 声明稳定的交付物标识，
   并在台账中持久记录本次使用的审计日志（规范化绝对路径）。同一交付物只能有一份台账在推进：
   - 换台账路径、删台账重建、复制台账另起一份、或更换审计日志，都不会把轮次归零：
@@ -766,7 +843,7 @@ REVIEW 的目标是用证据收敛到一个可交付裁决，不是无限补证�
     不要删除后重建；无法确认绑定时按下面的规则安全失败。
 - **并发复核被拒绝**：正式复核会对台账加独占锁，覆盖「读轮次 → 请求 → 入账」整段。
   同一台账同时只允许一次正式复核；第二个进程在出站前失败（退出码 2，未发请求、未计轮次）。
-  不要为了让两个任务并行而新建台账或复制台账——那会绕过轮次上限。
+  不要为了让两个任务并行而新建台账或复制台账——那会绕过默认预算与追加额度。
 - **`--audit-log` 的四种状态**（决定能否新建或继续）：
   - **参数缺失**（没传 `--audit-log`）：正式调用在出站前失败（退出码 2）；新建台账被拒绝。
   - **路径无效**（父目录不存在、指向目录、不可写）：审计写入失败，正式调用在出站前失败；
@@ -807,7 +884,9 @@ REVIEW 的目标是用证据收敛到一个可交付裁决，不是无限补证�
 - **裁决未形成（`UNPARSED`）不是有效裁决**：台账/审计记录 `UNPARSED` 时，说明回复没有可机读的
   三态行或存在冲突。按「无裁决」报告，不得当 PASS；主代理可以在报告中给出自己的判断，但必须
   标注它不是本轮正式裁决，也不得因此自动重发付费调用。
-- 轮次上限：普通 2 次（首轮 + 1 次针对性复核）；高风险 3 次（首轮 + 最多 2 次）。
+- 默认预算：普通 2 次（首轮 + 1 次针对性复核）；高风险 3 次（首轮 + 最多 2 次）。
+  它不是不可突破的硬上限：默认用尽后，若确有新增实质证据 / 整改进展 / 新风险证据，
+  可在弹性追加额度内继续定向复核（普通 +2、高风险 +3）。
   风险按影响判断：安装升级、权限或安全边界、不可逆操作、生产数据、用户要求独立复核 → `high`；
   普通交付 → `normal`。风险在创建台账时用 `--risk high` 指定；台账一旦创建，风险级别不可更改
   （脚本拒绝覆盖，不会静默改写）。新建台账只用于新的交付物；同一交付物的持续复核必须复用原台账。
@@ -815,12 +894,15 @@ REVIEW 的目标是用证据收敛到一个可交付裁决，不是无限补证�
   G4 只看任务状态的 `risk`，台账标 `high` 不能弥补任务状态被标成 `normal`。
   不为多跑几轮把普通任务标成 `high`，也不靠新建台账改级别。
 - 首轮之外的复核必须对应新的实质证据、未解决的关键缺陷或足以改变结论的矛盾，
-  并用 `--extra-round-reason` 说明；同一组证据原样重提会被拒绝（`security` 依据除外）。
-- 超限出口：`--extra-round-basis security`（新发现的重大安全问题，每次说明风险）与
-  `--extra-round-basis remediation`（已按裁决完成整改，每份台账仅一次，必须带整改产生的
-  新增/变化证据）。
-- 达到轮次上限仍有关键问题未解决时，停止自动循环，按 PARTIAL/BLOCKED 汇报，
-  写明缺什么、由谁决定下一步。
+  并用 `--extra-round-reason` 说明；同一组证据原样重提会被拒绝（Security 同样适用）。
+- 追加出口：`--extra-round-basis new-evidence` 与 `--extra-round-basis remediation`
+  （按裁决完成整改后的定向复核；两者都可越过默认预算，但必须带本轮新增/变化证据，
+  并在理由中写明对应哪条未闭合项）。`remediation` 是标签而非一次性名额。
+  `--extra-round-basis security` 只在普通预算全部用尽后可用，受独立额度硬顶约束
+  （普通 1 / 高风险 2），必须提供此前未用于 REVIEW 的新增证据并说明具体安全风险。
+- 普通与 Security 额度都用尽仍有关键问题未解决时，停止自动循环，按 PARTIAL/BLOCKED 汇报，
+  写明缺什么、由谁决定下一步；继续复核需要用户针对该任务、具体风险与追加范围明确授权。
+  不得为得到 PASS 新建台账、换 subject 或反复提交同一证据。
 
 处理复核意见：阻塞项才进入下一轮；非阻塞观察记录为延后项，不驱动复核。PARTIAL 不自动等于
 「再跑一轮完整复核」；先判断缺的是否关键、执行方能否补、是否只能由用户动作闭合。
@@ -842,8 +924,8 @@ REVIEW 的**评审深度与证据范围**。不因任务名称含 REVIEW 就套�
 | **安全** | 凭据、审计/台账、证据解析、外部请求、权限边界、失败关闭逻辑 | 全部受影响的安全不变量 + 攻击测试矩阵 + 失败路径 | 必须 1 次终审；仅在触发条件成立时追加 1 次定向复验 |
 
 拿不准时按更高一档；但**档位高不等于可以扩大改动范围**。安全档不得因「想少跑一轮」省略攻击测试。
-档位与台账的 `--risk` 是两个维度：档位决定**本轮评审深度与证据范围**，`--risk` 决定**台账轮次上限**，
-按实际影响面分别判断。该判 `high` 的仍按影响判 `high`；本节只反对**无依据抬高**，
+档位与台账的 `--risk` 是两个维度：档位决定**本轮评审深度与证据范围**，`--risk` 决定**台账默认预算
+与弹性追加额度**，按实际影响面分别判断。该判 `high` 的仍按影响判 `high`；本节只反对**无依据抬高**，
 不反对因安全影响而抬高。
 
 ### 2. 首轮评审后：先集中分级，再动手
@@ -873,8 +955,9 @@ REVIEW 的**评审深度与证据范围**。不因任务名称含 REVIEW 就套�
 - **独立复核最多 2 轮；到顶即停**。达到上限仍有阻塞项时，如实报 PARTIAL / BLOCKED 并写明缺口与责任方；
   **不得把未解决的 P0/P1 标成 PASS**，也不得无限循环。
 - P2 在有依据时可延后（写明触发条件与责任方），不驱动新一轮复核。
-- 这里的「轮」指独立复核轮次；与台账的付费 REVIEW 轮次上限（普通 2 / 高风险 3）是两件事，
-  互不替代，也不互相豁免。
+- 这里的「轮」指独立复核轮次；与台账的付费 REVIEW 默认预算（普通 2 / 高风险 3，
+  另有弹性追加额度）是两件事，互不替代，也不互相豁免。独立复核的 2 轮上限本阶段不变；
+  台账追加额度不能用来绕过独立复核的停止条件，反之亦然。
 
 ## 判断质量与收口（对照 ChatGPT 自定义指令 v5.0）
 
@@ -947,8 +1030,8 @@ ChatGPT 自定义指令 v5.0（2026-11-01 逐字落盘）只是判断原则的�
   「错误归属、跨任务/跨轮次串线、旧回复冒充本轮」这类来源混淆，不是防本机恶意篡改。
   因此正式运行只认标准审计日志路径，隔离的临时审计路径只在显式声明测试时使用；
   在报告里可以说「凭证与任务/轮次/合同绑定且不可跨任务复用」，不得说「不可伪造」。
-- 需要补证时只复验受影响的条件，不重跑已确认项；达到轮次上限仍未解决时如实报
-  PARTIAL/BLOCKED，并写明责任方。
+- 需要补证时只复验受影响的条件，不重跑已确认项；默认预算与弹性追加额度都用尽仍未解决时
+  如实报 PARTIAL/BLOCKED，并写明责任方。
 - 本 Skill 不新增或改动宿主的 provider、模型路由、工具与权限配置
   （含 ZCode 的 `~/.zcode/v2/provider_config.json`；Reasonix 侧 `config.toml` 为历史遗留、同样不动）。
 

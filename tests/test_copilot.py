@@ -1029,9 +1029,19 @@ class LedgerTests(unittest.TestCase):
         self.record(ledger, meta2)
 
         pack3 = write_pack(self.tmp.name, "r3.md", [("c.txt", "three")])
+        # 默认预算仍为 2 轮：没有追加依据时，第 3 次复核被拒绝。
         with self.assertRaises(review_ledger.LedgerError) as ctx:
-            review_ledger.merge_and_guard(ledger, [pack3], "再补一条", "new-evidence")
-        self.assertIn("上限", str(ctx.exception))
+            review_ledger.merge_and_guard(ledger, [pack3], "再补一条")
+        self.assertIn("默认复核预算已用尽", str(ctx.exception))
+        self.assertIn("弹性追加", str(ctx.exception))
+        # 有新增实质证据与明确理由时，允许在弹性额度内追加一轮定向复核。
+        _, meta3 = review_ledger.merge_and_guard(
+            ledger, [pack3], "按未闭合项 F1 整改，新增 c.txt 产物", "new-evidence")
+        self.assertEqual(meta3["round"], 3)
+        self.assertEqual(meta3["review_kind"], "extra")
+        self.assertEqual(meta3["extra_index"], 1)
+        self.assertEqual(meta3["extra_allowance"], 2)
+        self.assertEqual(meta3["extra_remaining_after"], 1)
 
     def test_high_risk_allows_three_rounds(self):
         ledger = self.new_ledger(risk="high")
@@ -1144,19 +1154,22 @@ class LedgerTests(unittest.TestCase):
 
     def test_security_basis_can_exceed_round_limit(self):
         ledger = self.new_ledger(risk="normal")
-        for idx in (1, 2):
+        # 默认 2 轮 + 弹性追加 2 轮全部用尽。
+        for idx in (1, 2, 3, 4):
             pack = write_pack(self.tmp.name, f"r{idx}.md", [(f"{idx}.txt", f"body{idx}")])
             _, meta = review_ledger.merge_and_guard(
-                ledger, [pack], f"round {idx}", "new-evidence")
+                ledger, [pack], f"round {idx}", "new-evidence" if idx > 1 else "")
             self.record(ledger, meta)
-        pack3 = write_pack(self.tmp.name, "r3.md", [("3.txt", "body3")])
+        pack5 = write_pack(self.tmp.name, "r5.md", [("5.txt", "body5")])
         with self.assertRaises(review_ledger.LedgerError):
-            review_ledger.merge_and_guard(ledger, [pack3], "普通补证", "new-evidence")
-        _, meta3 = review_ledger.merge_and_guard(ledger, [pack3], "新发现的重大安全问题", "security")
-        self.assertEqual(meta3["round"], 3)
+            review_ledger.merge_and_guard(ledger, [pack5], "普通补证", "new-evidence")
+        _, meta5 = review_ledger.merge_and_guard(
+            ledger, [pack5], "新发现的重大安全问题", "security")
+        self.assertEqual(meta5["round"], 5)
+        self.assertEqual(meta5["review_kind"], "security")
 
-    def test_remediation_basis_allows_one_round_past_limit(self):
-        """整改后定向复核：达到上限后允许一次，且必须带新增证据（复盘发现的缺口）。"""
+    def test_remediation_rounds_are_elastic_until_allowance(self):
+        """remediation 是弹性追加标签：有新增证据可继续，但受追加额度硬顶约束。"""
         ledger = self.new_ledger(risk="normal")
         for idx in (1, 2):
             pack = write_pack(self.tmp.name, f"r{idx}.md", [(f"c{idx}.txt", f"body{idx}")])
@@ -1171,13 +1184,46 @@ class LedgerTests(unittest.TestCase):
         self.assertEqual(meta3["round"], 3)
         self.assertEqual(meta3["new_count"], 1)
         self.assertEqual(meta3["extra_basis"], "remediation")
+        self.assertEqual(meta3["extra_index"], 1)
         self.record(ledger, meta3)
 
-        # 同一台账第二次 remediation 必须被拒绝：它不是「无限续轮」的后门。
+        # 追加额度内允许第二次整改定向复核（旧的一次性名额已取消）。
         fix2 = write_pack(self.tmp.name, "fix2.md", [("fixed2.txt", "再整改")])
+        _, meta4 = review_ledger.merge_and_guard(
+            ledger, [fix2], "按第3轮 F2 再整改，新增 fixed2.txt", "remediation")
+        self.assertEqual(meta4["round"], 4)
+        self.assertEqual(meta4["extra_index"], 2)
+        self.assertEqual(meta4["extra_remaining_after"], 0)
+        self.record(ledger, meta4)
+
+        # 追加额度用尽：第 5 次复核必须停止，不能靠 remediation 无限续轮。
+        fix3 = write_pack(self.tmp.name, "fix3.md", [("fixed3.txt", "第三次整改")])
         with self.assertRaises(review_ledger.LedgerError) as ctx:
-            review_ledger.merge_and_guard(ledger, [fix2], "再整改一次", "remediation")
-        self.assertIn("一次", str(ctx.exception))
+            review_ledger.merge_and_guard(ledger, [fix3], "再整改一次", "remediation")
+        self.assertIn("均已用尽", str(ctx.exception))
+
+    def test_extra_round_records_reason_and_allowance_in_ledger(self):
+        """追加轮次必须把理由、依据、追加序号与剩余额度写入台账，供审计复核。"""
+        ledger = self.new_ledger(risk="normal")
+        for idx in (1, 2):
+            pack = write_pack(self.tmp.name, f"r{idx}.md", [(f"g{idx}.txt", f"body{idx}")])
+            _, meta = review_ledger.merge_and_guard(
+                ledger, [pack], f"round {idx}", "new-evidence" if idx > 1 else "")
+            self.record(ledger, meta)
+        fix = write_pack(self.tmp.name, "fix.md", [("fixed.txt", "整改产物")])
+        _, meta3 = review_ledger.merge_and_guard(
+            ledger, [fix], "按第2轮 F1 整改，新增 fixed.txt 与测试输出", "remediation")
+        record = review_ledger.record_round(
+            ledger, self.ledger_path, meta3, "PARTIAL", "裁决：PARTIAL", "0" * 64,
+            identity=LEDGER_IDENTITY)
+        self.assertEqual(record["review_kind"], "extra")
+        self.assertEqual(record["n"], 3)
+        self.assertEqual(record["extra_basis"], "remediation")
+        self.assertIn("F1", record["extra_reason"])
+        self.assertEqual(record["extra_index"], 1)
+        self.assertEqual(record["extra_allowance"], 2)
+        self.assertEqual(record["extra_remaining_after"], 1)
+        self.assertEqual(record["verdict"], "PARTIAL")
 
     def test_remediation_requires_new_evidence(self):
         """remediation 不能拿同一组证据重跑：没有新增/变化证据时直接拒绝。"""
@@ -1204,8 +1250,9 @@ class LedgerTests(unittest.TestCase):
         _, meta3 = review_ledger.merge_and_guard(
             ledger, [fix], "按 F1 整改", "remediation")
         rendered = review_ledger.render_ledger(ledger, meta3)
-        self.assertIn("整改后的一次性定向复核", rendered)
-        self.assertIn("不安排下一轮", rendered)
+        self.assertIn("弹性追加第 1/2 轮", rendered)
+        self.assertIn("不自动安排下一轮复核", rendered)
+        self.assertIn("不重做全量审计", rendered)
 
     def test_pack_without_items_is_rejected(self):
         path = os.path.join(self.tmp.name, "empty.md")
@@ -1284,6 +1331,339 @@ class LedgerTests(unittest.TestCase):
         with self.assertRaises(review_ledger.LedgerError) as ctx:
             review_ledger.merge_and_guard(ledger, [p2], "新增", "new-evidence")
         self.assertIn("已变化", str(ctx.exception))
+
+
+class SecurityBudgetTests(unittest.TestCase):
+    """Security 独立追加额度：与普通预算分离、有硬顶、必须有新增证据。
+
+    只使用本地临时台账与模拟审计，不触发任何真实 SOL / Reviewer 请求。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.ledger_path = os.path.join(self.tmp.name, "ledger.json")
+        self.subject = "test-deliverable"
+        self.audit = os.path.join(self.tmp.name, "audit.jsonl")
+        isolate_standard_audit(self, self.audit)
+
+    def new_ledger(self, **kw):
+        kw.setdefault("subject", self.subject)
+        kw.setdefault("audit_log", self.audit)
+        return review_ledger.load_or_init(self.ledger_path, **kw)
+
+    def record(self, ledger, meta, verdict="PARTIAL", call_id=None):
+        return review_ledger.record_round(
+            ledger, self.ledger_path, meta, verdict, f"裁决：{verdict}",
+            "0" * 64, identity=LEDGER_IDENTITY, call_id=call_id)
+
+    def pack(self, name, source, body):
+        return write_pack(self.tmp.name, name, [(source, body)])
+
+    def fill_ordinary(self, ledger, total):
+        """按普通预算走满 total 轮：首轮无理由，之后就同一交付物补新证据。"""
+        for idx in range(1, total + 1):
+            path = self.pack(f"o{idx}.md", f"o{idx}.txt", f"ordinary body {idx}")
+            reason = "" if idx == 1 else f"新增 o{idx}.txt，继续第 {idx} 轮定向复核"
+            basis = "" if idx == 1 else "new-evidence"
+            _, meta = review_ledger.merge_and_guard(ledger, [path], reason, basis)
+            self.record(ledger, meta)
+
+    def audit_call(self, call_id, **extra):
+        return {
+            "channel": "cpa", "event": "call_result", "call_id": call_id,
+            "ts": "2026-11-04T00:00:00+08:00", "mode": "REVIEW", "ok": True,
+            "ledger": os.path.abspath(self.ledger_path), "subject": self.subject,
+            "review_round": 5, "review_max_rounds": 2, **extra,
+        }
+
+    def status(self):
+        return review_ledger.budget_status(self.ledger_path, audit_log=self.audit)
+
+    def test_normal_default_two_rounds_do_not_consume_security(self):
+        ledger = self.new_ledger(risk="normal")
+        self.fill_ordinary(ledger, 2)
+        self.assertEqual([r["n"] for r in ledger["rounds"]], [1, 2])
+        info = self.status()
+        self.assertEqual(info["used"], 2)
+        self.assertEqual(info["ordinary_used"], 2)
+        self.assertEqual(info["security_used"], 0)
+        self.assertEqual(info["security_allowance"], 1)
+        self.assertEqual(info["security_remaining"], 1)
+        self.assertFalse(info["security_available"], "普通预算用尽前 Security 不可用")
+        self.assertIn("普通弹性追加", info["next_action"])
+        self.assertIn("2 轮", info["next_action"])
+
+    def test_normal_ordinary_extra_allows_two_more_rounds(self):
+        ledger = self.new_ledger(risk="normal")
+        self.fill_ordinary(ledger, 4)
+        info = self.status()
+        self.assertEqual(info["ordinary_used"], 4)
+        self.assertEqual(info["ordinary_extra_used"], 2)
+        self.assertEqual(info["ordinary_extra_allowance"], 2)
+        self.assertEqual(info["ordinary_extra_remaining"], 0)
+        self.assertTrue(info["ordinary_exhausted"])
+        self.assertEqual(info["used"], 4)
+        self.assertEqual(info["security_used"], 0)
+        self.assertTrue(info["security_available"])
+        self.assertIn("security", info["next_action"])
+
+    def test_security_requires_ordinary_budget_exhausted(self):
+        ledger = self.new_ledger(risk="normal")
+        early = self.pack("early.md", "early.txt", "early security body")
+        with self.assertRaises(review_ledger.LedgerError) as ctx:
+            review_ledger.merge_and_guard(ledger, [early], "早期安全问题", "security")
+        self.assertIn("普通预算全部用尽", str(ctx.exception))
+        self.assertIn("不得用 security 提前进入例外通道", str(ctx.exception))
+
+        self.fill_ordinary(ledger, 3)
+        mid = self.pack("mid.md", "mid.txt", "mid security body")
+        with self.assertRaises(review_ledger.LedgerError) as ctx:
+            review_ledger.merge_and_guard(ledger, [mid], "普通追加期间的疑似安全问题", "security")
+        self.assertIn("普通预算全部用尽", str(ctx.exception))
+
+        self.fill_ordinary_one(ledger, 4)
+        late = self.pack("late.md", "late.txt", "genuine new security body")
+        _, meta = review_ledger.merge_and_guard(
+            ledger, [late], "普通预算用尽后发现的权限提升风险，新增 late.txt", "security")
+        self.assertEqual(meta["round"], 5)
+        self.assertEqual(meta["review_kind"], "security")
+        self.assertEqual(meta["extra_basis"], "security")
+
+    def fill_ordinary_one(self, ledger, idx):
+        path = self.pack(f"o{idx}.md", f"o{idx}.txt", f"ordinary body {idx}")
+        _, meta = review_ledger.merge_and_guard(
+            ledger, [path], f"新增 o{idx}.txt，继续第 {idx} 轮定向复核", "new-evidence")
+        self.record(ledger, meta)
+
+    def test_normal_security_allowance_is_one(self):
+        ledger = self.new_ledger(risk="normal")
+        self.fill_ordinary(ledger, 4)
+        first = self.pack("sec1.md", "sec1.txt", "first new security evidence")
+        _, meta = review_ledger.merge_and_guard(
+            ledger, [first], "新发现越权读取风险，新增 sec1.txt", "security")
+        self.assertEqual(meta["security_index"], 1)
+        self.assertEqual(meta["security_allowance"], 1)
+        self.assertEqual(meta["security_remaining_after"], 0)
+        record = self.record(ledger, meta)
+        self.assertEqual(record["review_kind"], "security")
+        self.assertEqual(record["security_index"], 1)
+        self.assertEqual(record["security_remaining_after"], 0)
+        self.assertEqual(record["risk"], "normal")
+
+        second = self.pack("sec2.md", "sec2.txt", "second new security evidence")
+        with self.assertRaises(review_ledger.LedgerError) as ctx:
+            review_ledger.merge_and_guard(
+                ledger, [second], "又一个安全问题", "security")
+        message = str(ctx.exception)
+        self.assertIn("Security 独立追加额度已用尽（1/1 轮）", message)
+        self.assertIn("用户", message)
+        self.assertIn("授权", message)
+        self.assertIn("不得用自由文本理由或自声明参数代替用户授权", message)
+
+    def test_high_risk_ordinary_six_then_security_two(self):
+        ledger = self.new_ledger(risk="high")
+        self.fill_ordinary(ledger, 6)
+        info = self.status()
+        self.assertEqual(info["ordinary_used"], 6)
+        self.assertEqual(info["ordinary_extra_allowance"], 3)
+        self.assertEqual(info["ordinary_extra_remaining"], 0)
+        self.assertEqual(info["security_allowance"], 2)
+        self.assertEqual(info["security_remaining"], 2)
+        extra = self.pack("sec-a.md", "sec-a.txt", "high risk security evidence a")
+        with self.assertRaises(review_ledger.LedgerError) as ctx:
+            review_ledger.merge_and_guard(ledger, [extra], "普通诉求，再复核一次", "new-evidence")
+        self.assertIn("均已用尽", str(ctx.exception))
+
+        for idx in (1, 2):
+            path = self.pack(f"high-sec{idx}.md", f"high-sec{idx}.txt",
+                             f"high risk security evidence {idx}")
+            _, meta = review_ledger.merge_and_guard(
+                ledger, [path], f"高风险安全问题 {idx}，新增 high-sec{idx}.txt", "security")
+            self.assertEqual(meta["security_index"], idx)
+            self.assertEqual(meta["security_allowance"], 2)
+            self.record(ledger, meta)
+
+        third = self.pack("high-sec3.md", "high-sec3.txt", "high risk security evidence 3")
+        with self.assertRaises(review_ledger.LedgerError) as ctx:
+            review_ledger.merge_and_guard(ledger, [third], "第三个安全问题", "security")
+        self.assertIn("Security 独立追加额度已用尽（2/2 轮）", str(ctx.exception))
+
+    def test_security_rejects_reused_history_evidence(self):
+        ledger = self.new_ledger(risk="normal")
+        self.fill_ordinary(ledger, 4)
+        body = "same security evidence body"
+        first = self.pack("sec-dup1.md", "audit.log", body)
+        _, meta = review_ledger.merge_and_guard(
+            ledger, [first], "新发现审计缺口，新增 audit.log", "security")
+        self.record(ledger, meta)
+
+        same = self.pack("sec-dup2.md", "audit.log", body)
+        with self.assertRaises(review_ledger.LedgerError) as ctx:
+            review_ledger.merge_and_guard(ledger, [same], "同一个安全问题再复核", "security")
+        self.assertIn("内容相同", str(ctx.exception))
+        self.assertIn("security", str(ctx.exception))
+
+    def test_security_reason_change_is_not_new_evidence(self):
+        ledger = self.new_ledger(risk="high")
+        self.fill_ordinary(ledger, 6)
+        body = "unchanged security body"
+        first = self.pack("sec-r1.md", "sec-r.txt", body)
+        _, meta = review_ledger.merge_and_guard(
+            ledger, [first], "权限提升风险，新增 sec-r.txt", "security")
+        self.record(ledger, meta)
+
+        same = self.pack("sec-r2.md", "sec-r.txt", body)
+        with self.assertRaises(review_ledger.LedgerError) as ctx:
+            review_ledger.merge_and_guard(
+                ledger, [same],
+                "换一套更严重的措辞说明同一风险，所以应当再复核一次", "security")
+        message = str(ctx.exception)
+        self.assertIn("内容相同", message)
+        self.assertIn("仅调整措辞", message)
+
+    def test_security_filename_change_is_not_new_evidence(self):
+        ledger = self.new_ledger(risk="high")
+        self.fill_ordinary(ledger, 6)
+        body = "identical bytes under a different name"
+        first = self.pack("orig-pack.md", "orig.log", body)
+        _, meta = review_ledger.merge_and_guard(
+            ledger, [first], "安全问题：原始日志，新增 orig.log", "security")
+        self.record(ledger, meta)
+
+        renamed = self.pack("renamed-pack.md", "renamed.log", body)
+        with self.assertRaises(review_ledger.LedgerError) as ctx:
+            review_ledger.merge_and_guard(
+                ledger, [renamed], "同一份日志换了文件名，当作新证据", "security")
+        self.assertIn("内容相同", str(ctx.exception))
+
+    def test_security_with_genuinely_new_evidence_is_allowed_and_stamped(self):
+        ledger = self.new_ledger(risk="normal")
+        self.fill_ordinary(ledger, 4)
+        path = self.pack("sec-new.md", "sec-new.txt", "previously unseen security evidence")
+        merged, meta = review_ledger.merge_and_guard(
+            ledger, [path], "新发现凭据泄露风险，新增 sec-new.txt", "security")
+        self.assertEqual(meta["new_count"], 1)
+        self.assertEqual(meta["review_kind"], "security")
+        self.assertEqual(meta["security_used"], 0)
+        self.assertEqual(meta["security_index"], 1)
+        self.assertEqual(meta["security_allowance"], 1)
+        self.assertEqual(meta["security_remaining_after"], 0)
+        self.assertEqual(meta["ordinary_used"], 4)
+        self.assertEqual(meta["ordinary_remaining"], 0)
+        self.assertEqual(meta["extra_index"], 0)
+        self.assertIn("Security 独立追加第 1/1 轮", review_ledger.render_ledger(ledger, meta))
+        self.assertIn("E5", merged)
+
+    def test_pending_security_call_occupies_quota(self):
+        ledger = self.new_ledger(risk="normal")
+        self.fill_ordinary(ledger, 4)
+        write_audit(self.audit, [self.audit_call(
+            "sec-pending", review_basis="security", review_kind="security")])
+        info = self.status()
+        self.assertEqual(info["used"], 5)
+        self.assertEqual(info["pending"], 1)
+        self.assertEqual(info["security_pending"], 1)
+        self.assertEqual(info["security_used"], 1)
+        self.assertEqual(info["security_remaining"], 0)
+        self.assertFalse(info["security_available"])
+        self.assertIn("用户", info["next_action"])
+        self.assertIn("授权", info["next_action"])
+        self.assertEqual(len(info["security_reasons"]), 1)
+        self.assertEqual(info["security_reasons"][0]["state"], "pending")
+
+        path = self.pack("sec-pending-new.md", "sec-pending-new.txt", "another new body")
+        with self.assertRaises(review_ledger.LedgerError) as ctx:
+            review_ledger.merge_and_guard(
+                ledger, [path], "再次尝试安全复核", "security",
+                audit_log=self.audit, ledger_path=self.ledger_path)
+        self.assertIn("Security 独立追加额度已用尽", str(ctx.exception))
+
+    def test_duplicate_call_id_in_ledger_and_audit_is_counted_once(self):
+        ledger = self.new_ledger(risk="normal")
+        self.fill_ordinary(ledger, 4)
+        path = self.pack("sec-cid.md", "sec-cid.txt", "security evidence with call id")
+        _, meta = review_ledger.merge_and_guard(
+            ledger, [path], "安全问题：新增 sec-cid.txt", "security")
+        self.record(ledger, meta, call_id="sec-1")
+        write_audit(self.audit, [
+            self.audit_call("sec-1", review_basis="security", review_kind="security"),
+            self.audit_call("sec-1", review_basis="security", review_kind="security"),
+        ])
+        info = self.status()
+        self.assertEqual(info["used"], 5)
+        self.assertEqual(info["pending"], 0)
+        self.assertEqual(info["security_used"], 1)
+        self.assertEqual(info["security_remaining"], 0)
+
+    def test_ordinary_rounds_do_not_consume_security_allowance(self):
+        ledger = self.new_ledger(risk="normal")
+        self.fill_ordinary(ledger, 4)
+        info = self.status()
+        self.assertEqual(info["security_used"], 0)
+        self.assertEqual(info["security_allowance"], 1)
+        self.assertEqual(info["security_remaining"], 1)
+        self.assertEqual(info["security_pending"], 0)
+
+    def test_budget_precheck_matches_merge_gate(self):
+        """只读预检说可用时合并必须放行，预检说停止时合并必须拒绝。"""
+        ledger = self.new_ledger(risk="normal")
+        self.fill_ordinary(ledger, 4)
+        info = self.status()
+        self.assertTrue(info["security_available"])
+        path = self.pack("consistent.md", "consistent.txt", "consistent security body")
+        _, meta = review_ledger.merge_and_guard(
+            ledger, [path], "新发现安全问题，新增 consistent.txt", "security")
+        self.assertEqual(meta["round"], 5)
+        self.record(ledger, meta)
+
+        info = self.status()
+        self.assertFalse(info["security_available"])
+        self.assertIn("用户", info["next_action"])
+        again = self.pack("consistent-2.md", "consistent-2.txt", "another security body")
+        with self.assertRaises(review_ledger.LedgerError):
+            review_ledger.merge_and_guard(
+                ledger, [again], "预检已说停止", "security",
+                audit_log=self.audit, ledger_path=self.ledger_path)
+
+    def test_security_round_does_not_reset_ordinary_budget(self):
+        ledger = self.new_ledger(risk="normal")
+        self.fill_ordinary(ledger, 4)
+        path = self.pack("sec-reset.md", "sec-reset.txt", "security body before ordinary retry")
+        _, meta = review_ledger.merge_and_guard(
+            ledger, [path], "新发现安全风险，新增 sec-reset.txt", "security")
+        self.record(ledger, meta)
+        info = self.status()
+        self.assertEqual(info["ordinary_used"], 4)
+        self.assertEqual(info["ordinary_extra_remaining"], 0)
+        self.assertTrue(info["ordinary_exhausted"])
+        self.assertEqual(info["total_remaining"], 0)
+
+        extra = self.pack("ordinary-after-sec.md", "ordinary-after-sec.txt", "new ordinary body")
+        with self.assertRaises(review_ledger.LedgerError) as ctx:
+            review_ledger.merge_and_guard(
+                ledger, [extra], "Security 复核后普通预算应当重新可用", "new-evidence")
+        self.assertIn("均已用尽", str(ctx.exception))
+
+    def test_both_channels_exhausted_reject_further_rounds(self):
+        ledger = self.new_ledger(risk="normal")
+        self.fill_ordinary(ledger, 4)
+        path = self.pack("sec-both.md", "sec-both.txt", "the one security body")
+        _, meta = review_ledger.merge_and_guard(
+            ledger, [path], "新发现安全问题，新增 sec-both.txt", "security")
+        self.record(ledger, meta)
+
+        ordinary = self.pack("both-ordinary.md", "both-ordinary.txt", "later ordinary body")
+        with self.assertRaises(review_ledger.LedgerError) as ctx:
+            review_ledger.merge_and_guard(
+                ledger, [ordinary], "再补一条普通证据", "new-evidence")
+        self.assertIn("均已用尽", str(ctx.exception))
+
+        security = self.pack("both-security.md", "both-security.txt", "later security body")
+        with self.assertRaises(review_ledger.LedgerError) as ctx:
+            review_ledger.merge_and_guard(
+                ledger, [security], "再补一条安全证据", "security")
+        self.assertIn("Security 独立追加额度已用尽", str(ctx.exception))
 
 
 class LedgerIdentityTests(unittest.TestCase):
@@ -1438,11 +1818,11 @@ class LedgerIdentityTests(unittest.TestCase):
         self.assertEqual(ledger["rounds"], [])
 
     def test_pending_calls_consume_the_round_limit(self):
-        """两次 GPT 已返回但未入账的调用，同样把轮次推到上限，不能再发起复核。"""
+        """未入账的成功调用同样占用默认预算与追加额度，不能靠重试免费多拿轮次。"""
         ledger = self.create(risk="normal")
         write_audit(self.audit, [
-            review_audit_record("p1", self.ledger_path, self.subject, 1),
-            review_audit_record("p2", self.ledger_path, self.subject, 2),
+            review_audit_record(f"p{idx}", self.ledger_path, self.subject, idx)
+            for idx in (1, 2, 3, 4)
         ])
         pack = write_pack(self.tmp.name, "r1.md", [("a.txt", "one")])
         with self.assertRaises(review_ledger.LedgerError) as ctx:
@@ -1450,7 +1830,7 @@ class LedgerIdentityTests(unittest.TestCase):
                 ledger, [pack], "补交证据", "new-evidence",
                 audit_log=self.audit, ledger_path=self.ledger_path)
         message = str(ctx.exception)
-        self.assertIn("上限", message)
+        self.assertIn("均已用尽", message)
         self.assertIn("未入账", message)
 
     def test_legacy_ledger_requires_subject_in_review_flow(self):
@@ -3378,7 +3758,8 @@ class SingleEntryPointTests(unittest.TestCase):
         # SKILL.md：多阶段协作与「复用同一台账 / 交接状态」
         self.assertIn("长任务的多阶段协作", skill)
         self.assertIn("--extra-round-basis remediation", skill)
-        self.assertIn("每份台账仅一次", skill.replace("**", ""))
+        self.assertIn("弹性追加额度", skill)
+        self.assertIn("没有新增实质证据时一律拒绝重复复核", skill)
         self.assertIn("按需建立交接状态", skill)
         self.assertIn("一次性 REVIEW 不强制创建 dispatch", skill)
         self.assertIn("ingest --reply-file", skill)
@@ -3543,7 +3924,7 @@ class WorkflowTierTests(unittest.TestCase):
     def test_existing_safety_boundaries_still_stated(self):
         """新增流程不得挤掉既有安全边界表述。"""
         for anchor in ("新建台账只接受标准审计日志", "并发复核被拒绝",
-                       "证据包格式版本", "达到轮次上限仍有关键问题未解决时"):
+                       "证据包格式版本", "普通与 Security 额度都用尽仍有关键问题未解决时"):
             self.assertIn(anchor, self.skill, f"安全边界表述被删除：{anchor}")
 
 
