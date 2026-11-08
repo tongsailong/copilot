@@ -60,6 +60,9 @@ LEDGER_VERSION = 1
 PACK_FORMAT_FIELD = "证据包格式"
 PACK_FORMAT_VERSION = 2
 PACK_FORMAT_RE = re.compile(r"^\s*[-*]\s*" + PACK_FORMAT_FIELD + r"\s*[：:]\s*(\d+)\s*$", re.M)
+# 历史默认轮次与追加额度：**只用于报告与审计观察**，不再作为停止条件。
+# 2026-11-08 起 REVIEW 没有人为轮次上限：每轮只要求「新增/变化证据 + 追加理由」，
+# 达到下列数字不会阻止继续复核，也不会要求用户逐轮授权。
 RISK_MAX_ROUNDS = {"normal": 2, "high": 3}
 # 默认预算之上的普通弹性追加额度。它不是「必须用完的配额」，而是防无限循环的硬顶：
 # 只有存在新增/变化证据（整改产物、验证输出、新风险证据）并写明理由时才可追加；
@@ -582,7 +585,8 @@ def load_or_init(path: str, risk: str | None = "normal", subject: str | None = N
             raise LedgerError("复核台账结构异常：rounds 不是列表")
         if risk is not None and risk != data.get("risk"):
             raise LedgerError(
-                f"复核台账已按 risk={data.get('risk')} 创建（上限 {data.get('max_rounds')} 轮），"
+                f"复核台账已按 risk={data.get('risk')} 创建"
+                f"（历史默认 {data.get('max_rounds')} 轮，仅用于观察用量，不阻止复核），"
                 f"不能用 risk={risk} 覆盖。风险级别在创建台账时确定，之后不可更改。"
                 "只有复核对象不同（新的交付物）才能新建台账；"
                 "同一交付物的持续复核必须复用本台账，不得用新建台账重置轮次或改写风险级别。"
@@ -1033,13 +1037,14 @@ def merge_and_guard(
             "没有新证据时直接修正并记录，不重新调用。"
         )
 
-    # 闸门 2：普通预算（默认 + 普通追加）优先，Security 是普通预算全部用尽后的
-    # **独立**安全例外，不能用 basis 提前切到 security 通道，也不与普通额度互相占用：
-    #  - 普通：默认（普通 2 / 高风险 3）+ 普通追加（+2 / +3），必须有新增证据与理由；
-    #  - Security：普通默认与普通追加全部用尽后，才可用独立额度（普通 +1 / 高风险 +2），
-    #    同样必须有新增证据与明确的安全风险说明；
-    #  - Security 额度用尽：停止自动调用并请求用户针对具体任务、风险、追加范围授权，
-    #    不接受自由文本或自声明 CLI 参数代替用户授权。
+    # 闸门 2：**没有固定轮次上限**（2026-11-08 起）。默认 2/3 轮、普通追加额度与
+    # Security 独立额度只保留在台账、审计与 `--budget` 里做用量观察，不再阻止继续
+    # 复核，也不再要求用户逐轮授权。真正把关的是：
+    #  - 闸门 1：第 2 轮起必须有新增/变化证据（同一组证据、换文件名或改措辞都不算）；
+    #  - 闸门 3：第 2 轮起必须说明为什么还需要一轮；
+    #  - Security 依据仍必须写明具体安全风险，但不再有独立次数硬顶。
+    # 用固定数字（2/3/5/8 轮）停止，会把「该不该继续判断」交给配置而不是证据，
+    # 因此改为按证据与进展决定；没有新增工作或证据时仍失败关闭。
     max_rounds = int(ledger.get("max_rounds", RISK_MAX_ROUNDS["normal"]))
     extra_allowance = _extra_allowance(ledger)
     security_allowance = _security_allowance(ledger)
@@ -1061,65 +1066,20 @@ def merge_and_guard(
             "本轮证据与已提交证据内容相同（新增 0 条）。"
             "只改措辞或重复同一组证据时不要重新调用，直接记录修正。"
         )
-    if extra_basis == SECURITY_BASIS:
-        if not ordinary_exhausted:
-            raise LedgerError(
-                f"Security 复核只能在普通预算全部用尽后使用：普通已用 {ordinary_used} 轮"
-                f"（默认 {max_rounds} 轮 + 普通追加 {extra_allowance} 轮 = {ordinary_capacity} 轮），"
-                f"还剩 {ordinary_capacity - ordinary_used} 轮。"
-                "普通预算内有新增证据时请用 --extra-round-basis new-evidence 或 remediation；"
-                "不得用 security 提前进入例外通道。")
-        if security_remaining <= 0:
-            raise LedgerError(
-                f"Security 独立追加额度已用尽（{security_used}/{security_allowance} 轮）。"
-                "停止自动调用：按 PARTIAL（缺证）或 BLOCKED 汇报，写明仍缺什么。"
-                "继续复核需要用户针对该任务、具体风险和追加范围明确授权；"
-                "不得用自由文本理由或自声明参数代替用户授权，也不得新建台账或换 subject 重置轮次。"
-                + (f"（另有 {len(pending)} 次未入账调用，已按已用轮次计入。）" if pending else ""))
-        if not extra_reason.strip():
-            raise LedgerError(
-                "Security 复核必须用 --extra-round-reason 说明具体安全风险："
-                "是什么风险、对应哪条未闭合项、本轮新增证据是哪几条。")
-    elif ordinary_used >= max_rounds:
-        if extra_basis not in (REMEDIATION_BASIS, "new-evidence"):
-            raise LedgerError(
-                f"默认复核预算已用尽（普通已用 {ordinary_used} 轮；默认 {max_rounds} 轮）。"
-                "继续复核必须使用 --extra-round-basis new-evidence（新增实质证据）或 "
-                "remediation（按裁决完成整改后的定向复核），并用 --extra-round-reason "
-                "写明实际整改内容、对应的未闭合项与新增证据。"
-                f"本台账普通弹性追加额度 {extra_allowance} 轮，已用 {ordinary_extra_used} 轮。"
-                "没有新增实质证据、没有新的风险发现或整改进展时不得重复复核。"
-                + (f"（另有 {len(pending)} 次 GPT 已返回但未入账的调用，已按已用轮次计入；"
-                   "先修复台账，不要靠重试重置轮次。）" if pending else "")
-            )
-        if ordinary_extra_remaining <= 0:
-            security_hint = (
-                f" 仅当存在新的实质安全风险、提供此前未用于 REVIEW 的新增证据时，"
-                f"才可用 --extra-round-basis security（独立额度剩余 {security_remaining} 轮）。"
-                if security_remaining > 0 else
-                " Security 独立额度也已用尽，继续复核需要用户明确授权，不得自行续轮。")
-            raise LedgerError(
-                f"默认预算与普通弹性追加额度均已用尽（默认 {max_rounds} 轮 + 普通追加 "
-                f"{extra_allowance} 轮）。停止自动复核：按 PARTIAL（缺证）或 BLOCKED 汇报，"
-                "写明仍缺什么、由谁决定下一步；不要为了得到 PASS 继续复核，"
-                "也不得新建台账或换 subject 重置轮次。" + security_hint
-                + (f"另有 {len(pending)} 次 GPT 已返回但未入账的调用，已按已用轮次计入；"
-                   "先修复台账，不要靠重试重置轮次。" if pending else "")
-            )
-        if not extra_reason.strip():
-            raise LedgerError(
-                "弹性追加复核仍需 --extra-round-reason 说明追加理由："
-                "实际改了什么、对应哪条未闭合裁决、新增证据是哪几条。"
-                "没有实质整改进展时不要追加复核。"
-            )
+    if extra_basis == SECURITY_BASIS and not extra_reason.strip():
+        raise LedgerError(
+            "Security 复核必须用 --extra-round-reason 说明具体安全风险："
+            "是什么风险、对应哪条未闭合项、本轮新增证据是哪几条。"
+            "Security 只影响留痕分类，不提供绕过新增证据要求的通道。")
 
     # 闸门 3：首轮之外，每次复核都必须说明“为什么还需要一轮”。
-    # 只调整措辞、补充背景或重复同一要求时，不应走到这里。
+    # 这不是轮次配额，也不是用户授权；它只要求把继续复核的依据写清楚。
     if used >= 1 and not extra_reason.strip():
         raise LedgerError(
-            f"这是第 {used + 1} 次 REVIEW。除首轮外，每次复核都必须用 --extra-round-reason "
-            "说明它对应哪一种理由：新的实质性证据 / 尚未解决的关键缺陷 / 足以改变结论的矛盾。"
-            "若只是调整措辞、补充背景或重复同一要求，直接修正并记录，不重新调用。"
+            f"这是第 {used + 1} 次 REVIEW。复核没有固定轮次上限，但除首轮外，每次复核都"
+            "必须用 --extra-round-reason 说明它对应哪一种理由：新的实质性证据 / 尚未解决的"
+            "关键缺陷 / 足以改变结论的矛盾。若只是调整措辞、补充背景或重复同一要求，"
+            "直接修正并记录，不重新调用。"
         )
 
     merged_text = _render_merged(merged, merged_omitted, current_round, new_items, duplicate_current)
@@ -1159,6 +1119,11 @@ def merge_and_guard(
         "security_allowance": security_allowance,
         "security_remaining": security_remaining,
         "security_available": ordinary_exhausted and security_remaining > 0,
+        # 2026-11-08：轮次/追加/Security 额度不再阻断复核，只用于观察用量。
+        # `limits_enforced=false` 明确表示下列数字不是停止条件。
+        "limits_enforced": False,
+        "unbounded": True,
+        "security_basis_allowed": True,
         "security_index": (security_used + 1) if extra_basis == SECURITY_BASIS else 0,
         "security_remaining_after": max(
             0, security_remaining - (1 if extra_basis == SECURITY_BASIS else 0)),
@@ -1545,11 +1510,12 @@ def budget_status(path: str, *, audit_log: str = "", risk: str = "normal",
     """只读预算查询；台账不存在时只报告默认值，不创建台账。
 
     ``pending`` 是审计中成功但未入账的 REVIEW 调用，和 ``merge_and_guard`` 使用
-    同一套口径，因此会占用对应额度。本函数不写台账、不写审计、不发起调用。
+    同一套口径，因此会占用轮次编号。本函数不写台账、不写审计、不发起调用。
 
-    普通预算与 Security 独立额度分别核算：``used`` 仍是全部 REVIEW 轮次（含 pending），
-    ``remaining``/``extra_*``/``total_remaining`` 只描述普通预算；Security 只看
-    ``security_*``。``next_action`` 与 ``merge_and_guard`` 的准入条件逐条对应。
+    2026-11-08 起复核**没有固定轮次上限**：``max_rounds`` / ``extra_*`` /
+    ``security_*`` 只描述历史用量，供审计与观察，``limits_enforced`` 恒为 False。
+    是否继续由 ``merge_and_guard`` 的证据闸门决定（第 2 轮起必须有新增/变化证据
+    并说明追加理由），不由任何固定数字决定。
     """
     requested = normalize_path(audit_log)
     security_reasons: list[dict] = []
@@ -1628,44 +1594,28 @@ def budget_status(path: str, *, audit_log: str = "", risk: str = "normal",
         pending_note = (f"；另有 {len(pending)} 次未入账调用已计入相应额度"
                         "（先补录/修复台账，不得重复发起）")
     if status == "not_created":
-        next_action = (f"台账未创建；默认预算 {max_rounds} 轮、普通追加 {extra_allowance} 轮，"
-                       f"Security 独立额度 {security_allowance} 轮（仅普通预算全部用尽后、"
-                       "有新增安全风险证据时可用）；首次正式 REVIEW 时按计划风险创建")
-    elif ordinary_used < max_rounds:
-        next_action = (f"还可进行 {remaining} 轮普通复核；默认用尽后如有新增实质证据/"
-                       f"整改进展可普通弹性追加最多 {extra_allowance} 轮（不是无条件续轮）"
+        next_action = (f"台账未创建；复核没有固定轮次上限（历史默认 {max_rounds} 轮仅作观察）。"
+                       "首次正式 REVIEW 时按计划风险创建；之后每轮只要求新增/变化证据与追加理由"
                        + pending_note)
-    elif extra_remaining > 0:
-        next_action = (f"默认预算已用尽；如有新增实质证据/整改进展可普通弹性追加"
-                       f"（剩余 {extra_remaining} 轮），否则按 PARTIAL/BLOCKED 汇报"
-                       + pending_note)
-    elif security_remaining > 0:
-        next_action = (f"普通预算与普通追加均已用尽；仅当存在新的实质安全风险、"
-                       f"且提供此前未用于 REVIEW 的新增证据并说明风险时，"
-                       f"可用 security 独立额度（剩余 {security_remaining} 轮），否则按 "
-                       f"PARTIAL/BLOCKED 汇报；不新建台账或换 subject 重置轮次" + pending_note)
     else:
-        next_action = ("普通预算、普通追加与 Security 独立额度均已用尽；停止自动调用，"
-                       "按 PARTIAL/BLOCKED 汇报，并请用户针对具体任务、风险与追加范围明确授权；"
-                       "不得用自由文本或自声明参数代替用户授权，也不新建台账或换 subject"
+        next_action = ("复核没有固定轮次上限；只要本轮有新增/变化证据并用 --extra-round-reason "
+                       "说明为什么还需要一轮，就可以继续（security 依据还需写明具体安全风险）。"
+                       f"已用 {used} 轮（仅供观察，不构成停止条件）"
                        + pending_note)
     return {
         "status": status,
         "subject": out_subject,
         "risk": out_risk,
-        # max_rounds 保留旧字段名，含义是「默认普通预算」，不含任何追加额度。
+        # 历史字段：max_rounds/default_rounds 等只用于观察用量，不再阻止复核。
         "max_rounds": max_rounds,
         "default_rounds": max_rounds,
         "used": used,
-        # 兼容字段：remaining 只表示默认普通预算剩余。
         "remaining": remaining,
         "extra_used": extra_used,
         "extra_allowance": extra_allowance,
         "extra_remaining": extra_remaining,
-        # 兼容字段：total_remaining 只描述普通预算（默认 + 普通追加），不含 Security。
         "total_remaining": remaining + extra_remaining,
         "extra_reasons": extra_reasons,
-        # 新增显式字段：普通 / Security 两条额度分开报告。
         "ordinary_used": ordinary_used,
         "ordinary_pending": len(split["ordinary_pending"]),
         "ordinary_remaining": remaining,
@@ -1683,6 +1633,11 @@ def budget_status(path: str, *, audit_log: str = "", risk: str = "normal",
         "pending_call_ids": [str(rec.get("call_id") or "") for rec in pending],
         "remediation_available": not remediation_used,
         "remediation_used": remediation_used,
+        # 明确的语义字段：下列数字不是停止条件，复核是否继续由「新增证据 + 追加理由」决定。
+        "allowed": True,
+        "limits_enforced": False,
+        "unbounded": True,
+        "security_basis_allowed": True,
         "next_action": next_action,
     }
 
@@ -1712,15 +1667,15 @@ def main() -> int:
             print(json.dumps(info, ensure_ascii=False, indent=2))
         else:
             print(f"交付物：{info['subject'] or '（未声明）'}；"
-                  f"风险级别：{info['risk']}；默认预算：{info['default_rounds']} 轮；"
-                  f"已用：{info['used']} 轮；默认剩余：{info['remaining']} 轮")
-            print(f"普通追加：已用 {info['extra_used']} 轮 / 额度 {info['extra_allowance']} 轮，"
-                  f"剩余 {info['extra_remaining']} 轮")
-            print(f"Security 独立额度：已用 {info['security_used']} 轮 "
-                  f"（未入账 {info['security_pending']}）/ 额度 {info['security_allowance']} 轮，"
-                  f"剩余 {info['security_remaining']} 轮；"
-                  f"当前可用：{'是' if info['security_available'] else '否'}"
-                  "（仅普通预算全部用尽后才可用）")
+                  f"风险级别：{info['risk']}；已用：{info['used']} 轮"
+                  "（复核没有固定轮次上限，下列数字仅供观察）")
+            print(f"历史默认参考：{info['default_rounds']} 轮，剩余 {info['remaining']} 轮；"
+                  f"历史普通追加参考：已用 {info['extra_used']} / 额度 "
+                  f"{info['extra_allowance']} 轮")
+            print(f"Security 依据：已用 {info['security_used']} 轮 "
+                  f"（未入账 {info['security_pending']}）；"
+                  "可随时按新增有效证据 + 具体安全风险说明使用，"
+                  "不受普通额度用尽限制")
             if info["extra_reasons"]:
                 for item in info["extra_reasons"]:
                     print(f"- 普通追加第{item['round']}轮 [{item['basis'] or '未指定'}]："

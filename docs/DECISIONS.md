@@ -91,6 +91,64 @@
     不变：默认/追加/Security 预算与停止条件、G1–G4、Reviewer 独立性、证据 SHA 与审计绑定；
     该闸门只拦「明知不完整仍送审」，不降低任何验收标准。
 
+16. **取消固定 REVIEW 轮次上限；用量与费用只记录、不阻断（取代第 13、14 条）。**
+    2026-11-08 起复核不再有「普通 2 / 高风险 3、追加 +2/+3、Security +1/+2」这类停止门：
+    历史数字保留在 `--budget` 输出里只作观察，`allowed` 恒为 true、`limits_enforced=false`。
+    是否继续只由「本轮有新增/变化证据」+「确有未闭合实质问题」决定；第 2 轮起仍必须用
+    `--extra-round-reason` 说明。内容哈希去重、subject/台账/审计日志绑定、换日志拒绝、
+    并发锁全部保留；`security` 只是本轮依据标签，可随时使用，但仍需具体安全风险说明与
+    此前未用于 REVIEW 的新增证据。请求数与累计 Token 照实记录（`budget.usage` / 审计），
+    不再作为 native/legacy 的默认阈值，也不再阻止 drive 或 call_gpt；只有用户在 `start`
+    显式给出 `max_requests` / `max_total_tokens` 才按显式运营上限执行。8 轮检查点与
+    `--rounds-limit` 同样降为观察信号。依据：2026-11-08 用户要求解除过保守预算——
+    固定轮次与 Token 阈值会在正常决策过程中打断任务。不变：G1–G4 fail-closed、Reviewer
+    独立性与只读边界、证据完整性闸门、模型身份校验、SOL 模型与 CPA 零工具路由。
+
+17. **输出预算默认不设人为上限；截断在同一任务/证据/轮次内自适应恢复。**
+    2026-11-08 起 `call_gpt.py` / `copilot_auto.py` 默认不发送 `max_output_tokens`
+    （不再有 8192 之类的固定值，也不把任何新数字变成天花板），由服务商/模型使用真实上限；
+    只有调用方显式 `--max-output-tokens` 才发送，`--max-output-tokens-ceiling` 是可选上界。
+    响应 `status=incomplete` + `reason=max_output_tokens` 时按「非裁决」处理：不写 `--out`、
+    不入台账、不写状态、不推进轮次，保留失败请求审计（`usage` / `usage_available` /
+    `max_output_tokens_sent` / `response_id`）与证据包指纹；按观测 `output_tokens` 约翻倍并对齐
+    4096 整数倍升档，用同一任务、同一证据、同一 REVIEW 轮次重发，重发前另记一条带
+    `retry_of` / `retry_reason` 的 `call_requested`。**升档默认不限次**：只有显式
+    `--max-output-retries` 才构成运营限制，显式 `--max-output-tokens-ceiling` 是另一上界。
+    预算无法继续提高或上游显式拒绝 `max_output_tokens` 时，不重发相同失败请求，而是生成
+    `copilot-segmentation-plan/v1`（`--segmentation-plan`）：按证据条目切分、逐段写文件并记录
+    SHA-256 与条目清单，声明 `same_failed_request_must_not_be_resent`；
+    `call_gpt.py` 以 `transition=segmentation_required` 失败关闭，`drive` 返回
+    `status=segmentation_required`，由主代理分段处理证据后重新进入 REVIEW，仍不产生裁决、
+    不消耗正式轮次。截断响应同样要通过模型身份校验。服务商限制、认证失败、网络错误分别处理。
+    不变：零工具、身份硬门、审计先行、pending 与恢复、证据完整性。
+
+18. **PARTIAL 自动推进：本地派生工作项 + 真实执行桥接，循环到 PASS 或真实 BLOCKED。**
+    2026-11-08 起 `copilot_auto.py drive` 在最近一轮 `verdict=partial` 且没有可执行安排时，
+    按未闭合条件与回复原文本地派生一个 `origin=partial-without-plan` 工作项并进入 `EXECUTE`
+    （0 请求、不消耗轮次、不需要用户传话或逐轮授权）。派生动作绑定 `source_round_id`，
+    携带 `goal / constraints / expected_evidence / completion_criteria / authorization /
+    return_contract / executed_by / directive_complete` 作为 `work_order`，明确「超出原授权
+    必须 BLOCKED」。同一轮一旦已有执行结果、复核、报告或已完成派工，就不再派生，必须把
+    新材料交回 SOL 判断。循环持续到 PASS 收口或真实 BLOCKED（需用户决策/授权/资源/不安全）；
+    轮次数字、检查点、累计费用都不停止。「六维无进展」也不再直接停机：streak ≥2 或同一工作项
+    连续失败 ≥3 次时，驱动汇总失败、未解决事项与新增证据，要求 SOL 分析原方案失效原因、
+    给出替代路径、下一步动作、完成条件/证据与授权边界，执行后再次 REVIEW；诊断材料无新信息时
+    才返回 `wait_user / no_progress_no_new_information`，REVIEW 恢复分析仍须显式 `--auto-review`。
+    只有不存在安全可执行替代方案、缺少用户决策/授权/资源或外部硬限制时才 BLOCKED，并须有
+    具体原因与证据；不得机械重复同一失败方案、伪造进展或降低验收标准。
+    SOL 保持零工具、不承担执行；ZCode 主代理是唯一工程执行主体。依据：2026-11-08 用户要求
+    解除 PARTIAL 后的人工中转与无进展即停。不变：G1–G4、独立复核、授权边界、PASS 语义
+    （SOL PASS 仍需本地四门与 native 复核完成度）。
+
+19. **未知用量单列，不与已知用量混算。**
+    `copilot_dispatch.task_spend_from_audit` 按审计逐条分类：成功且有 `usage` 计真实 Token；
+    成功但无 `usage`、已送达/可能送达的失败（HTTP 响应、超时、连接中断）无 `usage` 时计入
+    `unknown_usage_calls`；能确认未送达的传输失败只计 `not_delivered_calls`；失败但返回部分
+    `usage` 时记录已知 Token 并保留失败状态。同一响应按 `call_id + 升档序号 + response_id`
+    去重，重试不重复累计；`budget.usage` 从审计跨轮次重建，已知总量只累计真实 `usage`，
+    未知不当作 0，也不伪造 Token/费用。依据：2026-11-08 真实 REVIEW 中 408 无 usage 却
+    `unknown_usage_calls=0`。
+
 ## 建议（未采纳）
 
 - 每次源码修改通过测试后，按任务授权在本地 Git 提交可回溯版本；未获 commit 授权的
@@ -106,5 +164,5 @@
 - **Git 远程与后续提交策略**：已建立本地 `main` 基线（第 12 条）；是否配置远端、
   何时提交后续变更、是否要求分支保护，仍需用户决定。
 - **运行时残留测试与历史备份的长期保留策略**。
-- **Phase 4 范围**：Reviewer 自动派发、SOL 自动重判/收口、可信复核记录升级；
-  需要单独授权与实现。
+- **Phase 4 剩余范围**：Reviewer 自动派发、可信复核记录升级仍需单独授权与实现；
+  SOL 自动重判/收口与 PARTIAL 自动推进已按第 18 条落地（本机实现，未经真实长链验证）。

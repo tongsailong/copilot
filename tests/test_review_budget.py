@@ -125,8 +125,12 @@ class BudgetStatusTests(unittest.TestCase):
         self.assertEqual(info["total_remaining"], 3)
         self.assertEqual(info["pending"], 0)
         self.assertTrue(info["remediation_available"])
-        self.assertIn("1 轮普通复核", info["next_action"])
-        self.assertIn("弹性追加", info["next_action"])
+        # 用量字段只用于观察；继续复核由新增证据与理由决定。
+        self.assertFalse(info["limits_enforced"])
+        self.assertTrue(info["unbounded"])
+        self.assertTrue(info["allowed"])
+        self.assertIn("没有固定轮次上限", info["next_action"])
+        self.assertIn("新增/变化证据", info["next_action"])
         self.assertNotIn("终检", info["next_action"])
 
     def test_pending_counts_toward_used(self):
@@ -140,9 +144,10 @@ class BudgetStatusTests(unittest.TestCase):
         self.assertEqual(info["extra_remaining"], 2)
         self.assertEqual(info["pending"], 1)
         self.assertEqual(info["pending_call_ids"], ["c2"])
-        # pending 占用默认预算；remediation 标签本身仍未被使用。
+        # pending 占用轮次编号与用量观察；remediation 标签本身仍未被使用。
         self.assertTrue(info["remediation_available"])
-        self.assertIn("弹性追加", info["next_action"])
+        self.assertFalse(info["limits_enforced"])
+        self.assertIn("没有固定轮次上限", info["next_action"])
 
     def test_pending_remediation_counts_as_used(self):
         write_ledger(self.path, [{"n": 1, "call_id": "c1", "verdict": "PASS"}],
@@ -155,7 +160,7 @@ class BudgetStatusTests(unittest.TestCase):
         self.assertNotIn("终检", info["next_action"])
 
     def test_extra_round_is_counted_and_reason_reported(self):
-        """弹性追加轮次计入 used，并在预算里区分追加轮次、理由与剩余额度。"""
+        """追加轮次计入 used，并在预算里区分追加轮次、理由与剩余额度。"""
         write_ledger(self.path, [
             {"n": 1, "call_id": "c1", "verdict": "PARTIAL"},
             {"n": 2, "call_id": "c2", "verdict": "PARTIAL"},
@@ -173,10 +178,11 @@ class BudgetStatusTests(unittest.TestCase):
             "round": 3, "basis": "remediation",
             "reason": "按 F1 整改并补充行为测试",
         }])
-        self.assertIn("弹性追加", info["next_action"])
-        self.assertIn("1 轮", info["next_action"])
+        self.assertFalse(info["limits_enforced"])
+        self.assertIn("没有固定轮次上限", info["next_action"])
 
-    def test_extra_allowance_exhausted_stops_with_partial_or_blocked(self):
+    def test_extra_allowance_exhaustion_does_not_stop_review(self):
+        """旧「弹性追加用尽后必须 PARTIAL/BLOCKED」已取消：用量只做观察。"""
         rounds = [{"n": idx, "call_id": f"c{idx}", "verdict": "PARTIAL"}
                   for idx in (1, 2, 3, 4)]
         write_ledger(self.path, rounds, audit_log=self.audit)
@@ -185,11 +191,14 @@ class BudgetStatusTests(unittest.TestCase):
         self.assertEqual(info["extra_used"], 2)
         self.assertEqual(info["extra_remaining"], 0)
         self.assertEqual(info["total_remaining"], 0)
-        self.assertIn("PARTIAL/BLOCKED", info["next_action"])
-        self.assertIn("不新建台账", info["next_action"])
+        self.assertTrue(info["allowed"])
+        self.assertFalse(info["limits_enforced"])
+        self.assertIn("没有固定轮次上限", info["next_action"])
+        self.assertNotIn("PARTIAL/BLOCKED", info["next_action"])
+        self.assertNotIn("不新建台账", info["next_action"])
 
-    def test_pending_extra_consumes_allowance(self):
-        """审计中成功但未入账的追加调用也占用追加额度。"""
+    def test_pending_extra_is_counted_but_does_not_block(self):
+        """审计中成功但未入账的追加调用计入用量，但不构成停止条件。"""
         write_ledger(self.path, [
             {"n": 1, "call_id": "c1", "verdict": "PARTIAL"},
             {"n": 2, "call_id": "c2", "verdict": "PARTIAL"},
@@ -203,7 +212,9 @@ class BudgetStatusTests(unittest.TestCase):
         self.assertEqual(info["pending"], 2)
         self.assertEqual(info["extra_used"], 2)
         self.assertEqual(info["extra_remaining"], 0)
-        self.assertIn("PARTIAL/BLOCKED", info["next_action"])
+        self.assertFalse(info["limits_enforced"])
+        self.assertIn("没有固定轮次上限", info["next_action"])
+        self.assertIn("未入账", info["next_action"])
 
     def test_consult_calls_do_not_consume_review_budget(self):
         """CONSULT/PLAN 不是正式复核，不占用 REVIEW 预算。"""
@@ -256,9 +267,9 @@ class BudgetStatusTests(unittest.TestCase):
         self.assertEqual(info["security_allowance"], 1)
         self.assertEqual(info["security_remaining"], 1)
         self.assertTrue(info["security_available"])
-        self.assertIn("新的实质安全风险", info["next_action"])
-        self.assertIn("未用于 REVIEW", info["next_action"])
-        self.assertIn("剩余 1 轮", info["next_action"])
+        # 普通用量用尽后并非「必须走 Security」：普通补证仍可继续。
+        self.assertFalse(info["limits_enforced"])
+        self.assertIn("没有固定轮次上限", info["next_action"])
 
     def test_security_rounds_do_not_reset_ordinary_budget(self):
         rounds = [{"n": idx, "call_id": f"c{idx}", "verdict": "PARTIAL"}
@@ -279,10 +290,10 @@ class BudgetStatusTests(unittest.TestCase):
             "round": 5, "basis": "security",
             "reason": "新发现越权风险", "state": "recorded",
         }])
-        self.assertIn("用户", info["next_action"])
-        self.assertIn("授权", info["next_action"])
+        self.assertFalse(info["limits_enforced"])
+        self.assertIn("没有固定轮次上限", info["next_action"])
 
-    def test_pending_security_counts_and_stops_auto_calls(self):
+    def test_pending_security_is_counted_but_not_a_stop_condition(self):
         rounds = [{"n": idx, "call_id": f"c{idx}", "verdict": "PARTIAL"}
                   for idx in (1, 2, 3, 4)]
         write_ledger(self.path, rounds, audit_log=self.audit)
@@ -297,8 +308,10 @@ class BudgetStatusTests(unittest.TestCase):
         self.assertEqual(info["security_used"], 1)
         self.assertEqual(info["security_remaining"], 0)
         self.assertFalse(info["security_available"])
-        self.assertIn("用户", info["next_action"])
-        self.assertIn("授权", info["next_action"])
+        self.assertTrue(info["security_basis_allowed"])
+        self.assertFalse(info["limits_enforced"])
+        self.assertIn("没有固定轮次上限", info["next_action"])
+        self.assertIn("未入账", info["next_action"])
 
     def test_conflicting_security_classification_is_rejected(self):
         """review_kind 与 basis 冲突说明台账/审计被改写，不得猜一个继续计数。"""

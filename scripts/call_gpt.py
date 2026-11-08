@@ -5,7 +5,12 @@
   1. 出站请求体 *永不包含* `tools` 字段，并显式 `tool_choice="none"`。
   2. 上游响应中出现任何非良性 output 条目（function_call / web_search_call / …）即判安全事件，
      留痕、拒绝处理、退出码 5。绝不代执行。
-  3. status 非 completed / 带 error / 带 incomplete_details 的响应不构成可交付裁决（退出码 6）。
+  3. status 非 completed / 带 error 的响应不构成可交付裁决（退出码 6）。唯一的例外是
+     `status=incomplete` + `incomplete_details.reason=max_output_tokens`：那是输出被
+     截断（请求已送达、可能已计费），本脚本在同一任务/同一证据/同一 REVIEW 轮次内
+     自适应提高输出预算后重发；该过程不解析裁决、不入台账、不推进任务状态，每次
+     失败请求都留审计与真实 usage。升档次数用尽或触及真实上限时失败关闭，要求
+     调整证据组织/分段，不用同一请求无限重试。
   4. 超时与上游错误显式失败，不静默降级到更宽能力的链路，不伪造结果。
   5. 审计日志是正式调用的硬条件（`--audit-log` 必填），只写脱敏元数据；API key 永不进入
      日志、argv 或请求体 dump。先落盘 `call_requested` 开始记录（fsync）再出站；结果记录写
@@ -51,10 +56,10 @@ copilot 相对旧实现的增量：
   * **图片证据**：证据包声明的图片按魔数 + sha256 校验后读取真实像素，作为 `input_image` 内联
     （有图时 `input` 从字符串切换为 content 数组）；像素绝不能以路径、文字描述或 base64 文本代替。
     证据包声明了图片却读不到同一份像素 → 明确失败。请求体 dump / 审计只留图片元数据，不落 base64。
-  * **REVIEW 复核台账**（`--review-ledger`）：合并历史证据并按内容去重/重编号，注入往轮裁决，
-    执行默认复核预算（普通 2 轮 / 高风险 3 轮）、普通弹性追加额度（普通 +2 / 高风险 +3）
-    与 Security 独立额度（普通 +1 / 高风险 +2，仅普通预算全部用尽后可用）；
-    首轮之外的复核必须说明理由，任何追加都必须携带新增证据。
+  * **REVIEW 复核台账**（`--review-ledger`）：合并历史证据并按内容去重/重编号，注入往轮裁决。
+    复核**没有固定轮次上限**，也不因累计 Token/费用停止；首轮之外每轮都必须说明理由，
+    且必须携带新增实质证据（`--extra-round-basis` 记录依据：new-evidence / remediation /
+    security）。轮次与用量仍完整入账，供审计与观察。
     `--dry-run` 只构建并检查 prompt/证据/台账，不调用 GPT、不写审计；但可能创建/更新
     复核台账（subject/audit 绑定），不是完全无副作用。
 
@@ -493,10 +498,15 @@ def apply_review_output_contract(mode: str, prompt: str) -> str:
     return prompt.rstrip() + "\n\n" + REVIEW_OUTPUT_CONTRACT.strip() + "\n"
 
 
-def build_payload(model: str, instructions: str, prompt: str, max_output_tokens: int,
+def build_payload(model: str, instructions: str, prompt: str,
+                  max_output_tokens: int | None,
                   images: list[dict] | None = None,
                   reasoning_effort: str | None = None) -> dict:
     """安全不变量：返回的 dict 必须不含 `tools` 键。
+
+    `max_output_tokens` 为 None 时**不写该字段**：由服务商/模型使用其真实默认上限。
+    这是默认路径——代码不设置低于真实上限的人为输出上限；只有调用方显式给出数值、
+    或截断恢复主动升档时才发送该字段。
 
     images 为空时保持既有纯文本 input（向后兼容）；非空时按 Responses API 多模态结构构建：
     `input=[{"role":"user","content":[{"type":"input_text",...},{"type":"input_image",...}]}]`。
@@ -528,11 +538,12 @@ def build_payload(model: str, instructions: str, prompt: str, max_output_tokens:
     payload = {
         "model": model,
         "input": payload_input,
-        "max_output_tokens": max_output_tokens,
         "store": False,
         "stream": False,
         "tool_choice": "none",
     }
+    if max_output_tokens is not None:
+        payload["max_output_tokens"] = int(max_output_tokens)
     if effort:
         # 显式写进请求体：CPA 对 SOL 没有 payload 规则，不写就不会 High。
         payload["reasoning"] = {"effort": effort}
@@ -809,6 +820,190 @@ def find_tool_calls(payload: dict) -> list[dict]:
     return found
 
 
+def output_truncated(payload: dict) -> bool:
+    """响应是否因输出预算被截断（`status=incomplete` + `reason=max_output_tokens`）。
+
+    这是**可恢复**情形：请求已送达并计费，但回复不是完整裁决。它不能被解析成
+    PASS/PARTIAL/BLOCKED，也不能消耗正式 REVIEW 轮次；正确做法是同一任务、同一
+    证据、同一轮次提高输出预算后重发。其他 incomplete 原因（内容过滤、超时等）
+    仍按普通的非完整响应对待。
+    """
+    if str(payload.get("status") or "").lower() != "incomplete":
+        return False
+    inc = payload.get("incomplete_details")
+    reason = inc.get("reason") if isinstance(inc, dict) else None
+    return str(reason or "").strip() == "max_output_tokens"
+
+
+def next_output_budget(current: int | None, observed: int | None,
+                       ceiling: int | None) -> int | None:
+    """按实际输出量计算下一档输出预算（自适应升档，不是固定高上限）。
+
+    - 以当前预算与本次实际上报的 `output_tokens` 中较大者为基准翻倍；
+    - 向上取整到 4096 的整数倍，保证严格增长（不会重复请求同一预算）；
+    - `ceiling` 只作为调用方显式给出的可选上界，缺省不设人为上限；
+      基准已达上界时返回 None —— 说明真实上限仍不够，应改为拆分证据/分段复核。
+    """
+    base = max(int(current or 0), int(observed or 0))
+    if base <= 0:
+        return None
+    proposed = ((base * 2 + 4095) // 4096) * 4096
+    if proposed <= base:
+        proposed = base + 4096
+    if ceiling and ceiling > 0:
+        if base >= int(ceiling):
+            return None
+        proposed = min(proposed, int(ceiling))
+    return proposed
+
+
+def output_limit_rejected(status: int, raw: str) -> bool:
+    """4xx 是否明确指向「输出/上下文上限不可用」（模型真实边界被越过）。
+
+    只有状态码与正文都对得上时才据此给出「改分段」的结论，不做泛化猜测。
+    """
+    if status not in (400, 413, 422):
+        return False
+    text = (raw or "").lower()
+    return any(token in text for token in
+               ("max_output_tokens", "max_tokens", "maximum context", "context length"))
+
+
+SEGMENT_CHARS = 120_000
+
+
+def write_segmentation_plan(path: str, *, reason: str, mode: str, task_id: str,
+                            call_id: str, prompt: str, budgets: dict,
+                            evidence_paths: list[str],
+                            http_status: int | None = None) -> dict:
+    """输出预算无法继续提高时，自动生成可执行的分段证据计划。
+
+    这不是新的裁决，也不改变任务/合同/证据指纹：它只把「同一请求不能再发」
+    转成下一步可执行的分段材料。计划、分段文件与审计都只含本地路径和指纹，
+    不含证据正文或凭据。调用方（DeepSeek 执行方）按计划逐段处理，正式 REVIEW
+    仍走原授权门槛。
+    """
+    plan_path = os.path.abspath(path)
+    base, _ = os.path.splitext(plan_path)
+    segments: list[dict] = []
+    seen: set[str] = set()
+    for src_index, raw_path in enumerate(evidence_paths, 1):
+        src = os.path.abspath(raw_path)
+        try:
+            with open(src, "r", encoding="utf-8", errors="replace") as fh:
+                text = fh.read()
+            src_sha = sha256_file(src)
+        except OSError as exc:
+            # 证据读不到时仍然给出该来源的分段占位，不能静默当作已完整分段。
+            seg_path = f"{base}.segment-{src_index}-1.md"
+            payload = (f"<!-- 自动分段证据 S{src_index}-1；原证据 {src} 读取失败："
+                       f"{redact(str(exc))} -->\n# 分段证据（读取失败）\n")
+            with open(seg_path, "w", encoding="utf-8") as fh:
+                fh.write(payload)
+                fh.flush()
+                os.fsync(fh.fileno())
+            segments.append({
+                "id": f"S{src_index}-1", "file": os.path.abspath(seg_path),
+                "source": src, "source_sha256": None, "entry_ids": [],
+                "chars": len(payload), "sha256": sha256_text(payload),
+                "error": redact(str(exc)),
+            })
+            continue
+        items, _omitted = split_pack(text)
+        if len(items) >= 2:
+            groups: list[list[dict]] = []
+            current: list[dict] = []
+            chars = 0
+            for item in items:
+                body = str(item.get("body") or "")
+                if current and chars + len(body) > SEGMENT_CHARS:
+                    groups.append(current)
+                    current, chars = [], 0
+                current.append(item)
+                chars += len(body)
+            if current:
+                groups.append(current)
+        else:
+            groups = [[]]
+        for group_index, group in enumerate(groups, 1):
+            seg_path = f"{base}.segment-{src_index}-{group_index}.md"
+            if group:
+                header = (f"<!-- 自动分段证据 S{src_index}-{group_index}；"
+                          f"原证据 {src}；SHA-256 {src_sha} -->\n"
+                          "# 分段证据（自动生成）\n\n"
+                          "本文件只包含原证据的一个连续子集。不得把未出现在本段的条目"
+                          "当作缺证；跨段结论必须由全部段共同支持。\n\n")
+                payload = header + "".join(str(i.get("body") or "") for i in group)
+                ids = [str(i.get("old_id") or "") for i in group]
+            else:
+                payload = (f"<!-- 自动分段证据 S{src_index}-{group_index}；"
+                           f"原证据 {src}；SHA-256 {src_sha} -->\n"
+                           "# 分段证据（自动生成）\n\n"
+                           "原证据无法按条目切分，请按来源文件/行区间继续细分。\n")
+                ids = []
+            with open(seg_path, "w", encoding="utf-8") as fh:
+                fh.write(payload)
+                fh.flush()
+                os.fsync(fh.fileno())
+            key = os.path.abspath(seg_path)
+            if key in seen:
+                continue
+            seen.add(key)
+            segments.append({
+                "id": f"S{src_index}-{group_index}",
+                "file": key,
+                "source": src,
+                "source_sha256": src_sha,
+                "entry_ids": ids,
+                "chars": len(payload),
+                "sha256": sha256_text(payload),
+            })
+    if not segments:
+        segments.append({
+            "id": "S0-1",
+            "file": None,
+            "source": None,
+            "entry_ids": [],
+            "chars": 0,
+            "sha256": None,
+            "note": "本次调用没有证据包；请把任务文本或问题本身拆成有界子问题。",
+        })
+    plan = {
+        "schema": "copilot-segmentation-plan/v1",
+        "created_at": now_iso(),
+        "call_id": call_id,
+        "task_id": task_id,
+        "mode": mode,
+        "reason": reason,
+        "http_status": http_status,
+        "prompt_sha256": sha256_text(prompt),
+        "prompt_chars": len(prompt),
+        "budgets": budgets,
+        "evidence": [{"path": os.path.abspath(p),
+                      "sha256": (sha256_file(os.path.abspath(p))
+                                 if os.path.exists(os.path.abspath(p)) else None)}
+                     for p in evidence_paths],
+        "segments": segments,
+        "next_action": "segmented_evidence_processing",
+        "constraints": {
+            "same_failed_request_must_not_be_resent": True,
+            "formal_review_authorization_required": mode == "REVIEW",
+            "do_not_lower_acceptance_criteria": True,
+            "task_contract_and_evidence_fingerprints_unchanged": True,
+        },
+    }
+    tmp = plan_path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(plan, fh, ensure_ascii=False, indent=2)
+        fh.write("\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, plan_path)
+    return {"plan": plan, "path": plan_path,
+            "sha256": sha256_text(json.dumps(plan, ensure_ascii=False, sort_keys=True)),
+            "segments": len(segments)}
+
+
 def response_problem(payload: dict) -> str | None:
     status = str(payload.get("status") or "").lower()
     err = payload.get("error")
@@ -890,9 +1085,9 @@ def main() -> int:
                     help="GPT 的角色/规则文件（默认 copilot/references/role.md）")
     ap.add_argument("--mode", default="", help="CONSULT/PLAN/REVIEW（留痕 + 证据纪律注入）")
     ap.add_argument("--review-ledger", default="",
-                    help="REVIEW 复核台账 JSON：自动合并历史证据、注入往轮裁决，并执行轮次预算"
-                         "（默认普通 2 轮 / 高风险 3 轮；默认用尽后普通追加 +2 / +3；"
-                         "普通预算全部用尽后 Security 独立额度 +1 / +2；任何追加都要新增证据）")
+                    help="REVIEW 复核台账 JSON：自动合并历史证据、注入往轮裁决，并给本轮"
+                         "编号。复核**没有固定轮次上限**，也不因累计 Token/费用停止；"
+                         "首轮之外每轮都必须说明理由，且必须携带新增实质证据")
     ap.add_argument("--one-shot-visual-review", action="store_true",
                     help="显式声明一次性视觉评审（无台账）：要求证据包至少含 1 张图片，"
                          "不携带跨轮状态；普通带图续轮仍必须使用 --review-ledger")
@@ -904,12 +1099,10 @@ def main() -> int:
                          "与新增证据是哪几条；Security 追加必须写明具体安全风险")
     ap.add_argument("--extra-round-basis", default="",
                     choices=("new-evidence", "security", "remediation"),
-                    help="复核依据记录：new-evidence（新增实质证据）/ security（普通预算全部用尽后的"
-                         "独立安全例外，必须带此前未用于 REVIEW 的新增证据与安全风险说明）"
-                         "/ remediation（已按上一轮裁决完成整改后的定向复核）。"
-                         "new-evidence 与 remediation 可在默认预算用尽后弹性追加，普通最多 +2 / "
-                         "高风险 +3；security 只能在此后使用独立额度（普通 +1 / 高风险 +2），"
-                         "用尽后需用户明确授权；任何依据都不允许没有新证据的重复复核")
+                    help="复核依据记录：new-evidence（新增实质证据）/ security（具体安全"
+                         "风险，需带此前未用于 REVIEW 的新增证据与风险说明）/ remediation"
+                         "（已按上一轮裁决完成整改后的定向复核）。复核没有固定轮次额度，"
+                         "但任何依据都不允许在没有新增证据/整改的情况下重复复核")
     ap.add_argument("--accept-evidence-truncation", default="", metavar="REASON",
                     help="显式放行被采集器截断的 REVIEW 证据，并写明理由"
                          "（为什么无法重新采集、省略的是哪部分、结论如何不受影响）；"
@@ -939,7 +1132,23 @@ def main() -> int:
     ap.add_argument("--max-retries", type=int, default=None,
                     help="最大重试次数（仅对可证明未送达的连接失败生效）；"
                          "native 自动任务默认 0，legacy/手动默认 2")
-    ap.add_argument("--max-output-tokens", type=int, default=8192)
+    ap.add_argument("--max-output-tokens", type=int, default=None,
+                    help="初始输出预算（不传则**不发送该字段**，由服务商/模型用真实默认上限）。"
+                         "不要用它设置低于真实上限的人为上限；截断时本脚本会按实际输出量"
+                         "自适应升档重发（同一任务/证据/轮次，不消耗 REVIEW 轮次）")
+    ap.add_argument("--max-output-tokens-ceiling", type=int, default=None,
+                    help="可选：输出预算升档的显式上界。缺省不设人为上限；只在调用方"
+                         "已知服务商硬上限、又不希望一次升档越过它时使用")
+    ap.add_argument("--max-output-retries", type=int, default=None,
+                    help="可选的输出升档重发次数上限。默认不限制：只要还能提高预算就"
+                         "继续重发；每次请求都记入审计与用量。达到服务商真实上限或无法"
+                         "再升档时自动生成分段证据计划，不消耗正式 REVIEW 轮次。"
+                         "只有显式传入该参数时，才作为运营限制生效（0 表示不升档）。")
+    ap.add_argument("--segmentation-plan", default="",
+                    help="输出预算无法继续提高时，把分段证据计划写到该 JSON 路径"
+                         "（同目录生成 segment-*.md）。缺省写到审计日志旁的 "
+                         "`<audit>.segmentation.json`；调用方据此进入分段处理，"
+                         "不得重发完全相同的失败请求")
     ap.add_argument("--max-images", type=int, default=MAX_IMAGES,
                     help=f"单次内联图片证据上限（默认 {MAX_IMAGES}）；超出明确失败，不静默丢弃视觉证据")
     ap.add_argument("--max-image-bytes", type=int, default=MAX_IMAGE_BYTES,
@@ -1139,6 +1348,18 @@ def main() -> int:
         args.max_retries = 0 if native_state else 2
     if args.max_retries < 0:
         die(EXIT_USAGE, "--max-retries 不能为负数。")
+    if args.max_output_retries is not None and args.max_output_retries < 0:
+        die(EXIT_USAGE, "--max-output-retries 不能为负数（0 表示截断时不自动升档重发）；"
+                        "省略该参数表示不限制升档次数。")
+    if args.max_output_tokens is not None and args.max_output_tokens <= 0:
+        die(EXIT_USAGE, "--max-output-tokens 必须是正整数；不设人为上限时不要传该参数。")
+    if (args.max_output_tokens_ceiling is not None
+            and args.max_output_tokens_ceiling <= 0):
+        die(EXIT_USAGE, "--max-output-tokens-ceiling 必须是正整数（或省略表示不设上界）。")
+    if (args.max_output_tokens is not None
+            and args.max_output_tokens_ceiling is not None
+            and args.max_output_tokens_ceiling < args.max_output_tokens):
+        die(EXIT_USAGE, "--max-output-tokens-ceiling 不能小于初始 --max-output-tokens。")
 
     instructions = read_text(args.role_file) if args.role_file else ""
     prompt = build_prompt(prompt, evidence_block, "\n".join(selfchecks), ledger_block,
@@ -1162,6 +1383,11 @@ def main() -> int:
     payload = build_payload(args.model, instructions, prompt, args.max_output_tokens, images,
                             args.reasoning_effort)
     enforce_image_carry(payload, images)
+    # 输出预算：未显式指定时请求体不含 max_output_tokens（服务商用真实默认上限）。
+    # 截断恢复只在本进程内升档重发，不改变任务状态、证据包或复核轮次。
+    output_budget = payload.get("max_output_tokens")
+    output_budget_initial = output_budget
+    last_truncated_output_tokens = None
     # 审计记「实际发出的档位」而不是命令行原值：默认值也必须在留痕里看得见。
     effort_sent = str((payload.get("reasoning") or {}).get("effort") or "")
 
@@ -1173,6 +1399,32 @@ def main() -> int:
     }
     # 一次调用一个 call_id：开始记录与结果记录靠它关联；审计日志里不得出现提示词或像素。
     call_id = os.urandom(8).hex()
+
+    def emit_segmentation_plan(reason: str, *, http_status: int | None = None,
+                               rejected_budget: int | None = None) -> dict:
+        plan_path = (os.path.abspath(args.segmentation_plan)
+                     if args.segmentation_plan
+                     else os.path.abspath(args.audit_log) + ".segmentation.json")
+        budgets = {
+            "initial": output_budget_initial,
+            "last_sent": output_budget,
+            "rejected": rejected_budget,
+            "observed_output_tokens": last_truncated_output_tokens,
+            "escalations": output_escalations,
+            "explicit_retry_limit": args.max_output_retries,
+            "explicit_ceiling": args.max_output_tokens_ceiling,
+        }
+        try:
+            return write_segmentation_plan(
+                plan_path, reason=reason, mode=mode,
+                task_id=str(task_ref.get("task_id") or ""), call_id=call_id,
+                prompt=prompt, budgets=budgets, evidence_paths=list(args.evidence),
+                http_status=http_status)
+        except OSError as exc:
+            print(f"copilot: 警告：分段证据计划写入失败（{exc}）；"
+                  "不得重发同一失败请求，请人工拆分证据。", file=sys.stderr)
+            return {"plan": None, "path": os.path.abspath(plan_path),
+                    "sha256": None, "segments": 0, "error": redact(str(exc))}
 
     # 审计关联字段：交付物标识与台账路径，供跨台账核对轮次（不含正文、密钥或像素）。
     # 审计里的 subject 以台账实际绑定为准：已有台账允许省略 --subject，
@@ -1211,15 +1463,14 @@ def main() -> int:
         if merged_meta:
             kind = merged_meta.get("review_kind", "normal")
             if kind == "extra":
-                round_note = (f"弹性追加第 {merged_meta.get('extra_index')}"
-                              f"/{merged_meta.get('extra_allowance')} 轮")
+                round_note = "定向追加轮"
             elif kind == "security":
-                round_note = (f"Security 独立追加第 {merged_meta.get('security_index')}"
-                              f"/{merged_meta.get('security_allowance')} 轮")
+                round_note = "Security 依据轮"
             else:
-                round_note = f"默认预算 {merged_meta['round']}/{merged_meta['max_rounds']} 轮"
-            ledger_note = (f"；复核第 {merged_meta['round']} 轮，{round_note}"
-                           f"（新增 {merged_meta['new_count']} 条，沿用 {merged_meta['carried_count']} 条）")
+                round_note = "首轮/常规轮"
+            ledger_note = (f"；复核第 {merged_meta['round']} 轮（{round_note}，"
+                           f"无固定轮次上限；新增 {merged_meta['new_count']} 条，"
+                           f"沿用 {merged_meta['carried_count']} 条）")
         if truncated_new or truncated_carried:
             parts = []
             if truncated_new:
@@ -1230,6 +1481,7 @@ def main() -> int:
             ledger_note += "；证据被截断：" + "，".join(parts)
         print(f"copilot: dry-run（未调用 GPT）：mode={mode or '-'}；channel={channel}；"
               f"model={args.model}；reasoning.effort={effort_sent or '-'}；"
+              f"输出预算={output_budget or '服务商默认（未发送 max_output_tokens）'}；"
               f"证据包 {len(args.evidence)} 个；"
               f"证据条目 {sum(s['entries'] for s in stats_all)} 条；prompt {len(prompt)} 字符；"
               f"图片 {len(images)} 张{ledger_note}"
@@ -1381,6 +1633,9 @@ def main() -> int:
         "tools_sent": False, "tool_choice": "none",
         **review_ref, **task_ref,
         "max_attempts": args.max_retries + 1,
+        # None 表示未发送该字段（服务商/模型真实默认上限），不是「0」或某个固定小值。
+        "max_output_tokens": output_budget,
+        "max_output_retries": args.max_output_retries,
         "evidence_packs": len(args.evidence),
         "evidence_entries": sum(s["entries"] for s in stats_all),
         "evidence_images": sum(len(s["images"]) for s in stats_all),
@@ -1397,15 +1652,21 @@ def main() -> int:
         die(EXIT_USAGE, f"审计开始记录写入失败，GPT 请求未发出：{exc}")
 
     url = args.base_url.rstrip("/") + ENDPOINT
+    attempt = 0                  # 网络尝试序号（0 起）
     attempts, last_error, last_status = 0, "", 0
     last_elapsed_ms = None
     last_quota = None
     result_unknown = False
     http_response_received = False
 
-    for attempt in range(args.max_retries + 1):
+    # 输出被 max_output_tokens 截断时，在同一 call_id / 同一轮次 / 同一证据包内
+    # 提高输出预算后重发。这类重发不占用网络重试额度：它不是因为链路失败，而是
+    # 因为回复被截断（请求已送达并计费）。每一次真实请求都留审计与 usage。
+    output_escalations = 0
+    while True:
         attempts = attempt + 1
         result_unknown = False
+        data = None
         try:
             started = time.monotonic()
             status, data, raw = post_json(url, api_key, payload, args.timeout)
@@ -1444,6 +1705,13 @@ def main() -> int:
                         "tools_sent": False, "tool_choice": "none", "attempts": attempts,
                         "ok": False, "error": "malformed_response",
                         "detail": f"{type(exc).__name__}: {exc}",
+                        "http_status": status,
+                        "http_response_received": True,
+                        "request_may_have_been_delivered": True,
+                        "usage": (data.get("usage") if isinstance(data, dict)
+                                  and isinstance(data.get("usage"), dict) else None),
+                        "usage_available": bool(isinstance(data, dict)
+                                                and isinstance(data.get("usage"), dict)),
                         "response_id": data.get("id") if isinstance(data, dict) else None,
                     })
                     release_pending("malformed_response")
@@ -1454,17 +1722,157 @@ def main() -> int:
                         "ts": now_iso(), "mode": mode, "model": args.model, "tools_sent": False,
                         "tool_choice": "none", "attempts": attempts, "ok": False,
                         "security_event": "unexpected_output_item", "detail": tool_calls,
+                        "http_status": status,
+                        "http_response_received": True,
+                        "request_may_have_been_delivered": True,
+                        "usage": (data.get("usage") if isinstance(data, dict)
+                                  and isinstance(data.get("usage"), dict) else None),
+                        "usage_available": bool(isinstance(data, dict)
+                                                and isinstance(data.get("usage"), dict)),
+                        "response_id": data.get("id"),
                     })
                     release_pending("unexpected_output_item")
                     die(EXIT_TOOLCALL,
                         f"安全事件：上游返回了非良性 output 条目 {tool_calls}；已拒绝处理且未执行，"
                         "请检查链路是否被改动。")
 
+                if (not data.get("error")) and output_truncated(data):
+                    # 输出被截断：请求已送达（可能已计费），但回复不是完整裁决。
+                    # 不解析裁决、不入台账、不写 --out、不写交接状态、不推进任务；
+                    # 同一任务 / 同一证据 / 同一 REVIEW 轮次提高输出预算后重发。
+                    model_resolved = data.get("model")
+                    identity_ok = (isinstance(model_resolved, str)
+                                   and model_resolved.strip() == args.model)
+                    usage = data.get("usage") if isinstance(data.get("usage"), dict) else None
+                    partial_text = extract_text(data)
+                    aud({
+                        "ts": now_iso(), "mode": mode, "model": args.model,
+                        "model_requested": args.model, "model_resolved": model_resolved,
+                        "model_identity_ok": identity_ok, "model_source": model_source,
+                        "reasoning_effort": effort_sent,
+                        "tools_sent": False, "tool_choice": "none", "attempts": attempts,
+                        "ok": False, "http_status": status,
+                        "error": "max_output_tokens",
+                        "truncated": True,
+                        "incomplete_details": data.get("incomplete_details"),
+                        # 失败请求的真实用量：有就是有，没有就明确标记不可得，
+                        # 不用估算值冒充计费证据。
+                        "usage": usage,
+                        "usage_available": usage is not None,
+                        "max_output_tokens_sent": output_budget,
+                        "output_escalation_index": output_escalations,
+                        "reply_sha256": sha256_text(partial_text),
+                        "reply_chars": len(partial_text),
+                        "response_id": data.get("id"),
+                    })
+                    if not identity_ok:
+                        # 身份门优先：被截断的响应同样不得当作有效结果或被消费。
+                        release_pending("model_identity_mismatch")
+                        die(EXIT_IDENTITY,
+                            f"模型身份验证失败：请求模型 {args.model!r}，上游回显 "
+                            f"{model_resolved!r}。该截断回复已丢弃：未解析裁决、未入台账、"
+                            "未写交接状态，也未升档重发。请检查 CPA 别名或上游路由后人工决定。")
+                    observed = None
+                    if isinstance(usage, dict):
+                        for key in ("output_tokens", "completion_tokens"):
+                            value = usage.get(key)
+                            if isinstance(value, int) and not isinstance(value, bool):
+                                observed = value
+                                break
+                    last_truncated_output_tokens = observed
+                    nxt = next_output_budget(output_budget, observed,
+                                             args.max_output_tokens_ceiling)
+                    # 默认不限制升档次数：只有调用方显式给出 --max-output-retries
+                    # 才形成运营上限；否则一直按实际输出量提高预算，直到成功、到达
+                    # 显式 ceiling，或服务商拒绝该预算（真实边界）。
+                    limit_hit = (args.max_output_retries is not None
+                                 and output_escalations >= args.max_output_retries)
+                    if limit_hit or nxt is None:
+                        why = ("本轮已达调用方显式设置的升档次数上限"
+                               f"（{args.max_output_retries} 次）" if limit_hit and nxt is not None
+                               else "输出预算已达调用方显式上界（--max-output-tokens-ceiling）"
+                               if nxt is None else "输出预算无法继续提高")
+                        seg = emit_segmentation_plan(
+                            "output_budget_exhausted", rejected_budget=None)
+                        aud({
+                            "ts": now_iso(), "mode": mode, "model": args.model,
+                            "tools_sent": False, "tool_choice": "none",
+                            "attempts": attempts, "ok": False,
+                            "error": "output_truncated_exhausted", "detail": why,
+                            "reason": "output_budget_exhausted",
+                            "transition": "segmentation_required",
+                            "max_output_tokens_initial": output_budget_initial,
+                            "max_output_tokens_sent": output_budget,
+                            "output_escalation_index": output_escalations,
+                            "observed_output_tokens": observed,
+                            "segmentation_plan": seg.get("path"),
+                            "segmentation_plan_sha256": seg.get("sha256"),
+                            "segmentation_segments": seg.get("segments"),
+                            "response_id": data.get("id"),
+                        }, "call_post_failure")
+                        release_pending("output_segmentation_required")
+                        die(EXIT_SHAPE,
+                            f"输出连续被 max_output_tokens 截断，{why}（最后一次预算 "
+                            f"{output_budget or '服务商默认'}）。本次未产出裁决、未消耗正式 "
+                            "REVIEW 轮次（台账未入账）、未推进任务状态；原始证据包与指纹未改动。"
+                            f"已自动转入证据分段处理（分段复核）：分段计划 {seg.get('path')}"
+                            f"（{seg.get('segments')} 段）。不要再发送完全相同的失败请求；"
+                            "按计划逐段处理，再汇总为新的证据/复核轮次。")
+                    # 显式运营上限（用户自己设的请求数/Token 阈值）仍要遵守：
+                    # 升档重发是真实请求，不能绕过调用方显式配置。
+                    if dispatch_state is not None:
+                        try:
+                            limits = copilot_dispatch.budget_limits(dispatch_state)
+                            spend = copilot_dispatch.task_spend_from_audit(
+                                args.audit_log, str(dispatch_state.get("task_id") or ""))
+                        except copilot_dispatch.DispatchError as exc:
+                            release_pending("output_budget_unverified")
+                            die(EXIT_USAGE,
+                                f"无法核对显式运营上限（{exc}）；截断升档重发未发出。")
+                        if (limits["max_requests"] is not None
+                                and spend["requests"] + 1 > limits["max_requests"]):
+                            release_pending("explicit_request_limit")
+                            die(EXIT_BUDGET,
+                                "输出被截断，但自动升档重发会越过调用方显式设置的请求数上限"
+                                f"（已用 {spend['requests']}/{limits['max_requests']}）；"
+                                "本次未产出裁决、未消耗正式 REVIEW 轮次。请调整显式上限，"
+                                "或改用分段证据复核。")
+                    output_budget = nxt
+                    payload["max_output_tokens"] = nxt
+                    output_escalations += 1
+                    # 每次升档重发前先落审计开始记录（fsync）：没有记录就不出站。
+                    try:
+                        append_audit(args.audit_log, {
+                            "channel": channel, **start_record,
+                            "max_output_tokens": nxt,
+                            "output_escalation_index": output_escalations,
+                            "retry_of": call_id,
+                            "retry_reason": "max_output_tokens",
+                        })
+                    except AuditError as exc:
+                        release_pending("audit_unavailable")
+                        die(EXIT_USAGE,
+                            f"截断升档重发的审计开始记录写入失败，重发未发出：{exc}。")
+                    print(f"copilot: 输出被截断（max_output_tokens），同一任务/证据/轮次"
+                          f"升档至 {nxt} 后重发（第 {output_escalations} 次"
+                          + (f"/{args.max_output_retries}" if args.max_output_retries is not None
+                             else "；默认不限制次数")
+                          + "）；本次不计入正式 REVIEW 轮次。",
+                          file=sys.stderr)
+                    continue
+
                 if problem:
                     aud({
                         "ts": now_iso(), "mode": mode, "model": args.model, "tools_sent": False,
                         "tool_choice": "none", "attempts": attempts, "ok": False,
                         "error": "non_success_response", "detail": problem,
+                        "http_status": status,
+                        "http_response_received": True,
+                        "request_may_have_been_delivered": True,
+                        "usage": (data.get("usage") if isinstance(data, dict)
+                                  and isinstance(data.get("usage"), dict) else None),
+                        "usage_available": bool(isinstance(data, dict)
+                                                and isinstance(data.get("usage"), dict)),
                         "response_id": data.get("id"),
                     })
                     release_pending("non_success_response")
@@ -1476,6 +1884,13 @@ def main() -> int:
                         "ts": now_iso(), "mode": mode, "model": args.model, "tools_sent": False,
                         "tool_choice": "none", "attempts": attempts, "ok": False,
                         "error": "empty_output", "response_id": data.get("id"),
+                        "http_status": status,
+                        "http_response_received": True,
+                        "request_may_have_been_delivered": True,
+                        "usage": (data.get("usage") if isinstance(data, dict)
+                                  and isinstance(data.get("usage"), dict) else None),
+                        "usage_available": bool(isinstance(data, dict)
+                                                and isinstance(data.get("usage"), dict)),
                     })
                     release_pending("empty_output")
                     die(EXIT_SHAPE, "上游未返回可用的 message 文本。")
@@ -1547,6 +1962,9 @@ def main() -> int:
                     "tools_sent": False, "tool_choice": "none",
                     "attempts": attempts, "ok": True, "http_status": status,
                     "response_id": data.get("id"), "usage": data.get("usage"),
+                    # 实际发出的输出预算（None = 未发送该字段）。升档重发成功后，
+                    # 这一轮到底用了多大预算只能从审计看出来，不能靠猜。
+                    "max_output_tokens_sent": output_budget,
                     "evidence_packs": len(args.evidence),
                     "evidence_entries": sum(s["entries"] for s in stats_all),
                     "evidence_images": sum(len(s["images"]) for s in stats_all),
@@ -1740,6 +2158,35 @@ def main() -> int:
 
             last_error = redact(raw[:500] or f"HTTP {status}")
             last_quota = quota_signal(status, data)
+            if output_limit_rejected(status, raw):
+                # 服务商明确拒绝当前输出/上下文预算：这是模型或服务的真实边界，
+                # 不是链路故障。自动转成分段证据计划，不重发同一请求。
+                seg = emit_segmentation_plan(
+                    "output_budget_rejected", http_status=status,
+                    rejected_budget=output_budget)
+                aud({
+                    "ts": now_iso(), "mode": mode, "model": args.model,
+                    "tools_sent": False, "tool_choice": "none", "attempts": attempts,
+                    "ok": False, "error": "output_budget_rejected",
+                    "http_status": status,
+                    "reason": "output_budget_rejected",
+                    "max_output_tokens_initial": output_budget_initial,
+                    "max_output_tokens_sent": output_budget,
+                    "output_escalation_index": output_escalations,
+                    "observed_output_tokens": last_truncated_output_tokens,
+                    "segmentation_plan": seg.get("path"),
+                    "segmentation_plan_sha256": seg.get("sha256"),
+                    "segmentation_segments": seg.get("segments"),
+                    "detail": last_error,
+                }, "call_post_failure")
+                release_pending("output_budget_rejected")
+                die(EXIT_SHAPE,
+                    f"输出预算 {output_budget or '服务商默认'} 被上游拒绝（HTTP {status}），"
+                    "说明已触及模型/服务的真实输出或上下文上限。本次未产出裁决、未消耗正式 "
+                    "REVIEW 轮次、未推进任务状态；原始证据包与指纹未改动。"
+                    f"已自动转入证据分段处理：分段计划 {seg.get('path')}"
+                    f"（{seg.get('segments')} 段）。不要再用同一请求继续试探；"
+                    "按计划逐段处理，再汇总为新的证据/复核轮次。")
             # 已收到 HTTP 错误响应，但无法据此判断模型服务是否处理请求或产生费用：
             # 不得自动重发同一付费 POST；保留原始状态码与输出留痕后立即失败。
             http_response_received = True
@@ -1748,8 +2195,10 @@ def main() -> int:
         if result_unknown:
             # 请求结果未知：可能已被上游接收并计费，不进入下一轮自动重发。
             break
-        if attempt < args.max_retries:
-            time.sleep(min(2 ** attempt, 8))
+        attempt += 1
+        if attempt > args.max_retries:
+            break
+        time.sleep(min(2 ** (attempt - 1), 8))
 
     aud({
         "ts": now_iso(), "mode": mode, "model": args.model, "model_requested": args.model,
@@ -1758,6 +2207,20 @@ def main() -> int:
         "tools_sent": False,
         "tool_choice": "none", "attempts": attempts, "ok": False,
         "http_status": last_status, "error": last_error[:300],
+        # 用量与送达状态分开记录：有响应（含 HTTP 错误）说明请求已到达上游，
+        # 但没有 usage 时只能记「未知」，不能当作 0；confirmed_not_delivered
+        # 只用于可证明请求未建立的传输层失败。
+        "result_unknown": result_unknown,
+        "http_response_received": http_response_received,
+        "request_may_have_been_delivered": bool(result_unknown or http_response_received),
+        "delivery": ("unknown" if result_unknown else
+                     "responded" if http_response_received else "not_delivered"),
+        "usage": (data.get("usage") if isinstance(data, dict)
+                  and isinstance(data.get("usage"), dict) else None),
+        "usage_available": bool(isinstance(data, dict)
+                                and isinstance(data.get("usage"), dict)),
+        "max_output_tokens_sent": output_budget,
+        "max_output_tokens_initial": output_budget_initial,
         **({"quota": last_quota} if last_quota else {}),
     })
     if last_quota:

@@ -1,12 +1,13 @@
 # STATUS
 
-更新：2026-11-04 22:57 CST。本文件只记录现场可核实的事实；规划与未完成事项单独标注。
+更新：2026-11-08 CST。本文件只记录现场可核实的事实；规划与未完成事项单独标注。
 
 ## 当前阶段
 
 - **Phase 3.6**：离线协议、校验、信封生成、异常/幂等测试与兼容性已完成；
   **真实 SOL 端到端（C4）尚未执行**——没有获得真实调用授权，未发起任何 GPT/SOL 请求。
-- **Phase 4**：未开始。
+- **Phase 4（部分落地，2026-11-08）**：SOL 自动重判/收口与 PARTIAL 自动推进已实现并通过
+  离线全链路测试；Reviewer 自动派发、可信复核记录升级仍未开始，需单独授权。
 
 ## 源码与运行时
 
@@ -33,8 +34,9 @@
 
 ## 测试基线
 
-- 源码仓库：**700 tests OK**（`python3 -B -m unittest discover -s tests -p 'test_*.py'`，
-  59.9s，2026-11-04；证据完整性收口后全量复跑）。此前基线 689。
+- 源码仓库：**727 tests OK**（`python3 -B -m unittest discover -s tests -p 'test_*.py'`，
+  2026-11-08；预算解除、输出预算、PARTIAL 自动闭环与三项收尾修复落地后全量复跑）。
+  此前基线 711（本轮新增 16 项）。
 - 迁移前运行时基线：561 tests OK；新增 `tests/test_sync_runtime.py` 19 项。
 - 迁移适配：7 个测试原先从自身文件位置推断宿主目录，源码移出 `~/.zcode` 后失败；
   已改为显式 `~/.zcode/references`、`~/.zcode/skills`，并断言导入模块来自当前 checkout。
@@ -188,9 +190,103 @@
 - **未验证**：未发起真实 SOL 端到端复测（无付费授权）；节省以历史日志推算，不是实测；
   对「历史截断条目在后续轮次仍被沿用」只验证了元数据与提示，未做真实多轮调用。
 
+## 预算解除与 PARTIAL 自动闭环（2026-11-08）
+
+- **动因**：SOL 调用预算（固定 REVIEW 轮次、弹性追加额度、请求数/Token 阈值）与输出预算
+  （固定 8192）会打断正常决策；PARTIAL 后被当作终态，需要用户逐轮传话与授权。
+- **复核轮次（DECISIONS 第 16 条）**：`review_ledger.budget_status` 恒 `allowed: true`、
+  `limits_enforced: false`、`unbounded: true`；普通/追加/Security 数字只作观察输出。
+  继续条件只剩「本轮有新增或变化证据」+「确有未闭合实质问题」；第 2 轮起仍要求
+  `--extra-round-reason`。内容哈希去重、subject/台账/审计日志绑定、并发锁、换日志拒绝保留。
+- **请求与 Token（同上）**：`NATIVE_DEFAULT_MAX_REQUESTS` / `NATIVE_DEFAULT_MAX_TOTAL_TOKENS`
+  为 `None`，`budget_limits` 默认不设上限、`usage` 照实记录；只有 `start` 显式给出
+  `--max-requests` / `--max-total-tokens` 才按显式运营上限拒绝出站（`exit 11/12`）。
+  8 轮检查点与 `--rounds-limit` 降为观察信号，不拦截 drive。
+- **输出预算与截断恢复（DECISIONS 第 17 条）**：`call_gpt.py` / `copilot_auto.py` 默认不发送
+  `max_output_tokens`（删除固定 8192，也不新增固定天花板）。`status=incomplete` +
+  `reason=max_output_tokens` 时不写回复、不入台账、不写状态、不计正式轮次；按观测
+  `output_tokens` 约翻倍并对齐 4096 升档，用同一任务/证据/REVIEW 轮次重发，重发前记
+  `retry_of` / `retry_reason` 的 `call_requested`；升档默认不限次，只有显式
+  `--max-output-retries` 才构成运营限制，显式 `--max-output-tokens-ceiling` 是另一上界。
+  预算无法继续提高或上游显式拒绝时，不重发相同失败请求，而是生成分段计划
+  （`copilot-segmentation-plan/v1`，逐段文件 + SHA-256 + 条目清单，声明
+  `same_failed_request_must_not_be_resent`），以 `transition=segmentation_required` 失败关闭；
+  `drive` 返回 `status=segmentation_required`，由主代理分段处理证据后重新 REVIEW。
+  截断响应同样要通过模型身份校验（退出码 9 优先）。
+- **PARTIAL 自动推进（DECISIONS 第 18 条）**：`drive` 在最近一轮 `verdict=partial` 且无
+  可执行安排时，本地派生 `origin=partial-without-plan` 工作项（0 请求、不消耗轮次），
+  带 `goal / constraints / expected_evidence / completion_criteria / authorization /
+  return_contract / executed_by / directive_complete` 的 `work_order` 进入 `EXECUTE`，
+  由 ZCode 主代理执行；该轮已有执行/复核/报告材料时不再派生，必须把新材料交回 SOL。
+  新增 `_round_material()` 防止「执行完却不交回 SOL」的漏判。
+- **循环语义**：`REVIEW → PARTIAL → NEXT_WORK → EXECUTION → EVIDENCE → REVIEW` 直到 PASS
+  收口或真实 BLOCKED；轮次数字、检查点、累计费用都不停止。六维无进展（streak ≥2 或同一
+  工作项失败 ≥3 次）不再直接停机：驱动把失败、未解决事项与新增证据交 SOL 重新分析，
+  要求给出失效原因、替代路径、下一步、完成条件/证据与授权边界；相同诊断材料不重复发送，
+  REVIEW 恢复分析仍须显式 `--auto-review`。授权边界不变：超出原授权（生产发布、真实数据写删、
+  远push、对外消息、权限/安全策略、业务规则变更）→ BLOCKED 并说明所需授权。
+- **代码**：`scripts/review_ledger.py`、`scripts/call_gpt.py`、`scripts/copilot_dispatch.py`、
+  `scripts/copilot_auto.py`；文档 `SKILL.md`、`references/role.md`、
+  `references/agent-bridge.md`、`docs/DECISIONS.md`（第 16–18 条）。
+- **测试**：全量 **711 tests OK**。新增/改写覆盖：输出预算省略与升档重发（同输入/同轮次、
+  审计 `truncated`/`usage`）、显式 ceiling 与重试上限失败关闭、PARTIAL 无 plan 派生 +
+  执行 + 复核 + PASS 收口全链路（native 与 legacy 各一条）、BLOCKED 显式停止、
+  多轮不被固定上限拦截、显式请求/Token 上限仍在出站前拒绝、旧台账兼容。
+- **未验证**：未发起真实 SOL 调用（无付费授权）；真实上游 `max_output_tokens` 默认值、
+  截断升档后的实际恢复率、超长证据分段策略均只有单元测试与 Fake Upstream 证据。
+- **未提交**：本次改动仍在工作区，未 commit、未 push、未部署。
+
+## 真实 SOL 验证（2026-11-08，4 次 HTTP 请求）
+
+- **授权依据**：任务书 §6「必要时可发起真实 SOL 调用验证，内部成本预算不得阻断必要验证」。
+  只做链路自检，不产生业务裁决；审计与输出在 `/tmp/copilot/verify-20261108/`（临时目录，未入库）。
+- **验证 1（默认不发送 max_output_tokens）**：CONSULT 调用 HTTP 200（退出码 0），`model_resolved=gpt-6.1-sol`，
+  `model_identity_ok=true`，审计 `max_output_tokens=null`，usage 13544/36。证明省略该字段时
+  真实 CPA/SOL 通道正常接受并使用服务商默认上限。
+- **验证 2（截断识别）**：`--max-output-tokens 16 --max-output-retries 0`，真实响应
+  `incomplete_details.reason=max_output_tokens`、`usage.output_tokens=16`；审计写入
+  `error=max_output_tokens / truncated=true / max_output_tokens_sent=16 / output_escalation_index=0`，
+  随后 `call_post_failure=output_truncated_exhausted`，无 `--out`、无台账、无轮次推进。
+- **验证 3（升档恢复）**：初始预算 32 被截断（32 tokens）→ 自动升档到 4096 重发 → 完整回复
+  （846 tokens），退出码 0；审计两条 `call_requested`（第二条 `retry_of=<call_id>` /
+  `retry_reason=max_output_tokens` / `output_escalation_index=1`）与一条成功 `call_result`
+  （`max_output_tokens_sent=4096`）。
+- **合计**：4 次请求，输入 54125 / 输出 930 tokens。未用真实 SOL 跑完整 PARTIAL→EXECUTE→
+  REVIEW→PASS 多轮链路（该链路仍只有 Fake Upstream 全链路测试）。
+
+## 自动闭环最后收尾（2026-11-08）
+
+- **输出截断恢复**：`--max-output-retries` 默认改为 `None`（不限次），仅显式传入才构成运营
+  限制；按实际 `output_tokens` 约翻倍并对齐 4096 持续升档。无法继续提高（显式上限/ceiling）
+  或 Provider 拒绝预算时，不重发相同请求，自动写出 `copilot-segmentation-plan/v1` 与
+  `segment-*.md`（含条目、字符数、SHA-256），以 `transition=segmentation_required` 失败关闭；
+  `drive` 返回 `status=segmentation_required`。截断仍不产生裁决、不写台账、不推进轮次、
+  保留任务/合同/证据指纹；Provider 限制、认证失败、网络错误分别留痕。
+- **未知用量**：`task_spend_from_audit` 区分已知/未知用量。成功有 usage 计真实 Token；
+  成功无 usage、已送达/可能送达的失败无 usage 计入 `unknown_usage_calls`；确认未送达的
+  传输失败只计 `not_delivered_calls`；失败但有部分 usage 记录已知 Token 并保留失败状态。
+  同一响应按 `call_id + 升档序号 + response_id` 去重，重试不重复累计，跨轮次从审计重建。
+- **无进展恢复**：`drive` 不再因 `progress_streak >= 2` 直接停止；汇总失败、未解决事项与
+  新增证据，生成诊断包交 SOL 分析原方案失效原因、替代路径、下一步、完成条件/证据与授权边界，
+  DeepSeek 执行后再次 REVIEW。相同诊断材料不重复请求（`no_progress_no_new_information`）；
+  REVIEW 恢复分析仍须显式 `--auto-review`；只有无安全替代/缺决策/缺授权/缺资源/外部硬限制
+  才可 BLOCKED，并须给出具体原因与证据。
+- **代码**：`scripts/call_gpt.py`、`scripts/copilot_dispatch.py`、`scripts/copilot_auto.py`；
+  文档 `SKILL.md`、`references/role.md`、`docs/DECISIONS.md`（第 17–19 条）、本文件。
+- **测试**：全量 **727 tests OK**。新增覆盖：默认不限次升档直至成功、连续截断升档序列、
+  Provider 拒绝预算转分段、显式重试上限、HTTP 408 无 usage 计未知、已送达失败计未知、
+  确认未送达不计未知、成功 usage 准确、重复响应去重、跨轮次累计、连续无进展触发 SOL
+  重新分析、无新信息不重复请求、未授权 REVIEW 不绕过、SOL 无安全替代时带证据 BLOCKED。
+- **未验证**：未为本轮三项修复重新发起真实 SOL 调用（按任务书允许复用自动化与 Fake
+  Upstream）；真实 Provider 对极大 `max_output_tokens` 的接受边界、真实超长证据分段后的
+  裁决质量、无进展诊断在真实多轮中的效果仍只有单元测试与 Fake Upstream 证据。
+
 ## 未验证 / 未完成
 
 - 真实 SOL PLAN 与正式 Native Bridge 端到端循环（C4）：未调用、未验证。
+- 2026-11-08 的 PARTIAL 自动闭环已用真实 SOL 验证主链路；本轮三项收尾修复（默认不限次
+  升档、未知用量、无进展重析）未重新发起真实调用，仍以自动化与 Fake Upstream 为证据。
+  真实上游的默认输出上限绝对值未知（只验证了省略该字段可用、截断可识别、升档可恢复）。
 - `native_agent.py` 的真实子代理 `metadata.json` + rollout 提取：目前只有单元测试与
   合成记录验证，未用真实 ZCode 子代理运行记录跑通。
 - native 任务在真实执行/复核后的 G1–G4 与正常风险收口：未验证。
@@ -203,5 +299,7 @@
 ## 下一任务
 
 1. 获得一次性授权后执行 Phase 3.6 C4（真实 SOL，预算与请求上限见授权包）。
-2. 达成后按固定流程开发：源码修改 → 测试 → 检查 diff → 同步 → `--check` → 新会话加载。
-3. Phase 4 需单独授权与实现。
+2. 在需要时用真实 SOL 复测本轮三项收尾修复：默认不限次升档、未知用量统计、无进展重析
+   （需新的一次性授权）。
+3. 达成后按固定流程开发：源码修改 → 测试 → 检查 diff → 同步 → `--check` → 新会话加载。
+4. Phase 4 剩余范围（Reviewer 自动派发、可信复核记录升级）需单独授权与实现。

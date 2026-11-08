@@ -512,7 +512,9 @@ class SolHighContractTests(unittest.TestCase):
     真实 payload 逐键等价。全程拦截 post_json，零出站。
     """
 
-    VERIFIED_KEYS = {"input", "instructions", "max_output_tokens", "model",
+    # 2026-11-08 起默认不发送 max_output_tokens：由服务商/模型使用真实默认上限，
+    # 代码不再设置 8192 这类人为上限（截断时按实际输出量自适应升档）。
+    VERIFIED_KEYS = {"input", "instructions", "model",
                      "reasoning", "store", "stream", "tool_choice"}
 
     def setUp(self):
@@ -529,12 +531,17 @@ class SolHighContractTests(unittest.TestCase):
         self.status = 200
         self.body: dict = {"error": {"code": "server_error"}}
         self.response_override: dict | None = None  # 非默认 200 响应体（兼容性用例）
+        self.responses: list[dict] = []  # 依次返回的 200 响应（截断升档用例）
         self._orig = (call_gpt.post_json, call_gpt.resolve_api_key)
 
         def fake_post(url, key, payload, timeout):
-            self.calls.append({"url": url, "payload": payload})
+            # 深拷贝：升档重发会原地修改 payload，记录必须保留每次请求的真实形态。
+            self.calls.append({"url": url,
+                               "payload": json.loads(json.dumps(payload))})
             if self.status != 200:
                 return self.status, self.body, json.dumps(self.body)
+            if self.responses:
+                return 200, self.responses.pop(0), "{}"
             if self.response_override is not None:
                 return 200, self.response_override, "{}"
             response = {
@@ -574,6 +581,22 @@ class SolHighContractTests(unittest.TestCase):
         with open(self.audit, encoding="utf-8") as fh:
             return json.loads(fh.readlines()[-1])
 
+    def records(self) -> list[dict]:
+        if not os.path.exists(self.audit):
+            return []
+        with open(self.audit, encoding="utf-8") as fh:
+            return [json.loads(line) for line in fh if line.strip()]
+
+    def _truncated_response(self, output_tokens: int, *, text: str = "结论：可以。") -> dict:
+        return {
+            "id": "resp_cut", "status": "incomplete",
+            "model": call_gpt.DEFAULT_MODEL,
+            "incomplete_details": {"reason": "max_output_tokens"},
+            "output": [{"type": "message", "content": [
+                {"type": "output_text", "text": text}]}],
+            "usage": {"input_tokens": 100, "output_tokens": output_tokens},
+        }
+
     def test_dry_run_dump_is_key_equivalent_to_verified_payload(self):
         """dry-run 请求体必须与 2026-11-01 已验证的真实 SOL High 请求逐键等价。"""
         dump = os.path.join(self.tmp.name, "request.json")
@@ -588,7 +611,19 @@ class SolHighContractTests(unittest.TestCase):
         self.assertEqual(dumped["reasoning"], {"effort": "high"})
         self.assertEqual(dumped["tool_choice"], "none")
         self.assertNotIn("tools", dumped)
+        self.assertNotIn("max_output_tokens", dumped,
+                         "默认不得给输出设置低于真实上限的人为上限")
         self.assertIs(dumped["_audit"]["tools_present"], False)
+
+    def test_explicit_output_budget_is_honoured_without_becoming_a_default(self):
+        """显式给出输出预算时才发送该字段；默认路径保持不设人为上限。"""
+        dump = os.path.join(self.tmp.name, "request.json")
+        self.assertEqual(self.run_main("--mode", "CONSULT", "--dry-run",
+                                       "--max-output-tokens", "32768",
+                                       "--dump-request", dump), 0)
+        with open(dump, encoding="utf-8") as fh:
+            dumped = json.load(fh)
+        self.assertEqual(dumped["max_output_tokens"], 32768)
 
     def test_reasoning_effort_is_overridable_but_never_downgraded_implicitly(self):
         self.assertEqual(self.run_main("--mode", "CONSULT", "--reasoning-effort", "low"), 0)
@@ -788,8 +823,8 @@ class SolHighContractTests(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(self.tmp.name, "reply.md")))
         self.assertEqual(self.last_record()["security_event"], "unexpected_output_item")
 
-    def test_incomplete_response_still_exits_6(self):
-        """响应非完整成功仍是退出码 6，且不产出正文。"""
+    def test_truncated_output_fails_closed_without_consuming_a_round(self):
+        """输出被 max_output_tokens 截断且不再升档时失败关闭，不产出正文。"""
         self.response_override = {
             "id": "resp_inc", "status": "incomplete", "model": call_gpt.DEFAULT_MODEL,
             "incomplete_details": {"reason": "max_output_tokens"},
@@ -797,11 +832,128 @@ class SolHighContractTests(unittest.TestCase):
                 {"type": "output_text", "text": "结论：可以。"}]}],
         }
         with self.assertRaises(SystemExit) as ctx:
-            self.run_main("--mode", "CONSULT")
+            self.run_main("--mode", "CONSULT", "--max-output-retries", "0")
         self.assertEqual(ctx.exception.code, call_gpt.EXIT_SHAPE)
         self.assertEqual(self.out.getvalue(), "")
         self.assertFalse(os.path.exists(os.path.join(self.tmp.name, "reply.md")))
+        self.assertEqual(self.last_record()["error"], "output_truncated_exhausted")
+        self.assertEqual(self.last_record()["transition"], "segmentation_required")
+        self.assertTrue(self.last_record()["segmentation_plan"])
+        self.assertTrue(os.path.exists(self.last_record()["segmentation_plan"]))
+        # 截断不是有效裁决：不能按 PASS 处理，也不能写出半份结果。
+        self.assertIn("REVIEW 轮次", self.err.getvalue())
+        self.assertIn("分段", self.err.getvalue())
+
+    def test_non_truncation_incomplete_response_still_exits_6(self):
+        """其他 incomplete 原因（如内容过滤）仍按非完整响应对待，不触发升档。"""
+        self.response_override = {
+            "id": "resp_filtered", "status": "incomplete",
+            "model": call_gpt.DEFAULT_MODEL,
+            "incomplete_details": {"reason": "content_filter"},
+            "output": [{"type": "message", "content": [
+                {"type": "output_text", "text": "结论：可以。"}]}],
+        }
+        with self.assertRaises(SystemExit) as ctx:
+            self.run_main("--mode", "CONSULT")
+        self.assertEqual(ctx.exception.code, call_gpt.EXIT_SHAPE)
+        self.assertEqual(self.out.getvalue(), "")
         self.assertEqual(self.last_record()["error"], "non_success_response")
+        self.assertEqual(len(self.calls), 1, "非截断响应不得自动重发")
+
+    def test_truncated_output_escalates_in_place_then_delivers(self):
+        """截断时自动升档、同一任务同一证据重发；恢复后才交付正文。"""
+        self.responses = [self._truncated_response(6000)]
+        self.assertEqual(self.run_main("--mode", "CONSULT",
+                                       "--max-output-retries", "2"), 0)
+        self.assertEqual(len(self.calls), 2, "截断必须自动升档重发一次")
+        first, second = self.calls[0]["payload"], self.calls[1]["payload"]
+        # 默认不发送人为上限；升档值按实际观测输出量自适应（6000 → 12288）。
+        self.assertNotIn("max_output_tokens", first)
+        self.assertEqual(second["max_output_tokens"], 12288)
+        # 同一任务、同一证据：除输出预算外请求体完全一致。
+        for key in ("input", "instructions", "model", "reasoning", "tool_choice"):
+            self.assertEqual(first[key], second[key])
+        # 正文只在完整响应之后产生。
+        with open(os.path.join(self.tmp.name, "reply.md"), encoding="utf-8") as fh:
+            self.assertIn("结论：可以。", fh.read())
+
+        records = self.records()
+        failed = [r for r in records if r.get("truncated") is True]
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(failed[0]["error"], "max_output_tokens")
+        self.assertIs(failed[0]["ok"], False)
+        # 失败请求的真实用量照实记录，不冒充成功，也不隐藏计费依据。
+        self.assertTrue(failed[0]["usage_available"])
+        self.assertEqual(failed[0]["usage"]["output_tokens"], 6000)
+        self.assertIsNone(failed[0]["max_output_tokens_sent"])
+        self.assertEqual(failed[0]["output_escalation_index"], 0)
+        # 重发前另有一条开始记录，标明这是同一次判断的升档重发。
+        retries = [r for r in records if r.get("retry_reason") == "max_output_tokens"]
+        self.assertEqual(len(retries), 1)
+        self.assertEqual(retries[0]["max_output_tokens"], 12288)
+        self.assertEqual(retries[0]["output_escalation_index"], 1)
+        self.assertEqual(retries[0]["retry_of"], failed[0]["call_id"])
+        self.assertEqual(self.last_record()["ok"], True)
+        # 成功记录也写明实际发出的输出预算（升档后的值），审计可独立复原。
+        self.assertEqual(self.last_record()["max_output_tokens_sent"], 12288)
+
+    def test_truncation_escalation_stops_at_explicit_ceiling(self):
+        """显式输出上界是真正的天花板：到顶时不再重发，改为分段证据指引。"""
+        self.responses = [self._truncated_response(8192)]
+        with self.assertRaises(SystemExit) as ctx:
+            self.run_main("--mode", "CONSULT",
+                          "--max-output-tokens", "8192",
+                          "--max-output-tokens-ceiling", "8192")
+        self.assertEqual(ctx.exception.code, call_gpt.EXIT_SHAPE)
+        self.assertEqual(len(self.calls), 1)
+        self.assertIn("分段复核", self.err.getvalue())
+        self.assertEqual(self.last_record()["error"], "output_truncated_exhausted")
+
+    def test_truncation_escalation_is_bounded_by_retry_count(self):
+        """多次截断按次数收敛：不无限重发，也不把半份内容当结果。"""
+        self.responses = [self._truncated_response(4000) for _ in range(6)]
+        with self.assertRaises(SystemExit) as ctx:
+            self.run_main("--mode", "CONSULT", "--max-output-retries", "2")
+        self.assertEqual(ctx.exception.code, call_gpt.EXIT_SHAPE)
+        self.assertEqual(len(self.calls), 3, "首次 + 2 次升档")
+        self.assertEqual([c["payload"].get("max_output_tokens")
+                          for c in self.calls], [None, 8192, 16384])
+        self.assertFalse(os.path.exists(os.path.join(self.tmp.name, "reply.md")))
+
+    def test_truncation_default_escalation_is_unlimited_until_success(self):
+        """默认没有固定重试次数：连续截断时继续升档，直到完整响应或真实上限。"""
+        self.responses = [self._truncated_response(1000) for _ in range(4)]
+        self.assertEqual(self.run_main("--mode", "CONSULT"), 0)
+        self.assertEqual(len(self.calls), 5, "4 次截断 + 1 次成功")
+        self.assertEqual([c["payload"].get("max_output_tokens")
+                          for c in self.calls],
+                         [None, 4096, 8192, 16384, 32768])
+        # 每次重发都换了更大的预算，没有发送完全相同的失败请求。
+        self.assertEqual(len({c["payload"].get("max_output_tokens")
+                              for c in self.calls}), 5)
+
+    def test_provider_output_limit_rejection_transitions_to_segmentation(self):
+        """服务商拒绝输出预算时，不再盲目重发，自动生成分段证据计划。"""
+        self.status = 400
+        self.body = {"error": {"message": "max_output_tokens exceeds model limit"}}
+        plan_path = os.path.join(self.tmp.name, "segmentation.json")
+        with self.assertRaises(SystemExit) as ctx:
+            self.run_main("--mode", "CONSULT", "--max-output-tokens", "8192",
+                          "--segmentation-plan", plan_path)
+        self.assertEqual(ctx.exception.code, call_gpt.EXIT_SHAPE)
+        self.assertEqual(len(self.calls), 1, "真实上限被拒绝后不得重发同一请求")
+        record = self.last_record()
+        self.assertEqual(record["error"], "output_budget_rejected")
+        self.assertEqual(record["max_output_tokens_sent"], 8192)
+        self.assertEqual(record["max_output_tokens_initial"], 8192)
+        self.assertEqual(record["segmentation_plan"], plan_path)
+        self.assertTrue(os.path.exists(plan_path))
+        self.assertIn("分段", self.err.getvalue())
+        with open(plan_path, encoding="utf-8") as fh:
+            plan = json.load(fh)
+        self.assertEqual(plan["reason"], "output_budget_rejected")
+        self.assertEqual(plan["budgets"]["rejected"], 8192)
+        self.assertTrue(plan["constraints"]["same_failed_request_must_not_be_resent"])
 
     def test_success_audit_records_effort_and_elapsed(self):
         self.assertEqual(self.run_main("--mode", "PLAN"), 0)
@@ -1014,11 +1166,13 @@ class LedgerTests(unittest.TestCase):
         self.assertIn("裁决：PARTIAL", text, "已验证轮次的原文仍应回灌")
         self.assertEqual(meta["max_rounds"], 2)
 
-    def test_normal_round_limit_is_two(self):
+    def test_round_limit_is_observational_only(self):
+        """历史默认 2 轮仍在台账里，但不再阻止第 3 轮及之后的复核。"""
         pack = write_pack(self.tmp.name, "r1.md", [("a.txt", "one")])
         ledger = self.new_ledger(risk="normal")
         _, meta = review_ledger.merge_and_guard(ledger, [pack])
         self.assertEqual(meta["max_rounds"], 2)
+        self.assertFalse(meta["limits_enforced"])
         self.record(ledger, meta)
 
         pack2 = write_pack(self.tmp.name, "r2.md", [("b.txt", "two")])
@@ -1028,20 +1182,19 @@ class LedgerTests(unittest.TestCase):
         self.assertEqual(meta2["new_count"], 1)
         self.record(ledger, meta2)
 
+        # 旧实现在这里按「默认预算已用尽」拒绝；现在只要有新增证据与理由就继续。
         pack3 = write_pack(self.tmp.name, "r3.md", [("c.txt", "three")])
-        # 默认预算仍为 2 轮：没有追加依据时，第 3 次复核被拒绝。
-        with self.assertRaises(review_ledger.LedgerError) as ctx:
-            review_ledger.merge_and_guard(ledger, [pack3], "再补一条")
-        self.assertIn("默认复核预算已用尽", str(ctx.exception))
-        self.assertIn("弹性追加", str(ctx.exception))
-        # 有新增实质证据与明确理由时，允许在弹性额度内追加一轮定向复核。
         _, meta3 = review_ledger.merge_and_guard(
             ledger, [pack3], "按未闭合项 F1 整改，新增 c.txt 产物", "new-evidence")
         self.assertEqual(meta3["round"], 3)
         self.assertEqual(meta3["review_kind"], "extra")
-        self.assertEqual(meta3["extra_index"], 1)
-        self.assertEqual(meta3["extra_allowance"], 2)
-        self.assertEqual(meta3["extra_remaining_after"], 1)
+        self.record(ledger, meta3)
+
+        # 但仍然禁止没有新增证据的机械重复复核。
+        dup = write_pack(self.tmp.name, "r4.md", [("c.txt", "three")])
+        with self.assertRaises(review_ledger.LedgerError) as ctx:
+            review_ledger.merge_and_guard(ledger, [dup], "同一组证据再交一次")
+        self.assertIn("内容相同", str(ctx.exception))
 
     def test_high_risk_allows_three_rounds(self):
         ledger = self.new_ledger(risk="high")
@@ -1057,9 +1210,10 @@ class LedgerTests(unittest.TestCase):
         with self.assertRaises(review_ledger.LedgerError) as ctx:
             self.new_ledger(risk="high")
         message = str(ctx.exception)
-        # 机制事实：拒绝覆盖，并写明原级别与上限
+        # 机制事实：拒绝覆盖，并写明原级别与历史默认轮数（不是硬上限）
         self.assertIn("不能用 risk=high 覆盖", message)
-        self.assertIn("上限 2 轮", message)
+        self.assertIn("历史默认 2 轮", message)
+        self.assertIn("不阻止复核", message)
         # 明确区分合法新建与绕过
         self.assertIn("风险级别在创建台账时确定，之后不可更改", message)
         self.assertIn("新的交付物", message)
@@ -1152,29 +1306,49 @@ class LedgerTests(unittest.TestCase):
             review_ledger.merge_and_guard(ledger, [p2])
         self.assertIn("理由", str(ctx.exception))
 
-    def test_security_basis_can_exceed_round_limit(self):
+    def test_rounds_are_unbounded_and_security_still_needs_new_evidence(self):
+        """固定轮次上限已取消：继续复核只由新增证据与理由把关。"""
         ledger = self.new_ledger(risk="normal")
-        # 默认 2 轮 + 弹性追加 2 轮全部用尽。
-        for idx in (1, 2, 3, 4):
+        for idx in range(1, 7):
             pack = write_pack(self.tmp.name, f"r{idx}.md", [(f"{idx}.txt", f"body{idx}")])
             _, meta = review_ledger.merge_and_guard(
                 ledger, [pack], f"round {idx}", "new-evidence" if idx > 1 else "")
+            self.assertEqual(meta["round"], idx, "轮次不得因固定额度被拒绝")
+            self.assertFalse(meta["limits_enforced"])
+            self.assertTrue(meta["unbounded"])
             self.record(ledger, meta)
-        pack5 = write_pack(self.tmp.name, "r5.md", [("5.txt", "body5")])
-        with self.assertRaises(review_ledger.LedgerError):
-            review_ledger.merge_and_guard(ledger, [pack5], "普通补证", "new-evidence")
-        _, meta5 = review_ledger.merge_and_guard(
-            ledger, [pack5], "新发现的重大安全问题", "security")
-        self.assertEqual(meta5["round"], 5)
-        self.assertEqual(meta5["review_kind"], "security")
+        self.assertEqual(len(ledger["rounds"]), 6, "每轮都真实入账")
+        # Security 依据不再需要等普通额度用尽，但仍必须带新增证据。
+        dup = write_pack(self.tmp.name, "dup.md", [("1.txt", "body1")])
+        with self.assertRaises(review_ledger.LedgerError) as ctx:
+            review_ledger.merge_and_guard(ledger, [dup], "重大安全风险", "security")
+        self.assertIn("内容相同", str(ctx.exception))
+        pack7 = write_pack(self.tmp.name, "r7.md", [("7.txt", "body7")])
+        _, meta7 = review_ledger.merge_and_guard(
+            ledger, [pack7], "新发现的重大安全问题：新增 r7 证据", "security")
+        self.assertEqual(meta7["round"], 7)
+        self.assertEqual(meta7["review_kind"], "security")
+        self.assertTrue(meta7["security_basis_allowed"])
 
-    def test_remediation_rounds_are_elastic_until_allowance(self):
-        """remediation 是弹性追加标签：有新增证据可继续，但受追加额度硬顶约束。"""
+    def test_security_basis_requires_specific_risk_reason(self):
+        ledger = self.new_ledger(risk="normal")
+        for idx in (1, 2):
+            pack = write_pack(self.tmp.name, f"s{idx}.md", [(f"s{idx}.txt", f"body{idx}")])
+            _, meta = review_ledger.merge_and_guard(
+                ledger, [pack], f"round {idx}", "new-evidence" if idx > 1 else "")
+            self.record(ledger, meta)
+        pack3 = write_pack(self.tmp.name, "s3.md", [("s3.txt", "body3")])
+        with self.assertRaises(review_ledger.LedgerError) as ctx:
+            review_ledger.merge_and_guard(ledger, [pack3], "", "security")
+        self.assertIn("安全风险", str(ctx.exception))
+
+    def test_remediation_rounds_are_unbounded_with_new_evidence(self):
+        """remediation 不再受追加额度硬顶约束，但没有新增证据时仍失败关闭。"""
         ledger = self.new_ledger(risk="normal")
         for idx in (1, 2):
             pack = write_pack(self.tmp.name, f"r{idx}.md", [(f"c{idx}.txt", f"body{idx}")])
             _, meta = review_ledger.merge_and_guard(
-                ledger, [pack], f"round {idx}", "new-evidence")
+                ledger, [pack], f"round {idx}", "new-evidence" if idx > 1 else "")
             self.record(ledger, meta)
 
         fix = write_pack(self.tmp.name, "fix.md", [("fixed.txt", "整改后产物")])
@@ -1184,23 +1358,26 @@ class LedgerTests(unittest.TestCase):
         self.assertEqual(meta3["round"], 3)
         self.assertEqual(meta3["new_count"], 1)
         self.assertEqual(meta3["extra_basis"], "remediation")
-        self.assertEqual(meta3["extra_index"], 1)
         self.record(ledger, meta3)
 
-        # 追加额度内允许第二次整改定向复核（旧的一次性名额已取消）。
         fix2 = write_pack(self.tmp.name, "fix2.md", [("fixed2.txt", "再整改")])
         _, meta4 = review_ledger.merge_and_guard(
             ledger, [fix2], "按第3轮 F2 再整改，新增 fixed2.txt", "remediation")
         self.assertEqual(meta4["round"], 4)
-        self.assertEqual(meta4["extra_index"], 2)
-        self.assertEqual(meta4["extra_remaining_after"], 0)
         self.record(ledger, meta4)
 
-        # 追加额度用尽：第 5 次复核必须停止，不能靠 remediation 无限续轮。
+        # 旧实现会在追加额度用尽后拒绝第 5 轮；现在只要有新增证据就可以继续。
         fix3 = write_pack(self.tmp.name, "fix3.md", [("fixed3.txt", "第三次整改")])
+        _, meta5 = review_ledger.merge_and_guard(
+            ledger, [fix3], "按第4轮 F3 再整改，新增 fixed3.txt", "remediation")
+        self.assertEqual(meta5["round"], 5)
+        self.record(ledger, meta5)
+
+        # 机械重复（没有新增证据）仍被拒绝，不能靠 remediation 标签刷轮次。
+        dup = write_pack(self.tmp.name, "dup3.md", [("fixed3.txt", "第三次整改")])
         with self.assertRaises(review_ledger.LedgerError) as ctx:
-            review_ledger.merge_and_guard(ledger, [fix3], "再整改一次", "remediation")
-        self.assertIn("均已用尽", str(ctx.exception))
+            review_ledger.merge_and_guard(ledger, [dup], "再整改一次", "remediation")
+        self.assertIn("内容相同", str(ctx.exception))
 
     def test_extra_round_records_reason_and_allowance_in_ledger(self):
         """追加轮次必须把理由、依据、追加序号与剩余额度写入台账，供审计复核。"""
@@ -1334,7 +1511,7 @@ class LedgerTests(unittest.TestCase):
 
 
 class SecurityBudgetTests(unittest.TestCase):
-    """Security 独立追加额度：与普通预算分离、有硬顶、必须有新增证据。
+    """复核轮次/用量只做观察，不再阻断：是否继续由新增证据与理由决定。
 
     只使用本地临时台账与模拟审计，不触发任何真实 SOL / Reviewer 请求。
     """
@@ -1380,7 +1557,7 @@ class SecurityBudgetTests(unittest.TestCase):
     def status(self):
         return review_ledger.budget_status(self.ledger_path, audit_log=self.audit)
 
-    def test_normal_default_two_rounds_do_not_consume_security(self):
+    def test_usage_is_reported_but_never_enforced(self):
         ledger = self.new_ledger(risk="normal")
         self.fill_ordinary(ledger, 2)
         self.assertEqual([r["n"] for r in ledger["rounds"]], [1, 2])
@@ -1388,11 +1565,12 @@ class SecurityBudgetTests(unittest.TestCase):
         self.assertEqual(info["used"], 2)
         self.assertEqual(info["ordinary_used"], 2)
         self.assertEqual(info["security_used"], 0)
-        self.assertEqual(info["security_allowance"], 1)
-        self.assertEqual(info["security_remaining"], 1)
-        self.assertFalse(info["security_available"], "普通预算用尽前 Security 不可用")
-        self.assertIn("普通弹性追加", info["next_action"])
-        self.assertIn("2 轮", info["next_action"])
+        # 这些数字保留为历史用量观察，但明确不是停止条件。
+        self.assertFalse(info["limits_enforced"])
+        self.assertTrue(info["unbounded"])
+        self.assertTrue(info["allowed"])
+        self.assertIn("没有固定轮次上限", info["next_action"])
+        self.assertIn("新增/变化证据", info["next_action"])
 
     def test_normal_ordinary_extra_allows_two_more_rounds(self):
         ledger = self.new_ledger(risk="normal")
@@ -1408,35 +1586,32 @@ class SecurityBudgetTests(unittest.TestCase):
         self.assertTrue(info["security_available"])
         self.assertIn("security", info["next_action"])
 
-    def test_security_requires_ordinary_budget_exhausted(self):
+    def test_security_basis_is_allowed_without_ordinary_exhaustion(self):
+        """Security 不再需要等普通额度用尽；但仍然必须有新增证据与风险说明。"""
         ledger = self.new_ledger(risk="normal")
         early = self.pack("early.md", "early.txt", "early security body")
-        with self.assertRaises(review_ledger.LedgerError) as ctx:
-            review_ledger.merge_and_guard(ledger, [early], "早期安全问题", "security")
-        self.assertIn("普通预算全部用尽", str(ctx.exception))
-        self.assertIn("不得用 security 提前进入例外通道", str(ctx.exception))
-
-        self.fill_ordinary(ledger, 3)
-        mid = self.pack("mid.md", "mid.txt", "mid security body")
-        with self.assertRaises(review_ledger.LedgerError) as ctx:
-            review_ledger.merge_and_guard(ledger, [mid], "普通追加期间的疑似安全问题", "security")
-        self.assertIn("普通预算全部用尽", str(ctx.exception))
-
-        self.fill_ordinary_one(ledger, 4)
-        late = self.pack("late.md", "late.txt", "genuine new security body")
         _, meta = review_ledger.merge_and_guard(
-            ledger, [late], "普通预算用尽后发现的权限提升风险，新增 late.txt", "security")
-        self.assertEqual(meta["round"], 5)
+            ledger, [early], "早期发现的权限风险，新增 early.txt", "security")
+        self.assertEqual(meta["round"], 1)
         self.assertEqual(meta["review_kind"], "security")
         self.assertEqual(meta["extra_basis"], "security")
-
-    def fill_ordinary_one(self, ledger, idx):
-        path = self.pack(f"o{idx}.md", f"o{idx}.txt", f"ordinary body {idx}")
-        _, meta = review_ledger.merge_and_guard(
-            ledger, [path], f"新增 o{idx}.txt，继续第 {idx} 轮定向复核", "new-evidence")
+        self.assertTrue(meta["security_basis_allowed"])
         self.record(ledger, meta)
 
-    def test_normal_security_allowance_is_one(self):
+        mid = self.pack("mid.md", "mid.txt", "mid security body")
+        _, meta2 = review_ledger.merge_and_guard(
+            ledger, [mid], "普通追加期间的疑似安全问题，新增 mid.txt", "security")
+        self.assertEqual(meta2["round"], 2)
+        self.assertEqual(meta2["review_kind"], "security")
+        self.record(ledger, meta2)
+
+        # 没有新增证据时，security 依据同样被拒（不能靠标签刷轮次）。
+        dup = self.pack("mid-dup.md", "mid.txt", "mid security body")
+        with self.assertRaises(review_ledger.LedgerError) as ctx:
+            review_ledger.merge_and_guard(ledger, [dup], "同一风险再复核", "security")
+        self.assertIn("内容相同", str(ctx.exception))
+
+    def test_security_counters_are_observational(self):
         ledger = self.new_ledger(risk="normal")
         self.fill_ordinary(ledger, 4)
         first = self.pack("sec1.md", "sec1.txt", "first new security evidence")
@@ -1451,31 +1626,33 @@ class SecurityBudgetTests(unittest.TestCase):
         self.assertEqual(record["security_remaining_after"], 0)
         self.assertEqual(record["risk"], "normal")
 
+        # 旧的「Security 独立额度 1/1 已用尽」硬顶已取消：
+        # 有新增证据与具体风险说明时，第 2 次 security 复核被允许。
         second = self.pack("sec2.md", "sec2.txt", "second new security evidence")
-        with self.assertRaises(review_ledger.LedgerError) as ctx:
-            review_ledger.merge_and_guard(
-                ledger, [second], "又一个安全问题", "security")
-        message = str(ctx.exception)
-        self.assertIn("Security 独立追加额度已用尽（1/1 轮）", message)
-        self.assertIn("用户", message)
-        self.assertIn("授权", message)
-        self.assertIn("不得用自由文本理由或自声明参数代替用户授权", message)
+        _, meta2 = review_ledger.merge_and_guard(
+            ledger, [second], "又一处凭据泄露风险，新增 sec2.txt", "security")
+        self.assertEqual(meta2["round"], 6)
+        self.assertEqual(meta2["security_index"], 2)
 
-    def test_high_risk_ordinary_six_then_security_two(self):
+    def test_high_risk_rounds_continue_beyond_old_allowance(self):
         ledger = self.new_ledger(risk="high")
         self.fill_ordinary(ledger, 6)
         info = self.status()
         self.assertEqual(info["ordinary_used"], 6)
         self.assertEqual(info["ordinary_extra_allowance"], 3)
         self.assertEqual(info["ordinary_extra_remaining"], 0)
-        self.assertEqual(info["security_allowance"], 2)
-        self.assertEqual(info["security_remaining"], 2)
-        extra = self.pack("sec-a.md", "sec-a.txt", "high risk security evidence a")
-        with self.assertRaises(review_ledger.LedgerError) as ctx:
-            review_ledger.merge_and_guard(ledger, [extra], "普通诉求，再复核一次", "new-evidence")
-        self.assertIn("均已用尽", str(ctx.exception))
+        self.assertTrue(info["ordinary_exhausted"])
+        self.assertFalse(info["limits_enforced"])
 
-        for idx in (1, 2):
+        # 旧实现会在这里拒绝：普通额度用尽后只能走 Security 独立额度。
+        # 新语义：只要携带新增实质证据与理由，普通补证同样可以继续。
+        extra = self.pack("sec-a.md", "sec-a.txt", "high risk ordinary evidence a")
+        _, meta = review_ledger.merge_and_guard(
+            ledger, [extra], "新增 high 风险补证，继续定向复核", "new-evidence")
+        self.assertEqual(meta["round"], 7)
+        self.record(ledger, meta)
+
+        for idx in (1, 2, 3):
             path = self.pack(f"high-sec{idx}.md", f"high-sec{idx}.txt",
                              f"high risk security evidence {idx}")
             _, meta = review_ledger.merge_and_guard(
@@ -1483,11 +1660,6 @@ class SecurityBudgetTests(unittest.TestCase):
             self.assertEqual(meta["security_index"], idx)
             self.assertEqual(meta["security_allowance"], 2)
             self.record(ledger, meta)
-
-        third = self.pack("high-sec3.md", "high-sec3.txt", "high risk security evidence 3")
-        with self.assertRaises(review_ledger.LedgerError) as ctx:
-            review_ledger.merge_and_guard(ledger, [third], "第三个安全问题", "security")
-        self.assertIn("Security 独立追加额度已用尽（2/2 轮）", str(ctx.exception))
 
     def test_security_rejects_reused_history_evidence(self):
         ledger = self.new_ledger(risk="normal")
@@ -1555,7 +1727,7 @@ class SecurityBudgetTests(unittest.TestCase):
         self.assertIn("Security 独立追加第 1/1 轮", review_ledger.render_ledger(ledger, meta))
         self.assertIn("E5", merged)
 
-    def test_pending_security_call_occupies_quota(self):
+    def test_pending_security_call_is_counted_but_not_blocking(self):
         ledger = self.new_ledger(risk="normal")
         self.fill_ordinary(ledger, 4)
         write_audit(self.audit, [self.audit_call(
@@ -1565,19 +1737,18 @@ class SecurityBudgetTests(unittest.TestCase):
         self.assertEqual(info["pending"], 1)
         self.assertEqual(info["security_pending"], 1)
         self.assertEqual(info["security_used"], 1)
-        self.assertEqual(info["security_remaining"], 0)
-        self.assertFalse(info["security_available"])
-        self.assertIn("用户", info["next_action"])
-        self.assertIn("授权", info["next_action"])
+        self.assertFalse(info["limits_enforced"])
+        self.assertIn("未入账", info["next_action"])
         self.assertEqual(len(info["security_reasons"]), 1)
         self.assertEqual(info["security_reasons"][0]["state"], "pending")
 
+        # 未入账调用占用轮次编号与用量观察，但只要带新增证据，复核仍可继续。
         path = self.pack("sec-pending-new.md", "sec-pending-new.txt", "another new body")
-        with self.assertRaises(review_ledger.LedgerError) as ctx:
-            review_ledger.merge_and_guard(
-                ledger, [path], "再次尝试安全复核", "security",
-                audit_log=self.audit, ledger_path=self.ledger_path)
-        self.assertIn("Security 独立追加额度已用尽", str(ctx.exception))
+        _, meta = review_ledger.merge_and_guard(
+            ledger, [path], "再次尝试安全复核，新增 sec-pending-new.txt", "security",
+            audit_log=self.audit, ledger_path=self.ledger_path)
+        self.assertEqual(meta["round"], 6)
+        self.assertEqual(meta["pending_calls"], 1)
 
     def test_duplicate_call_id_in_ledger_and_audit_is_counted_once(self):
         ledger = self.new_ledger(risk="normal")
@@ -1606,11 +1777,12 @@ class SecurityBudgetTests(unittest.TestCase):
         self.assertEqual(info["security_pending"], 0)
 
     def test_budget_precheck_matches_merge_gate(self):
-        """只读预检说可用时合并必须放行，预检说停止时合并必须拒绝。"""
+        """只读预检的结论必须与合并闸门一致：预检 allowed 时合并必须放行。"""
         ledger = self.new_ledger(risk="normal")
         self.fill_ordinary(ledger, 4)
         info = self.status()
-        self.assertTrue(info["security_available"])
+        self.assertTrue(info["allowed"])
+        self.assertFalse(info["limits_enforced"])
         path = self.pack("consistent.md", "consistent.txt", "consistent security body")
         _, meta = review_ledger.merge_and_guard(
             ledger, [path], "新发现安全问题，新增 consistent.txt", "security")
@@ -1618,15 +1790,14 @@ class SecurityBudgetTests(unittest.TestCase):
         self.record(ledger, meta)
 
         info = self.status()
-        self.assertFalse(info["security_available"])
-        self.assertIn("用户", info["next_action"])
+        self.assertTrue(info["allowed"], "用量继续增长，但预检不得因固定数字变成停止条件")
         again = self.pack("consistent-2.md", "consistent-2.txt", "another security body")
-        with self.assertRaises(review_ledger.LedgerError):
-            review_ledger.merge_and_guard(
-                ledger, [again], "预检已说停止", "security",
-                audit_log=self.audit, ledger_path=self.ledger_path)
+        _, meta2 = review_ledger.merge_and_guard(
+            ledger, [again], "第二个安全问题，新增 consistent-2.txt", "security",
+            audit_log=self.audit, ledger_path=self.ledger_path)
+        self.assertEqual(meta2["round"], 6)
 
-    def test_security_round_does_not_reset_ordinary_budget(self):
+    def test_security_round_does_not_reset_ordinary_counters(self):
         ledger = self.new_ledger(risk="normal")
         self.fill_ordinary(ledger, 4)
         path = self.pack("sec-reset.md", "sec-reset.txt", "security body before ordinary retry")
@@ -1639,13 +1810,14 @@ class SecurityBudgetTests(unittest.TestCase):
         self.assertTrue(info["ordinary_exhausted"])
         self.assertEqual(info["total_remaining"], 0)
 
+        # security 不重置普通用量观察值；但普通补证仍可继续（有新增证据即可）。
         extra = self.pack("ordinary-after-sec.md", "ordinary-after-sec.txt", "new ordinary body")
-        with self.assertRaises(review_ledger.LedgerError) as ctx:
-            review_ledger.merge_and_guard(
-                ledger, [extra], "Security 复核后普通预算应当重新可用", "new-evidence")
-        self.assertIn("均已用尽", str(ctx.exception))
+        _, meta2 = review_ledger.merge_and_guard(
+            ledger, [extra], "Security 复核后新增普通证据", "new-evidence")
+        self.assertEqual(meta2["round"], 6)
+        self.assertEqual(meta2["ordinary_used"], 4, "普通用量只按普通轮次累计")
 
-    def test_both_channels_exhausted_reject_further_rounds(self):
+    def test_old_allowance_exhaustion_no_longer_stops_rounds(self):
         ledger = self.new_ledger(risk="normal")
         self.fill_ordinary(ledger, 4)
         path = self.pack("sec-both.md", "sec-both.txt", "the one security body")
@@ -1654,16 +1826,23 @@ class SecurityBudgetTests(unittest.TestCase):
         self.record(ledger, meta)
 
         ordinary = self.pack("both-ordinary.md", "both-ordinary.txt", "later ordinary body")
-        with self.assertRaises(review_ledger.LedgerError) as ctx:
-            review_ledger.merge_and_guard(
-                ledger, [ordinary], "再补一条普通证据", "new-evidence")
-        self.assertIn("均已用尽", str(ctx.exception))
+        _, meta2 = review_ledger.merge_and_guard(
+            ledger, [ordinary], "再补一条普通证据", "new-evidence")
+        self.assertEqual(meta2["round"], 6)
+        self.record(ledger, meta2)
 
         security = self.pack("both-security.md", "both-security.txt", "later security body")
+        _, meta3 = review_ledger.merge_and_guard(
+            ledger, [security], "再补一条安全证据，新增 both-security.txt", "security")
+        self.assertEqual(meta3["round"], 7)
+        self.record(ledger, meta3)
+
+        # 真正把关的仍是证据：同一内容重复提交失败关闭。
+        dup = self.pack("both-security-dup.md", "both-security.txt", "later security body")
         with self.assertRaises(review_ledger.LedgerError) as ctx:
             review_ledger.merge_and_guard(
-                ledger, [security], "再补一条安全证据", "security")
-        self.assertIn("Security 独立追加额度已用尽", str(ctx.exception))
+                ledger, [dup], "同一份安全证据再交一次", "security")
+        self.assertIn("内容相同", str(ctx.exception))
 
 
 class LedgerIdentityTests(unittest.TestCase):
@@ -1817,21 +1996,21 @@ class LedgerIdentityTests(unittest.TestCase):
         self.assertEqual(ledger["subject"], self.subject)
         self.assertEqual(ledger["rounds"], [])
 
-    def test_pending_calls_consume_the_round_limit(self):
-        """未入账的成功调用同样占用默认预算与追加额度，不能靠重试免费多拿轮次。"""
+    def test_pending_calls_count_toward_round_numbering(self):
+        """未入账的成功调用仍占用轮次编号（不能靠重试免费多拿一轮），但不阻断复核。"""
         ledger = self.create(risk="normal")
         write_audit(self.audit, [
             review_audit_record(f"p{idx}", self.ledger_path, self.subject, idx)
             for idx in (1, 2, 3, 4)
         ])
         pack = write_pack(self.tmp.name, "r1.md", [("a.txt", "one")])
-        with self.assertRaises(review_ledger.LedgerError) as ctx:
-            review_ledger.merge_and_guard(
-                ledger, [pack], "补交证据", "new-evidence",
-                audit_log=self.audit, ledger_path=self.ledger_path)
-        message = str(ctx.exception)
-        self.assertIn("均已用尽", message)
-        self.assertIn("未入账", message)
+        _, meta = review_ledger.merge_and_guard(
+            ledger, [pack], "补交证据", "new-evidence",
+            audit_log=self.audit, ledger_path=self.ledger_path)
+        self.assertEqual(meta["pending_calls"], 4)
+        self.assertEqual(meta["round"], 5, "未入账调用必须计入轮次编号")
+        self.assertFalse(meta["limits_enforced"])
+        self.assertTrue(meta["unbounded"])
 
     def test_legacy_ledger_requires_subject_in_review_flow(self):
         """旧台账（无 subject）进入正式复核时必须补一次 subject，不能靠省略它跳过核对。"""
@@ -3757,9 +3936,9 @@ class SingleEntryPointTests(unittest.TestCase):
 
         # SKILL.md：多阶段协作与「复用同一台账 / 交接状态」
         self.assertIn("长任务的多阶段协作", skill)
-        self.assertIn("--extra-round-basis remediation", skill)
-        self.assertIn("弹性追加额度", skill)
-        self.assertIn("没有新增实质证据时一律拒绝重复复核", skill)
+        self.assertIn("--extra-round-basis new-evidence|remediation|security", skill)
+        self.assertIn("没有固定轮次上限", skill)
+        self.assertIn("一律拒绝重复复核", skill)
         self.assertIn("按需建立交接状态", skill)
         self.assertIn("一次性 REVIEW 不强制创建 dispatch", skill)
         self.assertIn("ingest --reply-file", skill)
@@ -3908,8 +4087,10 @@ class WorkflowTierTests(unittest.TestCase):
         # 独立复核的执行者不是「本通道付费调用」
         self.assertIn("档位不构成调用理由", self.skill)
         # 与台账付费轮次是两回事，不能被混用
-        self.assertIn("互不替代，也不互相豁免", self.skill)
-        self.assertIn("普通 2 / 高风险 3", self.skill)
+        self.assertIn("互不替代", self.skill)
+        self.assertIn("也不互相豁免", self.skill)
+        self.assertIn("独立复核的 2 轮上限本阶段不变", self.skill)
+        self.assertIn("台账无上限不能用来绕过独立复核的停止条件", self.skill)
 
     def test_tiers_do_not_introduce_new_modes(self):
         """档位是评审深度，不是新路由：模式集合与脚本参数保持原样。"""
@@ -3924,7 +4105,7 @@ class WorkflowTierTests(unittest.TestCase):
     def test_existing_safety_boundaries_still_stated(self):
         """新增流程不得挤掉既有安全边界表述。"""
         for anchor in ("新建台账只接受标准审计日志", "并发复核被拒绝",
-                       "证据包格式版本", "普通与 Security 额度都用尽仍有关键问题未解决时"):
+                       "证据包格式版本", "没有新增证据时停止自动循环"):
             self.assertIn(anchor, self.skill, f"安全边界表述被删除：{anchor}")
 
 
@@ -8540,6 +8721,146 @@ class AuxiliaryReviewTests(StageTwoT3Fixture, unittest.TestCase):
                          "恢复已提交的辅助复核不得重复计轮")
         self.assertEqual(after["mode"], "PLAN")
         self.assertEqual(after["actions"], state["actions"])
+
+
+class UsageAccountingTests(unittest.TestCase):
+    """失败请求的未知用量与已知用量必须分开统计，不能把未知当 0。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.audit = os.path.join(self.tmp.name, "audit.jsonl")
+
+    def write(self, records: list[dict]) -> None:
+        with open(self.audit, "w", encoding="utf-8") as fh:
+            for record in records:
+                fh.write(json.dumps({"task_id": "task-1", **record},
+                                    ensure_ascii=False) + "\n")
+
+    def spend(self) -> dict:
+        return copilot_dispatch.task_spend_from_audit(self.audit, "task-1")
+
+    def test_success_usage_is_known_and_never_unknown(self):
+        self.write([{"event": "call_requested", "call_id": "c1"},
+                    {"event": "call_result", "call_id": "c1", "ok": True,
+                     "response_id": "r1",
+                     "usage": {"input_tokens": 10, "output_tokens": 5}}])
+        spend = self.spend()
+        self.assertEqual(spend["known_usage_calls"], 1)
+        self.assertEqual(spend["unknown_usage_calls"], 0)
+        self.assertEqual(spend["total_tokens"], 15)
+        self.assertEqual(spend["requests"], 1)
+
+    def test_success_without_usage_is_unknown_not_zero(self):
+        self.write([{"event": "call_result", "call_id": "c1", "ok": True,
+                     "response_id": "r1"}])
+        spend = self.spend()
+        self.assertEqual(spend["unknown_usage_calls"], 1)
+        self.assertEqual(spend["known_usage_calls"], 0)
+        self.assertEqual(spend["total_tokens"], 0)
+        self.assertEqual(spend["failed_calls"], 0)
+
+    def test_delivered_http_failure_without_usage_is_unknown(self):
+        self.write([{"event": "call_result", "call_id": "c1", "ok": False,
+                     "http_status": 408, "error": "timeout",
+                     "request_may_have_been_delivered": True}])
+        spend = self.spend()
+        self.assertEqual(spend["unknown_usage_calls"], 1)
+        self.assertEqual(spend["failed_unknown_usage_calls"], 1)
+        self.assertEqual(spend["failed_calls"], 1)
+        self.assertEqual(spend["total_tokens"], 0)
+
+    def test_confirmed_not_delivered_is_not_counted_as_upstream_usage(self):
+        self.write([{"event": "call_result", "call_id": "c1", "ok": False,
+                     "http_status": 0, "error": "connection refused",
+                     "result_unknown": False,
+                     "http_response_received": False,
+                     "request_may_have_been_delivered": False}])
+        spend = self.spend()
+        self.assertEqual(spend["unknown_usage_calls"], 0)
+        self.assertEqual(spend["not_delivered_calls"], 1)
+        self.assertEqual(spend["failed_calls"], 1)
+
+    def test_failed_but_usage_present_records_known_tokens_and_status(self):
+        self.write([{"event": "call_result", "call_id": "c1", "ok": False,
+                     "http_status": 200, "error": "model_identity_mismatch",
+                     "usage": {"input_tokens": 7, "output_tokens": 3}}])
+        spend = self.spend()
+        self.assertEqual(spend["known_usage_calls"], 1)
+        self.assertEqual(spend["failed_with_usage_calls"], 1)
+        self.assertEqual(spend["failed_unknown_usage_calls"], 0)
+        self.assertEqual(spend["total_tokens"], 10)
+
+    def test_same_response_audit_record_is_not_double_counted(self):
+        record = {"event": "call_result", "call_id": "c1", "ok": True,
+                  "response_id": "r1",
+                  "usage": {"input_tokens": 10, "output_tokens": 5}}
+        self.write([record, record])
+        spend = self.spend()
+        self.assertEqual(spend["known_usage_calls"], 1)
+        self.assertEqual(spend["total_tokens"], 15)
+
+    def test_cross_call_and_cross_round_accumulation(self):
+        self.write([
+            {"event": "call_result", "call_id": "c1", "ok": True,
+             "response_id": "r1", "usage": {"input_tokens": 10, "output_tokens": 5}},
+            {"event": "call_result", "call_id": "c2", "ok": False,
+             "http_status": 500, "response_id": "r2"},
+            {"event": "call_result", "call_id": "c3", "ok": True,
+             "response_id": "r3", "usage": {"input_tokens": 20, "output_tokens": 8}},
+        ])
+        spend = self.spend()
+        self.assertEqual(spend["known_usage_calls"], 2)
+        self.assertEqual(spend["unknown_usage_calls"], 1)
+        self.assertEqual(spend["total_tokens"], 43)
+        self.assertEqual(spend["requests"], 0)
+
+
+class SegmentationPlanTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_default_output_retries_are_unlimited(self):
+        """未显式传 --max-output-retries 时，只要还能升档就继续，直到成功。"""
+        # 用纯函数覆盖预算链，避免测试依赖真实 HTTP。
+        budgets, current, observed = [], None, 1000
+        for _ in range(6):
+            current = call_gpt.next_output_budget(current, observed, None)
+            if current is None:
+                break
+            budgets.append(current)
+        self.assertEqual(budgets[:4], [4096, 8192, 16384, 32768])
+        self.assertIsNone(call_gpt.next_output_budget(8192, 1000, 8192))
+
+    def test_segmentation_plan_writes_entry_segments(self):
+        evidence = os.path.join(self.tmp.name, "pack.md")
+        body = "\n".join([
+            "# 测试证据包", "", "- 证据包格式：2", "",
+            "## 已纳入的证据", "",
+            "### E1 — file: a.txt", "", "```text", "A" * 40, "```", "",
+            "### E2 — file: b.txt", "", "```text", "B" * 40, "```", "",
+        ])
+        with open(evidence, "w", encoding="utf-8") as fh:
+            fh.write(body)
+        plan_path = os.path.join(self.tmp.name, "segmentation.json")
+        result = call_gpt.write_segmentation_plan(
+            plan_path, reason="output_budget_rejected", mode="REVIEW",
+            task_id="task-1", call_id="call-1", prompt="复核",
+            budgets={"initial": 8192, "last_sent": 8192, "rejected": 8192},
+            evidence_paths=[evidence], http_status=400)
+        self.assertTrue(os.path.exists(plan_path))
+        self.assertGreaterEqual(result["segments"], 1)
+        with open(plan_path, encoding="utf-8") as fh:
+            plan = json.load(fh)
+        self.assertEqual(plan["schema"], "copilot-segmentation-plan/v1")
+        self.assertEqual(plan["reason"], "output_budget_rejected")
+        self.assertEqual(plan["constraints"]["formal_review_authorization_required"], True)
+        self.assertTrue(plan["segments"])
+        for segment in plan["segments"]:
+            if segment.get("file"):
+                self.assertTrue(os.path.exists(segment["file"]))
+        self.assertIn("E1", plan["segments"][0]["entry_ids"])
 
 
 if __name__ == "__main__":

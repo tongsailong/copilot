@@ -60,6 +60,7 @@ import tempfile
 from datetime import datetime, timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from review_ledger import parse_verdict  # noqa: E402
 from lib_common import (  # noqa: E402
     AUDIT_TEST_MODE_ENV, STANDARD_AUDIT_LOG, audit_path_trusted,
     is_standard_audit_path, normalize_block, now_iso, sha256_file, sha256_text,
@@ -122,13 +123,14 @@ MAX_DECISION_CHARS = 300
 MAX_EVIDENCE_INDEXED = 20
 MAX_TEXT_SECTION_CHARS = 1500
 CHECKPOINT_EVERY = 8
-# native 模式的默认预算（阶段 3.7）：
-# - max_requests 是**出站前**就能判定的硬上限，按审计中本任务的 call_requested 计数；
-# - max_total_tokens 是「已上报 usage」的阈值。usage 只有响应返回后才知道，单次
-#   调用可能让累计值越过阈值，因此它不是严格上界；另用保守预估做提前拦截。
-NATIVE_DEFAULT_MAX_REQUESTS = 6
-NATIVE_DEFAULT_MAX_TOTAL_TOKENS = 500_000
-NATIVE_BUDGET_PROJECTION = True
+# 2026-11-08：请求数 / 累计 Token **不再有代码默认上限**。
+# - 默认值全部为 None：不因调用次数或累计费用阻止正常调用；用量仍从审计重建并记录。
+# - 只有用户在 `start --max-requests/--max-total-tokens` 显式给出时才保留该上限，
+#   并明确标注为「显式运营上限」，不是默认阈值。
+# - 历史状态里显式写入的数值继续生效（不追溯删除用户设定），代码默认值不再补 6/500k。
+NATIVE_DEFAULT_MAX_REQUESTS = None
+NATIVE_DEFAULT_MAX_TOTAL_TOKENS = None
+NATIVE_BUDGET_PROJECTION = False
 # 默认审计日志：与 call_gpt.py 使用同一个文件，CLI 的 ingest 从这里重建调用凭证。
 DEFAULT_AUDIT_LOG = STANDARD_AUDIT_LOG
 
@@ -149,6 +151,10 @@ def _default_budget() -> dict:
             "projection": None,
             "usage": {"requests": 0, "input_tokens": 0, "output_tokens": 0,
                       "total_tokens": 0, "unknown_usage_calls": 0,
+                      "known_usage_calls": 0, "failed_calls": 0,
+                      "failed_with_usage_calls": 0,
+                      "failed_unknown_usage_calls": 0,
+                      "not_delivered_calls": 0,
                       "last_call_total": 0, "last_call_id": "",
                       "updated_at": None},
             "last_prompt_sha256": None, "last_progress_digest": None,
@@ -553,8 +559,8 @@ def start(path: str, goal: str, mode: str = "", note: str = "",
             raise DispatchError("rounds_limit 必须是正整数（8 轮检查点不受此限制）。")
     max_req = _budget_int(max_requests, "max_requests")
     max_tok = _budget_int(max_total_tokens, "max_total_tokens")
-    # native 模式把默认预算固化进状态，便于审计与跨进程延续；legacy 保持不设限
-    # （旧版单步驱动没有任务级请求计数，强行加限会改变既有行为）。
+    # 两种后端默认都不设请求/Token 上限（NATIVE_DEFAULT_* 为 None）：用量只记录进审计，
+    # 不阻断正常判断或执行。只有调用方显式给出数值时才是「显式运营上限」。
     projection: bool | None = None
     if backend == "native":
         if max_req is None:
@@ -673,19 +679,24 @@ def _validate_actions(raw: object, known_ids: set[str]) -> list[dict]:
         # 记录本项**实际给出**的字段：续轮更新只覆盖这些键，不把省略字段重置为默认值。
         given = [k for k in ("title", "assignee", "goal", "constraints",
                              "expected_evidence", "depends_on") if k in item]
+        goal = str(item.get("goal") or "").strip()
+        expected = str(item.get("expected_evidence") or "").strip()
         out.append({
             "id": aid,
             "title": title,
             "assignee": assignee,
-            "goal": str(item.get("goal") or "").strip(),
+            "goal": goal,
             "constraints": str(item.get("constraints") or "").strip(),
-            "expected_evidence": str(item.get("expected_evidence") or "").strip(),
+            "expected_evidence": expected,
             "depends_on": deps,
             "status": "pending",
             "result": "",
             "evidence_ids": [],
             "created": now_iso(),
             "updated": now_iso(),
+            # 指令是否可执行：PARTIAL 安排若缺目标或需返回证据，会被标注并按未闭合
+            # 条件补齐执行说明（来源可追溯），而不是把没写清的工作项直接派下去。
+            "directive_complete": bool(goal and expected),
             "_given": given,
         })
     return out
@@ -1529,15 +1540,31 @@ def ingest_reply(state: dict, reply: str, mode: str = "", *,
         })
         raise
     if plan is None:
-        state["rounds"].append({
+        record = {
             "ts": now_iso(), "mode": mode.upper(), "decision": None,
             "actions": [], "note": "回复未包含 copilot-plan 安排块（仅有结论时属正常）",
             # 无安排块是合法形态（CONSULT 常只给分析）。结论必须留痕并回灌，
             # 否则下一轮拿不到前序判断，多阶段协作退化为从零开始。
             "reply_digest": _reply_digest(reply),
             **fields,
-        })
-        return {"added": [], "updated": [], "decision": None, "skipped": True}
+        }
+        if mode.upper() == "REVIEW":
+            # REVIEW 的正式裁决行按契约独立成行，通常不在 copilot-plan 里。
+            # 不落账的话，PARTIAL 自动派生与 PASS 收口都看不到本轮判断。
+            # decision 按同一映射派生，保持 pass_pending / BLOCKED 语义一致。
+            verdict = parse_verdict(reply)
+            verdict = verdict.strip().lower() if verdict else None
+            record["verdict"] = verdict
+            if verdict:
+                record["decision"] = VERDICT_DECISION[verdict]
+                record["note"] = (f"REVIEW 无安排块；已落账正式裁决 {verdict.upper()}"
+                                  f"（decision={VERDICT_DECISION[verdict]}）。")
+            else:
+                record["note"] = ("REVIEW 无安排块，且未解析到唯一正式裁决行；"
+                                  "本轮不改变控制状态，不得当作 PASS。")
+        state["rounds"].append(record)
+        return {"added": [], "updated": [], "decision": record["decision"],
+                "verdict": record.get("verdict"), "skipped": True}
     decision = plan["decision"]
     verdict = plan.get("verdict")
     round_id = str(fields.get("round_id") or "")
@@ -1633,6 +1660,123 @@ def stalled_actions(state: dict) -> list[tuple[dict, str]]:
         if blockers:
             out.append((action, f"依赖 {', '.join(blockers)} 不可满足或尚需解阻"))
     return out
+
+
+DERIVED_WORK_PREFIX = "AUTO-"
+MAX_DERIVED_FINDINGS = 12
+MAX_DERIVED_LINE_CHARS = 400
+
+
+def _reply_findings(reply: str) -> list[str]:
+    """从 PARTIAL 回复原文里提取「哪里还没做好」的线索（只摘录，不解读）。
+
+    跳过 copilot-plan 围栏与普通代码块，只取列表行/编号行；每行裁剪到固定长度。
+    这些原文由主代理按原文核对，不能当成已确认事实，也不能替代证据。
+    """
+    out: list[str] = []
+    in_fence = False
+    for raw in (reply or "").splitlines():
+        line = raw.strip()
+        if line.startswith("```") or line.startswith("~~~"):
+            in_fence = not in_fence
+            continue
+        if in_fence or not line:
+            continue
+        match = re.match(r"^([-*•]|\d+[.)])\s+(.+)$", line)
+        if not match:
+            continue
+        text = match.group(2).strip()
+        if len(text) < 6:
+            continue
+        out.append(text[:MAX_DERIVED_LINE_CHARS])
+        if len(out) >= MAX_DERIVED_FINDINGS:
+            break
+    return out
+
+
+def unmet_criteria(state: dict) -> list[dict]:
+    """尚未核销的完成条件（pending / not_met）；没有条件时返回空列表。"""
+    criteria = (state.get("contract") or {}).get("criteria") or []
+    return [c for c in criteria
+            if str(c.get("status") or "pending") != "met"]
+
+
+def derive_work(state: dict, reply: str = "", *, round_id: str = "",
+                source: str = "partial-without-plan") -> dict:
+    """把 PARTIAL 判断转成主代理可执行的工作项（纯本地，不发起任何调用）。
+
+    触发条件：最近一个已验证轮次 `verdict=partial`，但 SOL 没有给出可执行安排
+    （或安排缺少 goal / expected_evidence）。派生的动作**明确标注来源**：
+    `origin=partial-without-plan`、`derived_from_round_id`，不是 SOL 直接安排，
+    也不改写 SOL 的判断。目标与证据要求来自原合同的未闭合条件，约束来自合同边界。
+
+    只派生一个工作项：一个人工/代理可一次做完的补证动作，避免把 PARTIAL 拆成
+    无人负责的碎片。调用方负责落盘（与 `record` / `add_report` 相同约定）。
+    """
+    _assert_open(state, "派生下一步工作项")
+    if isinstance(state.get("pending_call"), dict):
+        raise DispatchError("存在未结算的 pending_call：先 recover 再派生工作项。")
+    rounds = _verified_rounds(state)
+    if not rounds:
+        raise DispatchError("没有已验证轮次：不能派生工作项。")
+    latest = rounds[-1]
+    verdict = str(latest.get("verdict") or "").strip().lower()
+    if verdict != "partial":
+        raise DispatchError(
+            f"最近已验证轮次 verdict={verdict or '-'}，不是 partial；不派生工作项。")
+    rid = (round_id or str(latest.get("round_id") or "")).strip()
+    unmet = unmet_criteria(state)
+    findings = _reply_findings(reply)
+    if not unmet and not findings:
+        raise DispatchError(
+            "没有未闭合完成条件，也没有可提取的缺口描述；不派生工作项。"
+            "请补取证据或让 SOL 给出明确的下一步。")
+    existing = {str(a.get("id") or "") for a in state.get("actions") or []}
+    index = 1
+    while f"{DERIVED_WORK_PREFIX}{index}" in existing:
+        index += 1
+    aid = f"{DERIVED_WORK_PREFIX}{index}"
+    goal_lines = [f"补齐第 {rid or '最近'} 轮 PARTIAL 判断指出的未闭合项，"
+                  "并提交可直接核销的原始证据。"]
+    if unmet:
+        goal_lines.append("未闭合完成条件：")
+        goal_lines += [f"- {c.get('criterion_id')}："
+                       f"{c.get('description') or '（未描述）'}" for c in unmet]
+    if findings:
+        goal_lines.append("SOL 本轮指出的问题（原文摘录，按原文核对）：")
+        goal_lines += [f"- {text}" for text in findings]
+    boundaries = str((state.get("contract") or {}).get("boundaries") or "").strip()
+    constraints = ["不得越过原始授权范围；不得自行修改目标、完成条件或业务规则。",
+                   "只做本轮缺口需要的最小改动，不顺手重构无关内容。"]
+    if boundaries:
+        constraints.insert(0, f"原合同边界：{boundaries}")
+    evidence_need = "、".join(str(c.get("criterion_id") or "") for c in unmet)
+    action = {
+        "id": aid,
+        "title": f"补齐第 {rid or '最近'} 轮 PARTIAL 缺口",
+        "assignee": "zcode",
+        "goal": "\n".join(goal_lines),
+        "constraints": "\n".join(constraints),
+        "expected_evidence": (
+            f"覆盖未闭合条件 {evidence_need} 的原始产物（命令输出 / 文件内容 / 日志 / "
+            "diff / 测试结果），登记为证据后在 manifest 中引用"
+            if evidence_need else
+            "能证明上述缺口已闭合的原始产物（命令输出 / 文件内容 / 日志 / diff）"),
+        "depends_on": [],
+        "status": "pending",
+        "result": "",
+        "evidence_ids": [],
+        "created": now_iso(),
+        "updated": now_iso(),
+        "origin": source,
+        "derived_from_round_id": rid,
+        # 绑定来源轮次：该轮已通过模型身份验证（verdict=partial）。派生动作本身由
+        # 本地生成，不冒充 SOL 的直接安排，但它的授权与判断依据就是这一轮。
+        "source_round_id": rid,
+        "directive_complete": True,
+    }
+    state.setdefault("actions", []).append(action)
+    return action
 
 
 def _evidence_entry(state: dict, eid: str) -> dict | None:
@@ -2779,26 +2923,26 @@ def _budget_int(value: object, name: str) -> int | None:
 
 
 def budget_limits(state: dict) -> dict:
-    """解析本任务的请求/Token 预算。
+    """解析本任务的请求/Token 用量上限。
 
-    native 后端未显式配置时使用代码默认值（6 次请求 / 500k Token，旧状态同样
-    受约束）；legacy 未配置时保持不设限（兼容旧版单步驱动）。
+    2026-11-08 起默认**不设上限**：`max_requests` / `max_total_tokens` 为 None 表示
+    「不因调用次数或累计费用阻止正常调用」，用量仍从审计重建并写入 `budget.usage`
+    供观察。只有用户在 `start` 时显式给出上限（或历史状态里显式保存了数值）才生效，
+    此时 `enforced=True` 且报告为显式运营上限，而不是代码默认阈值。
     """
     budget = state.get("budget") or {}
     backend = str(state.get("execution_backend") or "legacy")
     max_requests = _budget_int(budget.get("max_requests"), "budget.max_requests")
     max_tokens = _budget_int(budget.get("max_total_tokens"), "budget.max_total_tokens")
     projection = budget.get("projection")
-    if backend == "native":
-        if max_requests is None:
-            max_requests = NATIVE_DEFAULT_MAX_REQUESTS
-        if max_tokens is None:
-            max_tokens = NATIVE_DEFAULT_MAX_TOTAL_TOKENS
-        if projection is None:
-            projection = NATIVE_BUDGET_PROJECTION
+    if projection is None:
+        projection = NATIVE_BUDGET_PROJECTION
+    enforced = max_requests is not None or max_tokens is not None
     return {"backend": backend,
-            "applicable": backend == "native" or max_requests is not None
-                          or max_tokens is not None,
+            "applicable": enforced,
+            "enforced": enforced,
+            "explicit": enforced,
+            "default_unbounded": True,
             "max_requests": max_requests,
             "max_total_tokens": max_tokens,
             "projection": bool(projection)}
@@ -2829,13 +2973,24 @@ def task_spend_from_audit(audit_log: str, task_id: str) -> dict:
 
     `call_requested` 是发送前落盘的记录：即使进程中途被杀，也算一次请求尝试。
     只认带 task_id 的记录——无任务级凭证的手工调用不计入任务预算。
+
+    usage 分两类，不能把「未知」当成 0：
+    - 有 usage（含失败/截断/身份不符但上游确实回了 usage）：计入真实 Token；
+    - 无 usage 但请求已送达或可能送达（HTTP 响应、超时、连接中断、200 但结构
+      异常）：计入 `unknown_usage_calls`，不伪造 Token；
+    - 能确认未送达的传输层失败（拒绝连接/解析失败/不可达）不计入未知上游用量。
+    `failed_calls` 等状态计数与 Token 统计分开保留，便于审计失败请求本身。
     """
     spend = {"requests": 0, "input_tokens": 0, "output_tokens": 0,
              "total_tokens": 0, "unknown_usage_calls": 0,
+             "known_usage_calls": 0, "failed_calls": 0,
+             "failed_with_usage_calls": 0, "failed_unknown_usage_calls": 0,
+             "not_delivered_calls": 0,
              "last_call_total": 0, "last_call_id": ""}
     task_id = str(task_id or "").strip()
     if not task_id or not audit_log or not os.path.exists(audit_log):
         return spend
+    seen_responses: set[tuple[str, str, str]] = set()
     for record in _audit_records(audit_log):
         if str(record.get("task_id") or "") != task_id:
             continue
@@ -2843,28 +2998,57 @@ def task_spend_from_audit(audit_log: str, task_id: str) -> dict:
         if event == "call_requested":
             spend["requests"] += 1
         elif event == "call_result":
-            # 失败调用也可能已经消耗真实额度（例如模型身份不匹配）：只要上游
-            # 回了 usage 就计入；没有 usage 的成功记录才记为「未知用量」。
             numbers = _usage_numbers(record.get("usage"))
-            if not numbers["total_tokens"]:
-                if record.get("ok") is True:
-                    spend["unknown_usage_calls"] += 1
+            ok = record.get("ok") is True
+            call_id = str(record.get("call_id") or "")
+            response_id = str(record.get("response_id") or "")
+            if response_id:
+                # 同一条上游响应可能因重试/恢复被重复写入；按响应身份去重，
+                # 但不用它合并不同请求（避免把重试用量算少）。
+                key = (call_id, str(record.get("output_escalation_index") or ""),
+                       response_id)
+                if key in seen_responses:
+                    continue
+                seen_responses.add(key)
+            if not ok:
+                spend["failed_calls"] += 1
+            if numbers["total_tokens"]:
+                for key in ("input_tokens", "output_tokens", "total_tokens"):
+                    spend[key] += numbers[key]
+                spend["known_usage_calls"] += 1
+                if not ok:
+                    spend["failed_with_usage_calls"] += 1
+                spend["last_call_total"] = numbers["total_tokens"]
+                spend["last_call_id"] = call_id
                 continue
-            for key in ("input_tokens", "output_tokens", "total_tokens"):
-                spend[key] += numbers[key]
-            spend["last_call_total"] = numbers["total_tokens"]
-            spend["last_call_id"] = str(record.get("call_id") or "")
+            # 无 usage：先判断请求是否可能已送达上游。已知字段优先；
+            # 旧记录没有这些字段时，HTTP 200 / response_id / 非本地错误码
+            # 一律按「可能送达」保守计入未知，绝不当作 0。
+            delivered = record.get("request_may_have_been_delivered")
+            if delivered is None:
+                status = record.get("http_status")
+                delivered = bool(record.get("http_response_received")
+                                 or (isinstance(status, int) and status > 0)
+                                 or response_id)
+            if ok:
+                spend["unknown_usage_calls"] += 1
+            elif delivered:
+                spend["unknown_usage_calls"] += 1
+                spend["failed_unknown_usage_calls"] += 1
+            else:
+                spend["not_delivered_calls"] += 1
     return spend
 
 
 def budget_status(state: dict, audit_log: str = "") -> dict:
-    """请求/Token 预算状态（发送前判定）。
+    """请求/Token 用量状态（发送前判定）。
 
-    `allowed=False` 的三种原因：
-    - request_limit_reached：请求数已达硬上限（出站前可精确判定）；
-    - token_budget_reached：已上报 usage 已达到/超过阈值（单次调用后才可知，
-      最终总量最多可能超出一次调用，不能宣称为严格硬上限）；
-    - token_budget_projected：按上一次调用总量预估将越过阈值，提前拦截（估计值）。
+    2026-11-08 起**默认 `allowed=True`**：请求数与累计 Token 只记录、不阻断，费用数据
+    用于审计与观察。只有显式配置的运营上限被触及时才 `allowed=False`：
+    - request_limit_reached：显式 `max_requests` 已达到（出站前可精确判定）；
+    - token_budget_reached：已上报 usage 达到显式阈值（单次调用后才可知）；
+    - token_budget_projected：按上一次调用总量预估将越过显式阈值（估计值）。
+    服务商真实的限额、配额与限流仍由上游错误码处理，不由这里放行。
     """
     limits = budget_limits(state)
     spend = task_spend_from_audit(audit_log, str(state.get("task_id") or ""))
@@ -2875,13 +3059,14 @@ def budget_status(state: dict, audit_log: str = "") -> dict:
     if limits["max_requests"] is not None and spend["requests"] >= limits["max_requests"]:
         allowed = False
         reason = "request_limit_reached"
-        detail = (f"本任务已发起 {spend['requests']} 次请求，达到上限 "
-                  f"{limits['max_requests']}；拒绝继续出站。")
+        detail = (f"本任务已发起 {spend['requests']} 次请求，达到**显式运营上限** "
+                  f"{limits['max_requests']}；拒绝继续出站。"
+                  "该上限由调用方显式设置，不是代码默认值。")
     elif (limits["max_total_tokens"] is not None
           and spend["total_tokens"] >= limits["max_total_tokens"]):
         allowed = False
         reason = "token_budget_reached"
-        detail = (f"已上报累计 {spend['total_tokens']} Token，达到阈值 "
+        detail = (f"已上报累计 {spend['total_tokens']} Token，达到**显式运营阈值** "
                   f"{limits['max_total_tokens']}；拒绝继续出站"
                   f"（单次调用可能使总量最多超出一次调用的量）。")
     elif (limits["projection"] and limits["max_total_tokens"] is not None
@@ -2890,10 +3075,12 @@ def budget_status(state: dict, audit_log: str = "") -> dict:
         allowed = False
         reason = "token_budget_projected"
         detail = (f"按上一次调用 {spend['last_call_total']} Token 预估累计将达 "
-                  f"{projected}，超过阈值 {limits['max_total_tokens']}；"
+                  f"{projected}，超过**显式运营阈值** {limits['max_total_tokens']}；"
                   f"这是保守估计，不是严格上界。")
     return {"allowed": allowed, "reason": reason, "detail": detail,
-            "limits": limits, "spend": spend, "projected_total": projected}
+            "limits": limits, "spend": spend, "projected_total": projected,
+            "limits_enforced": limits["enforced"],
+            "unbounded_default": True}
 
 
 def refresh_budget_usage(state: dict, audit_log: str = "") -> dict:
@@ -4170,6 +4357,16 @@ def main(argv: list[str] | None = None) -> int:
     p_loop.add_argument("--prompt-file", default="")
     p_loop.add_argument("--json", action="store_true")
 
+    p_derive = sub.add_parser(
+        "derive-work",
+        help="PARTIAL 未给出可执行安排时，按未闭合条件派生一个可执行工作项（纯本地）")
+    p_derive.add_argument("--state", required=True)
+    p_derive.add_argument("--reply-file", default="",
+                          help="PARTIAL 回复原文（用于摘录缺口线索）；'-' 表示 stdin")
+    p_derive.add_argument("--round-id", default="",
+                          help="缺省使用最近已验证轮次")
+    p_derive.add_argument("--json", action="store_true")
+
     args = ap.parse_args(argv)
     try:
         if args.cmd == "start":
@@ -4314,6 +4511,36 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"注意：{note}")
                 for command in result["next_commands"]:
                     print(f"  {command}")
+            return 0
+
+        if args.cmd == "derive-work":
+            reply = ""
+            if args.reply_file:
+                reply = _read_text_arg(args.reply_file)
+            state = load_state(args.state)
+            snapshot = {k: state.get(k) for k in ("round_seq", "pending_call")}
+            action = derive_work(state, reply, round_id=args.round_id)
+            save_state(args.state, state, expect=snapshot)
+            payload = {
+                "status": "derived",
+                "action": {
+                    "id": action["id"], "title": action["title"],
+                    "assignee": action["assignee"], "goal": action["goal"],
+                    "constraints": action["constraints"],
+                    "expected_evidence": action["expected_evidence"],
+                    "origin": action["origin"],
+                    "derived_from_round_id": action["derived_from_round_id"],
+                },
+                "state_path": os.path.abspath(args.state),
+                "http_requests": 0,
+                "notes": ["派生工作项来自未闭合完成条件与 PARTIAL 原文摘录，"
+                          "不是 SOL 直接安排；执行后仍由 SOL 复核。"],
+            }
+            if args.json:
+                print(json.dumps(payload, ensure_ascii=False, indent=2))
+            else:
+                print(f"已派生工作项 {action['id']}：{action['title']}")
+                print(action["goal"])
             return 0
 
         state = load_state(args.state)

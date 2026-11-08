@@ -22,9 +22,15 @@
 `--result-file`，legacy 状态拒绝 `--native-result`。Bridge 的普通复核不改变 G4，
 也不自动派发 Reviewer。
 
-native 默认预算：每任务 6 次请求（按审计 call_requested 在出站前判定，硬上限）
-与 500k 累计 Token（按审计 usage 核算；usage 响应后才知道，单次调用最多超出一次，
-另用上一次调用的总量做保守预估拦截）。预算状态从审计重建，进程重启不归零。
+预算与输出：默认**不设请求数/Token 上限**，用量按审计重建并写入状态，只用于观察与
+成本审计（进程重启不归零），不阻断 drive。只有调用方显式给出 max_requests /
+max_total_tokens 时才按显式运营上限拒绝出站。输出预算默认不发送 max_output_tokens
+（由服务商/模型使用真实上限）；被截断时由 call_gpt.py 在同一任务/证据/轮次内自适应
+升档重发，不消耗正式 REVIEW 轮次。
+
+PARTIAL 自动推进：最近一轮 verdict=partial 且没有可执行安排时，本地派生一个
+origin=partial-without-plan 工作项（0 请求）并进入 EXECUTE；该轮已有执行/复核/报告
+材料时不再派生，必须把新材料交回 SOL 判断。循环持续到 PASS 收口或真实 BLOCKED。
 
 复用边界
 --------
@@ -35,8 +41,9 @@ native 默认预算：每任务 6 次请求（按审计 call_requested 在出站
 
 失败关闭
 --------
-CLOSED / RECOVER / BLOCKED / QUOTA_WAIT / 无进展 / 8 轮检查点 / 轮次上限
-一律不发起新调用；结果未知的 pending 只能人工 recover 或显式 abandon。
+CLOSED / RECOVER / BLOCKED / QUOTA_WAIT / 无进展（六维 streak ≥2）一律不发起新调用；
+8 轮检查点与轮次上限只作观察信号，不停止循环。结果未知的 pending 只能人工 recover
+或显式 abandon。
 """
 from __future__ import annotations
 
@@ -60,7 +67,7 @@ DISPATCH = os.path.join(HERE, "copilot_dispatch.py")
 
 EXIT_OK, EXIT_USAGE = 0, 2
 EXIT_EXECUTE = 10   # 主代理需要执行工作项
-EXIT_WAIT = 11      # 等待用户/人工处理（恢复、阻塞、配额、检查点、无进展）
+EXIT_WAIT = 11      # 等待人工处理（恢复、阻塞、配额、无进展、真实阻塞）
 
 MAX_MANIFEST_BYTES = 2 << 20
 MAX_RESULT_CHARS = 200_000
@@ -826,6 +833,193 @@ def _gate_reasons(state: dict) -> list[str]:
     return reasons
 
 
+def _no_progress_material(state: dict) -> dict:
+    """无进展重新分析的结构化材料（稳定、可重复、不含时间戳）。
+
+    只放「已经发生的事实」：失败工作项、未闭合条件、证据索引、复核报告与最近
+    裁决。执行报告与轮次摘要不进入指纹——否则每次重新分析新增的报告会让指纹
+    自己变化，无法判断是否真的出现了新信息。
+    """
+    actions = []
+    for action in state.get("actions") or []:
+        if not isinstance(action, dict):
+            continue
+        actions.append({
+            "id": str(action.get("id") or ""),
+            "title": str(action.get("title") or ""),
+            "status": str(action.get("status") or ""),
+            "fail_streak": int(action.get("fail_streak") or 0),
+            "result": _clip(str(action.get("result") or ""), 2000),
+            "result_sha256": sha256_text(str(action.get("result") or "")),
+            "origin": str(action.get("origin") or ""),
+        })
+    criteria = []
+    for item in (state.get("contract") or {}).get("criteria") or []:
+        if not isinstance(item, dict):
+            continue
+        criteria.append({
+            "id": str(item.get("criterion_id") or ""),
+            "text": _clip(str(item.get("text") or ""), 1200),
+            "status": str(item.get("status") or ""),
+            "evidence_refs": sorted(str(r.get("id") or "")
+                                    for r in item.get("evidence_refs") or []),
+        })
+    evidence = sorted(
+        ({"id": str(e.get("id") or ""), "sha256": str(e.get("sha256") or ""),
+          "note": _clip(str(e.get("note") or ""), 500)}
+         for e in state.get("evidence") or [] if isinstance(e, dict)),
+        key=lambda e: e["id"])
+    reviews = []
+    for report in state.get("reports") or []:
+        if not isinstance(report, dict) or report.get("kind") != "review":
+            continue
+        reviews.append({
+            "round_id": str(report.get("round_id") or ""),
+            "verdict": str(report.get("verdict") or ""),
+            "review_of": str(report.get("review_of") or ""),
+            "review_of_kind": str(report.get("review_of_kind") or ""),
+            "review_source": str(report.get("review_source") or ""),
+            "raw_report_sha256": str(report.get("raw_report_sha256") or ""),
+            "summary": _clip(str(report.get("summary") or ""), 3000),
+        })
+    rounds = []
+    for rnd in state.get("rounds") or []:
+        if not isinstance(rnd, dict):
+            continue
+        rounds.append({
+            "round_id": str(rnd.get("round_id") or ""),
+            "verdict": str(rnd.get("verdict") or ""),
+            "summary": _clip(str(rnd.get("summary") or ""), 2000),
+        })
+    decisions = [{"ts": str(d.get("ts") or ""),
+                  "text": _clip(str(d.get("text") or ""), 1000)}
+                 for d in state.get("decisions") or [] if isinstance(d, dict)]
+    material = {
+        "task_id": str(state.get("task_id") or ""),
+        "mode": str(state.get("mode") or ""),
+        "round_seq": int(state.get("round_seq") or 0),
+        "actions": actions,
+        "criteria": criteria,
+        "evidence": evidence,
+        "review_reports": reviews,
+        "rounds": rounds[-6:],
+        "decisions": decisions[-8:],
+    }
+    material["digest"] = sha256_text(
+        json.dumps({k: material[k] for k in
+                    ("task_id", "mode", "actions", "criteria", "evidence",
+                     "review_reports", "decisions")},
+                   ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+    return material
+
+
+def _no_progress_prompt(material: dict) -> str:
+    failed = [a for a in material["actions"]
+              if a["status"] == "failed" or a["fail_streak"] > 0]
+    unmet = [c for c in material["criteria"] if c["status"] != "met"]
+    lines = [
+        "### 连续无进展：必须重新分析，不能重复原方案",
+        "",
+        "六维进展指纹已连续多轮没有实质变化；同一失败工作项或未闭合条件反复出现。"
+        "请把它当作**方案失效**的信号，而不是继续重复原来的建议。",
+        "",
+        f"- 失败工作项：{('、'.join(a['id'] for a in failed) or '（无记录）')}",
+        f"- 未闭合条件：{('、'.join(c['id'] for c in unmet) or '（无）')}",
+        "",
+        "你必须逐项回答（缺项视为无效回复）：",
+        "1. 无进展的直接原因：之前哪条执行路径/建议失效，证据是什么；"
+        "不要把「继续补证」当作原因。",
+        "2. 之前方案为什么失效：约束冲突、证据不可得、授权不足、方案本身不可执行，"
+        "或其他具体原因；引用上面的失败记录/证据索引。",
+        "3. 是否存在其他可行路径：至少给出一个与已失败方案**实质不同**的替代方案；"
+        "若没有，给出可验证的理由。",
+        "4. 下一步具体执行指令：用 ```copilot-plan``` 给出可执行工作项，写清目标、约束、"
+        "需要返回的原始证据、完成条件。",
+        "5. 继续执行的授权边界：哪些动作在现有授权内，哪些必须用户另行授权；"
+        "超出授权时必须停下并说明，不得默认放行。",
+        "",
+        "禁止事项：重复上一轮完全相同的建议；为了得到 PASS 降低验收标准；"
+        "声称已执行未执行的动作；把这份诊断上下文当作完成条件的核销证据。",
+        "只有在确实不存在安全、可执行的替代方案，或缺少用户业务决策/必要授权/"
+        "无法取得的资源/不可绕过的服务商限制时，才允许 `blocked`，并给出具体原因与证据。",
+        "",
+    ]
+    if failed:
+        lines += ["失败明细（来自任务状态）：", ""]
+        for a in failed:
+            lines.append(f"- {a['id']}（{a['status']}，连续失败 {a['fail_streak']} 次）："
+                         f"{a['result'] or '未记录失败原因'}")
+        lines.append("")
+    if unmet:
+        lines += ["未闭合条件：", ""]
+        for c in unmet:
+            lines.append(f"- {c['id']}：{c['text']}（状态 {c['status']}；"
+                         f"已引用证据 {('、'.join(c['evidence_refs']) or '无')}）")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def _build_no_progress_pack(workdir: str, material: dict) -> str:
+    """生成无进展诊断证据包；内容变化才产生新包，不发送完全相同的材料。"""
+    os.makedirs(workdir, exist_ok=True)
+    digest = material["digest"]
+    stem = os.path.join(workdir, f"no-progress-{digest[:12]}")
+    context_path = stem + ".md"
+    pack_path = stem + "-evidence.md"
+    manifest_path = stem + "-manifest.json"
+    failed = [a for a in material["actions"]
+              if a["status"] == "failed" or a["fail_streak"] > 0]
+    unmet = [c for c in material["criteria"] if c["status"] != "met"]
+    lines = [
+        "# 无进展诊断上下文（自动生成）",
+        "",
+        "这不是新的交付物证据，也不能用于核销完成条件；它只记录为什么自动循环"
+        "没有继续推进，供 SOL 重新分析失效方案与替代路径。",
+        "",
+        f"- 任务：{material['task_id']}",
+        f"- 模式：{material['mode']}",
+        f"- 当前轮次：{material['round_seq']}",
+        f"- 诊断指纹：{digest}",
+        "",
+        "## 失败工作项",
+        "",
+    ]
+    lines += ([f"- {a['id']}（{a['status']}，连续失败 {a['fail_streak']} 次）："
+               f"{a['result'] or '未记录失败原因'}" for a in failed]
+              or ["- （无失败工作项记录）"])
+    lines += ["", "## 未闭合条件", ""]
+    lines += ([f"- {c['id']}：{c['text']}（{c['status']}）" for c in unmet]
+              or ["- （无未闭合条件）"])
+    lines += ["", "## 已有证据索引（只列编号与指纹，不重复正文）", ""]
+    lines += ([f"- {e['id']}：SHA-256 {e['sha256']}；{e['note']}" for e in material["evidence"]]
+              or ["- （无已登记证据）"])
+    lines += ["", "## 最近复核报告", ""]
+    lines += ([f"- 轮次 {r['round_id']}：verdict={r['verdict']}；"
+               f"review_of={r['review_of']}；来源={r['review_source']}\n  {r['summary']}"
+               for r in material["review_reports"][-3:]]
+              or ["- （无复核报告）"])
+    lines += ["", "## 最近裁决与决策", ""]
+    lines += ([f"- {r['round_id']}：{r['verdict']}；{r['summary']}"
+               for r in material["rounds"][-3:]] or ["- （无往轮摘要）"])
+    lines += ([f"- {d['ts']}：{d['text']}" for d in material["decisions"][-3:]] or [])
+    lines += ["", "## 约束", "",
+              "- 同一失败方案不得机械重复；没有新信息时不得无限重复相同 SOL 请求。",
+              "- 不得降低验收标准，不得伪造 progress_streak 或执行结果。",
+              "- 正式 REVIEW 的授权门槛不变；超出授权必须 BLOCKED 并说明。", ""]
+    with open(context_path, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines))
+    cmd = [sys.executable, "-B", BRIDGE,
+           "--goal", "连续无进展诊断：分析原方案失效原因与替代路径",
+           "--out", pack_path, "--manifest", manifest_path,
+           "--max-chars", "60000", "--file", context_path,
+           "--note", "无进展诊断上下文；不是交付物证据，不用于核销完成条件"]
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+    if proc.returncode != 0:
+        raise AutoError("无进展诊断证据包生成失败："
+                        + (proc.stderr.strip() or proc.stdout.strip())[-1500:])
+    return pack_path
+
+
 def _build_prompt(state: dict, loop: dict, question: str) -> str:
     phase = loop.get("phase") or ""
     rid = _latest_round_id(state)
@@ -911,7 +1105,8 @@ def _build_prompt(state: dict, loop: dict, question: str) -> str:
         "2. `partial` 时用 ```copilot-plan``` 给最小可执行工作项；"
         "工作项要写清目标、约束和需要返回的原始证据。",
         "3. `pass` 时必须恰好覆盖全部完成条件各一次，每条 `met` 且引用已登记证据；"
-        "不能只用自然语言总结代替逐条核销。",
+        "不能只用自然语言总结代替逐条核销。若完成条件仍为 draft，须在同一 "
+        "```copilot-plan``` 中给出 `criteria_confirmed: true`，否则本地 G2 无法核销。",
         "4. 你的回复会被自动写入任务状态并直接进入下一轮，不需要用户转发、复制或重新组织。",
         "5. 你仍不能读取本机文件或执行命令；判断只依据本消息中的交接状态与证据包。",
         ("6. 原生复核报告是独立报告，不等于 G4；不得把执行方自报或复核报告合并。"
@@ -924,7 +1119,70 @@ def _build_prompt(state: dict, loop: dict, question: str) -> str:
 
 # ── 调用 ───────────────────────────────────────────────────────────────────
 
-def _call_gpt(args, state: dict, prompt: str, evidence: list[str]) -> dict:
+def _review_ledger_path(args, workdir: str) -> str:
+    """REVIEW 台账路径：显式优先，否则放在本轮 work-dir 下保持跨轮稳定。"""
+    if args.review_ledger:
+        return os.path.abspath(args.review_ledger)
+    return os.path.join(workdir, "review-ledger.json")
+
+
+def _review_round_count(path: str) -> int:
+    """台账已入账的 REVIEW 轮数；读不到按 0 处理（由 review_ledger 自己初始化）。"""
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return 0
+    rounds = data.get("rounds") if isinstance(data, dict) else None
+    return len(rounds) if isinstance(rounds, list) else 0
+
+
+def _review_subject(path: str, state: dict) -> str:
+    """台账的交付物标识：已存在则沿用其 subject；新建时才用 task_id。
+
+    已存在的台账若没有 subject，不在这里静默补一个（那会把「未知归属」说成
+    「属于本任务」），交给 review_ledger 失败关闭，要求人工显式声明。
+    """
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            return ""
+        if isinstance(data, dict):
+            return str(data.get("subject") or "").strip()
+        return ""
+    return str(state.get("task_id") or "").strip()
+
+
+def _auto_extra_round_reason(state: dict, ledger_path: str,
+                             new_ids: list[str]) -> str:
+    """首轮之外自动生成 `--extra-round-reason`。
+
+    只陈述事实：第几轮、上一轮裁决、本轮新增证据 id、仍未闭合的条件。它不是
+    新的授权或判断，只满足「为什么还需要一轮」的留痕要求；复核是否继续仍由
+    review_ledger 的新增证据闸门决定。
+    """
+    used = _review_round_count(ledger_path)
+    if used < 1:
+        return ""
+    rounds = [r for r in state.get("rounds") or []
+              if isinstance(r, dict) and r.get("model_identity_ok") is True]
+    verdict = str((rounds[-1] if rounds else {}).get("verdict") or "未记录")
+    unmet = [str(c.get("criterion_id") or "")
+             for c in D.unmet_criteria(state) if c.get("criterion_id")]
+    # evidence id 在 manifest 里通常已带 E 前缀；不要重复拼接成 EE1。
+    evidence = "、".join(
+        str(i) if str(i).upper().startswith("E") else f"E{i}" for i in new_ids
+    ) if new_ids else "本轮证据包（内容哈希与往轮不同）"
+    return (f"自动驱动第 {used + 1} 轮 REVIEW：上一轮裁决 {verdict}；"
+            f"本轮新增/变化证据 {evidence}，用于继续核验未闭合条件 "
+            f"{('、'.join(unmet) or '（无）')}。继续复核的依据是新增证据，"
+            "不是重复同一组材料。")
+
+
+def _call_gpt(args, state: dict, prompt: str, evidence: list[str],
+              extra_round_reason: str = "") -> dict:
     workdir = os.path.abspath(args.work_dir)
     os.makedirs(workdir, exist_ok=True)
     round_no = int(state.get("round_seq") or 0) + 1
@@ -933,18 +1191,40 @@ def _call_gpt(args, state: dict, prompt: str, evidence: list[str]) -> dict:
     with open(prompt_path, "w", encoding="utf-8") as fh:
         fh.write(prompt + "\n")
     mode = str(state.get("mode") or "PLAN").strip().upper() or "PLAN"
-    if mode not in ("PLAN", "CONSULT"):
+    if mode not in ("PLAN", "CONSULT", "REVIEW"):
         raise AutoError(
-            f"自动驱动只承接 PLAN / CONSULT 任务（当前 {mode}）；"
-            "REVIEW 必须走复核台账路径，不能由自动循环代替。")
+            f"自动驱动只承接 PLAN / CONSULT / REVIEW 任务（当前 {mode}）。")
+    if mode == "REVIEW" and not getattr(args, "auto_review", False):
+        raise AutoError(
+            "REVIEW 自动闭环需要显式 --auto-review（表示用户已明确要求连续正式 "
+            "REVIEW）；未显式授权时 REVIEW 仍走复核台账人工路径，不能由自动循环代替。")
     cmd = [sys.executable, "-B", CALL,
            "--mode", mode,
            "--dispatch-state", os.path.abspath(args.state),
            "--prompt-file", prompt_path,
            "--audit-log", args.audit_log,
            "--out", reply_path,
-           "--timeout", str(args.timeout),
-           "--max-output-tokens", str(args.max_output_tokens)]
+           "--timeout", str(args.timeout)]
+    if mode == "REVIEW":
+        ledger_path = _review_ledger_path(args, workdir)
+        cmd += ["--review-ledger", ledger_path]
+        subject = _review_subject(ledger_path, state)
+        if subject:
+            cmd += ["--subject", subject]
+        if extra_round_reason.strip():
+            cmd += ["--extra-round-reason", extra_round_reason.strip(),
+                    "--extra-round-basis", "new-evidence"]
+    # 输出预算默认不发送：不在代码里设置低于服务商真实上限的人为上限。
+    if args.max_output_tokens is not None:
+        cmd += ["--max-output-tokens", str(args.max_output_tokens)]
+    if args.max_output_tokens_ceiling is not None:
+        cmd += ["--max-output-tokens-ceiling", str(args.max_output_tokens_ceiling)]
+    if getattr(args, "max_output_retries", None) is not None:
+        if args.max_output_retries < 0:
+            raise AutoError("--max-output-retries 不能为负数")
+        cmd += ["--max-output-retries", str(args.max_output_retries)]
+    segmentation_plan = os.path.join(workdir, f"round-{round_no}-segmentation.json")
+    cmd += ["--segmentation-plan", segmentation_plan]
     if args.max_retries is not None:
         if args.max_retries < 0:
             raise AutoError("--max-retries 不能为负数")
@@ -967,12 +1247,14 @@ def _call_gpt(args, state: dict, prompt: str, evidence: list[str]) -> dict:
     except subprocess.TimeoutExpired:
         return {"exit": 4, "stderr": "call_gpt.py 进程超时（请求结果未知）",
                 "stdout": "", "prompt_file": prompt_path,
-                "reply_file": reply_path, "evidence": evidence}
+                "reply_file": reply_path, "evidence": evidence,
+                "segmentation_plan": segmentation_plan}
     if proc.stderr.strip():
         print(proc.stderr.strip(), file=sys.stderr)
     return {"exit": proc.returncode, "stderr": proc.stderr,
             "stdout": proc.stdout, "prompt_file": prompt_path,
-            "reply_file": reply_path, "evidence": evidence}
+            "reply_file": reply_path, "evidence": evidence,
+            "segmentation_plan": segmentation_plan}
 
 
 def _run_recover(args) -> None:
@@ -1069,6 +1351,22 @@ def _auto_recover_rejected(args, path: str, state: dict,
             "after_state_sha256": applied.get("after_state_sha256")}
 
 
+NEXT_STEPS = {
+    "execute": "主代理按 actions[].work_order 执行并回填 manifest，然后再次 drive；"
+               "不需要用户转发或逐轮授权",
+    "closed": "已收口，停止调用与执行",
+    "wait_user": "按 reason 处理；PARTIAL 不在停止状态里",
+    "blocked": "真实阻塞：说明缺口与所需授权，等待用户决定",
+    "quota_wait": "配额/冷却中：不调用、不执行，恢复后再继续",
+    "recover": "先按 pending_call 恢复，不重新发起请求",
+    "review_pending": "先回填独立复核，再显式 drive",
+    "failed": "调用失败：按退出码处理，不自动重发",
+    "segmentation_required": "输出预算达到真实上限：按 segmentation_plan 逐段处理证据，"
+                             "再提交新的复核；不要重发完全相同请求",
+    "budget_exhausted": "仅当显式运营上限被触及时出现；不是默认预算",
+}
+
+
 def _result(status: str, state: dict, loop: dict, **extra) -> dict:
     out = {
         "status": status,
@@ -1083,9 +1381,58 @@ def _result(status: str, state: dict, loop: dict, **extra) -> dict:
         "gate": (loop or {}).get("gate"),
         "native_review": (loop or {}).get("native_review"),
         "notes": list((loop or {}).get("notes") or []),
+        "loop_stats": _loop_stats(state),
+        "next_step": NEXT_STEPS.get(status, ""),
     }
     out.update(extra)
     return out
+
+
+def _work_order(state: dict, action: dict) -> dict:
+    """把内部工作项翻译成宿主可直接执行的工单。
+
+    只读：不改写 SOL 安排的目标/约束/证据要求，也不把内部字段换成结论。
+    除 SOL 原字段外补三类信息供主代理执行与回传：
+    - 完成条件：本任务未闭合条件（以及该工作项引用的条件）；
+    - 授权边界：原合同边界 + 「超出原始授权必须 BLOCKED」的硬约束；
+    - 回传要求：manifest 路径与必须登记的原始证据。
+    """
+    assignee = str(action.get("assignee") or "zcode")
+    unmet = D.unmet_criteria(state)
+    criteria = [{
+        "criterion_id": c.get("criterion_id"),
+        "description": c.get("description") or "",
+        "status": c.get("status") or "pending",
+    } for c in unmet]
+    boundaries = str((state.get("contract") or {}).get("boundaries") or "").strip()
+    complete = bool(str(action.get("goal") or "").strip()
+                    and str(action.get("expected_evidence") or "").strip())
+    return {
+        "id": action.get("id"),
+        "title": action.get("title"),
+        "assignee": assignee,
+        # 执行主体：zcode 由主代理直接做；deepseek 由主代理派发宿主原生子代理。
+        # 两者都由主代理负责回填结果与证据，SOL 不执行。
+        "executed_by": ("main-agent" if assignee in ("zcode", "deepseek", "reasonix")
+                        else "unknown"),
+        "goal": action.get("goal"),
+        "constraints": action.get("constraints"),
+        "expected_evidence": action.get("expected_evidence"),
+        "depends_on": action.get("depends_on") or [],
+        "status": action.get("status"),
+        "origin": action.get("origin") or "sol-plan",
+        "derived_from_round_id": action.get("derived_from_round_id") or "",
+        "directive_complete": complete,
+        "completion_criteria": criteria,
+        "authorization": (boundaries or "仅限原任务授权范围") +
+                         "；不得自行扩大授权（生产部署/发布、真实数据写入、Git push、"
+                         "外部消息、权限或全局配置修改、新增业务规则），"
+                         "超出时按 BLOCKED 汇报并请求用户授权。",
+        "return_contract": ("执行后用 manifest 回填：actions[].id/status/result/evidence_ids + "
+                            "evidence[].id/file/kind/note/include，再运行 "
+                            "`copilot_auto.py drive --result-file <manifest>`；"
+                            "只登记摘要不算证据，必须给出可重读的原始产物。"),
+    }
 
 
 def _action_packet(state: dict) -> list[dict]:
@@ -1098,7 +1445,134 @@ def _action_packet(state: dict) -> list[dict]:
         "expected_evidence": a.get("expected_evidence"),
         "depends_on": a.get("depends_on") or [],
         "status": a.get("status"),
+        # 宿主执行衔接：work_order 是同一工作项的完整可执行视图（不改写 SOL 字段）。
+        "work_order": _work_order(state, a),
     } for a in D.ready_actions(state)]
+
+
+def _latest_verified_round(state: dict) -> dict | None:
+    rounds = [r for r in state.get("rounds") or []
+              if isinstance(r, dict) and r.get("model_identity_ok") is True]
+    return rounds[-1] if rounds else None
+
+
+def _round_material(state: dict, round_id: str) -> list[str]:
+    """该轮之后已经产生了哪些新材料（执行结果 / 复核 / 报告 / 已完成派工）。
+
+    新材料意味着「下一步不是再派活，而是把结果交给 SOL 判断」：本地派生工作项
+    只在那一轮确实什么都没发生时才成立。
+    """
+    rid = str(round_id or "").strip()
+    if not rid:
+        return []
+    found = []
+    for entry in state.get("native_results") or []:
+        if isinstance(entry, dict) and str(entry.get("round_id") or "") == rid:
+            found.append("execution")
+    for entry in state.get("native_reviews") or []:
+        if isinstance(entry, dict) and str(entry.get("round_id") or "") == rid:
+            found.append("review")
+    for entry in state.get("reports") or []:
+        if isinstance(entry, dict) and str(entry.get("round_id") or "") == rid:
+            found.append(str(entry.get("kind") or "report"))
+    for entry in state.get("actions") or []:
+        if (isinstance(entry, dict)
+                and str(entry.get("derived_from_round_id") or "") == rid
+                and str(entry.get("status") or "") in ("done", "failed", "blocked")):
+            found.append("derived-work")
+    return found
+
+
+def _partial_without_actions(state: dict) -> dict | None:
+    """最近一轮 PARTIAL 是否「说了没做好，但没给可执行工作」。
+
+    只认最近已验证轮次：`verdict=partial` 且该轮没有新增任何安排、也没有任何
+    新材料。已经给过安排、执行后再次进入 GUIDANCE_NEEDED 的情形不算——那需要把
+    执行结果交给 SOL 判断，不是再派一次活；同样的道理，派生工作项执行完并登记
+    证据/报告之后，也必须把新材料交回 SOL，不能本地再派一轮。
+    """
+    latest = _latest_verified_round(state)
+    if latest is None:
+        return None
+    if str(latest.get("verdict") or "").strip().lower() != "partial":
+        return None
+    if latest.get("actions"):
+        return None
+    if D.ready_actions(state):
+        return None
+    if _round_material(state, str(latest.get("round_id") or "")):
+        return None
+    return latest
+
+
+def _reply_text(path: str) -> str:
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            return fh.read()
+    except OSError:
+        return ""
+
+
+def _derive_partial_work(path: str, state: dict, reply_text: str) -> dict | None:
+    """PARTIAL 没有可执行安排时，本地派生下一步工作项（0 请求）。"""
+    if _partial_without_actions(state) is None:
+        return None
+    snapshot = _snapshot(state)
+    action = D.derive_work(state, reply_text)
+    D.save_state(path, state, expect=snapshot)
+    return action
+
+
+def _loop_stats(state: dict) -> dict:
+    """轮次与用量观察值：只记录，不作为停止条件。"""
+    budget = state.get("budget") or {}
+    usage = budget.get("usage") or {}
+    return {
+        "round_seq": int(state.get("round_seq") or 0),
+        "rounds": len(state.get("rounds") or []),
+        "requests": int(usage.get("requests") or 0),
+        "total_tokens": int(usage.get("total_tokens") or 0),
+        "unknown_usage_calls": int(usage.get("unknown_usage_calls") or 0),
+        "limits_enforced": False,
+        "checkpoint": int(state.get("round_seq") or 0) > 0
+                      and int(state.get("round_seq") or 0)
+                      % int(budget.get("checkpoint_every") or D.CHECKPOINT_EVERY) == 0,
+        "note": "轮次/Token 只用于审计与观察，不构成停止条件",
+    }
+
+
+def _maybe_advance_partial(path: str, state: dict, loop: dict,
+                           common: dict, workdir: str) -> tuple[dict, dict, dict]:
+    """PARTIAL 但没有可执行安排时，推进到「下一步工作」而不是停下等用户。
+
+    这一步是纯本地的：不发请求、不改轮次、不改 SOL 的判断。派生动作明确标注
+    `origin=partial-without-plan`，目标与证据要求来自未闭合条件与回复原文摘录。
+    """
+    if loop.get("phase") != "GUIDANCE_NEEDED":
+        return state, loop, common
+    latest = _partial_without_actions(state)
+    if latest is None:
+        return state, loop, common
+    reply_path = os.path.join(
+        workdir, f"round-{int(state.get('round_seq') or 0)}-reply.md")
+    try:
+        action = _derive_partial_work(path, state, _reply_text(reply_path))
+    except (D.DispatchError, OSError) as exc:
+        common["partial_bridge_error"] = str(exc)
+        return state, loop, common
+    if action is None:
+        return state, loop, common
+    state = D.load_state(path)
+    loop = D.loop_step(path, persist=True)
+    common["derived_work"] = {
+        "id": action.get("id"),
+        "title": action.get("title"),
+        "origin": action.get("origin"),
+        "derived_from_round_id": action.get("derived_from_round_id"),
+        "reason": "最近一轮 PARTIAL 没有给出可执行安排；按未闭合条件本地派生，"
+                  "不是 SOL 直接安排",
+    }
+    return state, loop, common
 
 
 def _emit(payload: dict, code: int) -> int:
@@ -1109,17 +1583,12 @@ def _emit(payload: dict, code: int) -> int:
 # ── 主流程 ─────────────────────────────────────────────────────────────────
 
 def _stop_reason(loop: dict, state: dict) -> str:
-    if loop.get("checkpoint"):
-        return "checkpoint"
-    if loop.get("no_progress"):
-        return "no_progress"
-    limit = (state.get("budget") or {}).get("rounds_limit")
-    if limit is not None:
-        try:
-            if int(state.get("round_seq") or 0) >= int(limit):
-                return "rounds_limit"
-        except (TypeError, ValueError):
-            pass
+    """保留接口但不再因无进展计数直接停止。
+
+    2026-11-08 起连续无进展由 `drive` 转入 SOL 重新分析（见 `_no_progress_material`）；
+    只有没有新信息、缺少正式 REVIEW 授权或 SOL 给出有证据的 BLOCKED 时才停。
+    轮次数字、检查点与累计用量仍然只观察、不停止。
+    """
     return ""
 
 
@@ -1182,6 +1651,13 @@ def drive(args) -> int:
     common = {"dry_run": bool(args.dry_run), "manifest": manifest_info,
               "state_path": path}
 
+    # PARTIAL 但 SOL 没给可执行安排：先用本地派生把循环推进到 EXECUTE，
+    # 不用同一组证据再刷一次付费调用，也不把决定权交回用户。
+    if not args.dry_run:
+        state, loop, common = _maybe_advance_partial(
+            path, state, loop, common, os.path.abspath(args.work_dir))
+        phase = loop.get("phase")
+
     if phase == "CLOSED":
         return _emit(_result("closed", state, loop, **common), EXIT_OK)
     if phase == "RECOVER":
@@ -1229,11 +1705,8 @@ def drive(args) -> int:
                              round_id=_latest_round_id(state), **native_extra),
                      EXIT_OK if args.dry_run else EXIT_EXECUTE)
 
-    # GUIDANCE_NEEDED / REJUDGE：只在没有停摆/检查点/轮次上限时发起调用。
-    reason = _stop_reason(loop, state)
-    if reason:
-        return _emit(_result("wait_user", state, loop, **common, reason=reason),
-                     EXIT_OK if args.dry_run else EXIT_WAIT)
+    # GUIDANCE_NEEDED / REJUDGE：无进展不再直接终止。真正的判定放在
+    # stamp_progress 之后（streak 可能在本轮才达到阈值），见下方出站前分支。
 
     if phase == "REJUDGE" and not args.dry_run:
         # 按 SKILL 的 REJUDGE 流程先留痕失败原因，再发起重新判断。
@@ -1257,6 +1730,8 @@ def drive(args) -> int:
         question = args.question
     prompt = _build_prompt(state, loop, question)
     if args.dry_run:
+        if loop.get("no_progress"):
+            prompt += "\n" + _no_progress_prompt(_no_progress_material(state))
         return _emit(_result("call", state, loop, **common, prompt=prompt,
                              would_call=True), EXIT_OK)
 
@@ -1275,26 +1750,86 @@ def drive(args) -> int:
                                      manifest_evidence, question)
     if auto_pack:
         evidence.append(auto_pack)
-
-    # 本轮无进展指纹在真实调用前落盘。若这次指纹使 streak 达到停摆阈值，
-    # 必须在出站前停止——否则「先检查后调用」会多刷一轮付费调用。
+    # 本轮无进展指纹在真实调用前落盘。连续无进展不再直接停止：先确认是否有
+    # 新信息，再把失败项/未闭合条件/证据提交 SOL 重新分析；没有新信息才停。
+    reanalysis = None
     try:
         stamp = D.stamp_progress(path, prompt)
     except (OSError, D.DispatchError) as exc:
         raise AutoError(f"无法记录本轮无进展指纹：{exc}") from None
-    if stamp.get("no_progress"):
+    state = D.load_state(path)
+    if bool(loop.get("no_progress")) or bool(stamp.get("no_progress")):
+        mode = str(state.get("mode") or "").strip().upper()
+        if mode == "REVIEW" and not getattr(args, "auto_review", False):
+            # 无进展恢复不能绕过正式 REVIEW 的显式授权门槛。
+            return _emit(_result("wait_user", state, loop, **common,
+                                 reason="no_progress_reanalysis_requires_auto_review"),
+                         EXIT_WAIT)
+        material = _no_progress_material(state)
+        last_digest = str((state.get("budget") or {}).get(
+            "last_no_progress_digest") or "")
+        if last_digest and last_digest == material["digest"]:
+            # 相同失败/未闭合项/证据：不再发完全相同的新请求。
+            state = D.load_state(path)
+            loop = D.loop_step(path, persist=True)
+            return _emit(_result(
+                "wait_user", state, loop, **common,
+                reason="no_progress_no_new_information",
+                no_progress={"digest": material["digest"],
+                             "failed_actions": [a["id"] for a in material["actions"]
+                                                if a["status"] == "failed"
+                                                or a["fail_streak"] > 0],
+                             "unmet_criteria": [c["id"] for c in material["criteria"]
+                                                if c["status"] != "met"]}),
+                EXIT_WAIT)
+        reanalysis = {"material": material, "digest": material["digest"]}
+        prompt += "\n" + _no_progress_prompt(material)
+        pack = _build_no_progress_pack(os.path.abspath(args.work_dir), material)
+        evidence.append(pack)
+        reanalysis["pack"] = pack
+        common["no_progress_reanalysis"] = {
+            "digest": material["digest"],
+            "failed_actions": [a["id"] for a in material["actions"]
+                               if a["status"] == "failed" or a["fail_streak"] > 0],
+            "unmet_criteria": [c["id"] for c in material["criteria"]
+                               if c["status"] != "met"],
+            "pack": pack,
+        }
+    if stamp.get("no_progress") and not reanalysis:
         state = D.load_state(path)
         loop = D.loop_step(path, persist=True)
         return _emit(_result("wait_user", state, loop, **common,
                              reason="no_progress",
                              stamp=stamp), EXIT_WAIT)
 
-    call = _call_gpt(args, state, prompt, evidence)
+    extra_round_reason = ""
+    if str(state.get("mode") or "").strip().upper() == "REVIEW":
+        extra_round_reason = _auto_extra_round_reason(
+            state, _review_ledger_path(args, os.path.abspath(args.work_dir)),
+            [str(e.get("id") or "") for e in manifest_evidence
+             if isinstance(e, dict)])
+        if reanalysis:
+            extra_round_reason += (
+                "；本轮为连续无进展重新分析：提交失败工作项、未闭合条件与已有证据"
+                f"诊断包 {reanalysis['digest'][:12]}，用于分析原方案为何失效；"
+                "该诊断包不是交付物证据，不用于核销完成条件。")
+    call = _call_gpt(args, state, prompt, evidence, extra_round_reason)
     call_info = {"exit": call["exit"], "prompt_file": call["prompt_file"],
-                 "reply_file": call["reply_file"], "evidence": evidence}
+                 "reply_file": call["reply_file"], "evidence": evidence,
+                 "extra_round_reason": extra_round_reason,
+                 "segmentation_plan": call.get("segmentation_plan")}
     if call["exit"] != 0:
         state = D.load_state(path)
         pending = state.get("pending_call")
+        plan_path = str(call.get("segmentation_plan") or "")
+        if plan_path and os.path.exists(plan_path):
+            # 输出预算已无法继续提高：转入分段证据处理，不把同一失败请求
+            # 当作普通失败重试。正式 REVIEW 轮次没有被消耗。
+            loop = D.loop_step(path, persist=True)
+            return _emit(_result(
+                "segmentation_required", state, loop, **common, call=call_info,
+                segmentation_plan=plan_path,
+                reason="输出预算达到真实上限；按分段计划处理证据后重新提交"), EXIT_EXECUTE)
         if call["exit"] == 12:
             loop = D.loop_step(path, persist=True)
             return _emit(_result(
@@ -1325,7 +1860,21 @@ def drive(args) -> int:
                 reason=reason), call["exit"])
 
     state = D.load_state(path)
+    if reanalysis:
+        # 本轮重新分析已被 SOL 受理：记录诊断指纹，下一轮只有在失败项/
+        # 未闭合条件/证据真正变化时才再次发起，避免无限重复相同请求。
+        snapshot = _snapshot(state)
+        budget = state.setdefault("budget", {})
+        budget["last_no_progress_digest"] = reanalysis["digest"]
+        budget["last_no_progress_round_seq"] = int(state.get("round_seq") or 0)
+        D.save_state(path, state, expect=snapshot)
+        state = D.load_state(path)
     loop = D.loop_step(path, persist=True)
+    phase = loop.get("phase")
+    # 本轮 SOL 若给出 PARTIAL 但没有可执行安排，同样立刻派生下一步工作项，
+    # 让循环继续到 EXECUTE，而不是以 guidance_without_actions 停下。
+    state, loop, common = _maybe_advance_partial(
+        path, state, loop, common, os.path.abspath(args.work_dir))
     phase = loop.get("phase")
     if phase == "CLOSURE_CHECK":
         closure = D.close_task(path)
@@ -1482,10 +2031,23 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--base-url", default="",
                    help="仅测试/自建上游使用；正式运行留空走 CPA 默认")
     p.add_argument("--timeout", type=float, default=300.0)
-    p.add_argument("--max-output-tokens", type=int, default=8192)
+    p.add_argument("--max-output-tokens", type=int, default=None,
+                   help="可选初始输出预算；默认不传，由服务商/模型使用真实默认上限。"
+                        "截断时 call_gpt 会自适应升档重发（不消耗正式 REVIEW 轮次）")
+    p.add_argument("--max-output-tokens-ceiling", type=int, default=None,
+                   help="可选输出预算显式上界；缺省不设人为上限")
+    p.add_argument("--max-output-retries", type=int, default=None,
+                   help="可选输出升档重发次数上限；默认不限制。只有显式传入时才"
+                        "作为运营限制透传给 call_gpt.py（0 表示不升档）")
     p.add_argument("--max-retries", type=int, default=None,
                    help="透传给 call_gpt.py 的最大重试次数；0 表示只尝试一次"
                         "（native 默认 0，legacy 默认沿用 call_gpt 的 2）")
+    p.add_argument("--auto-review", action="store_true",
+                   help="显式声明用户已要求连续正式 REVIEW，允许自动驱动承接 "
+                        "REVIEW 任务；未给出时 REVIEW 仍只能走人工复核台账路径")
+    p.add_argument("--review-ledger", default="",
+                   help="REVIEW 复核台账路径；缺省为 <work-dir>/review-ledger.json，"
+                        "跨轮保持同一台账以合并历史证据与往轮裁决")
     p.add_argument("--dry-run", action="store_true",
                    help="只求值与校验，不写状态、不写文件、不调用 GPT")
 

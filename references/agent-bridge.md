@@ -41,9 +41,10 @@ python3 ~/.zcode/skills/copilot/scripts/copilot_dispatch.py start \
 - native 状态拒绝 `ingest --result-file`；legacy 状态拒绝 `ingest --native-result`
   （`drive --native-result` 已停用，只保留迁移提示）。两个渠道不能混用，避免把人工
   manifest 和原生报告当成同一份执行结果。
-- native 默认预算写入状态：`budget.max_requests=6`、`budget.max_total_tokens=500000`、
-  `budget.projection=true`；可用 `--max-requests / --max-total-tokens /
-  --no-budget-projection` 覆盖。旧 native 状态未配置时按同一默认值执行。
+- 预算默认不设限：`budget.max_requests` / `budget.max_total_tokens` 默认为 `null`，
+  `budget.projection` 默认关闭；用量只从审计重建并写入 `budget.usage` 供观察。
+  只有调用方显式 `--max-requests / --max-total-tokens / --budget-projection` 时才生效，
+  并在 `budget_limits.explicit=true` 中标记为显式运营上限。
 
 ## 3. 状态字段
 
@@ -56,7 +57,7 @@ python3 ~/.zcode/skills/copilot/scripts/copilot_dispatch.py start \
 | `review_channel` | `null` / `native` / `gpt_review`；同一轮不得让两个渠道同时拥有复核权威 |
 | `review_round` | 原生复核所属轮次 |
 | `review_consumed` | 已被原生复核消费的执行结果 SHA 列表；每个执行结果只允许一份原生复核 |
-| `budget.max_requests` / `budget.max_total_tokens` / `budget.projection` | 请求数硬上限、累计 Token 阈值与保守预估开关（native 默认 6 / 500000 / true） |
+| `budget.max_requests` / `budget.max_total_tokens` / `budget.projection` | 可选显式运营上限（默认空＝不限）与保守预估开关；用量只记录，不作为停止门 |
 | `budget.usage` | 从审计重建的用量快照（输入/输出/总量/请求数/未知 usage 调用数）；权威来源仍是审计 |
 
 执行报告和复核报告分别写入 `reports`，通过 `kind=execution` / `kind=review` 区分；
@@ -286,10 +287,10 @@ CLI 会把 `BridgeError.code` 包进 `AutoError` 并返回退出码 2；失败�
    REVIEW 或另一个复核渠道。复核 `partial|blocked` 同样只作为复核报告留痕，不自动重试。
 7. 下一轮由 SOL 根据真实回填与新证据重新安排；不要用同一个执行结果重复复核，也不要把
    Reviewer 的 PASS 当成任务 PASS 或 G4。
-8. 请求/Token 预算：native 默认每任务 6 次请求（按审计 `call_requested` 在出站前判定，
-   硬上限）与 500k 累计 Token（按 `usage` 核算，响应后才知道，不是严格上界；另按上次
-   调用总量做保守预估拦截）。预算从审计重建，进程重启不归零；耗尽时 `drive` 返回
-   `budget_exhausted`，`call_gpt.py` 返回退出码 12。
+8. 请求/Token 预算：默认**不设上限**，用量按审计 `call_requested` 与 `usage` 重建，
+   进程重启不归零，只用于观察与成本审计。只有显式运营上限被触及时才拒绝：显式请求数上限
+   在出站前判定（`drive` 返回 `budget_exhausted`，`call_gpt.py` 退出码 12）；显式 Token
+   阈值按 `usage` 核算，响应后才知道，不是严格上界。
 
 ## 7. Reviewer Profile
 

@@ -54,14 +54,20 @@ class NativeFlowBase(unittest.TestCase):
 
     # ── 状态与信封 ────────────────────────────────────────────────────────
     def make_state(self, *, task_id: str = "native-flow", risk: str = "normal",
-                   with_action: bool = True, backend: str = "native") -> dict:
+                   with_action: bool = True, backend: str = "native",
+                   verdict: str = "partial",
+                   max_requests: int | None = None,
+                   max_total_tokens: int | None = None,
+                   budget_projection: bool | None = None) -> dict:
         D.start(
             self.state_path, "native 闭环测试", "PLAN",
             contract="## 完成条件\n- 工作项完成\n边界：仅测试",
             task_id=task_id, criteria=["工作项完成"], risk=risk,
-            execution_backend=backend)
+            execution_backend=backend, max_requests=max_requests,
+            max_total_tokens=max_total_tokens,
+            budget_projection=budget_projection)
         state = D.load_state(self.state_path)
-        self.add_round(state, 1, verdict="partial", decision="continue")
+        self.add_round(state, 1, verdict=verdict, decision="continue")
         if with_action:
             state["actions"].append({
                 "id": "T1", "title": "执行 T1", "assignee": "zcode",
@@ -212,7 +218,7 @@ class NativeFlowBase(unittest.TestCase):
         proc = self.cli(
             AUTO, "drive", "--state", self.state_path, "--audit-log", self.audit,
             "--work-dir", self.workdir, "--base-url", self.upstream.url,
-            "--timeout", "5", "--max-output-tokens", "4096", *args,
+            "--timeout", "5", *args,
             timeout=timeout)
         payload = {}
         if proc.stdout.strip():
@@ -265,6 +271,73 @@ class NativeFlowBase(unittest.TestCase):
 
     def queue(self, plan_obj: dict) -> None:
         self.upstream.push(success(plan(plan_obj), model=MODEL))
+
+
+class NativeFullChainTests(NativeFlowBase):
+    def test_partial_without_plan_derives_executes_reviews_and_passes(self):
+        """PARTIAL 无 plan：本地派生 → native 派工 → 回填执行/复核 → 再判断 → PASS。"""
+        state = self.make_state(with_action=False)
+
+        # 1) 派生工作项并生成可绑定的 native dispatch（本步骤 0 请求）。
+        proc, first = self.drive()
+        self.assertEqual(proc.returncode, 10, proc.stderr)
+        self.assertEqual(first["status"], "execute")
+        self.assertEqual(self.upstream.requests, [])
+        work = first["actions"][0]
+        order = work["work_order"]
+        self.assertTrue(work["id"].startswith("AUTO-"), work)
+        self.assertEqual(order["origin"], "partial-without-plan")
+        self.assertEqual(order["executed_by"], "main-agent")
+        self.assertTrue(order["directive_complete"])
+        self.assertIn("不得自行扩大授权", order["authorization"])
+        dispatch = first["native_dispatch"]
+        self.assertTrue(dispatch["dispatch_id"])
+        item = dispatch["actions"][0]
+        self.assertEqual(item["work_item_id"], work["id"])
+        self.assertTrue(item["idempotency_key"])
+        self.assertEqual(dispatch["round_id"], first["round_id"])
+
+        # 2) ZCode 主 Agent（模拟执行方）执行并回填原始证据；复核独立回填。
+        state = self.state_json()
+        execution = self.execution(state, dispatch)
+        execution_path = self.write_json("chain-execution.json", execution)
+        proc, ingested = self.ingest("--native-result", execution_path)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(ingested["http_requests"], 0)
+        self.assertEqual(self.upstream.requests, [])
+
+        review = self.review(self.state_json(), dispatch, execution)
+        review_path = self.write_json("chain-review.json", review)
+        proc, reviewed = self.ingest("--native-result", review_path)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(reviewed["http_requests"], 0)
+
+        # 3) 新材料交回 SOL：下一次 drive 必须携带执行与复核材料再判断。
+        self.queue({
+            "decision": "stop", "verdict": "pass", "summary": "已完成并复核",
+            "criteria_confirmed": True,
+            "criteria": [{"criterion_id": "C1", "status": "met",
+                          "evidence_refs": ["E1"]}],
+        })
+        proc, second = self.drive()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(second["status"], "closed")
+        self.assertEqual(len(self.upstream.requests), 1)
+
+        payload_text = json.dumps(self.upstream.requests[0]["payload"],
+                                  ensure_ascii=False)
+        self.assertIn("最近一次执行报告", payload_text)
+        self.assertIn("原生独立复核报告", payload_text)
+        self.assertIn(order["id"], payload_text)
+
+        saved = self.state_json()
+        self.assertEqual(len(saved["native_results"]), 1)
+        self.assertEqual(saved["native_results"][0]["work_item_id"], order["id"])
+        self.assertEqual(len(saved["native_reviews"]), 1)
+        self.assertEqual(saved["native_reviews"][0]["g4_eligible"], False)
+        self.assertEqual([a["status"] for a in saved["actions"]], ["done"])
+        self.assertEqual(saved["closure"]["verdict"], "pass")
+        self.assertEqual(saved["closure"]["closed_by"], "gate")
 
 
 class IngestSeparationTests(NativeFlowBase):
@@ -479,21 +552,35 @@ class ReviewOrderingTests(NativeFlowBase):
 
 
 class BudgetTests(NativeFlowBase):
-    def test_native_default_retry_zero(self):
+    def test_native_defaults_are_unbounded_and_derive_work(self):
+        """默认不设请求/Token 上限；PARTIAL 无安排时本地派生工作项而不是等用户。"""
         state = self.make_state(with_action=False)
-        self.queue({"decision": "continue", "summary": "无新安排", "actions": []})
+        limits = D.budget_limits(state)
+        self.assertIsNone(limits["max_requests"])
+        self.assertIsNone(limits["max_total_tokens"])
+        self.assertTrue(limits["default_unbounded"])
+        status = D.budget_status(state, self.audit)
+        self.assertTrue(status["allowed"])
+        self.assertEqual(status["reason"], "")
+
         proc, payload = self.drive()
-        self.assertEqual(proc.returncode, 11, proc.stderr)
-        self.assertEqual(payload["status"], "wait_user")
-        requested = self.audit_events("call_requested")
-        self.assertEqual(len(requested), 1)
-        self.assertEqual(requested[0]["max_attempts"], 1)
-        results = self.audit_events("call_result")
-        self.assertEqual(results[0]["attempts"], 1)
+        self.assertEqual(proc.returncode, 10, proc.stderr)
+        self.assertEqual(payload["status"], "execute")
+        saved = self.state_json()
+        self.assertEqual(saved["actions"][-1]["origin"], "partial-without-plan")
+        self.assertIsNone(saved["pending_call"])
+        # 派生是纯本地的：不消耗付费请求，也不要求用户中转。
+        self.assertEqual(self.upstream.requests, [])
+        self.assertEqual(self.audit_events("call_requested"), [])
 
     def test_request_cap_six_is_enforced_before_send(self):
-        state = self.make_state(with_action=False)
+        """显式运营上限仍然生效：这是调用方设置的上限，不是代码默认值。"""
+        state = self.make_state(with_action=False, verdict="continue",
+                                max_requests=6)
         self.assertEqual(state["budget"]["max_requests"], 6)
+        limits = D.budget_limits(state)
+        self.assertTrue(limits["enforced"])
+        self.assertTrue(limits["explicit"])
         self.seed_audit(state["task_id"], [None] * 6)
         proc, payload = self.drive()
         self.assertEqual(proc.returncode, 11, proc.stderr)
@@ -505,8 +592,9 @@ class BudgetTests(NativeFlowBase):
         self.assertEqual(self.state_json()["round_seq"], state["round_seq"])
 
     def test_call_gpt_itself_refuses_without_send(self):
-        """预算门也在 call_gpt 内：绕过 drive 也不能多发请求。"""
-        state = self.make_state(with_action=False)
+        """预算门也在 call_gpt 内：绕过 drive 也不能超过显式上限。"""
+        state = self.make_state(with_action=False, verdict="continue",
+                                max_requests=6)
         self.seed_audit(state["task_id"], [None] * 6)
         prompt = self.write_text("prompt.md", "预算测试")
         before = self.state_json()
@@ -557,7 +645,13 @@ class BudgetTests(NativeFlowBase):
         self.assertEqual(restarted["spend"]["requests"], 3)
 
     def test_token_threshold_and_projection_refuse_outbound(self):
-        state = self.make_state(with_action=False)
+        """Token 阈值同样只在显式设置时生效；默认不因累计费用阻止调用。"""
+        state = self.make_state(with_action=False, verdict="continue",
+                                max_total_tokens=500_000,
+                                budget_projection=True)
+        plain = json.loads(json.dumps(state))
+        plain["budget"]["max_total_tokens"] = None
+        self.assertTrue(D.budget_status(plain, self.audit)["allowed"])
         self.seed_audit(state["task_id"], [
             {"input": 300_000, "output": 160_000, "total": 460_000},
         ])
@@ -586,22 +680,28 @@ class BudgetTests(NativeFlowBase):
 
 
 class LegacyCompatibilityTests(NativeFlowBase):
-    def test_legacy_default_retry_and_budget_unchanged(self):
+    def test_legacy_default_budget_is_unbounded(self):
+        """legacy 默认同样不设上限，PARTIAL 无安排时同样派生工作项。"""
         state = self.make_state(with_action=False, backend="legacy",
                                 task_id="legacy-flow")
         self.assertIsNone(state["budget"]["max_requests"])
         self.assertIsNone(state["budget"]["max_total_tokens"])
-        self.queue({"decision": "continue", "summary": "无新安排", "actions": []})
-        proc, payload = self.drive()
-        self.assertEqual(proc.returncode, 11, proc.stderr)
-        self.assertEqual(payload["status"], "wait_user")
-        requested = self.audit_events("call_requested")
-        self.assertEqual(len(requested), 1)
-        # legacy 保留 call_gpt 的历史默认：2 次重试（max_attempts=3）。
-        self.assertEqual(requested[0]["max_attempts"], 3)
-        status = D.budget_status(self.state_json(), self.audit)
+        status = D.budget_status(state, self.audit)
         self.assertFalse(status["limits"]["applicable"])
+        self.assertFalse(status["limits"]["enforced"])
         self.assertTrue(status["allowed"])
+        self.assertTrue(status["unbounded_default"])
+
+        proc, payload = self.drive()
+        self.assertEqual(proc.returncode, 10, proc.stderr)
+        self.assertEqual(payload["status"], "execute")
+        self.assertEqual(self.state_json()["execution_backend"], "legacy")
+        saved = self.state_json()
+        self.assertEqual(saved["actions"][-1]["origin"], "partial-without-plan")
+        self.assertEqual(self.upstream.requests, [])
+        # legacy 保留 call_gpt 的历史默认：2 次重试（max_attempts=3）只在真正
+        # 出站时体现；本轮没有出站，因此不产生 call_requested 记录。
+        self.assertEqual(self.audit_events("call_requested"), [])
 
 
 if __name__ == "__main__":
