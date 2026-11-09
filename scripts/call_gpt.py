@@ -156,7 +156,8 @@ EXIT_QUOTA = 8
 # 模型身份验证失败：回显模型缺失、不可解析或与请求不一致。该回复不得输出、落盘、
 # 入账或写回交接状态——未经验证身份的响应不能成为任何有效 GPT 指导。
 EXIT_IDENTITY = 9
-# 预算耗尽：本任务请求数已达硬上限，或累计 Token 已达阈值/预估将越过阈值。
+# 显式运营上限耗尽：调用方在 start 显式给出的请求数上限已达，或累计 Token 已达阈值/
+# 预估将越过阈值。它不是代码默认预算，只有显式设置时才存在。
 # 该退出码发生在发送前（或保守预估拦截），不得据此认为本次请求已发出。
 EXIT_BUDGET = 12
 # 配额类错误码（CPA / 上游 usage 限制与模型冷却）。命中即退出码 8，不重试、不换模型。
@@ -185,9 +186,10 @@ NEVER_SENT_HINTS = ("refused", "getaddrinfo", "name or service not known",
 
 
 def _review_round_meta(merged_meta: dict) -> dict:
-    """REVIEW 轮次审计字段：普通预算、Security 独立额度与新增证据留痕。
+    """REVIEW 轮次审计字段：旧策略额度参考、复核依据与新增证据留痕。
 
-    审计是预算与追加理由的权威留痕；这里只写元数据，裁决仍在结果记录里。
+    审计是复核依据与追加理由的权威留痕；这里只写元数据，裁决仍在结果记录里。
+    轮次与额度数字只用于审计观察，不构成停止条件。
     Security 轮次额外记录新增证据编号与 SHA-256，便于事后还原证据变化。
     """
     meta = {
@@ -1095,13 +1097,13 @@ def main() -> int:
                     help="创建台账时的风险级别（默认 normal）；台账已存在时不得改变")
     ap.add_argument("--extra-round-reason", default="",
                     help="首轮之外每次复核的理由（新增证据 / 未解决的关键缺陷 / 新矛盾）；"
-                         "默认预算用尽后的普通追加轮次必须写明实际整改内容、对应的未闭合项"
-                         "与新增证据是哪几条；Security 追加必须写明具体安全风险")
+                         "追加轮次须写明实际整改内容、对应的未闭合项与新增证据是哪几条；"
+                         "Security 依据须写明具体安全风险（复核没有固定轮次上限）")
     ap.add_argument("--extra-round-basis", default="",
                     choices=("new-evidence", "security", "remediation"),
                     help="复核依据记录：new-evidence（新增实质证据）/ security（具体安全"
                          "风险，需带此前未用于 REVIEW 的新增证据与风险说明）/ remediation"
-                         "（已按上一轮裁决完成整改后的定向复核）。复核没有固定轮次额度，"
+                         "（已按上一轮裁决完成整改后的定向复核）。复核没有固定轮次上限，"
                          "但任何依据都不允许在没有新增证据/整改的情况下重复复核")
     ap.add_argument("--accept-evidence-truncation", default="", metavar="REASON",
                     help="显式放行被采集器截断的 REVIEW 证据，并写明理由"

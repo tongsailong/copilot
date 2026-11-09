@@ -1196,6 +1196,34 @@ class LedgerTests(unittest.TestCase):
             review_ledger.merge_and_guard(ledger, [dup], "同一组证据再交一次")
         self.assertIn("内容相同", str(ctx.exception))
 
+    def test_review_continues_beyond_all_legacy_caps_with_new_evidence(self):
+        """旧策略合计上限（普通 2+2+1=5 轮）之后，有新证据与理由仍可继续复核。
+
+        同时锁定提示文本：旧配额语义不得再作为「继续/停止条件」注入 SOL。
+        """
+        ledger = self.new_ledger(risk="normal")
+        for idx in range(1, 7):
+            pack = write_pack(
+                self.tmp.name, f"cap{idx}.md",
+                [(f"cap{idx}.txt", f"body{idx}")])
+            _, meta = review_ledger.merge_and_guard(
+                ledger, [pack], f"第{idx}轮新增 cap{idx}.txt 证据", "new-evidence")
+            self.record(ledger, meta)
+        self.assertEqual(meta["round"], 6)
+        self.assertTrue(meta["unbounded"])
+        self.assertFalse(meta["limits_enforced"])
+        rendered = review_ledger.render_ledger(ledger, meta)
+        self.assertIn("复核没有固定轮次上限", rendered)
+        self.assertIn("不是继续或停止条件", rendered)
+        for stale in ("默认预算", "弹性追加第", "额度用尽后必须停下",
+                      "等待用户明确授权", "仍有追加额度时才继续"):
+            self.assertNotIn(stale, rendered)
+        # 仍然禁止同组证据的机械重复复核。
+        dup = write_pack(self.tmp.name, "cap-dup.md", [("cap6.txt", "body6")])
+        with self.assertRaises(review_ledger.LedgerError):
+            review_ledger.merge_and_guard(
+                ledger, [dup], "同一组证据再交一次", "new-evidence")
+
     def test_high_risk_allows_three_rounds(self):
         ledger = self.new_ledger(risk="high")
         self.assertEqual(ledger["max_rounds"], 3)
@@ -1427,8 +1455,9 @@ class LedgerTests(unittest.TestCase):
         _, meta3 = review_ledger.merge_and_guard(
             ledger, [fix], "按 F1 整改", "remediation")
         rendered = review_ledger.render_ledger(ledger, meta3)
-        self.assertIn("弹性追加第 1/2 轮", rendered)
+        self.assertIn("本轮是整改后的定向复核", rendered)
         self.assertIn("不自动安排下一轮复核", rendered)
+        self.assertIn("仍可按原授权再次发起定向复核", rendered)
         self.assertIn("不重做全量审计", rendered)
 
     def test_pack_without_items_is_rejected(self):
@@ -1724,7 +1753,11 @@ class SecurityBudgetTests(unittest.TestCase):
         self.assertEqual(meta["ordinary_used"], 4)
         self.assertEqual(meta["ordinary_remaining"], 0)
         self.assertEqual(meta["extra_index"], 0)
-        self.assertIn("Security 独立追加第 1/1 轮", review_ledger.render_ledger(ledger, meta))
+        rendered = review_ledger.render_ledger(ledger, meta)
+        self.assertIn("本轮针对具体安全风险", rendered)
+        self.assertIn("只是依据标签", rendered)
+        self.assertNotIn("Security 独立追加第", rendered)
+        self.assertNotIn("额度用尽后必须停下", rendered)
         self.assertIn("E5", merged)
 
     def test_pending_security_call_is_counted_but_not_blocking(self):
@@ -4076,21 +4109,30 @@ class WorkflowTierTests(unittest.TestCase):
         self.assertIn("不顺手扩大范围", self.skill)
         self.assertIn("不省略关键攻击测试", self.skill)
 
-    def test_independent_review_has_budget_and_stop_conditions(self):
-        """独立复核默认 1 次终审、最多 2 轮，且 P0/P1 不得因上限被放过。"""
+    def test_independent_review_is_evidence_driven_without_fixed_cap(self):
+        """独立复核默认 1 次终审、无固定次数上限；追加须有新证据，P0/P1 不得被放过。"""
         self.assertIn("默认 1 次只读终审", self.skill)
-        self.assertIn("独立复核最多 2 轮；到顶即停", self.skill)
+        self.assertIn("独立复核没有固定次数上限", self.skill)
+        self.assertIn("取代此前「最多 2 轮；到顶即停」", self.skill)
         self.assertIn("新的 P0/P1、关键不变量失效、或证据不足以判断安全性", self.skill)
         self.assertIn("不得把未解决的 P0/P1 标成 PASS", self.skill)
+        self.assertIn("PARTIAL 不是默认终态", self.skill)
         self.assertIn("不重跑未变更区域的完整调查", self.skill)
         self.assertIn("P2 在有依据时可延后", self.skill)
+        # 追加复核仍受证据闸门约束：同组证据 / 只改措辞不算再次复核理由
+        self.assertIn("新增或变化证据", self.skill)
+        self.assertIn("同一问题、同一组证据", self.skill)
+        self.assertIn("不构成再次复核的理由", self.skill)
         # 独立复核的执行者不是「本通道付费调用」
         self.assertIn("档位不构成调用理由", self.skill)
         # 与台账付费轮次是两回事，不能被混用
         self.assertIn("互不替代", self.skill)
         self.assertIn("也不互相豁免", self.skill)
-        self.assertIn("独立复核的 2 轮上限本阶段不变", self.skill)
-        self.assertIn("台账无上限不能用来绕过独立复核的停止条件", self.skill)
+        self.assertIn("台账不能用来绕过", self.skill)
+        self.assertIn("G4 可信复核门禁", self.skill)
+        # 文档层不得再出现固定的独立复核次数停止门
+        self.assertNotIn("独立复核最多 2 轮", self.skill)
+        self.assertNotIn("2 轮上限本阶段不变", self.skill)
 
     def test_tiers_do_not_introduce_new_modes(self):
         """档位是评审深度，不是新路由：模式集合与脚本参数保持原样。"""

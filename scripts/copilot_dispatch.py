@@ -556,7 +556,7 @@ def start(path: str, goal: str, mode: str = "", note: str = "",
         except (TypeError, ValueError):
             raise DispatchError(f"rounds_limit={rounds_limit!r} 不是整数。") from None
         if limit <= 0:
-            raise DispatchError("rounds_limit 必须是正整数（8 轮检查点不受此限制）。")
+            raise DispatchError("rounds_limit 必须是正整数（该字段只作观察，不构成停止条件）。")
     max_req = _budget_int(max_requests, "max_requests")
     max_tok = _budget_int(max_total_tokens, "max_total_tokens")
     # 两种后端默认都不设请求/Token 上限（NATIVE_DEFAULT_* 为 None）：用量只记录进审计，
@@ -3619,7 +3619,7 @@ def _render_sections(state: dict, cfg: dict, prompt_repeat: bool) -> tuple[list[
     quota = state.get("quota") or {}
     seq = int(state.get("round_seq") or 0)
     limit = budget.get("rounds_limit")
-    limit_text = f"（软上限 {limit}）" if limit else ""
+    limit_text = f"（历史观察字段 {limit}，不构成停止条件）" if limit else ""
     checkpoint = int(budget.get("checkpoint_every") or CHECKPOINT_EVERY)
     on_checkpoint = seq > 0 and seq % checkpoint == 0
     quota_state = str(quota.get("state") or "ok")
@@ -4185,17 +4185,16 @@ def main(argv: list[str] | None = None) -> int:
                          help="执行后端：legacy（默认，主代理直接执行 + manifest）"
                               "或 native（Agent Bridge dispatch/--native-result）")
     p_start.add_argument("--rounds-limit", default="",
-                         help="软轮次上限（可选）；8 轮检查点始终生效，不是硬上限")
+                         help="仅记录为观察字段；不构成停止条件（8 轮检查点同样只提示）")
     p_start.add_argument("--max-requests", default="",
-                         help="本任务请求数硬上限（按审计 call_requested 计数）；"
-                              "native 默认 6，legacy 默认不设限")
+                         help="显式运营上限：本任务请求数硬上限（按审计 call_requested 计数）；"
+                              "不传即不设限（与执行后端无关）")
     p_start.add_argument("--max-total-tokens", default="",
-                         help="本任务累计 Token 阈值（按审计 usage 核算）；"
-                              "native 默认 500000。usage 响应后才知道，"
-                              "不是严格上界")
+                         help="显式运营阈值：本任务累计 Token（按审计 usage 核算）；"
+                              "不传即不设限。usage 响应后才知道，不是严格上界")
     p_start.add_argument("--no-budget-projection", action="store_true",
                          help="关闭按上一次调用总量做的保守预估拦截"
-                              "（仍保留请求数硬上限与 usage 阈值）")
+                              "（仅在显式给出 Token 阈值时才有实际效果）")
     p_start.add_argument("--criteria-file", default="",
                          help="结构化完成条件 JSON（数组：字符串或 {criterion_id, description}）；"
                               "留空时从合同「## 完成条件」列表解析")
