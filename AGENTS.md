@@ -6,9 +6,9 @@
 
 ## 1. 项目定位
 
-Copilot 是 ZCode 上的**任务管理与判断通道**：GPT-6.1-SOL 负责认知判断与任务安排，
-ZCode 主代理负责现场执行与调度，原生子代理承担执行与独立复核，Copilot 状态层负责
-合同、轮次、证据与门禁（G1–G4）。
+Copilot 是 ZCode 上的**任务承接与协作治理层**：按需经 SOL 获取高级工程决策；用户侧 ChatGPT
+负责需求与产品层目标、交接与验收，ZCode 原生 Agent 负责工程调查、规划、执行与调度。原生子代理
+承担执行与独立复核，Copilot 状态层负责合同、轮次、证据与门禁（G1–G4）。
 
 - 本仓库是**唯一源码**。`~/.zcode/skills/copilot` 与 `~/.zcode/agents/reviewer.md`
   是构建产物，只能由 `scripts-sync/sync_runtime.py` 单向下发，不得直接编辑。
@@ -17,12 +17,16 @@ ZCode 主代理负责现场执行与调度，原生子代理承担执行与独�
 
 ## 2. 角色职责
 
+顶层协作角色按 `docs/PROJECT-CHARTER.md` 的六角色定义：用户、ChatGPT（用户侧）、Copilot、SOL、
+ZCode 原生 Agent、DesignWise。下表只列本仓库直接约束的执行侧与通道侧分工；Executor / Reviewer 是
+ZCode 工程执行体系内的子角色，不是与六角色并列的顶层角色。
+
 | 角色 | 职责 | 关键限制 |
 |---|---|---|
-| SOL（GPT-6.1-SOL High） | 需求理解、产品探索、方案规划、技术评估、任务定义、进度判断、结果验收 | 零工具；只经 `scripts/call_gpt.py` 走 CPA；不读文件、不跑命令、不取证 |
+| SOL（GPT-6.1-SOL High） | 高级工程判断、技术方案取舍、风险分析；依据提交证据给出工程工作安排及工程结果判断 | 零工具；只经 `scripts/call_gpt.py` 走 CPA；不读文件、不跑命令、不取证；意见不是授权、执行结果或独立复核 |
 | ZCode 主代理 | 现场调查、工程规划、实现、调试、测试、交付；派发子代理；执行自检与必要的独立复核 | 不擅自改变产品目标、业务规则或授权范围 |
 | Executor 子代理 | 按工作项执行具体实现与取证，回报事实 | 有工具但无最终判断权；不得替代 Reviewer |
-| Reviewer 子代理 | 在独立上下文基于真实文件、diff、测试日志与原始证据给出复核结论 | 只读（`Read,Grep,Glob,Bash`，禁止 `Write,Edit`）；不得修改代码或代替执行方 |
+| Reviewer 子代理 | 在独立上下文基于真实文件、diff、测试日志与原始证据给出复核结论 | 只读工具集（`Read,Grep,Glob,Bash`，禁止 `Write,Edit`）；这是提示词与工具配置层面的要求，不是操作系统沙箱；不得修改代码或代替执行方 |
 | Copilot 状态层 | 合同、轮次、证据登记、四门、收口、审计 | 是脚本与状态，不是模型；门禁不得绕过 |
 
 **模型独立 ≠ Agent 独立。** 共享同一 Provider/模型不等于共享上下文、会话或判断。
@@ -33,8 +37,10 @@ Reviewer 跟随主代理模型就认为它与主代理或执行方“同一个 A
 ## 3. 模型路由规则
 
 - **SOL 固定**：`gpt-6.1-sol` + `reasoning.effort=high`，经 CPA 零工具通道调用；
-  请求体不得包含 `tools`，不得自动降档，不得用 `--model` 覆盖。SOL 的模型与路由
-  未经用户明确授权不得修改。
+  请求体不得包含 `tools`，不得自动降档。标准 SOL／自动协作通道不得用 `--model` 覆盖模型与路由；
+  不带 `--dispatch-state` 的手动一次性调用仍可用 `--model`（见 `SKILL.md` 模型段落），
+  按手动模式留痕（`model_source=override`），不属于自动协作通道，也不改变本条默认路由。
+  SOL 的模型与路由未经用户明确授权不得修改。
 - **Executor / Reviewer 继承主代理**：Profile 中省略 `model` 或写 `model: inherit`，
   Provider/模型/推理级别跟随主代理当前会话。不得写死官方 DeepSeek 直连模型或任何
   固定 Provider；`thoughtLevel` 只在钉死具体模型时生效，`inherit` 下忽略。

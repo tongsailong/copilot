@@ -1,13 +1,19 @@
 # STATUS
 
-更新：2026-11-08 CST。本文件只记录现场可核实的事实；规划与未完成事项单独标注。
+更新：2026-11-09 CST。本文件只记录现场可核实的事实；规划与未完成事项单独标注。
 
 ## 当前阶段
 
-- **Phase 3.6**：离线协议、校验、信封生成、异常/幂等测试与兼容性已完成；
-  **真实 SOL 端到端（C4）尚未执行**——没有获得真实调用授权，未发起任何 GPT/SOL 请求。
+- **Phase 3.6**：离线协议、校验、信封生成、异常/幂等测试与兼容性已完成；**完整 Native Bridge
+  端到端（C4）仍未执行、未验证**。2026-11-08 在用户授权下完成过 **4 次真实 SOL HTTP 调用**，
+  只做链路自检（字段省略、截断识别、一次升档恢复），不构成 C4 验收，也不构成完整业务闭环。
 - **Phase 4（部分落地，2026-11-08）**：SOL 自动重判/收口与 PARTIAL 自动推进已实现并通过
   离线全链路测试；Reviewer 自动派发、可信复核记录升级仍未开始，需单独授权。
+- **文档与代码口径（2026-11-09）**：`SKILL.md`、`references/role.md`、项目 `AGENTS.md`、
+  `docs/PROJECT-CHARTER.md` 的现行文本已统一到 ChatGPT 自定义指令 v5.3.2；历史预算与旧角色
+  口径保留并加替代注，不改写当时事实。同日清理了 Python 侧会进入运行时提示的旧预算文字
+  （`review_ledger.py` / `call_gpt.py` / `copilot_dispatch.py`），并把独立复核的「最多 2 轮；
+  到顶即停」改为证据驱动的无固定次数上限；见下文「本轮收口」。
 
 ## 源码与运行时
 
@@ -21,6 +27,7 @@
 | 分发的 Reviewer 文件 | 1 个（`agents/reviewer.md`） |
 | 首次同步 | 2026-11-02 20:25–20:26 CST |
 | 同步前备份 | `/home/ctyun/.zcode/backups/copilot-presync-20261102-202527` |
+| 最近同步 | 2026-11-09（SKILL.md、call_gpt.py、copilot_dispatch.py、review_ledger.py 共 4 个文件） |
 
 首次同步结果：
 
@@ -34,9 +41,8 @@
 
 ## 测试基线
 
-- 源码仓库：**727 tests OK**（`python3 -B -m unittest discover -s tests -p 'test_*.py'`，
-  2026-11-08；预算解除、输出预算、PARTIAL 自动闭环与三项收尾修复落地后全量复跑）。
-  此前基线 711（本轮新增 16 项）。
+- 源码仓库：**728 tests OK**（`python3 -B -m unittest discover -s tests -p 'test_*.py'`，
+  2026-11-09；本轮新增 1 项「旧额度上限之外仍可凭新证据复核」）。此前基线 727（2026-11-08）。
 - 迁移前运行时基线：561 tests OK；新增 `tests/test_sync_runtime.py` 19 项。
 - 迁移适配：7 个测试原先从自身文件位置推断宿主目录，源码移出 `~/.zcode` 后失败；
   已改为显式 `~/.zcode/references`、`~/.zcode/skills`，并断言导入模块来自当前 checkout。
@@ -103,7 +109,11 @@
   源基线重建为 13 个文件（含既有 `scripts/reply_protocol.py`）；配置前 Reviewer
   运行时备份在 `~/.zcode/backups/copilot-reviewer-model-route-20261103-114752/`。
 
-## REVIEW 弹性预算（2026-11-04）
+## REVIEW 弹性预算（2026-11-04；历史实施记录，非现行预算规则）
+
+> **状态（2026-11-09）**：本节记录当时已落地并验证的机制，**已由 2026-11-08 的预算解除取代**
+> （`docs/DECISIONS.md` 第 16 条）。默认 2/3 轮与 +2/+3 追加额度现在只是观察输出，不是停止
+> 条件；下文保留当时事实，不作为当前规则引用。
 
 - **实际阻塞证据**：万年历广告对齐任务 `rili-ad-alignment-20261103`
   （台账 `/tmp/copilot/rili-align-20261103/review.json`）第 1 轮 PARTIAL、第 2 轮
@@ -135,7 +145,11 @@
   SOL 模型（`gpt-6.1-sol` + `reasoning.effort=high`）与 CPA 路由；未发起真实 SOL 调用。
 - **已本地提交（四阶段优化合并提交），未推送、未部署**；仓库无远端。
 
-## Security REVIEW 预算收口（2026-11-04）
+## Security REVIEW 预算收口（2026-11-04；历史实施记录，非现行预算规则）
+
+> **状态（2026-11-09）**：本节的 Security 独立额度与「普通预算用尽后才可用」已由
+> `docs/DECISIONS.md` 第 16 条取代（`security` 现为可随时使用的本轮依据标签，仍要求具体安全
+> 风险与新增证据）。证据去重、call_id 去重、identity 校验等非预算约束继续有效。
 
 - **审计结论**：旧规则（`security` 不设次数、只要求非空理由）可对同一 subject、同一组证据
   连续发起任意多轮 security REVIEW，且绕过证据内容去重；普通预算、台账/审计绑定、模型身份
@@ -234,7 +248,8 @@
   多轮不被固定上限拦截、显式请求/Token 上限仍在出站前拒绝、旧台账兼容。
 - **未验证**：未发起真实 SOL 调用（无付费授权）；真实上游 `max_output_tokens` 默认值、
   截断升档后的实际恢复率、超长证据分段策略均只有单元测试与 Fake Upstream 证据。
-- **未提交**：本次改动仍在工作区，未 commit、未 push、未部署。
+- **提交状态（截至该阶段记录时）**：当时仍在工作区，未 commit、未 push。后续事实：该批改动
+  已随本地提交 `d2ba759`（2026-11-08 20:26）入库；仍未 push，仓库无远端。
 
 ## 真实 SOL 验证（2026-11-08，4 次 HTTP 请求）
 
@@ -281,12 +296,94 @@
   Upstream）；真实 Provider 对极大 `max_output_tokens` 的接受边界、真实超长证据分段后的
   裁决质量、无进展诊断在真实多轮中的效果仍只有单元测试与 Fake Upstream 证据。
 
+## 本轮收口：代码文本与独立复核口径（2026-11-09）
+
+> **此前记录的偏差已处理完毕**：2026-11-09 早先版本的本节列出 5 项「Python 仍保留旧预算文字 /
+> 独立复核仍有 2 轮上限」，现已全部改写，不再存在「披露但未修」的现行偏差。
+
+**独立复核「最多 2 轮」的实际语义（调查结论）**：该上限只写在 `SKILL.md` 的说明文字里，
+`copilot_dispatch.py`、`call_gpt.py`、`copilot_auto.py` 与本机原生子代理链路均无任何按次数的
+强制、拒绝或停止分支；`review_ledger.py --budget` 的 `allowed` 恒为 true、`limits_enforced=false`。
+因此它不是代码级闸门，而是**文档级的验收链停止门**：执行方按文档在 2 轮后即不再组织复核，
+即使已有整改与新证据也一样。按 v5.3.2「默认安排不应成为硬停止门」，本轮改为证据驱动、无固定次数上限。
+
+- **改动范围**：`scripts/review_ledger.py`（模块说明、常量注释、`merge_and_guard` 文档、
+  `render_ledger` 注入文本与 `--budget` 输出）、`scripts/call_gpt.py`（`--extra-round-reason` /
+  `--extra-round-basis` 帮助、`_review_round_meta`、`EXIT_BUDGET` 注释）、
+  `scripts/copilot_dispatch.py`（`--rounds-limit` / `--max-requests` / `--max-total-tokens` /
+  `--no-budget-projection` 帮助、参数校验与 `render_state` 段 8）、`SKILL.md`
+  「评审档位与缺陷处置」§4 与版本沿革、`tests/test_copilot.py`。
+- **没有改动**：状态机、`budget_status` 计算、证据去重、G1–G4、原生独立复核工具集与独立性约束、
+  正式 REVIEW 授权门、模型路由、CPA 配置。
+- **旧数字的去向**：`RISK_MAX_ROUNDS` / `EXTRA_ROUND_ALLOWANCE` / `SECURITY_EXTRA_ALLOWANCE`
+  常量保留，注释标为「旧策略参数，只用于报告与审计追溯」；`--budget` 以「历史参考」展示并注明
+  「不构成停止条件」。继续复核的实际条件仍是「本轮有新增/变化证据 + 写明理由」。
+- **G4 未受影响**：G4 仍要求宿主可信原生复核记录，缺少即 `native_review_missing` fail-closed；
+  `g4_eligible=false` 不变。SOL 的 CONSULT/PLAN 意见依旧不是原生独立复核，也不是授权。
+- **提交**：机制改动已本地提交 `a5c56f2`（`fix(copilot): make review continuation evidence-driven`），
+  未 push；仓库无远端。
+
+### 本轮验证（2026-11-09）
+
+- 全量回归：`python3 -B -m unittest discover -s tests -p 'test_*.py'` → **728 tests OK**。
+- 定向：`tests.test_review_budget`（19 OK）、`tests.test_copilot`（511 OK）、
+  `tests.test_auto_loop` + `tests.test_sync_runtime`（40 OK）。
+- 本地提示捕获（未联网、未付费）：用 `/tmp/copilot/budget-semantics/prompt-check/capture.py`
+  在进程内替换 `write_request_dump`，以 `--mode REVIEW --dry-run` 构建出**真实最终请求体**。
+  第 3 轮（越过旧 2+2+1 上限）的输入中确认包含「复核没有固定轮次上限」「轮次与历史额度数字只用于
+  审计观察，不是继续或停止条件」「本轮复核理由（整改后定向复核）」；旧停止语句
+  （「最多 2 轮」「到顶即停」「额度用尽后必须停下」「等待用户授权」「剩余额度」）均不存在。
+- 运行时同步：`sync_runtime.py --apply` 写入 4 个 Skill 文件，复查 `--check`
+  **缺失 0 / 不同 0 / Reviewer same**；5 个运行时 `tests/*.py` 未受管理并保留。
+  源码与运行时 SHA-256 一致：
+  `SKILL.md` `5f3b6d94…`、`scripts/call_gpt.py` `936da404…`、
+  `scripts/copilot_dispatch.py` `f951c774…`、`scripts/review_ledger.py` `6e722b9e…`；
+  Reviewer `9ef6dccf…` 两侧一致。审计日志 mtime 09:54（本轮 SOL CONSULT），dry-run 未写审计。
+- **未验证**：本轮没有发起任何真实 SOL 调用；未做运行时端的真实 REVIEW 闭环；上述捕获证明的是
+  请求体构建与文本注入，不等于 GPT 端实际解读或裁决质量。
+
+## 文档一致性对齐（2026-11-09）
+
+> **批次说明**：本节记录当日的 Markdown 对齐批次；同日后续的代码文本与独立复核收口见上节
+> 「本轮收口」，两节的范围内表述互不冲突（本节「只改 Markdown」只适用于本批次）。
+
+- **范围**：`SKILL.md`、`references/role.md`、项目 `AGENTS.md`、`docs/PROJECT-CHARTER.md`、
+  `docs/DECISIONS.md`、`docs/ROADMAP.md`、`README.md`、本文件。只改 Markdown，未改 Python、
+  测试、状态机、预算实现、模型路由与 G1–G4。
+- **现行口径**：协作基线统一为 ChatGPT 自定义指令 **v5.3.2**（`chatgpt-v5.3.2-alignment.md`
+  标注为摘要而非原文）；补入六角色边界；删除「每轮一次 / 预算 / 配额」这类把默认观察值写成
+  停止门的表述；明确「一次 drive 至多一次 SOL 调用」只是单轮驱动节流，不是任务总轮次或 HTTP
+  请求总数上限；区分正式 REVIEW、运行时 verdict、原生独立复核与 G4。
+- **历史处理**：SKILL.md / role.md 的版本沿革保留并加替代注；DECISIONS 第 13、14 条标为历史
+  预算方案（由第 16 条取代），第 15 条只标预算/停止条件部分被取代，证据完整性与机器绑定继续
+  有效；STATUS 的 2026-11-04 预算小节标为历史实施记录，不改写当时事实。
+- **真实调用范围**：明确 2026-11-08 的 4 次真实调用只做链路自检（字段省略、截断识别、一次升档
+  恢复），完整 C4 与真实多轮闭环仍未验证。
+- **验证**（本次执行）：
+  - 全量测试 `python3 -B -m unittest discover -s tests -p 'test_*.py'`：**Ran 727 tests, OK**
+    （exit 0）。
+  - 同步：首次 `--apply` 写入 2 个 Skill 文件（`SKILL.md`、`references/role.md`）；修正交叉引用
+    后再次 `--apply` 只写入 `SKILL.md`，Reviewer 无需更新。最终 `--check`：**缺失 0、不同 0、
+    Reviewer same**（exit 0）。运行时仍保留 5 个未受管理 `tests/*.py`（设计上不清理）。
+  - 哈希（该批次结束时）：源与运行时 `SKILL.md` 均为 `d4b3f572…`，`references/role.md` 均为
+    `7c1be8b8…`。
+  - 实际加载：在**独立子代理新上下文**中经 Skill 工具加载 `~/.zcode/skills/copilot/SKILL.md`，
+    确认 description 含「不存在人为默认的轮次、请求数或累计 Token 上限」、正文标题为
+    「copilot：GPT-6.1-SOL 高级工程决策通道」、存在「六角色边界（v5.3.2）」、当前对照为 v5.3.2。
+    项目 `AGENTS.md` 在该子会话上下文中已注入。**注意**：这是子代理新上下文加载，**不是新的
+    桌面/headless 会话**；本机没有可用的 ZCode headless CLI（`/usr/bin/zcode` 指向 Electron
+    桌面应用），因此「新桌面会话加载验证」**未执行**。
+- **未验证**：新桌面会话 / headless 进程级加载验证；真实 SOL 对这些文档的复核（本轮只有一次
+  真实 PLAN 调用，`6eae8e768f390bbb`）。
+
 ## 未验证 / 未完成
 
-- 真实 SOL PLAN 与正式 Native Bridge 端到端循环（C4）：未调用、未验证。
-- 2026-11-08 的 PARTIAL 自动闭环已用真实 SOL 验证主链路；本轮三项收尾修复（默认不限次
-  升档、未知用量、无进展重析）未重新发起真实调用，仍以自动化与 Fake Upstream 为证据。
-  真实上游的默认输出上限绝对值未知（只验证了省略该字段可用、截断可识别、升档可恢复）。
+- **真实 SOL 端到端（C4 / Native Bridge）**：未执行、未验证。2026-11-08 的 4 次真实调用只覆盖
+  默认字段省略、截断识别与一次升档恢复，**不等于**完整闭环，也不替代 C4。
+- **真实多轮业务闭环**：PARTIAL → EXECUTE → REVIEW → PASS 的完整链路目前只有 Fake Upstream
+  全链路测试，**没有**真实 SOL 多轮闭环证据；真实上游的默认输出上限绝对值未知。
+- 2026-11-08 三项收尾修复（默认不限次升档、未知用量、无进展重析）未重新发起真实调用，
+  仍以自动化与 Fake Upstream 为证据。
 - `native_agent.py` 的真实子代理 `metadata.json` + rollout 提取：目前只有单元测试与
   合成记录验证，未用真实 ZCode 子代理运行记录跑通。
 - native 任务在真实执行/复核后的 G1–G4 与正常风险收口：未验证。
@@ -298,7 +395,8 @@
 
 ## 下一任务
 
-1. 获得一次性授权后执行 Phase 3.6 C4（真实 SOL，预算与请求上限见授权包）。
+1. 获得一次性授权后执行 Phase 3.6 C4（真实 SOL，预算与请求上限见授权包）；2026-11-08 的 4 次
+   局部调用不计入 C4 验收。
 2. 在需要时用真实 SOL 复测本轮三项收尾修复：默认不限次升档、未知用量统计、无进展重析
    （需新的一次性授权）。
 3. 达成后按固定流程开发：源码修改 → 测试 → 检查 diff → 同步 → `--check` → 新会话加载。
