@@ -1473,7 +1473,9 @@ class LedgerTests(unittest.TestCase):
         self.assertEqual(review_ledger.parse_verdict("裁决：PASS"), "PASS")
         self.assertEqual(review_ledger.parse_verdict("裁决: partial"), "PARTIAL")
         self.assertEqual(review_ledger.parse_verdict("**裁决：**BLOCKED"), "BLOCKED")
-        self.assertEqual(review_ledger.parse_verdict("裁决：PASS（所有关键条件有证据）"), "PASS")
+        # 裁决值必须是精确三态词：附加叙述不作数（宁可无裁决，不得误判通过）
+        self.assertIsNone(review_ledger.parse_verdict("裁决：PASS（所有关键条件有证据）"))
+        self.assertIsNone(review_ledger.parse_verdict("裁决：PASS —— 证据充分"))
         # 明确且唯一的兼容写法
         self.assertEqual(review_ledger.parse_verdict("最终裁决：PASS"), "PASS")
         self.assertEqual(review_ledger.parse_verdict("整体结论：BLOCKED"), "BLOCKED")
@@ -1481,8 +1483,8 @@ class LedgerTests(unittest.TestCase):
         self.assertEqual(review_ledger.parse_verdict("- **整体结论：BLOCKED。**"), "BLOCKED")
         self.assertEqual(review_ledger.parse_verdict("### 最终裁决\n\n- **整体结论：BLOCKED。**"),
                          "BLOCKED")
-        # 同一裁决重复出现仍然唯一
-        self.assertEqual(review_ledger.parse_verdict("裁决：PASS\n最终裁决：PASS"), "PASS")
+        # 独立且唯一：重复同一裁决行也不接受（不猜哪一行是真裁决）
+        self.assertIsNone(review_ledger.parse_verdict("裁决：PASS\n最终裁决：PASS"))
         # 解析不到、模板、冲突、裸结论、伪造位置都必须回落 None
         self.assertIsNone(review_ledger.parse_verdict("看起来还行"))
         self.assertIsNone(review_ledger.parse_verdict("结论：PASS"))
@@ -1492,6 +1494,13 @@ class LedgerTests(unittest.TestCase):
         self.assertIsNone(review_ledger.parse_verdict("裁决：PASS / PARTIAL"))
         self.assertIsNone(review_ledger.parse_verdict("裁决：PASSED"))
         self.assertIsNone(review_ledger.parse_verdict("裁决：BLOCKEDNESS"))
+        # 否定句里的三态词不能落成该结论（否则明确拒绝会被记成 PASS）
+        self.assertIsNone(review_ledger.parse_verdict("裁决：未达到 PASS 标准"))
+        self.assertIsNone(review_ledger.parse_verdict("裁决：不能判 PASS，因为证据缺失"))
+        self.assertIsNone(review_ledger.parse_verdict("整体结论：不通过（PASS 条件未满足）"))
+        self.assertIsNone(review_ledger.parse_verdict("裁决：PASS 条件未满足"))
+        self.assertIsNone(review_ledger.parse_verdict("裁决：not PASS"))
+        self.assertEqual(review_ledger.parse_verdict("裁决：未通过 PASS 之外的条件"), None)
         self.assertIsNone(review_ledger.parse_verdict("裁决：PASS\n裁决：BLOCKED"))
         self.assertIsNone(review_ledger.parse_verdict("> 裁决：PASS"))
         self.assertIsNone(review_ledger.parse_verdict("  > 裁决：PASS"))
@@ -1499,6 +1508,9 @@ class LedgerTests(unittest.TestCase):
         self.assertIsNone(review_ledger.parse_verdict("~~~text\n裁决：PASS\n~~~"))
         self.assertIsNone(review_ledger.parse_verdict("**裁决：PASS/PARTIAL**"))
         self.assertIsNone(review_ledger.parse_verdict("    裁决：PASS"))
+        self.assertIsNone(review_ledger.parse_verdict("\t裁决：PASS"))
+        self.assertIsNone(review_ledger.parse_verdict("\t 裁决：PASS"))
+        self.assertIsNone(review_ledger.parse_verdict("裁决：PASS\n裁决：PASS"))
         self.assertIsNone(review_ledger.parse_verdict("示例：裁决：PASS"))
         self.assertIsNone(review_ledger.parse_verdict(
             '```copilot-plan\n{"decision": "blocked", "actions": []}\n```'))
@@ -5189,6 +5201,36 @@ class ReviewHardeningTests(VerifiedIngestMixin, unittest.TestCase):
                 call_gpt.assert_distinct_paths(args)
             self.assertEqual(ctx.exception.code, call_gpt.EXIT_USAGE)
 
+    def test_same_file_rejects_segmentation_plan_alias_of_ledger(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = os.path.join(tmp, "ledger.json")
+            with open(ledger, "w", encoding="utf-8") as fh:
+                fh.write("{}\n")
+            plan = os.path.join(tmp, "plan.json")
+            os.symlink(ledger, plan)
+            args = types.SimpleNamespace(
+                audit_log="", out="", dump_request="", review_ledger=ledger,
+                dispatch_state="", segmentation_plan=plan,
+                role_file="", prompt_file="", evidence=[])
+            with self.assertRaises(SystemExit) as ctx:
+                call_gpt.assert_distinct_paths(args)
+            self.assertEqual(ctx.exception.code, call_gpt.EXIT_USAGE)
+
+    def test_same_file_rejects_output_alias_of_evidence_input(self):
+        # --out 与 --evidence 同文件：任何回复写入都会覆盖本轮输入证据。
+        with tempfile.TemporaryDirectory() as tmp:
+            pack = os.path.join(tmp, "pack.md")
+            with open(pack, "w", encoding="utf-8") as fh:
+                fh.write("# 证据包\n")
+            link = os.path.join(tmp, "reply.md")
+            os.symlink(pack, link)
+            args = types.SimpleNamespace(
+                audit_log="", out=link, dump_request="", review_ledger="",
+                dispatch_state="", role_file="", prompt_file="", evidence=[pack])
+            with self.assertRaises(SystemExit) as ctx:
+                call_gpt.assert_distinct_paths(args)
+            self.assertEqual(ctx.exception.code, call_gpt.EXIT_USAGE)
+
     def test_malformed_response_structures_are_rejected(self):
         cases = [
             {"status": "completed", "output": ["not-a-dict"]},
@@ -6566,6 +6608,26 @@ class QuotaCallChainTests(unittest.TestCase):
         self.assertEqual(self.quota()["state"], "ok")
         self.assertEqual(len(self.calls), 2)
 
+    def test_http_200_with_quota_body_exits_8_and_persists_waiting(self):
+        """HTTP 200 也可能把配额/冷却错误包在成功体里，必须与 429 同走配额通道。"""
+        self.status = 200
+        self.body = {"id": "resp_quota_200", "status": "completed",
+                     "error": {"code": "usage_limit_reached",
+                               "resets_in_seconds": 900}}
+        self.expect_exit(call_gpt.EXIT_QUOTA)
+        quota = self.quota()
+        self.assertEqual(quota["state"], "waiting")
+        self.assertEqual(quota["code"], "usage_limit_reached")
+        self.assertEqual(quota["reset_seconds"], 900)
+        state = self.load()
+        self.assertIsNone(state["pending_call"])
+        self.assertEqual(state["rounds"], [])
+        self.assertEqual(state["actions"], [])
+        self.assertEqual(len(self.calls), 1, "配额错误不得自动重试")
+        self.assertFalse(os.path.exists(self.out), "配额失败不得写出回复文件")
+        self.assertIn("reset_seconds=900", self.err.getvalue())
+        self.assertIn("usage_limit_reached", self.err.getvalue())
+
     def test_invalid_reset_seconds_is_treated_as_unknown(self):
         for value in (-5, "600", None):
             copilot_dispatch.clear_quota(self.state_path, "测试重置")
@@ -6883,9 +6945,17 @@ class ContextBudgetTests(unittest.TestCase):
                        "不是现场证据"):
             self.assertIn(marker, text)
 
-    def test_goal_is_clipped_at_1500(self):
+    def test_goal_uses_protected_budget_not_short_quote_budget(self):
+        # 目标是保护段：1500 字符以内不截断（旧行为会截断，导致模型看不到完整目标）。
         state = copilot_dispatch.load_state(self.state_path)
         state["goal"] = "目标" + "长" * 3000
+        text = copilot_dispatch.render_state(state)
+        self.assertIn(state["goal"], text)
+        self.assertNotIn("完整目标", text)
+
+    def test_goal_is_clipped_beyond_protected_budget(self):
+        state = copilot_dispatch.load_state(self.state_path)
+        state["goal"] = "目标" + "长" * (copilot_dispatch.MAX_PROTECTED_SECTION_CHARS + 500)
         text = copilot_dispatch.render_state(state)
         self.assertIn("已截断", text)
         self.assertIn("完整目标", text)
@@ -6941,20 +7011,86 @@ class ContextBudgetTests(unittest.TestCase):
         self.assertIn("不是现场证据", text)
 
     def test_budget_boundary_20000_and_20001(self):
-        # 用工作项标题（不受裁剪）精确把未裁剪长度调到 20000 / 20001。
+        # 用目标段（保护段预算内不受裁剪）精确把未裁剪长度调到 20000 / 20001。
         state = self._fat(n=24, result_len=600, title_len=0)
+        state["goal"] = "G"
         base = self._measure(state)
-        filler = copilot_dispatch.MAX_RENDER_CHARS - base
+        filler = copilot_dispatch.MAX_RENDER_CHARS - base + 1
         self.assertGreater(filler, 0, "构造的状态应在默认预算内，便于精确调整到边界")
-        state["actions"][0]["title"] = "T" * filler
+        self.assertLessEqual(filler, copilot_dispatch.MAX_PROTECTED_SECTION_CHARS,
+                             "填充物必须能完整放进保护段，否则测量不再精确")
+        state["goal"] = "G" * filler
         self.assertEqual(self._measure(state), copilot_dispatch.MAX_RENDER_CHARS)
         exact = copilot_dispatch.render_state(state)
         self.assertNotIn("注入预算裁剪", exact)
         self.assertLessEqual(len(exact), copilot_dispatch.MAX_RENDER_CHARS)
-        state["actions"][0]["title"] = "T" * (filler + 1)
+        state["goal"] = "G" * (filler + 1)
         trimmed = copilot_dispatch.render_state(state)
         self.assertIn("注入预算裁剪", trimmed)
         self.assertLessEqual(len(trimmed), copilot_dispatch.MAX_RENDER_CHARS)
+        # 裁剪只压缩可裁剪段，保护段（目标/条件/边界）仍完整。
+        self.assertIn(state["goal"], trimmed)
+        self.assertIn("条件甲", trimmed)
+        self.assertIn("不联网", trimmed)
+
+    def _with_criteria(self, descriptions: list[str]) -> dict:
+        state = copilot_dispatch.load_state(self.state_path)
+        state["contract"]["criteria"] = [
+            {"criterion_id": f"C{idx}", "description": text, "status": "open",
+             "evidence_refs": []}
+            for idx, text in enumerate(descriptions, start=1)]
+        state["contract"]["criteria_state"] = "confirmed"
+        state["contract"]["confirmed_round_id"] = "task-ctx-r1"
+        return state
+
+    def test_criteria_are_never_dropped_inside_protected_budget(self):
+        # 条件段超过旧的 1500 字符引用预算后，仍必须逐条出现（只截断单条描述）。
+        descriptions = [f"条件{idx:02d}：" + "描" * 300 for idx in range(1, 9)]
+        state = self._with_criteria(descriptions)
+        text = copilot_dispatch.render_state(state)
+        for idx in range(1, 9):
+            self.assertIn(f"C{idx}", text)
+        self.assertNotIn("省略", text)
+        self.assertLessEqual(len(text), copilot_dispatch.MAX_RENDER_CHARS)
+
+    def test_single_long_criterion_is_clipped_not_dropped(self):
+        state = self._with_criteria(["长条件：" + "描" * 2000, "短条件"])
+        text = copilot_dispatch.render_state(state)
+        self.assertIn("C1", text)
+        self.assertIn("C2", text)
+        self.assertIn(f"本条描述已截断至 {copilot_dispatch.MAX_CRITERION_CHARS} 字符", text)
+        self.assertIn("短条件", text)
+
+    def test_criteria_over_protected_budget_fails_closed(self):
+        # 整段条件超出保护段预算时明确拒绝渲染，不产生「其余 N 条省略」的不完整合同。
+        descriptions = [f"条件{idx:02d}：" + "描" * 900 for idx in range(1, 12)]
+        state = self._with_criteria(descriptions)
+        with self.assertRaises(copilot_dispatch.DispatchError) as ctx:
+            copilot_dispatch.render_state(state)
+        self.assertIn("超过保护段预算", str(ctx.exception))
+        self.assertIn("拆分任务", str(ctx.exception))
+
+    def test_long_terminal_actions_use_compact_tier(self):
+        # 终态工作项多到任何常规档都超预算时，退到最低档压缩表示，而不是直接抛错。
+        state = self._fat(n=120, result_len=600, title_len=10)
+        text = copilot_dispatch.render_state(state)
+        self.assertLessEqual(len(text), copilot_dispatch.MAX_RENDER_CHARS)
+        self.assertIn("已终态工作项 120 项", text)
+        self.assertIn("终态工作项仅保留 id/状态汇总（120 项）", text)
+        self.assertIn("T1(done)", text)
+        self.assertIn("条件甲", text)
+
+    def test_compact_tier_keeps_open_actions_and_blockers(self):
+        state = self._fat(n=120, result_len=600, title_len=10)
+        state["actions"].append({
+            "id": "T121", "title": "未完成项", "status": "blocked",
+            "depends_on": [], "assignee": "zcode",
+            "result": "等待上游授权", "evidence_ids": [], "blocked_reason": "等待授权"})
+        text = copilot_dispatch.render_state(state)
+        self.assertLessEqual(len(text), copilot_dispatch.MAX_RENDER_CHARS)
+        self.assertIn("未终态工作项（完整）", text)
+        self.assertIn("- T121 [blocked] 未完成项", text)
+        self.assertIn("等待上游授权", text)
 
     def test_quota_waiting_is_rendered(self):
         copilot_dispatch.record_quota(self.state_path, {"reset_seconds": 600})
@@ -7500,6 +7636,20 @@ class ClosureGateTests(StageTwoT3Fixture, unittest.TestCase):
     def test_g2_requires_pass_round(self):
         check = copilot_dispatch.closure_check(self.state)
         self.assertIn("no_pass_round", self.codes(check))
+
+    def test_g2_rejects_old_pass_when_latest_judgment_is_partial(self):
+        """最新判断是 partial 时，旧 PASS 已被覆盖，四门不得据此核销。"""
+        self.completed_state()
+        self.assertTrue(copilot_dispatch.closure_check(self.state)["passed"])
+        self.ingest(self.state, self.plan_reply({
+            "decision": "continue", "verdict": "partial",
+            "summary": "复核发现缺口，需要补证据",
+        }), "PLAN")
+        check = copilot_dispatch.closure_check(self.state)
+        self.assertFalse(check["passed"])
+        self.assertIn("latest_judgment_not_pass", self.codes(check))
+        self.assertFalse(check["gates"]["G2"]["passed"])
+        self.assertEqual(check["round_id"], "")
 
     def test_g2_rejects_unconfirmed_criteria(self):
         self.state["rounds"].append({

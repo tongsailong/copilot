@@ -55,6 +55,406 @@ class ReviewHandoffBase(NativeBridgeBase):
                     marker: str = "REVIEWER-RAW-MARKER") -> str:
         return self.write(name, f"# Reviewer 原始报告\n\n{marker}\n结论：pass\n")
 
+    def native_raw(self, name: str = "native-review.json",
+                   **payload) -> str:
+        data = {"schema": "copilot-native-review/v1", "verdict": "blocked"}
+        data.update(payload)
+        return self.write(name, json.dumps(data, ensure_ascii=False))
+
+
+class NativeRawVerdictFidelityTests(ReviewHandoffBase):
+    def test_registration_rejects_verdict_that_rewrites_raw_review(self):
+        fixture = self.legacy_state("native-raw-mismatch")
+        raw = self.native_raw(verdict="blocked")
+        before = len(fixture["state"]["evidence"])
+        with self.assertRaises(D.DispatchError) as ctx:
+            D.register_review_evidence(
+                fixture["state"], file_path=raw,
+                review_of=fixture["exec_report_sha256"],
+                review_of_kind="execution-report", review_source="legacy",
+                verdict="partial",
+                round_id=fixture["state"]["rounds"][-1]["round_id"])
+        self.assertIn("不一致", str(ctx.exception))
+        self.assertEqual(len(fixture["state"]["evidence"]), before)
+
+    def test_report_rejects_verdict_that_differs_from_registered_evidence(self):
+        fixture = self.legacy_state("native-raw-report-mismatch")
+        raw = self.native_raw(verdict="blocked")
+        evidence = D.register_review_evidence(
+            fixture["state"], file_path=raw,
+            review_of=fixture["exec_report_sha256"],
+            review_of_kind="execution-report", review_source="legacy",
+            verdict="blocked",
+            round_id=fixture["state"]["rounds"][-1]["round_id"])
+        with self.assertRaises(D.DispatchError) as ctx:
+            D.add_report(
+                fixture["state"], "把 blocked 改写成 partial", kind="review",
+                review_of=fixture["exec_report_sha256"], verdict="partial",
+                review_of_kind="execution-report", evidence_id=evidence["id"],
+                raw_report_sha256=evidence["sha256"], review_source="legacy")
+        self.assertIn("不一致", str(ctx.exception))
+
+    def test_matching_native_raw_verdict_is_accepted(self):
+        fixture = self.legacy_state("native-raw-match")
+        raw = self.native_raw(verdict="blocked")
+        evidence = D.register_review_evidence(
+            fixture["state"], file_path=raw,
+            review_of=fixture["exec_report_sha256"],
+            review_of_kind="execution-report", review_source="legacy",
+            verdict="blocked",
+            round_id=fixture["state"]["rounds"][-1]["round_id"])
+        report = D.add_report(
+            fixture["state"], "原始结论为 blocked", kind="review",
+            review_of=fixture["exec_report_sha256"], verdict="blocked",
+            review_of_kind="execution-report", evidence_id=evidence["id"],
+            raw_report_sha256=evidence["sha256"], review_source="legacy")
+        self.assertEqual(report["verdict"], "blocked")
+        self.assertEqual(evidence["verdict"], "blocked")
+
+    def test_native_schema_without_valid_verdict_is_rejected(self):
+        fixture = self.legacy_state("native-raw-no-verdict")
+        for payload in ({"verdict": ""}, {"verdict": "unknown"}):
+            with self.subTest(payload=payload):
+                raw = self.native_raw(name=f"raw-{payload['verdict'] or 'empty'}.json",
+                                      **payload)
+                with self.assertRaises(D.DispatchError):
+                    D.register_review_evidence(
+                        fixture["state"], file_path=raw,
+                        review_of=fixture["exec_report_sha256"],
+                        review_of_kind="execution-report",
+                        review_source="legacy", verdict="blocked",
+                        round_id=fixture["state"]["rounds"][-1]["round_id"])
+
+    def test_schema_match_ignores_case_and_surrounding_space(self):
+        fixture = self.legacy_state("native-raw-schema-case")
+        raw = self.write("raw-case.json", json.dumps({
+            "schema": "  Copilot-Native-Review/V1 ", "verdict": "blocked"}))
+        evidence = D.register_review_evidence(
+            fixture["state"], file_path=raw,
+            review_of=fixture["exec_report_sha256"],
+            review_of_kind="execution-report", review_source="legacy",
+            verdict="blocked",
+            round_id=fixture["state"]["rounds"][-1]["round_id"])
+        self.assertEqual(evidence["verdict"], "blocked")
+        # 大写声明同样受原始结论约束，不能借大小写差异绕过一致性检查。
+        with self.assertRaises(D.DispatchError):
+            D.register_review_evidence(
+                fixture["state"], file_path=raw,
+                review_of=fixture["exec_report_sha256"],
+                review_of_kind="execution-report", review_source="legacy",
+                verdict="partial",
+                round_id=fixture["state"]["rounds"][-1]["round_id"])
+
+    def test_truncated_native_json_is_rejected(self):
+        fixture = self.legacy_state("native-raw-truncated")
+        raw = self.write("raw-truncated.json", (
+            '{"schema": "copilot-native-review/v1", "verdict": "blocked"'))
+        before = len(fixture["state"]["evidence"])
+        with self.assertRaises(D.DispatchError) as ctx:
+            D.register_review_evidence(
+                fixture["state"], file_path=raw,
+                review_of=fixture["exec_report_sha256"],
+                review_of_kind="execution-report", review_source="legacy",
+                verdict="blocked",
+                round_id=fixture["state"]["rounds"][-1]["round_id"])
+        self.assertIn("不是", str(ctx.exception))
+        self.assertEqual(len(fixture["state"]["evidence"]), before)
+
+    def test_truncated_native_json_variants_still_fail_closed(self):
+        fixture = self.legacy_state("native-raw-truncated-variants")
+        before = len(fixture["state"]["evidence"])
+        for name, text in (
+                ("raw-truncated-upper.json",
+                 '{"schema": "COPILOT-NATIVE-REVIEW/V1", "verdict": "pass"'),
+                ("raw-truncated-escaped.json",
+                 '{"schema": "copilot-native-review\\/v1", "verdict": "pass"'),
+                ("raw-truncated-unicode.json",
+                 '{"schema": "copilot-native-review\\u002fv1", "verdict": "pass"'),
+                ("raw-truncated-space.json",
+                 '{"schema": "copilot-native-review/v1   ", "verdict": "pass"'),
+                ("raw-truncated-escaped-value.json",
+                 '{"schema": "copilot-native-rev\\u0069ew/v1", '
+                 '"verdict": "pass"'),
+                ("raw-truncated-escaped-field.json",
+                 '{"sch\\u0065ma": "copilot-native-review/v1", '
+                 '"verdict": "pass"'),
+                ("raw-truncated-json-no-schema.json",
+                 '{"verdict": "pass"'),
+                ("raw-truncated-fenced.json",
+                 '```json\n{"schema": "copilot-native-review/v1", '
+                 '"verdict": "pass"'),
+                ("raw-truncated-fenced-escaped.json",
+                 '```json\n{"schema": "copilot-native-rev\\u0069ew/v1", '
+                 '"verdict": "pass"'),
+                ("raw-truncated-fenced-escaped-field.json",
+                 '```\n{"sch\\u0065ma": "copilot-native-review/v1", '
+                 '"verdict": "pass"'),
+                ("raw-truncated-fenced-extra-info.json",
+                 '```json extra info\n{"schema": '
+                 '"copilot-native-rev\\u0069ew/v1", "verdict": "pass"')):
+            with self.subTest(name=name):
+                raw = self.write(name, text)
+                with self.assertRaises(D.DispatchError):
+                    D.register_review_evidence(
+                        fixture["state"], file_path=raw,
+                        review_of=fixture["exec_report_sha256"],
+                        review_of_kind="execution-report",
+                        review_source="legacy", verdict="pass",
+                        round_id=fixture["state"]["rounds"][-1]["round_id"])
+                self.assertEqual(len(fixture["state"]["evidence"]), before)
+
+    def test_prose_report_with_json_fence_stays_legacy(self):
+        # 整份报告不是纯 JSON/单围栏 → 只有不声明 native schema 时才按 legacy 文本。
+        fixture = self.legacy_state("legacy-prose-fence")
+        raw = self.write("raw-prose-fence.md", (
+            "# 复核结论\n\n结论：不通过。\n\n```json\n"
+            '{"verdict": "pass"}\n```\n'))
+        evidence = D.register_review_evidence(
+            fixture["state"], file_path=raw,
+            review_of=fixture["exec_report_sha256"],
+            review_of_kind="execution-report", review_source="legacy",
+            verdict="blocked",
+            round_id=fixture["state"]["rounds"][-1]["round_id"])
+        self.assertEqual(evidence["verdict"], "blocked")
+
+    def test_prose_report_declaring_schema_is_rejected(self):
+        # 散文里夹了明文 schema 声明：按「声明了 native schema」拒绝，不放成 legacy。
+        fixture = self.legacy_state("legacy-prose-literal-schema")
+        raw = self.write("raw-prose-literal.md", (
+            "# 复核结论\n\n结论：不通过。\n\n```json\n"
+            '{"schema": "copilot-native-review/v1", "verdict": "pass"}\n```\n'))
+        before = len(fixture["state"]["evidence"])
+        with self.assertRaises(D.DispatchError) as ctx:
+            D.register_review_evidence(
+                fixture["state"], file_path=raw,
+                review_of=fixture["exec_report_sha256"],
+                review_of_kind="execution-report", review_source="legacy",
+                verdict="blocked",
+                round_id=fixture["state"]["rounds"][-1]["round_id"])
+        self.assertIn("不是合法 JSON", str(ctx.exception))
+        self.assertEqual(len(fixture["state"]["evidence"]), before)
+
+    def test_complete_fenced_native_json_is_registered_and_enforced(self):
+        # 与宿主输出容忍单围栏的口径一致：完整围栏内是合法 native JSON 时按原始结论处理。
+        fixture = self.legacy_state("native-raw-fenced-complete")
+        raw = self.write("raw-fenced-complete.json", (
+            '```json\n{"schema": "copilot-native-rev\\u0069ew/v1", '
+            '"verdict": "blocked"}\n```\n'))
+        evidence = D.register_review_evidence(
+            fixture["state"], file_path=raw,
+            review_of=fixture["exec_report_sha256"],
+            review_of_kind="execution-report", review_source="legacy",
+            verdict="blocked",
+            round_id=fixture["state"]["rounds"][-1]["round_id"])
+        self.assertEqual(evidence["verdict"], "blocked")
+        # 原始结论仍然约束登记：不能借围栏把 blocked 报成 pass。
+        with self.assertRaises(D.DispatchError):
+            D.register_review_evidence(
+                fixture["state"], file_path=raw,
+                review_of=fixture["exec_report_sha256"],
+                review_of_kind="execution-report", review_source="legacy",
+                verdict="pass",
+                round_id=fixture["state"]["rounds"][-1]["round_id"])
+
+    def test_bom_prefixed_native_json_is_registered(self):
+        fixture = self.legacy_state("native-raw-bom")
+        raw = self.write("raw-bom.json", "\ufeff" + json.dumps({
+            "schema": "copilot-native-review/v1", "verdict": "pass"}))
+        evidence = D.register_review_evidence(
+            fixture["state"], file_path=raw,
+            review_of=fixture["exec_report_sha256"],
+            review_of_kind="execution-report", review_source="legacy",
+            verdict="pass",
+            round_id=fixture["state"]["rounds"][-1]["round_id"])
+        self.assertEqual(evidence["verdict"], "pass")
+
+    def test_schema_key_is_case_insensitive(self):
+        # `{"Schema": ...}` 同样声明 native schema：必须按原始结论约束，不能当 legacy。
+        fixture = self.legacy_state("native-raw-schema-key-case")
+        for key in ("Schema", "SCHEMA", " Schema "):
+            with self.subTest(key=key):
+                raw = self.write(f"raw-key-{key.strip().lower()}.json",
+                                 json.dumps({key: "copilot-native-review/v1",
+                                             "verdict": "blocked"}))
+                with self.assertRaises(D.DispatchError):
+                    D.register_review_evidence(
+                        fixture["state"], file_path=raw,
+                        review_of=fixture["exec_report_sha256"],
+                        review_of_kind="execution-report",
+                        review_source="legacy", verdict="pass",
+                        round_id=fixture["state"]["rounds"][-1]["round_id"])
+                with self.assertRaises(D.DispatchError):
+                    # 同一文件换裁决值重复登记同样被原始结论拒绝。
+                    D.register_review_evidence(
+                        fixture["state"], file_path=raw,
+                        review_of=fixture["exec_report_sha256"],
+                        review_of_kind="execution-report",
+                        review_source="legacy", verdict="partial",
+                        round_id=fixture["state"]["rounds"][-1]["round_id"])
+
+    def test_fenced_native_json_fence_forms(self):
+        # 围栏信息串不限、~~~ 与不同长度围栏、收尾围栏后允许空行；BOM 同时容忍。
+        fixture = self.legacy_state("native-raw-fence-forms")
+        for name, text in (
+                ("fence-tilde.md",
+                 '~~~json\n{"schema": "copilot-native-review/v1", '
+                 '"verdict": "pass"}\n~~~\n'),
+                ("fence-four.md",
+                 '````json\n{"schema": "copilot-native-review/v1", '
+                 '"verdict": "pass"}\n````\n'),
+                ("fence-extra-info.md",
+                 '```json extra info\n{"schema": "copilot-native-review/v1", '
+                 '"verdict": "pass"}\n```\n'),
+                ("fence-blank-after.md",
+                 '```json\n{"schema": "copilot-native-review/v1", '
+                 '"verdict": "pass"}\n```\n\n'),
+                ("bom-fence.md",
+                 '\ufeff```json\n{"schema": "copilot-native-review/v1", '
+                 '"verdict": "pass"}\n```')):
+            with self.subTest(name=name):
+                raw = self.write(name, text)
+                evidence = D.register_review_evidence(
+                    fixture["state"], file_path=raw,
+                    review_of=fixture["exec_report_sha256"],
+                    review_of_kind="execution-report",
+                    review_source="legacy", verdict="pass",
+                    round_id=fixture["state"]["rounds"][-1]["round_id"])
+                self.assertEqual(evidence["verdict"], "pass")
+
+    def test_schema_declaration_cannot_hide_in_odd_shapes(self):
+        # 声明了 native schema 就不能落成 legacy：重复键、嵌套、带后缀、散文+转义围栏、
+        # 混合围栏都按「声明」拒绝，原始 verdict 始终有约束。
+        fixture = self.legacy_state("native-raw-odd-declarations")
+        before = len(fixture["state"]["evidence"])
+        for name, text in (
+                ("dup-keys.json",
+                 '{"schema": "junk", "Schema": "copilot-native-review/v1", '
+                 '"verdict": "blocked"}'),
+                # 带后缀的声明不能被后面的合法声明覆盖：任一含标识的值都必须精确匹配。
+                ("schema-suffix-masked.json",
+                 '{"schema": "copilot-native-review/v1 extra", '
+                 '"Schema": "copilot-native-review/v1", "verdict": "blocked"}'),
+                # 完全同名重复键：json.loads 只保留最后一个值（"junk"），声明层必须兜底拒绝。
+                ("dup-same-key-native-first.json",
+                 '{"schema": "copilot-native-review/v1", "schema": "junk", '
+                 '"verdict": "blocked"}'),
+                # 同名键折叠不能用后一个合法声明掩盖前一个非法声明（两种排列都拒绝）。
+                ("dup-exact-schema-suffix-first.json",
+                 '{"schema": "copilot-native-review/v1 extra", "schema": '
+                 '"copilot-native-review/v1", "verdict": "blocked"}'),
+                ("dup-exact-schema-suffix-last.json",
+                 '{"schema": "copilot-native-review/v1", "schema": '
+                 '"copilot-native-review/v1 extra", "verdict": "blocked"}'),
+                # 同名 verdict 键同样会被折叠，后一个值能改写原始结论，一律拒绝。
+                ("dup-verdict-keys.json",
+                 '{"schema": "copilot-native-review/v1", "verdict": "blocked", '
+                 '"verdict": "pass"}'),
+                # 嵌套层的重复键也拒绝：折叠后无法证明哪一份是原始结论。
+                ("dup-nested-keys.json",
+                 '{"a": {"k": 1, "k": 2}, "schema": '
+                 '"copilot-native-review/v1", "verdict": "blocked"}'),
+                # 带首尾空白的字段名：解析后按去空白判定，声明层也必须能识别。
+                ("padded-key-truncated.md",
+                 '# 结论\n\n```json\n{"schema ": '
+                 '"copilot-native-review/v1", "verdict": "blocked"'),
+                ("nested-schema.json",
+                 '{"a": {"schema": "copilot-native-review/v1"}, '
+                 '"verdict": "blocked"}'),
+                ("schema-suffix.json",
+                 '{"schema": "copilot-native-review/v1 extra", '
+                 '"verdict": "blocked"}'),
+                ("prose-escaped-fence.md",
+                 '# 结论\n\n```json\n{"schema": '
+                 '"copilot-native-rev\\u0069ew/v1", "verdict": "blocked"}\n```\n'),
+                ("prose-escaped-key.md",
+                 '# 结论\n\n```json\n{"sch\\u0065ma": '
+                 '"copilot-native-review/v1", "verdict": "blocked"}\n```\n'),
+                ("multi-fence-mixed.md",
+                 '~~~json\n{"schema": "copilot-native-review/v1", '
+                 '"verdict": "blocked"}\n~~~\n```json\n{"schema": '
+                 '"copilot-native-review/v1", "verdict": "blocked"}\n```\n')):
+            with self.subTest(name=name):
+                raw = self.write(name, text)
+                with self.assertRaises(D.DispatchError):
+                    D.register_review_evidence(
+                        fixture["state"], file_path=raw,
+                        review_of=fixture["exec_report_sha256"],
+                        review_of_kind="execution-report",
+                        review_source="legacy", verdict="pass",
+                        round_id=fixture["state"]["rounds"][-1]["round_id"])
+                self.assertEqual(len(fixture["state"]["evidence"]), before)
+
+    def test_multiple_valid_schema_declarations_stay_native(self):
+        # 多个合法声明不是冲突：仍按原始 verdict 约束登记（与「任一非法即拒绝」互补）。
+        fixture = self.legacy_state("native-raw-multi-valid-schema")
+        raw = self.write("multi-valid-schema.json", json.dumps({
+            "schema": "copilot-native-review/v1",
+            "Schema": "Copilot-Native-Review/V1", "verdict": "pass"}))
+        evidence = D.register_review_evidence(
+            fixture["state"], file_path=raw,
+            review_of=fixture["exec_report_sha256"],
+            review_of_kind="execution-report", review_source="legacy",
+            verdict="pass",
+            round_id=fixture["state"]["rounds"][-1]["round_id"])
+        self.assertEqual(evidence["verdict"], "pass")
+
+    def test_duplicate_keys_rejected_even_in_legacy_json(self):
+        # 重复键检查不限于 native 声明：任何 JSON 原始结论被折叠后都无法证明哪一份
+        # 是 Reviewer 的实际 verdict，因此一律失败关闭且状态不变。
+        fixture = self.legacy_state("legacy-raw-duplicate-verdict")
+        before = len(fixture["state"]["evidence"])
+        raw = self.write("legacy-dup-verdict.json",
+                         '{"verdict": "blocked", "verdict": "pass"}')
+        with self.assertRaises(D.DispatchError):
+            D.register_review_evidence(
+                fixture["state"], file_path=raw,
+                review_of=fixture["exec_report_sha256"],
+                review_of_kind="execution-report", review_source="legacy",
+                verdict="pass",
+                round_id=fixture["state"]["rounds"][-1]["round_id"])
+        self.assertEqual(len(fixture["state"]["evidence"]), before)
+
+    def test_padded_schema_key_parsed_stays_native(self):
+        # 声明层放宽到「引号内允许空白」，解析成功时 `_schema_fields` 的去空白口径一致：
+        # 合法 native JSON 仍按原始 verdict 登记，不因键名空白被误拒。
+        fixture = self.legacy_state("native-raw-padded-key")
+        raw = self.write("padded-key.json", json.dumps({
+            "schema ": "copilot-native-review/v1", "verdict": "pass"}))
+        evidence = D.register_review_evidence(
+            fixture["state"], file_path=raw,
+            review_of=fixture["exec_report_sha256"],
+            review_of_kind="execution-report", review_source="legacy",
+            verdict="pass",
+            round_id=fixture["state"]["rounds"][-1]["round_id"])
+        self.assertEqual(evidence["verdict"], "pass")
+
+    def test_multi_fence_legacy_text_without_declaration_stays_legacy(self):
+        # 多围栏只对「声明了 native schema」的报告失败关闭；不带声明的普通评审文本
+        # 仍按 legacy 登记（与 docs 的限定口径一致）。
+        fixture = self.legacy_state("legacy-multi-fence")
+        raw = self.write("legacy-multi-fence.md",
+                         '# 结论\n\n```text\ndiff 片段\n```\n\n'
+                         '```python\nprint(1)\n```\n')
+        evidence = D.register_review_evidence(
+            fixture["state"], file_path=raw,
+            review_of=fixture["exec_report_sha256"],
+            review_of_kind="execution-report", review_source="legacy",
+            verdict="pass",
+            round_id=fixture["state"]["rounds"][-1]["round_id"])
+        self.assertEqual(evidence["verdict"], "pass")
+
+    def test_schema_field_must_be_a_string(self):
+        fixture = self.legacy_state("native-raw-schema-list")
+        raw = self.write("raw-schema-list.json", json.dumps({
+            "schema": ["copilot-native-review/v1"], "verdict": "pass"}))
+        with self.assertRaises(D.DispatchError):
+            D.register_review_evidence(
+                fixture["state"], file_path=raw,
+                review_of=fixture["exec_report_sha256"],
+                review_of_kind="execution-report", review_source="legacy",
+                verdict="pass",
+                round_id=fixture["state"]["rounds"][-1]["round_id"])
+
 
 class LegacyReviewRegistrationTests(ReviewHandoffBase):
     def test_cli_registers_raw_file_and_is_idempotent(self):

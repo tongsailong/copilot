@@ -82,6 +82,8 @@ EXECUTION_BACKENDS = ("legacy", "native")
 # 同时拥有复核权威；原生结果回填遇到 gpt_review 时失败关闭。
 REVIEW_CHANNELS = (None, "native", "gpt_review")
 VERDICTS = ("pass", "partial", "blocked")
+# Reviewer 原始报告的唯一 native schema 标识；比较时忽略大小写与首尾空白。
+_NATIVE_REVIEW_SCHEMA = "copilot-native-review/v1"
 # 复核对象类型：native 保持原有 execution_result_sha256 语义；legacy 明确区分
 # 「执行报告摘要」与「已登记证据摘要」，不把两者混成同一个 review_of。
 REVIEW_OF_KINDS = ("execution-report", "evidence")
@@ -121,7 +123,13 @@ MAX_ACTION_RESULT_INJECTED = 600
 MAX_DECISIONS_INJECTED = 8
 MAX_DECISION_CHARS = 300
 MAX_EVIDENCE_INDEXED = 20
-MAX_TEXT_SECTION_CHARS = 1500
+# 目标/完成条件/边界属于「不可裁剪」的保护段：单段预算远大于可裁剪段，
+# 但仍是有界的（总注入预算 MAX_RENDER_CHARS 才是硬上限）。
+MAX_TEXT_SECTION_CHARS = 1500      # 简短引用/单行摘要用
+MAX_PROTECTED_SECTION_CHARS = 6000  # 保护段（目标、条件、边界）可完整注入的预算
+MAX_CRITERION_CHARS = 800           # 单条条件描述上限；超出显式标注，不丢条目
+MAX_ACTION_TITLE_CHARS = 300        # 工作项标题上限；超出显式标注
+MAX_ACTION_EXPECT_CHARS = 400       # 预期证据上限；超出显式标注
 CHECKPOINT_EVERY = 8
 # 2026-11-08：请求数 / 累计 Token **不再有代码默认上限**。
 # - 默认值全部为 None：不因调用次数或累计费用阻止正常调用；用量仍从审计重建并记录。
@@ -2003,6 +2011,199 @@ def _verify_review_target(state: dict, sha: str, review_of_kind: str,
         f"{NATIVE_REVIEW_OF_KIND} / {' / '.join(REVIEW_OF_KINDS)}。")
 
 
+_NATIVE_SCHEMA_FIELD_RE = re.compile(r'"\s*schema\s*"\s*:', re.IGNORECASE)
+_JSON_UNICODE_ESCAPE_RE = re.compile(r"\\u([0-9a-fA-F]{4})")
+
+
+def _declares_native_schema(text: str) -> bool:
+    """在可能非法/截断的 JSON 文本里判断是否声明了 native schema。
+
+    不依赖能否解析：先解码 `\\uXXXX`（涵盖 `\\/` 与 `\\u002f`）并忽略大小写，只要出现
+    schema 字段且文本含 native schema 标识就按声明处理。任意合法转义都能还原成明文，
+    所以穷举转义写法没有意义——宁可拒绝不可解析的声明，也不把它降级成 legacy 文本
+    绕过 verdict 一致性检查。
+    """
+    flat = _JSON_UNICODE_ESCAPE_RE.sub(
+        lambda m: chr(int(m.group(1), 16)), text.replace("\\/", "/"))
+    return bool(_NATIVE_SCHEMA_FIELD_RE.search(flat)) and \
+        _NATIVE_REVIEW_SCHEMA in flat.lower()
+
+
+_FENCED_REPORT_HEAD_RE = re.compile(
+    r"\A(?P<fence>`{3,}|~{3,})[^\r\n]*\r?\n")
+
+
+def _fence_tail_re(fence: str) -> re.Pattern:
+    """收尾围栏：同一围栏字符、长度不小于开头，之后只允许空白。"""
+    return re.compile(
+        r"\r?\n[ \t]*" + re.escape(fence[0]) + "{" + str(len(fence)) + r",}"
+        r"(?:[ \t]*\r?\n)*[ \t]*\Z")
+
+
+def _stray_fence_re(fence: str) -> re.Pattern:
+    """围栏内出现的同类收尾行（后面还有内容时说明不是整份报告）。"""
+    return re.compile(
+        r"\r?\n[ \t]*" + re.escape(fence[0]) + "{" + str(len(fence)) + r",}[ \t]*\r?\n")
+
+
+def _single_fenced_body(text: str) -> str | None:
+    """整份报告就是一个代码围栏时返回围栏内正文，否则返回 None。
+
+    与 `native_agent` 解析宿主输出时「只容忍单个围栏」的口径一致：围栏前只有空白，
+    围栏信息串不限（```json、``` 等），收尾围栏用同一字符且不短于开头，之后只允许
+    空白。缺收尾围栏（截断）仍返回围栏后正文，由调用方按解析失败失败关闭。围栏后面
+    还有其它文字或出现多个围栏时，这不是整份报告，返回 None。
+    """
+    flat = text.lstrip("\ufeff \t\r\n")
+    head = _FENCED_REPORT_HEAD_RE.match(flat)
+    if not head:
+        return None
+    fence = head.group("fence")
+    body = flat[head.end():]
+    tail = _fence_tail_re(fence).search(body)
+    if tail:
+        return body[:tail.start()]
+    if _stray_fence_re(fence).search(body):
+        return None
+    return body
+
+
+def _looks_structured_report(text: str) -> bool:
+    """JSON 形态报告（以 `{`/`[` 开头）解析失败时一律失败关闭。
+
+    不能靠明文 schema 字符串判断：`copilot-native-rev\u0069ew/v1` 这类任意合法
+    JSON 转义在截断后仍声明了结构化报告，却匹配不到明文 schema，会被错误降级为
+    legacy 文本并跳过 verdict 一致性校验。格式边界比继续枚举转义更可靠。
+
+    整份报告可以是纯 JSON，也可以是单个代码围栏包住的 JSON（含截断、缺收尾围栏）。
+    围栏前后还有别的文字（叙述、多围栏）就不是整份报告，按 legacy 文本处理；那种
+    情况若声明了 native schema，仍由 `_declares_native_schema` 拒绝。
+    """
+    body = text.lstrip("\ufeff \t\r\n")
+    if body.startswith(("{", "[")):
+        return True
+    inner = _single_fenced_body(text)
+    if inner is None:
+        return False
+    return inner.lstrip("\ufeff \t\r\n").startswith(("{", "["))
+
+
+def _schema_fields(data: dict) -> list:
+    """按大小写不敏感收集所有 schema 字段的值（不短路）。
+
+    成功解析后不能只认精确小写 `schema`：`{"Schema": ...}` 同样声明了 native
+    schema；同时出现多个同名字段（如 `schema` 与 `Schema`）时也不能只看第一个，
+    否则「先放一个非 native 的 schema、再放 native 声明」就能降级为 legacy。
+    """
+    return [item for key, item in data.items()
+            if isinstance(key, str) and key.strip().lower() == "schema"]
+
+
+class _ObjectPairs(list):
+    """JSON 对象的保留重复键表示（`object_pairs_hook` 产物，区别于 JSON 数组）。"""
+
+
+def _duplicate_keys(node: object, path: str = "") -> list[str]:
+    """收集任意层级里出现不止一次的键。
+
+    `json.loads` 默认把同名键折成最后一个值：`{"schema": ".../v1 extra",
+    "schema": ".../v1"}` 折叠后只剩合法声明，非法声明被静默隐藏；`verdict` 同理
+    可以被后一个值改写。登记层不能依赖「折叠后的样子」，因此任何重复键都按失败
+    关闭处理，而不是只特判 schema。
+    """
+    out: list[str] = []
+    if isinstance(node, _ObjectPairs):
+        seen: set[str] = set()
+        for key, value in node:
+            if isinstance(key, str):
+                if key in seen:
+                    out.append(f"{path}.{key}" if path else key)
+                seen.add(key)
+            child = f"{path}.{key}" if path else str(key)
+            out.extend(_duplicate_keys(value, child))
+    elif isinstance(node, list):
+        for idx, value in enumerate(node):
+            out.extend(_duplicate_keys(value, f"{path}[{idx}]"))
+    return out
+
+
+def _raw_review_verdict(path: str) -> str | None:
+    """读取原始复核文件里的 native Reviewer verdict；legacy 文本返回 None。
+
+    只有明确声明 `copilot-native-review/v1` 的 JSON 才按 Reviewer 原始结论处理。
+    已声明该 schema 但正文不是合法 JSON、不是对象、schema 非字符串，或 verdict
+    缺失/非法时失败关闭，不能降级为“不解析的文本”。JSON 形态（`{`/`[` 开头，或
+    单个代码围栏包住的 JSON）解析失败时一律拒绝，不再依赖明文 schema 标识。
+    围栏信息串不限，收尾围栏需同字符且不短于开头（之后只允许空白），截断仍拒绝；
+    BOM 前缀在解析前剥离。schema 字段名与值比较都忽略大小写与首尾空白；声明出现在
+    非顶层（嵌套）时同样拒绝，不能靠结构位置绕过原始结论约束。
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            text = fh.read()
+    except OSError as exc:
+        raise DispatchError(f"无法读取原始复核报告 {path}：{exc}") from exc
+    inner = _single_fenced_body(text)
+    src = inner if inner is not None else text.lstrip("\ufeff")
+    try:
+        data = json.loads(src)
+    except ValueError:
+        if _looks_structured_report(text) or _declares_native_schema(text):
+            raise DispatchError(
+                f"原始复核报告是 JSON 形态或声明了 {_NATIVE_REVIEW_SCHEMA}，"
+                f"但正文不是合法 JSON：{path}；"
+                f"拒绝登记，不能降级为 legacy 文本。")
+        return None
+    if not isinstance(data, dict):
+        if _declares_native_schema(text):
+            raise DispatchError(
+                f"原始复核报告声明 schema={_NATIVE_REVIEW_SCHEMA}，但正文不是"
+                f"JSON 对象：{path}；拒绝登记。")
+        return None
+    dups = _duplicate_keys(json.loads(src, object_pairs_hook=_ObjectPairs))
+    if dups:
+        raise DispatchError(
+            f"原始复核报告含重复键（{', '.join(dups[:3])}）：{path}；"
+            f"同名键会被 JSON 折叠，可能隐藏非法声明或改写 verdict；拒绝登记。")
+    values = _schema_fields(data)
+    if not values:
+        if _declares_native_schema(text):
+            raise DispatchError(
+                f"原始复核报告声明了 {_NATIVE_REVIEW_SCHEMA}，但没有顶层 schema "
+                f"字段：{path}；拒绝登记。")
+        return None
+    declaring: str | None = None
+    for value in values:
+        if isinstance(value, str):
+            if _NATIVE_REVIEW_SCHEMA not in value.strip().lower():
+                continue
+            # 任一含标识的字符串都必须精确等于该标识：带后缀/额外修饰的声明不能被
+            # 后面的合法声明覆盖，否则判定顺序会改变结论。
+            if value.strip().lower() != _NATIVE_REVIEW_SCHEMA:
+                raise DispatchError(
+                    f"原始复核报告声明了 {_NATIVE_REVIEW_SCHEMA}，但 schema="
+                    f"{value!r} 不是该标识：{path}；拒绝登记。")
+            declaring = value
+        elif _NATIVE_REVIEW_SCHEMA in json.dumps(
+                value, ensure_ascii=False).lower():
+            raise DispatchError(
+                f"原始复核报告 schema 字段不是字符串，但声明了 "
+                f"{_NATIVE_REVIEW_SCHEMA}：{path}；拒绝登记。")
+    if declaring is None:
+        if _declares_native_schema(text):
+            raise DispatchError(
+                f"原始复核报告正文出现 {_NATIVE_REVIEW_SCHEMA} 声明，但解析后的 "
+                f"schema 字段没有保留该声明（如 schema 字段自报其它值，或正文声明"
+                f"与解析结果不一致）：{path}；拒绝登记，不能降级为 legacy 文本。")
+        return None
+    raw = str(data.get("verdict") or "").strip().lower()
+    if raw not in VERDICTS:
+        raise DispatchError(
+            f"原始复核报告 schema={_NATIVE_REVIEW_SCHEMA}，但 verdict="
+            f"{data.get('verdict')!r} 非法；拒绝登记。")
+    return raw
+
+
 def register_review_evidence(state: dict, *, file_path: str, review_of: str,
                              review_of_kind: str, review_source: str,
                              verdict: str, round_id: str = "",
@@ -2058,6 +2259,11 @@ def register_review_evidence(state: dict, *, file_path: str, review_of: str,
     if not os.path.isfile(path):
         raise DispatchError(f"复核报告文件不存在：{path}")
     digest = sha256_file(path)
+    raw_verdict = _raw_review_verdict(path)
+    if raw_verdict is not None and raw_verdict != verdict:
+        raise DispatchError(
+            f"登记 verdict={verdict!r} 与原始复核报告 verdict={raw_verdict!r} "
+            "不一致；不得静默改写 Reviewer 结论。")
     if eid and not EVIDENCE_ID_RE.match(eid):
         raise DispatchError(f"证据 id {eid!r} 非法（应形如 E1）。")
     existing = _find_evidence_by_id(state, eid) if eid else None
@@ -2075,6 +2281,11 @@ def register_review_evidence(state: dict, *, file_path: str, review_of: str,
                 or str(existing.get("review_source") or "") != review_source):
             raise DispatchError(
                 f"证据 {eid} 已绑定到其他复核对象或来源；不能改绑。")
+        stored = str(existing.get("verdict") or "").strip().lower()
+        if stored in VERDICTS and stored != verdict:
+            raise DispatchError(
+                f"证据 {eid} 已登记 verdict={stored!r}，与本次 verdict="
+                f"{verdict!r} 不一致；拒绝静默覆盖原始复核结论。")
     if existing is None:
         for entry in state.get("evidence") or []:
             if (isinstance(entry, dict)
@@ -2199,6 +2410,11 @@ def add_report(state: dict, summary: str, round_id: str = "", *,
                 or str(evidence.get("review_source") or "") != review_source):
             raise DispatchError(
                 f"证据 {evidence_id} 不是该复核对象/来源的原始报告证据；拒绝绑定。")
+        stored_verdict = str(evidence.get("verdict") or "").strip().lower()
+        if stored_verdict in VERDICTS and stored_verdict != verdict:
+            raise DispatchError(
+                f"复核报告 verdict={verdict!r} 与已登记原始证据 {evidence_id} 的 "
+                f"verdict={stored_verdict!r} 不一致；拒绝登记。")
         for existing in state.get("reports") or []:
             if not isinstance(existing, dict) or existing.get("kind") != "review":
                 continue
@@ -2533,6 +2749,18 @@ def _latest_pass_round(state: dict) -> dict | None:
     return None
 
 
+def _latest_judged_round(state: dict) -> dict | None:
+    """最近一个**带判断**的已验证轮次（被拒绝或无数值判断的轮次不改变控制状态）。"""
+    invalid = _invalidated_pass_rounds(state)
+    for rnd in reversed(_verified_rounds(state)):
+        if str(rnd.get("round_id") or "") in invalid:
+            continue
+        if rnd.get("rejected") or not rnd.get("decision"):
+            continue
+        return rnd
+    return None
+
+
 def pass_pending(state: dict) -> bool:
     """PASS 已拿到但尚未收口：此期间不执行普通工作项。
 
@@ -2541,14 +2769,8 @@ def pass_pending(state: dict) -> bool:
     """
     if bool((state.get("closure") or {}).get("closed")):
         return False
-    invalid = _invalidated_pass_rounds(state)
-    for rnd in reversed(_verified_rounds(state)):
-        if str(rnd.get("round_id") or "") in invalid:
-            continue
-        if rnd.get("rejected") or not rnd.get("decision"):
-            continue
-        return str(rnd.get("verdict") or "").strip().lower() == "pass"
-    return False
+    judged = _latest_judged_round(state)
+    return bool(judged) and str(judged.get("verdict") or "").strip().lower() == "pass"
 
 
 def _gate_actions(state: dict) -> dict:
@@ -2693,8 +2915,13 @@ def closure_check(state: dict, review_ledger: str = "",
 
     `review_ledger` 与 `state_path` 保留仅为兼容旧调用；G4 不读取 GPT REVIEW
     台账，传入任何台账都不会改变判定。
+
+    核销轮次取「最近一次带判断的已验证轮」，且只在该轮 verdict=pass 时成立：
+    最新判断若是 partial/blocked，旧 PASS 已被覆盖，不能拿它产出四门通过证据。
     """
-    pass_round = _latest_pass_round(state)
+    judged = _latest_judged_round(state)
+    judged_verdict = str((judged or {}).get("verdict") or "").strip().lower()
+    pass_round = judged if judged_verdict == "pass" else None
     round_id = str((pass_round or {}).get("round_id") or "")
     gates = {
         "G1": _gate_actions(state),
@@ -2702,6 +2929,13 @@ def closure_check(state: dict, review_ledger: str = "",
         "G3": _gate_stalled(state),
         "G4": _gate_review(state),
     }
+    if judged is not None and pass_round is None:
+        gates["G2"]["reasons"].append({
+            "code": "latest_judgment_not_pass",
+            "detail": f"最近一次已验证判断（{judged.get('round_id')}）为 "
+                      f"{judged_verdict or '无裁决'}；旧 PASS 已被覆盖，不能据此核销",
+        })
+        gates["G2"]["passed"] = False
     reasons = []
     for name in ("G1", "G2", "G3", "G4"):
         for reason in gates[name]["reasons"]:
@@ -3381,6 +3615,10 @@ _RENDER_LADDER = (
     {**_RENDER_BASE, "evidence": 0, "summary": 400},
     {**_RENDER_BASE, "evidence": 0, "summary": 400, "action": 200},
     {**_RENDER_BASE, "evidence": 0, "summary": 400, "action": 200, "decisions": 3},
+    # 最低档：终态工作项只保留 id/状态汇总，未终态项完整保留。历史不删除，
+    # 但保证长任务在注入预算内仍可渲染（不再直接抛错卡住 drive/brief）。
+    {**_RENDER_BASE, "evidence": 0, "summary": 400, "action": 200, "decisions": 3,
+     "_compact_actions": True},
 )
 
 
@@ -3429,13 +3667,13 @@ def _render_sections(state: dict, cfg: dict, prompt_repeat: bool) -> tuple[list[
         lines.append(f"- 本轮目标：{goal}")
         return lines, omitted
 
-    # 段 1：原始目标（不可裁剪）
-    goal, clipped = _clip(state.get("goal"), MAX_TEXT_SECTION_CHARS)
+    # 段 1：原始目标（保护段）
+    goal, clipped = _clip(state.get("goal"), MAX_PROTECTED_SECTION_CHARS)
     lines += ["", "【原始目标】", goal or "（未记录）"]
     if clipped:
-        lines.append(f"（目标超出 {MAX_TEXT_SECTION_CHARS} 字符已截断；完整目标见状态文件。）")
+        lines.append(f"（目标超出 {MAX_PROTECTED_SECTION_CHARS} 字符已截断；完整目标见状态文件。）")
 
-    # 段 2：完成条件与边界（不可裁剪）
+    # 段 2：完成条件与边界（保护段）
     contract = state.get("contract") or {}
     criteria = contract.get("criteria") or []
     state_label = ("draft（待 GPT 首轮审定后确认）"
@@ -3445,29 +3683,38 @@ def _render_sections(state: dict, cfg: dict, prompt_repeat: bool) -> tuple[list[
     if not criteria:
         lines.append("- 尚无结构化完成条件：本轮请给出可逐条核销的条件草案"
                      "（每条一句可判定的话），由主代理落盘后在下一轮确认。")
-    used = 0
-    for idx, item in enumerate(criteria):
+    # 条件段是核销依据：**每一条的 id 与状态都必须出现**。单条描述过长时只截断
+    # 该条描述并显式标注；整段超预算则明确拒绝渲染，绝不能用「其余 N 条省略」
+    # 让模型看不到条件却仍被要求逐条裁决。
+    criteria_lines: list[str] = []
+    for item in criteria:
         refs = item.get("evidence_refs") or []
         ref_text = ("；证据 " + ", ".join(
             f"{ref.get('id')}@{str(ref.get('sha256') or '')[:12]}" for ref in refs)) if refs else ""
-        line = (f"- {item.get('criterion_id')} [{item.get('status')}] "
-                f"{str(item.get('description') or '').strip()}{ref_text}")
-        if used + len(line) > MAX_TEXT_SECTION_CHARS:
-            lines.append(f"- …（其余 {len(criteria) - idx} 条因条件段预算省略；"
-                         "完整条件见 contract 输出）")
-            break
-        lines.append(line)
-        used += len(line)
+        description = str(item.get("description") or "").strip()
+        if len(description) > MAX_CRITERION_CHARS:
+            description = (description[:MAX_CRITERION_CHARS]
+                           + f"…（本条描述已截断至 {MAX_CRITERION_CHARS} 字符；"
+                             "完整条文见原始完成条件）")
+        criteria_lines.append(
+            f"- {item.get('criterion_id')} [{item.get('status')}] {description}{ref_text}")
+    criteria_chars = sum(len(line) for line in criteria_lines)
+    if criteria_chars > MAX_PROTECTED_SECTION_CHARS:
+        raise DispatchError(
+            f"完成条件段共 {len(criteria)} 条、{criteria_chars} 字符，超过保护段预算 "
+            f"{MAX_PROTECTED_SECTION_CHARS}；为保持逐条核销完整，拒绝渲染不完整条件。"
+            "请先精简条件描述（amend）或拆分任务后再继续；不能在不完整合同上判断。")
+    lines.extend(criteria_lines)
     done_text = str(contract.get("done_criteria_text") or "").strip()
     if done_text:
-        text, clipped = _clip(done_text, MAX_TEXT_SECTION_CHARS)
+        text, clipped = _clip(done_text, MAX_PROTECTED_SECTION_CHARS)
         lines += ["", "原始完成条件条文（供理解，不参与机器判定）：", text]
         if clipped:
-            lines.append("（条文超长已截断。）")
-    boundaries, clipped = _clip(contract.get("boundaries"), MAX_TEXT_SECTION_CHARS)
+            lines.append(f"（条文超出 {MAX_PROTECTED_SECTION_CHARS} 字符已截断。）")
+    boundaries, clipped = _clip(contract.get("boundaries"), MAX_PROTECTED_SECTION_CHARS)
     lines += ["", "边界（不可越界）：", boundaries or "（未单独声明边界；仍受全局授权约束。）"]
     if clipped:
-        lines.append(f"（边界超出 {MAX_TEXT_SECTION_CHARS} 字符已截断。）")
+        lines.append(f"（边界超出 {MAX_PROTECTED_SECTION_CHARS} 字符已截断。）")
 
     # 段 3：已确认业务决策（可裁剪 8→3）
     decisions = state.get("decisions") or []
@@ -3482,27 +3729,55 @@ def _render_sections(state: dict, cfg: dict, prompt_repeat: bool) -> tuple[list[
     if omitted["decisions"]:
         lines.append(f"（因预算省略更早的 {omitted['decisions']} 条决策。）")
 
-    # 段 4：工作项进度（可裁剪结果 600→200）
+    # 段 4：工作项进度（可裁剪结果 600→200；title/预期证据也有上限）
     actions = state.get("actions") or []
     lines += ["", f"【工作项进度（{len(actions)} 项）】"]
     if not actions:
         lines.append("（尚无工作项：本轮由你判断需要做什么并给出 copilot-plan。）")
-    for action in actions:
-        deps = f"；依赖 {', '.join(action['depends_on'])}" if action.get("depends_on") else ""
-        lines.append(f"- {action['id']} [{action['status']}] {action['title']}"
-                     f"（执行方：{action.get('assignee', 'zcode')}{deps}）")
-        if action.get("expected_evidence"):
-            lines.append(f"  预期证据：{action['expected_evidence']}")
-        if action.get("result"):
-            feedback, clipped = _clip(action["result"], cfg["action"])
-            if clipped:
-                feedback += f"（完整反馈 {len(action['result'])} 字符，需要时向主代理索取）"
-            lines.append(f"  执行反馈：{feedback}")
-        if action.get("evidence_ids"):
-            lines.append(f"  对应证据：{', '.join(action['evidence_ids'])}")
-    ready = ready_actions(state)
-    if ready:
-        lines.append("当前可执行（依赖已满足）：" + ", ".join(a["id"] for a in ready))
+    if cfg.get("_compact_actions"):
+        # 最低档：未终态项完整保留（含阻断原因），终态项只汇总 id/状态。
+        # 历史仍在状态文件里；这里只压缩**表示**，不删除、不隐藏未完成项。
+        open_actions = [a for a in actions if a.get("status") not in TERMINAL]
+        closed_actions = [a for a in actions if a.get("status") in TERMINAL]
+        if open_actions:
+            lines.append("未终态工作项（完整）：")
+        for action in open_actions:
+            title, title_clipped = _clip(action.get("title"), MAX_ACTION_TITLE_CHARS)
+            lines.append(f"- {action['id']} [{action['status']}] {title}"
+                         + ("（标题已截断）" if title_clipped else ""))
+            if action.get("result"):
+                feedback, clipped = _clip(action["result"], cfg["action"])
+                lines.append(f"  执行反馈：{feedback}" + ("（已截断）" if clipped else ""))
+        if closed_actions:
+            lines.append(
+                f"已终态工作项 {len(closed_actions)} 项（明细见状态文件）："
+                + "、".join(f"{a['id']}({a.get('status')})" for a in closed_actions))
+        omitted["actions"] = len(closed_actions)
+        ready = ready_actions(state)
+        if ready:
+            lines.append("当前可执行（依赖已满足）：" + ", ".join(a["id"] for a in ready))
+    else:
+        for action in actions:
+            deps = f"；依赖 {', '.join(action['depends_on'])}" if action.get("depends_on") else ""
+            title, title_clipped = _clip(action.get("title"), MAX_ACTION_TITLE_CHARS)
+            lines.append(f"- {action['id']} [{action['status']}] {title}"
+                         + ("（标题已截断）" if title_clipped else "")
+                         + f"（执行方：{action.get('assignee', 'zcode')}{deps}）")
+            if action.get("expected_evidence"):
+                expect, expect_clipped = _clip(action["expected_evidence"],
+                                               MAX_ACTION_EXPECT_CHARS)
+                lines.append(f"  预期证据：{expect}"
+                             + ("（已截断）" if expect_clipped else ""))
+            if action.get("result"):
+                feedback, clipped = _clip(action["result"], cfg["action"])
+                if clipped:
+                    feedback += f"（完整反馈 {len(action['result'])} 字符，需要时向主代理索取）"
+                lines.append(f"  执行反馈：{feedback}")
+            if action.get("evidence_ids"):
+                lines.append(f"  对应证据：{', '.join(action['evidence_ids'])}")
+        ready = ready_actions(state)
+        if ready:
+            lines.append("当前可执行（依赖已满足）：" + ", ".join(a["id"] for a in ready))
 
     # 段 4b：原生执行/复核报告（仅 native 任务；两者必须分区，不能合并）
     reports = [r for r in state.get("reports") or [] if isinstance(r, dict)]
@@ -3701,13 +3976,16 @@ def render_state(state: dict, include_actions: bool = True,
             trims.append(f"工作项反馈截断至 {chosen['action']} 字符")
         if chosen["decisions"] != MAX_DECISIONS_INJECTED:
             trims.append(f"决策仅保留最近 {chosen['decisions']} 条")
+        if chosen.get("_compact_actions") and omitted.get("actions"):
+            trims.append(f"终态工作项仅保留 id/状态汇总（{omitted['actions']} 项）")
         if trims:
             lines += ["", "（注入预算裁剪：" + "；".join(trims) + "。）"]
     text = "\n".join(lines)
     if len(text) > MAX_RENDER_CHARS:
         raise DispatchError(
             f"交接状态注入 {len(text)} 字符，超过 {MAX_RENDER_CHARS} 字符预算；"
-            "不可裁剪段（目标/完成条件/边界/收口）过长，请先精简。")
+            "保护段（目标/完成条件/边界/收口/阻断原因）过长，且工作项已压缩到最小"
+            "表示。请先精简合同文本或拆分任务（历史记录未删除）。")
     return text
 
 
@@ -3836,6 +4114,20 @@ def _state_fingerprint(state: dict) -> str:
                                   separators=(",", ":")))
 
 
+def _disk_state_fingerprint(path: str) -> str:
+    """磁盘原文的整状态摘要：恢复入口 CAS 的基线。
+
+    必须与 `_check_expect` 的比较对象同源（都读磁盘原文，而不是 `load_state`
+    补过默认键的内存态）。否则任何缺嵌套默认键的旧状态，都会在写盘前被误报成
+    「加载后被外部修改」，而 `recover-reply` 恰恰最常处理这种旧状态。
+    """
+    with open(path, "r", encoding="utf-8") as fh:
+        current = json.load(fh)
+    if not isinstance(current, dict):
+        raise DispatchError(f"交接状态 {path} 不是 JSON 对象；拒绝恢复。")
+    return _state_fingerprint(current)
+
+
 def recovery_audit_path(state_path: str, override: str = "") -> str:
     """恢复审计与状态同目录、独立文件；不写模型调用审计。"""
     if (override or "").strip():
@@ -3949,6 +4241,14 @@ def recover_consumed_reply(path: str, state: dict, audit_log: str, *,
     * 已应用：幂等返回 `already_applied`，不重复写条件/工作项；
     * 任何校验/应用失败：状态不变，恢复审计记录拒绝原因。
     """
+    # CAS 基线取磁盘原文（与 `_check_expect` 同源）；工作副本也必须来自同一快照，
+    # 否则「调用方 load → 基线」窗口内的外部写入会被这次恢复静默覆盖（CAS 通过但
+    # 内容被回退）。先取基线、再按磁盘重载，全部校验都基于该快照。
+    before_fp = _disk_state_fingerprint(path)
+    loaded = load_state(path)
+    if _state_fingerprint(loaded) != _state_fingerprint(state):
+        state.clear()
+        state.update(loaded)
     _assert_open(state, "恢复已消费回复")
     audit_path = (audit_log or "").strip() or DEFAULT_AUDIT_LOG
     if task_credential(state) is None:
@@ -4049,13 +4349,16 @@ def recover_consumed_reply(path: str, state: dict, audit_log: str, *,
                  allow_existing_round=True, require_pending=False)
 
     audit_target = recovery_audit_path(path, recovery_audit)
-    before_fp = _state_fingerprint(state)
+    # 基线已在入口处按磁盘原文取得（与 `_check_expect` 同源），此处不再重取，
+    # 以免校验窗口内的外部写入被当成基线。
     base_record = {
         "ts": now_iso(), "task_id": str(state.get("task_id") or ""),
         "round_id": round_id, "call_id": call_id,
         "original_reply_sha256": sha256_text(reply),
         "audit_reply_sha256": str(fields.get("reply_sha256") or ""),
         "before_state_sha256": before_fp,
+        "before_state_sha256_basis": "disk-raw",
+        "loaded_state_sha256": _state_fingerprint(state),
     }
 
     def reject(reason: str) -> None:
@@ -4135,8 +4438,8 @@ def recover_consumed_reply(path: str, state: dict, audit_log: str, *,
         "normalized_reply_sha256": normalized_sha, "preview": preview,
     })
     expect = {"round_seq": state.get("round_seq", 0), "pending_call_id": ""}
-    if state.get("version") == 2:
-        expect["state_sha256"] = before_fp
+    # 基线来自磁盘原文，对升级前后的任何版本都成立，因此不再只对 version=2 启用。
+    expect["state_sha256"] = before_fp
     try:
         save_state(path, working, expect=expect)
     except (DispatchError, OSError) as exc:

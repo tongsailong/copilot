@@ -76,7 +76,6 @@ REMEDIATION_BASIS = "remediation"
 # 只在行首识别；引用块、代码块（含缩进代码块）里的同名行都是材料或转述，
 # 不能当成本轮裁决。
 VERDICT_LABELS = r"(?:最终裁决|整体结论|裁决)"
-VERDICT_TOKEN_RE = re.compile(r"\b(PASS|PARTIAL|BLOCKED)\b", re.I)
 VERDICT_LINE_RE = re.compile(
     r"^\s*(?:[-+*]\s+)?#{0,6}\s*\**\s*" + VERDICT_LABELS
     + r"\s*\**\s*[：:]\s*(?P<value>.*)$", re.I)
@@ -128,14 +127,31 @@ def iter_fence_flags(text: str):
             yield line, True
 
 
+# 裁决行的值必须**只**是三态词本身（允许外层 markdown 强调与标点）。任何附加叙述、
+# 否定（`未达到 PASS`、`不能判 PASS`、`PASS 条件未满足`）或模板都会因不精确匹配而
+# 不作数。用「精确语法」而不是「先找三态词再判极性」：黑名单永远可能漏掉新的否定说法，
+# 而精确匹配只会漏掉非标准写法（失败方向是「无裁决」，不是误判 PASS）。
+VERDICT_DECORATION = " \t*_`~。.,，、;；:：!！?？-—–()（）[]【】\"'“”‘’"
+
+
+def _verdict_core(value: str) -> str:
+    """去掉裁决值外层的强调符号与标点，返回核心文本（可能是多词叙述）。"""
+    core = value.strip()
+    while True:
+        new = core.strip(VERDICT_DECORATION)
+        if new == core:
+            return core
+        core = new
+
+
 def parse_verdict(reply: str) -> str | None:
     """从 REVIEW 回复中提取本轮三态裁决；提取不到、或存在冲突时返回 None。
 
     只认代码围栏之外、非引用块、非缩进代码块的行首裁决行。回复里引用上一轮结论、
     贴输出示例、给格式模板都很常见，直接对全文 search 会把引用或示例中的 PASS
-    当成本轮裁决。同一行出现多个不同三态词（如 `PASS | PARTIAL`）视为模板或自相
-    矛盾，不猜；不同行给出互相冲突的裁决时同样返回 None，交给调用方按「无裁决」
-    记录（不得当 PASS）。裸 `结论：` 与 `copilot-plan` 的 decision 都不算正式裁决。
+    当成本轮裁决。裁决值必须是精确的三态词：带叙述、否定或模板的行不作数；整个回复
+    必须恰好有一行这样的裁决（`独立、唯一`），重复或多行一律返回 None，交给调用方按
+    「无裁决」记录（不得当 PASS）。裸 `结论：` 与 `copilot-plan` 的 decision 都不算。
     """
     found: list[str] = []
     for line, in_fence in iter_fence_flags(reply or ""):
@@ -144,19 +160,20 @@ def parse_verdict(reply: str) -> str | None:
         stripped = line.lstrip()
         if stripped.startswith(">"):
             continue
-        indent = len(line) - len(stripped)
-        if indent >= 4 or stripped.startswith("\t"):
+        lead = line[:len(line) - len(stripped)]
+        # 缩进代码块（4 空格或任意 tab 缩进）里的裁决不算：SKILL 明确排除。
+        if len(lead) >= 4 or "\t" in lead:
             continue
         m = VERDICT_LINE_RE.match(line)
         if not m:
             continue
-        tokens = {t.upper() for t in VERDICT_TOKEN_RE.findall(m.group("value") or "")}
-        if len(tokens) != 1:
-            # 缺值、模板（PASS | PARTIAL | BLOCKED）或自相矛盾：本行不作数。
+        core = _verdict_core(m.group("value") or "")
+        verdict = core.upper()
+        if verdict not in ("PASS", "PARTIAL", "BLOCKED"):
+            # 缺值、模板（`PASS | PARTIAL | BLOCKED`）、否定或附加叙述：本行不作数。
             continue
-        verdict = next(iter(tokens))
-        if verdict not in found:
-            found.append(verdict)
+        found.append(verdict)
+    # 独立且唯一：重复同一裁决行也算违约，不猜哪一行是「真」裁决。
     return found[0] if len(found) == 1 else None
 
 

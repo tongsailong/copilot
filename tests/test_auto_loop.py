@@ -29,6 +29,7 @@ sys.path.insert(0, HERE)
 sys.path.insert(0, SCRIPTS)
 from test_e2e_fake_upstream import Reply, Upstream, plan, success  # noqa: E402
 import copilot_auto  # noqa: E402
+import copilot_dispatch  # noqa: E402
 
 MODEL = "gpt-6.1-sol"
 
@@ -639,6 +640,71 @@ class AutoLoopBase(unittest.TestCase):
             self.assertEqual(after["round_seq"], before["round_seq"])
         self.assertEqual(len(self.upstream.requests), 1)
 
+    def test_07b_manifest_is_rejected_before_apply_in_quota_wait(self):
+        """阶段门禁先于回填：配额等待时提交执行结果必须整轮拒绝、磁盘不变。"""
+        self.first_round()
+        copilot_dispatch.record_quota(
+            self.state, {"code": "usage_limit_reached", "reset_seconds": 600},
+            call_id="call-quota-gate")
+        before = self.state_json()
+        raw = self.write("t1-quota.log", "QUOTA-GATE-EVIDENCE\n")
+        manifest = self.manifest({
+            "round_id": before["rounds"][-1]["round_id"],
+            "actions": [{"id": "T1", "status": "done", "result": "完成",
+                         "evidence_ids": ["E1"]}],
+            "evidence": [{"id": "E1", "file": raw, "kind": "test-output"}],
+        })
+        proc, _ = self.drive("--result-file", manifest)
+        self.assertEqual(proc.returncode, 2, proc.stderr)
+        self.assertIn("QUOTA_WAIT", proc.stderr)
+        self.assertIn("未写入任何状态", proc.stderr)
+        after = self.state_json()
+        self.assertEqual(after["actions"], before["actions"])
+        self.assertEqual(after["evidence"], before["evidence"])
+        self.assertEqual(after["reports"], before["reports"])
+        self.assertEqual(after["round_seq"], before["round_seq"])
+        self.assertEqual(after["quota"], before["quota"])
+        self.assertEqual(len(self.upstream.requests), 1)
+
+    def test_07d_manifest_include_must_be_boolean(self):
+        """include 只接受 JSON 布尔：字符串 "false"/0/null 不得被当成 true 静默入包。"""
+        self.first_round()
+        before = self.state_json()
+        raw = self.write("t1-include.log", "INCLUDE-EVIDENCE\n")
+        for index, value in enumerate(("false", 0, None)):
+            manifest = self.manifest({
+                "actions": [{"id": "T1", "status": "done", "result": "完成",
+                             "evidence_ids": ["E1"]}],
+                "evidence": [{"id": "E1", "file": raw, "kind": "test-output",
+                              "include": value}],
+            }, f"include-{index}.json")
+            proc, _ = self.drive("--result-file", manifest)
+            self.assertEqual(proc.returncode, 2, proc.stderr)
+            self.assertIn("不是布尔值", proc.stderr)
+            self.assertEqual(self.state_json(), before, f"include={value!r}")
+        self.assertEqual(len(self.upstream.requests), 1)
+
+    def test_07e_manifest_on_closed_task_is_rejected_not_ignored(self):
+        """已收口任务提交回填必须整轮拒绝：不能静默忽略 manifest 还返回成功。"""
+        self.first_round()
+        state = self.state_json()
+        state["closure"] = {"closed": True, "verdict": "pass", "closed_by": "gate"}
+        with open(self.state, "w", encoding="utf-8") as fh:
+            json.dump(state, fh, ensure_ascii=False, indent=2)
+        before = self.state_json()
+        raw = self.write("t1-closed.log", "CLOSED-GATE-EVIDENCE\n")
+        manifest = self.manifest({
+            "actions": [{"id": "T1", "status": "done", "result": "完成",
+                         "evidence_ids": ["E1"]}],
+            "evidence": [{"id": "E1", "file": raw, "kind": "test-output"}],
+        })
+        proc, _ = self.drive("--result-file", manifest)
+        self.assertEqual(proc.returncode, 2, proc.stderr)
+        self.assertIn("CLOSED", proc.stderr)
+        self.assertIn("未写入任何状态", proc.stderr)
+        self.assertEqual(self.state_json(), before)
+        self.assertEqual(len(self.upstream.requests), 1)
+
     # ── 8. dry-run 只预测，不写不调用 ──────────────────────────────────
     def test_08_dry_run_predicts_without_side_effects(self):
         self.start(task_id="auto-dry")
@@ -761,7 +827,8 @@ class AutoLoopBase(unittest.TestCase):
         text2 = self.payload_text(1)
         self.assertIn("REVIEW-ROUND2-EVIDENCE", text2)
         self.assertIn("自动驱动第 2 轮 REVIEW", text2)
-        self.assertIn("本轮新增/变化证据 E1，", text2)
+        self.assertIn("本轮提交 manifest 证据 E1（是否构成新增由台账按内容哈希判定）",
+                      text2)
         self.assertNotIn("EE1", text2)
 
         with open(ledger, encoding="utf-8") as fh:
@@ -825,6 +892,167 @@ class AutoDocsTest(unittest.TestCase):
         self.assertIn("不等于真实 GPT 调用验证", self.skill)
         self.assertIn("必须显式 `--auto-review`", self.skill)
         self.assertIn("未显式授权时 `drive` 拒绝 REVIEW", self.skill)
+
+
+class AutoExtraRoundReasonTests(unittest.TestCase):
+    """自动生成的首轮外理由只能陈述事实，不得替调用方断言「新增证据」。"""
+
+    def make_ledger(self, rounds: int) -> str:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = os.path.join(tmp.name, "ledger.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"subject": "task-x",
+                       "rounds": [{"round_id": f"r{i}"} for i in range(rounds)]},
+                      fh, ensure_ascii=False)
+        return path
+
+    def state(self, verdict: str = "partial") -> dict:
+        return {"task_id": "task-x",
+                "rounds": [{"model_identity_ok": True, "verdict": verdict}],
+                "contract": {"criteria": [
+                    {"criterion_id": "C1", "status": "pending"}]}}
+
+    def test_first_round_has_no_reason(self):
+        self.assertEqual(
+            copilot_auto._auto_extra_round_reason(self.state(), self.make_ledger(0), ["E1"]),
+            ("", ""))
+
+    def test_reason_defers_novelty_judgment_to_ledger(self):
+        reason, basis = copilot_auto._auto_extra_round_reason(
+            self.state(), self.make_ledger(1), ["E1"])
+        self.assertEqual(basis, "new-evidence")
+        self.assertIn("第 2 轮", reason)
+        self.assertIn("上一轮裁决 partial", reason)
+        self.assertIn("提交 manifest 证据 E1", reason)
+        self.assertIn("由台账按内容哈希判定", reason)
+        self.assertNotIn("新增证据 E1", reason)
+        self.assertIn("C1", reason)
+
+    def test_reason_without_evidence_claims_no_basis(self):
+        reason, basis = copilot_auto._auto_extra_round_reason(
+            self.state(), self.make_ledger(2), [])
+        self.assertEqual(basis, "")
+        self.assertIn("未附新的 manifest 证据", reason)
+        self.assertIn("交由台账判定", reason)
+
+    def test_reason_does_not_double_prefix_evidence_ids(self):
+        reason, _ = copilot_auto._auto_extra_round_reason(
+            self.state(), self.make_ledger(1), ["E7", "8"])
+        self.assertIn("证据 E7、E8", reason)
+
+
+class NoProgressMaterialTests(unittest.TestCase):
+    """无进展材料必须带条件正文，且只有实质事实变化才改变指纹。"""
+
+    def state(self) -> dict:
+        return {
+            "task_id": "task-np", "mode": "REVIEW", "round_seq": 3,
+            "actions": [{"id": "T1", "title": "执行", "status": "failed",
+                         "fail_streak": 1, "result": "失败输出",
+                         "origin": "plan"}],
+            "contract": {"criteria": [
+                {"criterion_id": "C1", "description": "安装包能启动",
+                 "status": "pending", "evidence_refs": []}]},
+            "evidence": [], "reports": [], "rounds": [], "decisions": [],
+        }
+
+    def test_criteria_description_is_rendered(self):
+        material = copilot_auto._no_progress_material(self.state())
+        self.assertEqual(material["criteria"][0]["text"], "安装包能启动")
+        prompt = copilot_auto._no_progress_prompt(material)
+        self.assertIn("C1", prompt)
+
+    def test_fail_streak_alone_does_not_change_digest(self):
+        state = self.state()
+        first = copilot_auto._no_progress_material(state)["digest"]
+        state["actions"][0]["fail_streak"] = 7
+        self.assertEqual(
+            copilot_auto._no_progress_material(state)["digest"], first)
+
+    def test_substantive_change_updates_digest(self):
+        state = self.state()
+        first = copilot_auto._no_progress_material(state)["digest"]
+        state["actions"][0]["result"] = "新的失败输出：权限被拒绝"
+        self.assertNotEqual(
+            copilot_auto._no_progress_material(state)["digest"], first)
+
+
+class AutoPackReviewVerbatimTests(unittest.TestCase):
+    """--no-auto-evidence 只关闭 manifest 证据；复核原文必须仍然完整入包。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.workdir = os.path.join(self.tmp.name, "auto")
+        self.report = os.path.join(self.tmp.name, "review.md")
+        self.body = "裁决：PARTIAL\n\n复核原文正文：T1 未覆盖回滚路径。\n"
+        with open(self.report, "w", encoding="utf-8") as fh:
+            fh.write(self.body)
+        import hashlib
+        self.sha = hashlib.sha256(self.body.encode("utf-8")).hexdigest()
+
+    def state(self) -> dict:
+        return {
+            "task_id": "task-pack", "round_seq": 2,
+            "contract": {"criteria": []},
+            "evidence": [{
+                "id": "E9", "sha256": self.sha, "task_id": "task-pack",
+                "origin": "review-report", "path_hint": self.report,
+                "review_of": "exec-1", "review_of_kind": "execution",
+                "review_source": "native", "dropped": False, "note": ""}],
+            "reports": [{
+                "kind": "review", "round_id": "task-pack-r2",
+                "evidence_id": "E9", "raw_report_sha256": self.sha,
+                "review_of": "exec-1", "review_of_kind": "execution",
+                "review_source": "native", "verdict": "PARTIAL"}],
+        }
+
+    def manifest_evidence(self) -> list[dict]:
+        return [{"id": "E1", "kind": "inline", "note": "",
+                 "include": True, "text": "MANIFEST-ONLY-EVIDENCE"}]
+
+    def read(self, path: str) -> str:
+        with open(path, encoding="utf-8") as fh:
+            return fh.read()
+
+    def test_no_auto_evidence_still_includes_review_verbatim(self):
+        pack = copilot_auto._build_auto_pack(
+            self.workdir, self.state(), self.manifest_evidence(), "",
+            include_manifest=False)
+        self.assertIsNotNone(pack)
+        text = self.read(pack)
+        self.assertIn("复核原文正文：T1 未覆盖回滚路径。", text)
+        self.assertIn("复核原文", text)
+        self.assertNotIn("MANIFEST-ONLY-EVIDENCE", text)
+
+    def test_default_pack_includes_both_sources(self):
+        pack = copilot_auto._build_auto_pack(
+            self.workdir, self.state(), self.manifest_evidence(), "")
+        text = self.read(pack)
+        self.assertIn("复核原文正文：T1 未覆盖回滚路径。", text)
+        self.assertIn("MANIFEST-ONLY-EVIDENCE", text)
+
+
+class LocalRunTimeoutTests(unittest.TestCase):
+    """本地子进程超时必须转成可读错误，不得重试或伪装成普通失败。"""
+
+    def test_timeout_raises_auto_error_without_retry(self):
+        from unittest import mock
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout"))
+
+        with mock.patch.object(copilot_auto.subprocess, "run",
+                               side_effect=fake_run):
+            with self.assertRaises(copilot_auto.AutoError) as ctx:
+                copilot_auto._run_local(["copilot_dispatch.py"], 5, "恢复挂起轮次")
+        self.assertEqual(len(calls), 1)
+        self.assertIn("恢复挂起轮次", str(ctx.exception))
+        self.assertIn("超时", str(ctx.exception))
+        self.assertIn("不要自动重试", str(ctx.exception))
 
 
 if __name__ == "__main__":

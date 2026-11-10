@@ -169,7 +169,8 @@ TEXT_FIELDS = {"input", "instructions"}
 REVIEW_OUTPUT_CONTRACT = (
     "\n## 输出契约（REVIEW，必须遵守）\n\n"
     "必须在回复中单独一行输出一个正式裁决：`裁决：PASS`、`裁决：PARTIAL` 或 "
-    "`裁决：BLOCKED`。该行不得放进代码块、引用块或示例中；全篇只能有一个裁决值。\n"
+    "`裁决：BLOCKED`。该行不得放进代码块、引用块或示例中；全篇只能有一行这样的裁决行"
+    "（重复同一声明也算违约，只写最终一行）。\n"
     "`最终裁决：` / `整体结论：` 只在明确且唯一时兼容；裸 `结论：` 与 "
     "`copilot-plan` 的 decision 不是三态裁决。\n"
 )
@@ -1059,22 +1060,35 @@ def _same_file(a: str, b: str) -> bool:
 
 
 def assert_distinct_paths(args) -> None:
-    """拒绝会让截断写入破坏审计/台账/交接状态的路径别名。"""
-    targets = [
+    """拒绝会让截断写入破坏审计/台账/交接状态/输入证据的路径别名。"""
+    outputs = [
         ("--audit-log", args.audit_log),
         ("--out", args.out),
         ("--dump-request", args.dump_request),
         ("--review-ledger", args.review_ledger),
         ("--dispatch-state", args.dispatch_state),
+        # 分段计划用 os.replace 原子写；与上述任一输出同路径会静默覆盖它们。
+        ("--segmentation-plan", getattr(args, "segmentation_plan", "")),
     ]
-    for i in range(len(targets)):
-        for j in range(i + 1, len(targets)):
-            name_a, path_a = targets[i]
-            name_b, path_b = targets[j]
+    inputs = [("--role-file", getattr(args, "role_file", ""))]
+    prompt = str(getattr(args, "prompt_file", "") or "")
+    if prompt and prompt != "-":
+        inputs.append(("--prompt-file", prompt))
+    inputs += [("--evidence", path) for path in (getattr(args, "evidence", None) or [])]
+    for i in range(len(outputs)):
+        for j in range(i + 1, len(outputs)):
+            name_a, path_a = outputs[i]
+            name_b, path_b = outputs[j]
             if _same_file(path_a, path_b):
                 die(EXIT_USAGE,
                     f"{name_a} 与 {name_b} 指向同一文件（{path_a}）；"
                     "输出或请求 dump 的截断写入会破坏审计/台账/交接记录，拒绝执行。")
+    for out_name, out_path in outputs:
+        for in_name, in_path in inputs:
+            if _same_file(out_path, in_path):
+                die(EXIT_USAGE,
+                    f"{out_name} 与输入 {in_name} 指向同一文件（{out_path}）；"
+                    "任何输出写入都会覆盖本轮输入证据，拒绝执行。")
 
 
 def main() -> int:
@@ -1695,6 +1709,16 @@ def main() -> int:
             last_elapsed_ms = elapsed_ms
             last_status = status
             if status == 200:
+                # HTTP 200 也可能携带配额/冷却错误体（代理或上游把业务错误包在
+                # 成功状态里）。此时必须与非 200 走同一配额通道：写等待状态、退出 8、
+                # 不自动重发；否则主控会把「额度已用尽」当成普通结构错误立即重试。
+                quota = quota_signal(status, data)
+                if quota:
+                    last_quota = quota
+                    last_error = redact(str(response_problem(data)
+                                           or "quota/cooldown reported in HTTP 200 body"))
+                    http_response_received = True
+                    break
                 try:
                     tool_calls = find_tool_calls(data)
                     problem = response_problem(data)

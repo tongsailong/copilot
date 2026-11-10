@@ -111,6 +111,20 @@ def _clip(text: str, limit: int) -> str:
     return text[:limit] + f"\n…（已截断，原长 {len(text)} 字符）"
 
 
+def _run_local(cmd: list[str], timeout: float, label: str):
+    """本地子进程调用：超时转成可读的 AutoError，不让 TimeoutExpired 逃成 traceback。
+
+    本地脚本超时表示结果未知（例如 recover 可能已经部分写盘）：这里只报错，
+    不重试、不清 pending——恢复语义仍由调用方按「结果未知」处理。
+    """
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise AutoError(
+            f"{label} 超时（{timeout:.0f}s）：结果可能未知；不要自动重试，"
+            "先检查审计与交接状态（pending 保留）后人工确认。") from None
+
+
 def _verified_rounds(state: dict) -> list[dict]:
     return [r for r in state.get("rounds") or []
             if isinstance(r, dict) and r.get("model_identity_ok") is True]
@@ -504,11 +518,17 @@ def _manifest_evidence(manifest: dict) -> list[dict]:
         has_text = item.get("text") is not None
         if has_file == has_text:
             raise AutoError(f"{eid} 必须且只能提供 file 或 text 之一。")
+        include = item.get("include", True)
+        if not isinstance(include, bool):
+            # JSON 里 "false"/0/null 都不是布尔。bool("false") == True 会把
+            # 明确要求排除的敏感证据静默放进 SOL 上下文。
+            raise AutoError(
+                f"{eid} 的 include={include!r} 不是布尔值；请写 true 或 false。")
         entry = {
             "id": eid,
             "kind": str(item.get("kind") or ("file" if has_file else "inline")).strip(),
             "note": str(item.get("note") or "").strip(),
-            "include": bool(item.get("include", True)),
+            "include": include,
         }
         if has_file:
             path = os.path.abspath(str(item.get("file")).strip())
@@ -713,13 +733,18 @@ def _review_handoff_entries(state: dict, *, verify_files: bool) -> list[dict]:
 
 
 def _build_auto_pack(workdir: str, state: dict, manifest_evidence: list[dict],
-                     question: str) -> str | None:
+                     question: str, *, include_manifest: bool = True) -> str | None:
     """把 manifest 证据与相关复核原文整理成 call_gpt 可读的证据包。
 
     复用 bridge_evidence 的脱敏、指纹、预算与省略标注；复核原文被截断、整体
     未纳入或摘要不符时失败关闭，绝不退化成只用摘要。
+
+    `include_manifest=False`（`--no-auto-evidence`）只关闭可选的 manifest 证据
+    打包；已有复核原文仍必须完整入包——那是正式 REVIEW 的证据链要求，不能用
+    开关关闭。
     """
-    manifest_selected = [e for e in manifest_evidence if e.get("include", True)]
+    manifest_selected = ([e for e in manifest_evidence if e.get("include", True)]
+                         if include_manifest else [])
     review_selected = _review_handoff_entries(state, verify_files=True)
     if not manifest_selected and not review_selected:
         return None
@@ -789,7 +814,7 @@ def _build_auto_pack(workdir: str, state: dict, manifest_evidence: list[dict],
         mapping.append("；".join(source["labels"]))
     cmd += ["--note", "自动证据包编号与任务状态证据索引是两套编号；"
                       "任务状态编号对应关系：" + "；".join(mapping)]
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+    proc = _run_local(cmd, 180, "自动证据包生成（bridge_evidence.py）")
     if proc.returncode != 0:
         raise AutoError("自动证据包生成失败（bridge_evidence.py）："
                         + (proc.stderr.strip() or proc.stdout.strip())[-1500:])
@@ -859,7 +884,10 @@ def _no_progress_material(state: dict) -> dict:
             continue
         criteria.append({
             "id": str(item.get("criterion_id") or ""),
-            "text": _clip(str(item.get("text") or ""), 1200),
+            # 完成条件的正文在契约里叫 `description`；读 `text` 会渲染成空串，
+            # SOL 看到的未闭合条件就全是空描述。
+            "text": _clip(str(item.get("description")
+                              or item.get("text") or ""), 1200),
             "status": str(item.get("status") or ""),
             "evidence_refs": sorted(str(r.get("id") or "")
                                     for r in item.get("evidence_refs") or []),
@@ -905,10 +933,15 @@ def _no_progress_material(state: dict) -> dict:
         "rounds": rounds[-6:],
         "decisions": decisions[-8:],
     }
+    # 指纹只看「实质事实」：`fail_streak` 是同一失败的计数，只增计数不构成新信息；
+    # 若把它算进取指纹，同一份材料每轮都会被判为「有新进展」，付费重析闸门失效。
+    digest_actions = [{k: v for k, v in action.items() if k != "fail_streak"}
+                      for action in actions]
     material["digest"] = sha256_text(
-        json.dumps({k: material[k] for k in
-                    ("task_id", "mode", "actions", "criteria", "evidence",
-                     "review_reports", "decisions")},
+        json.dumps({**{k: material[k] for k in
+                       ("task_id", "mode", "criteria", "evidence",
+                        "review_reports", "decisions")},
+                    "actions": digest_actions},
                    ensure_ascii=False, sort_keys=True, separators=(",", ":")))
     return material
 
@@ -1013,7 +1046,7 @@ def _build_no_progress_pack(workdir: str, material: dict) -> str:
            "--out", pack_path, "--manifest", manifest_path,
            "--max-chars", "60000", "--file", context_path,
            "--note", "无进展诊断上下文；不是交付物证据，不用于核销完成条件"]
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+    proc = _run_local(cmd, 180, "无进展诊断证据包生成（bridge_evidence.py）")
     if proc.returncode != 0:
         raise AutoError("无进展诊断证据包生成失败："
                         + (proc.stderr.strip() or proc.stdout.strip())[-1500:])
@@ -1156,16 +1189,16 @@ def _review_subject(path: str, state: dict) -> str:
 
 
 def _auto_extra_round_reason(state: dict, ledger_path: str,
-                             new_ids: list[str]) -> str:
-    """首轮之外自动生成 `--extra-round-reason`。
+                             new_ids: list[str]) -> tuple[str, str]:
+    """首轮之外自动生成 `--extra-round-reason`；返回 (理由, 依据标签)。
 
-    只陈述事实：第几轮、上一轮裁决、本轮新增证据 id、仍未闭合的条件。它不是
-    新的授权或判断，只满足「为什么还需要一轮」的留痕要求；复核是否继续仍由
-    review_ledger 的新增证据闸门决定。
+    只陈述本轮**实际提交**的事实：第几轮、上一轮裁决、本轮提交了哪些 manifest
+    证据、仍未闭合的条件。是否真的构成「新增证据」由台账按内容哈希判定，这里
+    不预先断言「新增/哈希变化」——自动生成的文字不能替调用方取得新增证据资格。
     """
     used = _review_round_count(ledger_path)
     if used < 1:
-        return ""
+        return "", ""
     rounds = [r for r in state.get("rounds") or []
               if isinstance(r, dict) and r.get("model_identity_ok") is True]
     verdict = str((rounds[-1] if rounds else {}).get("verdict") or "未记录")
@@ -1174,15 +1207,20 @@ def _auto_extra_round_reason(state: dict, ledger_path: str,
     # evidence id 在 manifest 里通常已带 E 前缀；不要重复拼接成 EE1。
     evidence = "、".join(
         str(i) if str(i).upper().startswith("E") else f"E{i}" for i in new_ids
-    ) if new_ids else "本轮证据包（内容哈希与往轮不同）"
+    )
+    if evidence:
+        reason = (f"自动驱动第 {used + 1} 轮 REVIEW：上一轮裁决 {verdict}；"
+                  f"本轮提交 manifest 证据 {evidence}（是否构成新增由台账按内容哈希"
+                  f"判定），用于继续核验未闭合条件 {('、'.join(unmet) or '（无）')}。")
+        return reason, "new-evidence"
     return (f"自动驱动第 {used + 1} 轮 REVIEW：上一轮裁决 {verdict}；"
-            f"本轮新增/变化证据 {evidence}，用于继续核验未闭合条件 "
-            f"{('、'.join(unmet) or '（无）')}。继续复核的依据是新增证据，"
-            "不是重复同一组材料。")
+            f"本轮未附新的 manifest 证据，仅提交任务状态当前证据与复核原文，"
+            f"继续核验未闭合条件 {('、'.join(unmet) or '（无）')}；"
+            "是否构成新增证据交由台账判定。"), ""
 
 
 def _call_gpt(args, state: dict, prompt: str, evidence: list[str],
-              extra_round_reason: str = "") -> dict:
+              extra_round_reason: str = "", extra_round_basis: str = "") -> dict:
     workdir = os.path.abspath(args.work_dir)
     os.makedirs(workdir, exist_ok=True)
     round_no = int(state.get("round_seq") or 0) + 1
@@ -1212,8 +1250,9 @@ def _call_gpt(args, state: dict, prompt: str, evidence: list[str],
         if subject:
             cmd += ["--subject", subject]
         if extra_round_reason.strip():
-            cmd += ["--extra-round-reason", extra_round_reason.strip(),
-                    "--extra-round-basis", "new-evidence"]
+            cmd += ["--extra-round-reason", extra_round_reason.strip()]
+            if extra_round_basis.strip():
+                cmd += ["--extra-round-basis", extra_round_basis.strip()]
     # 输出预算默认不发送：不在代码里设置低于服务商真实上限的人为上限。
     if args.max_output_tokens is not None:
         cmd += ["--max-output-tokens", str(args.max_output_tokens)]
@@ -1262,7 +1301,7 @@ def _run_recover(args) -> None:
            "--state", os.path.abspath(args.state),
            "--audit-log", args.audit_log,
            "--reply-file", args.recover_reply]
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    proc = _run_local(cmd, 120, "恢复挂起轮次（copilot_dispatch.py recover）")
     if proc.stderr.strip():
         print(proc.stderr.strip(), file=sys.stderr)
     if proc.returncode != 0:
@@ -1478,9 +1517,12 @@ def _round_material(state: dict, round_id: str) -> list[str]:
         if isinstance(entry, dict) and str(entry.get("round_id") or "") == rid:
             found.append(str(entry.get("kind") or "report"))
     for entry in state.get("actions") or []:
+        # `dropped` 也是终态：派生项被放弃并写明原因后，本轮已有事实需要交回 SOL，
+        # 不能因为状态不是 done/failed 就再派生一条同义 AUTO 项无限空转。
         if (isinstance(entry, dict)
                 and str(entry.get("derived_from_round_id") or "") == rid
-                and str(entry.get("status") or "") in ("done", "failed", "blocked")):
+                and str(entry.get("status") or "") in ("done", "failed", "blocked",
+                                                       "dropped")):
             found.append("derived-work")
     return found
 
@@ -1604,6 +1646,12 @@ def drive(args) -> int:
     # 注意：不能写 str(value) 判断——str(False) == "False" 为真，会把未收口
     # 的新任务误判成 CLOSED。
     if bool((state.get("closure") or {}).get("closed")):
+        # 已收口任务不接受执行回填：否则 --result-file 会被静默忽略而 exit 0，调用方
+        # 会误以为本轮执行已被采纳。仅纯只读调用（无回填参数）才直接返回 CLOSED。
+        if args.result_file or args.native_result:
+            raise AutoError(
+                "任务已 CLOSED，不接受执行回填（--result-file / --native-result）："
+                "本次未写入任何状态。如需继续，先按新目标重建任务合同。")
         return _emit(_result("closed", state, {"phase": "CLOSED"},
                              state_path=path), EXIT_OK)
 
@@ -1636,14 +1684,28 @@ def drive(args) -> int:
         manifest = _load_json(args.result_file)
         if not isinstance(manifest, dict):
             raise AutoError("manifest 顶层必须是对象。")
+        manifest_evidence = _manifest_evidence(manifest)
+        actions = _manifest_actions(manifest, state, manifest_evidence)
         if args.dry_run:
-            manifest_evidence = _manifest_evidence(manifest)
-            actions = _manifest_actions(manifest, state, manifest_evidence)
-            return _emit(_result(
-                "manifest_valid", state, {"phase": "DRY_RUN"},
-                dry_run=True,
+            preview_loop = D.loop_step(path, persist=False)
+            preview = _result(
+                "manifest_valid", state, preview_loop, dry_run=True,
                 manifest={"actions": [a["id"] for a in actions],
-                          "evidence": [e["id"] for e in manifest_evidence]}), EXIT_OK)
+                          "evidence": [e["id"] for e in manifest_evidence]})
+            # 不改变状态；只把阶段的只读预演结果标成 DRY_RUN。
+            preview["state_phase"] = preview.get("phase")
+            preview["phase"] = "DRY_RUN"
+            return _emit(preview, EXIT_OK)
+        # 阶段门禁必须先于回填：待复核（REVIEW_PENDING）、配额等待、BLOCKED(G4)
+        # 等状态下，磁盘不能前进——否则被复核的执行快照会被新证据/新报告污染，
+        # 用户看到「停止」，状态却在走。预检只读（persist=False），不写盘。
+        gate = D.loop_step(path, persist=False)
+        gate_phase = str(gate.get("phase") or "")
+        if gate_phase in ("CLOSED", "RECOVER", "BLOCKED", "QUOTA_WAIT",
+                          "REVIEW_PENDING"):
+            raise AutoError(
+                f"当前阶段 {gate_phase} 不接受执行回填：先处理该阶段（recover / 复核 / "
+                "等待冷却 / 用户决策），再提交新一轮执行结果；本次未写入任何状态。")
         manifest_info = _apply_manifest(path, state, manifest)
         manifest_evidence = manifest_info["evidence"]
         state = D.load_state(path)
@@ -1746,10 +1808,11 @@ def drive(args) -> int:
                              budget=budget), EXIT_WAIT)
 
     evidence = [os.path.abspath(p) for p in args.evidence]
-    auto_pack = None
-    if not args.no_auto_evidence:
-        auto_pack = _build_auto_pack(os.path.abspath(args.work_dir), state,
-                                     manifest_evidence, question)
+    # 复核原文入包不受 --no-auto-evidence 影响：该开关只关闭可选的 manifest
+    # 证据打包，不能关闭复核证据链的完整性要求。
+    auto_pack = _build_auto_pack(os.path.abspath(args.work_dir), state,
+                                 manifest_evidence, question,
+                                 include_manifest=not args.no_auto_evidence)
     if auto_pack:
         evidence.append(auto_pack)
     # 本轮无进展指纹在真实调用前落盘。连续无进展不再直接停止：先确认是否有
@@ -1805,8 +1868,9 @@ def drive(args) -> int:
                              stamp=stamp), EXIT_WAIT)
 
     extra_round_reason = ""
+    extra_round_basis = ""
     if str(state.get("mode") or "").strip().upper() == "REVIEW":
-        extra_round_reason = _auto_extra_round_reason(
+        extra_round_reason, extra_round_basis = _auto_extra_round_reason(
             state, _review_ledger_path(args, os.path.abspath(args.work_dir)),
             [str(e.get("id") or "") for e in manifest_evidence
              if isinstance(e, dict)])
@@ -1815,7 +1879,9 @@ def drive(args) -> int:
                 "；本轮为连续无进展重新分析：提交失败工作项、未闭合条件与已有证据"
                 f"诊断包 {reanalysis['digest'][:12]}，用于分析原方案为何失效；"
                 "该诊断包不是交付物证据，不用于核销完成条件。")
-    call = _call_gpt(args, state, prompt, evidence, extra_round_reason)
+            extra_round_basis = extra_round_basis or "new-evidence"
+    call = _call_gpt(args, state, prompt, evidence, extra_round_reason,
+                     extra_round_basis)
     call_info = {"exit": call["exit"], "prompt_file": call["prompt_file"],
                  "reply_file": call["reply_file"], "evidence": evidence,
                  "extra_round_reason": extra_round_reason,

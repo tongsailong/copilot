@@ -497,5 +497,86 @@ class RecoveryValidationTests(RecoveryFixture):
         self.assertEqual(copilot_dispatch.load_state(self.path)["note"], "外部修改")
 
 
+class RecoveryCasBaselineTests(RecoveryFixture):
+    """恢复入口的 CAS 基线必须与比较对象同源（磁盘原文），而非升级后的内存态。"""
+
+    def strip_default_keys(self, keys: tuple[str, ...]) -> dict:
+        """模拟旧状态文件：磁盘上缺 v2 默认节，加载时由 `_upgrade_state` 补齐。"""
+        with open(self.path, encoding="utf-8") as fh:
+            raw = json.load(fh)
+        for key in keys:
+            raw.pop(key, None)
+        with open(self.path, "w", encoding="utf-8") as fh:
+            json.dump(raw, fh, ensure_ascii=False)
+        return raw
+
+    def test_legacy_disk_without_default_keys_can_still_recover(self):
+        reply = self.real_plan()
+        self.rejected_round(reply)
+        raw = self.strip_default_keys(("review_consumed", "native_results",
+                                       "native_reviews"))
+        loaded = copilot_dispatch.load_state(self.path)
+        result = copilot_dispatch.recover_consumed_reply(
+            self.path, loaded, self.audit, call_id="call-recovery-1",
+            reply=reply, recovery_audit=self.recovery_audit)
+        self.assertEqual(result["status"], "applied")
+        record = [r for r in audit_records(self.recovery_audit)
+                  if r.get("event") == "recover_result"][-1]
+        self.assertEqual(record["result"], "applied")
+        self.assertEqual(record["before_state_sha256_basis"], "disk-raw")
+        disk_fp = sha256_text(json.dumps(raw, ensure_ascii=False, sort_keys=True,
+                                         separators=(",", ":")))
+        self.assertEqual(record["before_state_sha256"], disk_fp)
+        self.assertNotEqual(record["loaded_state_sha256"], disk_fp,
+                            "该现场正是「加载后补默认键」导致内存态与磁盘原文不同")
+        self.assertEqual(len(loaded["rounds"]), 2)
+        self.assertFalse(loaded["rounds"][-1]["rejected"])
+
+    def test_concurrent_write_between_caller_load_and_baseline_is_preserved(self):
+        """调用方 load 之后、取基线之前的写入必须被读入，不能被恢复静默回退。"""
+        reply = self.real_plan()
+        self.rejected_round(reply)
+        stale = copilot_dispatch.load_state(self.path)
+        with open(self.path, encoding="utf-8") as fh:
+            current = json.load(fh)
+        current["note"] = "基线前外部写入"
+        with open(self.path, "w", encoding="utf-8") as fh:
+            json.dump(current, fh, ensure_ascii=False)
+        result = copilot_dispatch.recover_consumed_reply(
+            self.path, stale, self.audit, call_id="call-recovery-1",
+            reply=reply, recovery_audit=self.recovery_audit)
+        self.assertEqual(result["status"], "applied")
+        after = copilot_dispatch.load_state(self.path)
+        self.assertEqual(after["note"], "基线前外部写入",
+                         "基线来自磁盘原文，工作副本必须同源")
+        self.assertFalse(after["rounds"][-1]["rejected"])
+
+    def test_concurrent_write_between_baseline_and_save_is_rejected(self):
+        reply = self.real_plan()
+        self.rejected_round(reply)
+        original = copilot_dispatch.save_state
+
+        def racing_save(path, state, expect=None):
+            if expect and "state_sha256" in expect:
+                with open(path, encoding="utf-8") as fh:
+                    current = json.load(fh)
+                current["note"] = "外部进程写入"
+                with open(path, "w", encoding="utf-8") as fh:
+                    json.dump(current, fh, ensure_ascii=False)
+            return original(path, state, expect=expect)
+
+        with mock.patch.object(copilot_dispatch, "save_state",
+                               side_effect=racing_save):
+            with self.assertRaises(copilot_dispatch.DispatchError) as ctx:
+                self.recover(reply=reply)
+        self.assertIn("state_sha256", str(ctx.exception))
+        after = copilot_dispatch.load_state(self.path)
+        self.assertEqual(after["note"], "外部进程写入", "恢复不得覆盖外部写入")
+        self.assertTrue(after["rounds"][-1]["rejected"], "恢复失败时轮次保持原状")
+        record = [r for r in audit_records(self.recovery_audit)
+                  if r.get("event") == "recover_result"][-1]
+        self.assertEqual(record["result"], "failed")
+
+
 if __name__ == "__main__":
     unittest.main()
