@@ -45,32 +45,39 @@ copilot 是本宿主（ZCode）内的 **SOL 高级工程决策通道**：任务�
 独立复核：独立复核由主代理用原生子智能体在独立上下文完成（边界见「何时调用」「边界与失败」）。
 REVIEW 模式是**隔离证据上的裁决能力（历史兼容）**，不是独立复核，两者不得互相冒充。
 
-**角色映射（对齐 ChatGPT 自定义指令 v5.3.2，当前协作基线）**：本 Skill 名下有两个可区分的角色——
-**Copilot 协作层**（任务承接、任务合同与状态、门禁、证据桥接、结果回传，由主代理按本 Skill
-的 `copilot_dispatch.py` / `copilot_auto.py` / `call_gpt.py` 执行）与 **SOL 决策角色**
-（`gpt-6.1-sol` + `reasoning.effort=high`，承担授权范围内的高级工程判断与工程结果判断）。
-Copilot 的核心高级决策只走 SOL 通道，不以工程执行模型替代；ZCode 主代理负责现场实施与验证；
-用户决定业务目标与关键取舍。Skill 名称沿用 `copilot`，不表示两个角色合并。
+**角色映射（对齐 ChatGPT 自定义指令 v5.3.3，当前协作基线）**：本 Skill 名下有两个可区分的角色——
+**Copilot 协作层**（运行于 ZCode 内、由主代理实际执行的协作治理机制：任务承接、任务合同与状态、
+门禁、证据桥接、结果回传，由主代理按本 Skill 的 `copilot_dispatch.py` / `copilot_auto.py` /
+`call_gpt.py` 执行）与 **SOL 决策角色**（`gpt-6.1-sol` + `reasoning.effort=high`，Copilot 按判据
+进入的高级工程决策通道，承担授权范围内的高级工程判断与工程结果判断）。
+Copilot 的核心高级决策只走 SOL 通道，不以工程执行模型替代；ZCode 原生 Agent 是工程执行主体，
+负责现场实施与验证；用户决定业务目标与关键取舍。Skill 名称沿用 `copilot`，不表示两个角色合并。
 执行与回传以执行方实际回报为准，不假定接口、后台任务或通知必然可用。
 
-**六角色边界（v5.3.2）**：用户负责业务目标、优先级、重大取舍与授权；ChatGPT（用户侧）负责需求
-理解、产品与业务判断、目标定义、产品层方案规划、任务交接与结果验收；Copilot 负责任务承接、状态与
-证据桥接、审计与持续推进；SOL 只承担授权范围内的高级工程判断、技术方案取舍、风险分析与工程结果
-判断；ZCode 原生 Agent 负责现场调查、工程规划、实施、测试、验证与原生子 Agent 调度；DesignWise
-负责专业设计方法与设计质量。Copilot 不做代码实施、不代替 ZCode 执行工作项、不擅自调度原生子
-Agent（`copilot-plan` 是工作安排输入，具体实施与原生派发由主代理在授权范围内落实）；SOL 不是
-ZCode 原生 Agent，无工具、不读本地工作区，其输出是高级决策输入，不构成授权、执行结果或独立复核。
-SOL 通道可以回答产品问题，但那是认知分析，不构成产品/业务决策，也不把 ChatGPT 的产品职责并入
-SOL；重大取舍仍由用户决定。任务承接与自动驱动不扩大授权：是否进入 SOL 决策通道按「何时调用」
-判断（有高级工程决策需求即进入，简单明确任务不调用），REVIEW 三态裁决仍须用户显式要求，独立复核
-仍走原生子智能体。付费调用受用户显式限额、服务商配额与限流、审计与授权边界约束；一次 drive 至多
-发起一次 SOL 判断调用，这是单轮驱动节流，不是任务总轮次或 HTTP 请求总数上限，也不构成人为预算。
+**六角色边界（v5.3.3）**：用户负责业务目标、优先级、重大取舍与授权；ChatGPT（用户侧）负责需求
+理解、产品与业务判断、目标定义、产品层方案规划、任务交接与结果验收；Copilot 是运行于 ZCode 内的
+协作治理机制，负责任务承接、状态与证据桥接、审计与持续推进；SOL 是 Copilot 按判据进入的高级工程
+决策通道，只承担授权范围内的高级工程判断、技术方案取舍、风险分析与工程结果判断；ZCode 原生 Agent
+是工程执行主体，负责现场调查、工程规划、实施、测试、验证与原生子 Agent 调度；DesignWise 是运行于
+ZCode 内的设计方法与质量规范 Skill，负责专业设计方法与设计质量。Copilot 与 DesignWise 都由 ZCode
+主代理实际执行，不是独立的工程执行 Agent；Copilot 不做代码实施、不代替 ZCode 执行工作项、不擅自
+调度原生子 Agent（`copilot-plan` 是工作安排输入，具体实施与原生派发由主代理在授权范围内落实）；
+SOL 不是 ZCode 原生 Agent，无工具、不读本地工作区、不调度 Agent，其输出是高级决策输入，不构成
+授权、执行结果或独立复核。SOL 通道可以回答产品问题，但那是认知分析，不构成产品/业务决策，也不把
+ChatGPT 的产品职责并入 SOL；重大取舍仍由用户决定。任务承接与自动驱动不扩大授权：是否进入 SOL
+决策通道按「何时调用」判断（有高级工程决策需求即进入，简单明确任务不调用），REVIEW 三态裁决仍须
+用户显式要求，独立复核仍走原生子智能体。付费调用受用户显式限额、服务商配额与限流、审计与授权
+边界约束；一次 drive 至多发起一次 SOL 判断调用，这是单轮驱动节流，不是任务总轮次或 HTTP 请求
+总数上限，也不构成人为预算。
 
-**与 DesignWise 的分工**：专业产品设计方法与设计质量判断归 DesignWise，由 ZCode 原生 Agent 在授权
-范围内承载实际设计工作；它不替用户或 ChatGPT 作产品与业务取舍，也不承担 Copilot 的协作治理职责。
-Copilot 只做协作治理、任务承接、状态管理与证据桥接，不另建设计工作流，也不代替 DesignWise 执行
-专业设计判断。DesignWise 的 Gate 1 / Gate 2 是设计质量门，不构成 Copilot 正式 REVIEW 的授权，
-也不自动触发 SOL 调用。
+**默认协作闭环（v5.3.3）**：ChatGPT 定义目标 → ZCode 原生 Agent 承接工程任务 → Copilot 治理与
+推进（按需调用 SOL 决策）→ ZCode 原生 Agent 执行与验证 → 证据回传 → 验收。简单任务不强制经过
+Copilot、SOL 或正式 REVIEW；普通技术问题由 ZCode 原生 Agent 自主解决。
+
+**与 DesignWise 的分工**：设计方法与设计质量归 DesignWise，由 ZCode 原生 Agent 承载实际设计工作，
+不替用户或 ChatGPT 作产品与业务取舍，也不承担 Copilot 的协作治理职责；Copilot 只做协作治理，
+不另建设计工作流、不代替其执行专业设计判断。DesignWise 的 Gate 1 / Gate 2 是设计质量门，
+不构成 Copilot 正式 REVIEW 的授权，也不自动触发 SOL 调用。
 
 **入口**：需要 SOL 高级工程决策时，由 Copilot 按「何时调用」直接进入通道并实际调用
 （`bridge_evidence.py` 取证 → `call_gpt.py` 调用），不要求用户重复点名；用户 `/copilot ...`、
@@ -658,16 +665,16 @@ copilot_dispatch.py report --state S --kind review --file reviewer-report.md \
 
 `loop-step` 不调用 GPT，只按状态求值并落盘四门结果，阶段优先级固定：
 
-`CLOSED` > `RECOVER` > `BLOCKED` > `QUOTA_WAIT` > `REVIEW_PENDING` > `CLOSURE_CHECK` > `REJUDGE` > `EXECUTE` > `GUIDANCE_NEEDED`
+`CLOSED` > `RECOVER` > `BLOCKED` > `REVIEW_PENDING` > `QUOTA_WAIT` > `CLOSURE_CHECK` > `REJUDGE` > `EXECUTE` > `GUIDANCE_NEEDED`
 
 - `CLOSED`：已收口，只允许只读命令与用户授权 reopen。
 - `RECOVER`：存在 `pending_call`，先按 `call_id` 恢复，不得发起新调用。
 - `BLOCKED`：最近判断为 blocked，或高风险任务缺少原生独立复核记录（外部能力缺口），
   等待用户决策/授权或必要前提。
+- `REVIEW_PENDING`：native 执行结果已回填但独立复核未完成。即使 GPT 已 PASS，也不
+  进入最终判断/收口；先回填复核，再显式 `drive`。该阶段先于 `QUOTA_WAIT` 求值。
 - `QUOTA_WAIT`：配额/冷却阻塞；若已有 PASS 挂起，仍先做本地四门核销，失败则停在
   `QUOTA_WAIT`（此时 `pass_pending` 可能为 true）。不调用 GPT、不执行普通工作项。
-- `REVIEW_PENDING`：native 执行结果已回填但独立复核未完成。即使 GPT 已 PASS，也不
-  进入最终判断/收口；先回填复核，再显式 `drive`。
 - `CLOSURE_CHECK`：PASS 挂起、native 复核完成且四门通过，下一步按四门收口（冷却期内也可本地收口）。
 - `REJUDGE`：PASS 挂起但四门失败，或 native 复核有 blocking finding/verdict≠pass，
   需要补充证据或由 GPT 重新判断；G4 缺少原生复核属于外部能力缺口，不走本阶段，直接 BLOCKED。
@@ -982,12 +989,12 @@ REVIEW 的**评审深度与证据范围**。不因任务名称含 REVIEW 就套�
   独立复核的证据要求，独立复核也不能用来重置台账轮次或替代其裁决。原生独立复核、正式 REVIEW 裁决、
   运行时验收判断与 G4 可信复核门禁同样互不替代，也不互相豁免。
 
-## 判断质量与收口（现行：ChatGPT 自定义指令 v5.3.2；历史对照 v5.0 / v5.1.1 / v5.2.0）
+## 判断质量与收口（现行：ChatGPT 自定义指令 v5.3.3；历史对照 v5.0 / v5.1.1 / v5.2.0 / v5.3.2）
 
 判断原则按 v5.0 的 30 条承载（逐条落点表在 `references/role.md`，无遗漏、无弱化），
 完整原文见 `~/.zcode/references/chatgpt-custom-instructions-v5.0.md`；本 Skill 只选择性融入，不是复制。
 
-**协作语义基线是 v5.3.2**（`~/.zcode/references/chatgpt-v5.3.2-alignment.md` 是对齐摘要，不是原文
+**协作语义基线是 v5.3.3**（`~/.zcode/references/chatgpt-v5.3.3-alignment.md` 是对齐摘要，不是原文
 全文、不是权限来源）。六角色（用户 / ChatGPT 用户侧 / Copilot / SOL / ZCode 原生 Agent / DesignWise）
 与「不因人为默认轮次、Token 预算或内部费用阈值提前停止」「PARTIAL 不是默认终点」「五种机制不混同」
 的现行口径见 `~/.zcode/AGENTS.md` §1、§2、§5 与本 Skill「角色映射」；v5.2.0 的产品设计层要求
@@ -1061,49 +1068,16 @@ SOL。复核原则上单轮完成，按风险独立决定；无新增证据不�
 
 ## 版本与历史
 
-- **当前对照**：ChatGPT 自定义指令 **v5.3.2**（2026-11-08 按用户提供全文对齐，2026-11-09 起为本仓
-  文档的现行协作基线；`~/.zcode/references/chatgpt-v5.3.2-alignment.md` 是**对齐摘要，不是原文
-  全文**，需要原文时以用户侧自定义指令为准）。角色分工、授权边界与「不因人为默认轮次 / Token 预算 /
-  内部费用阈值提前停止」的现行口径以它为准；判断原则的 30 条逐条映射仍以 **v5.0**
-  （2026-11-01 逐字落盘）为历史粒度参考（`references/role.md`）。**引用层级要分清**：v5.0 原文只
-  给出原则（原生能力优先、按风险决定复核范围、复核者与执行上下文隔离、原则上单轮复核），本 Skill
-  的**具体调用判据是本地的实施规则**，依据这些原则制定，不是原文逐字规定；两者表述不一致时以
-  「何时调用」的本地判据执行，并如实标注它是本地规则。v5.2.0 对齐文件
-  （`chatgpt-v5.2.0-alignment.md`）自 v5.3.2 起仅作历史对照。
-- **模型基线**：`gpt-6.1-sol` + 请求体显式 `reasoning.effort="high"`。2026-11-01 单次真实调用已验证：
-  请求名与响应 `model` 字段完全一致、上游接受该参数并产出独立 reasoning 条目、零工具、无回退。
-  **未验证**：High 相对低档位的实际能力增益（缺对照实验），不得据 `reasoning_tokens > 0` 宣称
-  High 已生效。
-- **2026-11-04 调用门槛修正**：SOL 决策通道不再要求用户显式点名；Copilot 在需要高级工程决策时按
-  「何时调用」自主进入，简单明确任务不调用，高级工程决策不得由工程执行模型替代；REVIEW 三态裁决
-  仍须用户显式要求，独立复核与 G4 的授权边界不变。
-- **2026-11-08 全局门槛对齐（已收口）**：用户确认上述授权，并把 `~/.zcode/AGENTS.md` §5 的显式点名
-  要求收窄为仅正式 REVIEW；§5 已按同一口径改写（正式 REVIEW 含隔离证据下的三态裁决须用户明确要求，
-  运行时 verdict 不算正式 REVIEW；SOL 通道由 Copilot 按「何时调用」判据自主进入；独立复核请求、
-  风险升级、原生复核失败、其他 Skill 的评审门不构成进入理由）。**该条中「仍受次数、预算、配额与
-  授权边界约束」是当时的表述，已由 2026-11-09 的现行口径取代**：默认不设轮次、请求数或累计 Token
-  上限，只保留用户显式限额、服务商配额与限流、审计与授权边界；独立复核与 G4 规则未变。
-- **2026-11-09 文档一致性对齐**：本 Skill 与 `references/role.md`、项目 `AGENTS.md`、
-  `docs/PROJECT-CHARTER.md` 的现行文本统一到 v5.3.2 六角色口径；删除「每轮一次 / 预算 / 配额」这类
-  把默认观察值写成停止门的表述，保留显式限额与真实恢复门禁。历史记录（旧预算方案、当时的调用门槛）
-  保留原文并加替代注，不改写当时事实。
-- **2026-11-09 代码文本与独立复核口径收口**：同一口径下清理了 Python 侧仍会误导的旧文字——
-  `review_ledger.py` 模块说明/常量注释/`render_ledger` 生成给 SOL 的提示不再展示「默认预算剩余」
-  「弹性追加第 N/M 轮」「额度用尽必须停下等待授权」，改为「轮次与历史额度只用于审计观察，不是继续
-  或停止条件」，实际闸门仍是「本轮新增/变化证据 + 追加理由」；`call_gpt.py` 与
-  `copilot_dispatch.py` 的参数 help 与 docstring 改到与实际默认（请求数/Token 默认不设限、
-  `rounds_limit` 只作观察）一致。独立复核的「最多 2 轮；到顶即停」同日改为**无固定次数上限 +
-  证据驱动**（见「评审档位与缺陷处置」§4）；旧默认 2/3 轮、+2/+3、Security +1/+2 只保留为
-  历史追溯与用量观察。
-- **历史**：v5.1.1（2026-11-04 逐字落盘，`chatgpt-custom-instructions-v5.1.1.md`，上一版协作基线，
-  现仅作历史对照）；v4.3（2026-10-23 的调用口径，未落盘为独立原文，其历史门槛已由 2026-11-04 的
-  SOL 决策职责修正取代）；v4.5（2026-10-25 的对照版本）；历史版本文件
-  `chatgpt-custom-instructions-v4.5.md`、`chatgpt-custom-instructions-v4.2.md`、
-  `chatgpt-custom-instructions-v4.0.md`、`chatgpt-custom-instructions-v3.4.md` 只作历史保留，不再是
-  当前依据；早期按用户提供的 v3.9 原则做定向融合（v3.9 无本地原文，已由后续版本依次取代）。
-- ChatGPT 自定义指令只是行为理念的对照来源，**不是权限来源**，不高于宿主系统指令、用户授权或
-  全局工作规范。`gpt-cpa` 与 `gpt-director` 已并入本技能并从技能目录删除（2026-10-18），保持退役，
-  不重新引入；历史审计归档在 `~/.reasonix/archive/removed-skills-20261018/`（历史记录）。
-- 本技能原名 `gpt-assist`（2026-10-19 更名 `copilot`；2026-11-01 从「GPT 判断与指挥通道」升级为
-  「GPT-6.1-SOL 完整认知角色通道」），是唯一正式 GPT 助理入口。上述历史名称只记录沿革；现行职责
-  按 v5.3.2 收窄为高级工程决策通道——产品与业务层判断归用户与用户侧 ChatGPT（见开头「角色映射」）。
+- **当前对照**：ChatGPT 自定义指令 **v5.3.3**（2026-11-09 对齐；对齐摘要
+  `~/.zcode/references/chatgpt-v5.3.3-alignment.md` 不是原文全文，也不是权限来源）。判断原则与
+  30 条映射见上文「判断质量与收口」。
+- **模型基线**：`gpt-6.1-sol` + 显式 `reasoning.effort="high"`；请求名与响应 `model` 已验证一致，
+  High 相对低档位的实际能力增益未验证。
+- **历史对照（只作历史，不是现行依据）**：v5.3.2 与 v5.2.0 对齐文件、v5.1.1
+  （`chatgpt-custom-instructions-v5.1.1.md`）、v4.5（`chatgpt-custom-instructions-v4.5.md`）、
+  v4.2（`chatgpt-custom-instructions-v4.2.md`）、v4.0（`chatgpt-custom-instructions-v4.0.md`）、
+  v3.4（`chatgpt-custom-instructions-v3.4.md`）；**v4.3**（2026-10-23 调用口径，未落盘，只作历史）
+  与 v3.9 定向融合同只作历史。
+- 更名与退役：原名 `gpt-assist`（2026-10-19 更名 `copilot`）；`gpt-cpa` / `gpt-director` 于
+  2026-10-18 并入后退役，归档见 `~/.reasonix/archive/removed-skills-20261018/`；变更记录见
+  `references/history.md`（历史记录，不改现行规则）。

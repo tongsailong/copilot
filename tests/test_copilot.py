@@ -7990,8 +7990,8 @@ class ClosureGateTests(StageTwoT3Fixture, unittest.TestCase):
 
 
 class LoopStepTests(StageTwoT3Fixture, unittest.TestCase):
-    """八阶段求值：CLOSED > RECOVER > BLOCKED > QUOTA_WAIT > CLOSURE_CHECK >
-    REJUDGE > EXECUTE > GUIDANCE_NEEDED。"""
+    """九阶段求值：CLOSED > RECOVER > BLOCKED > REVIEW_PENDING > QUOTA_WAIT >
+    CLOSURE_CHECK > REJUDGE > EXECUTE > GUIDANCE_NEEDED。"""
 
     def waiting_quota(self) -> dict:
         now = copilot_dispatch._now_dt()

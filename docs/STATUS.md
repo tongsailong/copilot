@@ -10,7 +10,8 @@
 - **Phase 4（部分落地，2026-11-08）**：SOL 自动重判/收口与 PARTIAL 自动推进已实现并通过
   离线全链路测试；Reviewer 自动派发、可信复核记录升级仍未开始，需单独授权。
 - **文档与代码口径（2026-11-09）**：`SKILL.md`、`references/role.md`、项目 `AGENTS.md`、
-  `docs/PROJECT-CHARTER.md` 的现行文本已统一到 ChatGPT 自定义指令 v5.3.2；历史预算与旧角色
+  `docs/PROJECT-CHARTER.md` 的现行文本已统一到 ChatGPT 自定义指令 v5.3.3（v5.3.2 起的批次
+  已由同日后续升级取代，见下节「协作基线升级到 v5.3.3」）；历史预算与旧角色
   口径保留并加替代注，不改写当时事实。同日清理了 Python 侧会进入运行时提示的旧预算文字
   （`review_ledger.py` / `call_gpt.py` / `copilot_dispatch.py`），并把独立复核的「最多 2 轮；
   到顶即停」改为证据驱动的无固定次数上限；见下文「本轮收口」。
@@ -23,11 +24,11 @@
 | 运行时 Skill | `/home/ctyun/.zcode/skills/copilot` |
 | Reviewer 运行时 | `/home/ctyun/.zcode/agents/reviewer.md` |
 | 同步工具 | `scripts-sync/sync_runtime.py` |
-| 分发的 Skill 文件 | 12 个（`SKILL.md` + 9 个 `scripts/*.py` + 2 个 `references/*.md`） |
+| 分发的 Skill 文件 | 13 个（`SKILL.md` + 9 个 `scripts/*.py` + 3 个 `references/*.md`） |
 | 分发的 Reviewer 文件 | 1 个（`agents/reviewer.md`） |
 | 首次同步 | 2026-11-02 20:25–20:26 CST |
 | 同步前备份 | `/home/ctyun/.zcode/backups/copilot-presync-20261102-202527` |
-| 最近同步 | 2026-11-09（SKILL.md、call_gpt.py、copilot_dispatch.py、review_ledger.py 共 4 个文件） |
+| 最近同步 | 2026-11-09（维护清理：`SKILL.md`、`references/history.md`、`references/role.md`、`scripts/copilot_auto.py`、`scripts/copilot_dispatch.py` 共 5 个文件；同日早先为 v5.3.3 对齐 2 个文件与代码文本收口 4 个文件） |
 
 首次同步结果：
 
@@ -350,8 +351,8 @@
 - **范围**：`SKILL.md`、`references/role.md`、项目 `AGENTS.md`、`docs/PROJECT-CHARTER.md`、
   `docs/DECISIONS.md`、`docs/ROADMAP.md`、`README.md`、本文件。只改 Markdown，未改 Python、
   测试、状态机、预算实现、模型路由与 G1–G4。
-- **现行口径**：协作基线统一为 ChatGPT 自定义指令 **v5.3.2**（`chatgpt-v5.3.2-alignment.md`
-  标注为摘要而非原文）；补入六角色边界；删除「每轮一次 / 预算 / 配额」这类把默认观察值写成
+- **当时口径**：协作基线统一为 ChatGPT 自定义指令 **v5.3.2**（`chatgpt-v5.3.2-alignment.md`
+  标注为摘要而非原文；后由 v5.3.3 升级，见下节）；补入六角色边界；删除「每轮一次 / 预算 / 配额」这类把默认观察值写成
   停止门的表述；明确「一次 drive 至多一次 SOL 调用」只是单轮驱动节流，不是任务总轮次或 HTTP
   请求总数上限；区分正式 REVIEW、运行时 verdict、原生独立复核与 G4。
 - **历史处理**：SKILL.md / role.md 的版本沿革保留并加替代注；DECISIONS 第 13、14 条标为历史
@@ -369,14 +370,59 @@
     `7c1be8b8…`。
   - 实际加载：在**独立子代理新上下文**中经 Skill 工具加载 `~/.zcode/skills/copilot/SKILL.md`，
     确认 description 含「不存在人为默认的轮次、请求数或累计 Token 上限」、正文标题为
-    「copilot：GPT-6.1-SOL 高级工程决策通道」、存在「六角色边界（v5.3.2）」、当前对照为 v5.3.2。
+    「copilot：GPT-6.1-SOL 高级工程决策通道」、存在「六角色边界（v5.3.2）」、当时对照为 v5.3.2。
     项目 `AGENTS.md` 在该子会话上下文中已注入。**注意**：这是子代理新上下文加载，**不是新的
     桌面/headless 会话**；本机没有可用的 ZCode headless CLI（`/usr/bin/zcode` 指向 Electron
     桌面应用），因此「新桌面会话加载验证」**未执行**。
 - **未验证**：新桌面会话 / headless 进程级加载验证；真实 SOL 对这些文档的复核（本轮只有一次
   真实 PLAN 调用，`6eae8e768f390bbb`）。
 
-## 未验证 / 未完成
+## 协作基线升级到 v5.3.3（2026-11-09）
+
+- **范围**：`SKILL.md`、`references/role.md`、项目 `AGENTS.md`、`docs/PROJECT-CHARTER.md`、
+  `docs/DECISIONS.md`、`docs/STATUS.md`、`README.md` 与
+  `~/.zcode/references/chatgpt-v5.3.3-alignment.md` 的现行基线引用与角色表述。只改文档与规则
+  文本，未改业务代码、脚本、测试、状态机、模型路由、调用判据、预算实现与 G1–G4。
+- **现行口径**：协作基线为 ChatGPT 自定义指令 **v5.3.3**（`chatgpt-v5.3.3-alignment.md` 为摘要，
+  不是原文，也不是权限来源）。明确：ZCode 原生 Agent 是工程执行主体；Copilot 是运行于 ZCode 内的
+  协作治理机制；SOL 是 Copilot 按判据调用的高级工程决策通道，不是独立执行 Agent；DesignWise 是
+  运行于 ZCode 内的设计方法与质量规范 Skill；ChatGPT 负责产品与业务判断、产品层方案规划、任务交接
+  与结果验收。默认闭环按 v5.3.3 表述，简单任务不强制经过 Copilot、SOL 或正式 REVIEW。
+- **保留**：v5.3.2、v5.2.0、v5.1.1、v5.0 及更早的版本沿革保留为历史对照；判断原则的 30 条逐条
+  映射仍以 v5.0 原文为历史粒度参考。自动推进、PARTIAL 修复、SOL 调用判据、正式 REVIEW 授权门、
+  原生独立复核与 G1–G4 未变。
+- **验证**：
+  - 全量测试 `python3 -B -m unittest discover -s tests -p 'test_*.py'`：**Ran 728 tests, OK**
+    （exit 0）。
+  - 同步：`sync_runtime.py --apply` 写入 2 个 Skill 文件（`SKILL.md`、`references/role.md`），
+    Reviewer 无需更新；复查 `--check` 为**缺失 0 / 不同 0 / Reviewer same**（exit 0），运行时保留
+    5 个未受管理 `tests/*.py`（设计上不清理）。
+  - 哈希：源与运行时 `SKILL.md` 均为 `8acf7ebb…`，`references/role.md` 均为 `bc698a55…`，
+    Reviewer 两侧均为 `9ef6dccf…`。
+  - 运行时文本抽查：`SKILL.md` 与 `references/role.md` 均显示「当前协作基线为 v5.3.3」，
+    v5.3.2 只出现在历史对照与版本沿革段落。
+- **未验证**：未发起真实 SOL 调用；未做新桌面 / headless 会话的 Skill 重新加载验证（本机无
+  headless CLI，运行时副本按 SHA-256 与源码一致）。
+
+## 维护清理（2026-11-09）
+
+- **SKILL.md 加载余量**：迁移前 99,829 字节（距 ZCode 100,000 字节加载上限仅 171 字节，超限会静默
+  截断尾部）。把「版本与历史」段（5,966 字节）原文迁到 `references/history.md`，SKILL.md 只留当前
+  基线、模型基线与历史入口；同时压缩重复的 DesignWise 分工表述。修改后 **95,002 字节**，余量
+  **4,998 字节**（约 4.9 KiB）；核心职责、调用判据、安全边界、SOL 规则与「版本与历史」标题均保留，
+  v5.3.3 语义未变。
+- **源码基线**：`manifests/source-baseline.sha256` 原记录停留在 2026-11-05（13 个文件），此后多个
+  提交与工作区改动未刷新，7 个哈希与实际文件不符。用 `sync_runtime.py --baseline` 重建为
+  **14 个文件**，`sha256sum -c` 全部成功；旧值保留在 Git 历史，不破坏审计。
+- **CLI 阶段描述**：`loop_step` 实际有 **9 个阶段**（含 `REVIEW_PENDING`，优先于 `QUOTA_WAIT`），
+  `copilot_dispatch.py` 的 docstring / `--loop-step` 帮助、`copilot_auto.py` 模块说明、SKILL.md §8
+  与 `references/role.md` 第 9 条仍写「八阶段」且顺序缺 `REVIEW_PENDING`。只改文案与顺序，未改
+  状态机、阶段转换或调用行为。
+- **验证**：定向测试（ZCode 加载约束、版本当前/历史分离、role.md 30 条映射、`test_sync_runtime`
+  全部、`AutoDocsTest`）24 项 OK；未重跑 728 项全量。同步 `--apply` 写入 5 个文件后 `--check` 为
+  **缺失 0 / 不同 0 / Reviewer same**；运行时多出 5 个未受管理 `tests/*.py`（默认保留）。
+- **未验证**：未做新桌面会话的 Skill 重新加载验证；未提交、未推送（按任务边界）。
+
 
 - **真实 SOL 端到端（C4 / Native Bridge）**：未执行、未验证。2026-11-08 的 4 次真实调用只覆盖
   默认字段省略、截断识别与一次升档恢复，**不等于**完整闭环，也不替代 C4。

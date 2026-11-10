@@ -1,9 +1,10 @@
 # Copilot × ZCode 原生 Agent 协作系统
 
-Copilot 是 ZCode 上的任务承接与协作治理层：用户侧 ChatGPT 负责需求与产品层目标、交接与验收，
-SOL（GPT-6.1-SOL）按需要在授权范围内承担高级工程判断与工作安排，ZCode 主代理负责现场执行与
-调度，Executor 子代理（继承主代理模型）负责工程实施，独立 Reviewer 负责复核，Copilot 状态层负责
-合同、轮次、证据与门禁。角色边界见 `docs/PROJECT-CHARTER.md`。本仓库是**唯一源码**；
+Copilot 是运行于 ZCode 内的协作治理 Skill：用户侧 ChatGPT 负责需求与产品层目标、交接与验收；
+ZCode 原生 Agent 是工程执行主体，负责现场调查、规划、执行与调度；SOL（GPT-6.1-SOL）是 Copilot
+按判据进入的高级工程决策通道，按需在授权范围内承担高级工程判断与工作安排；Executor 子代理（继承
+主代理模型）负责工程实施，独立 Reviewer 负责复核，Copilot 状态层负责合同、轮次、证据与门禁。
+角色边界见 `docs/PROJECT-CHARTER.md`。本仓库是**唯一源码**；
 `~/.zcode/skills/copilot` 与 `~/.zcode/agents/reviewer.md` 是构建产物，只允许从本仓库单向下发。
 
 ## 目录

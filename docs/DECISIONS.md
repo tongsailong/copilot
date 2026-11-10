@@ -173,7 +173,8 @@
     第 16–19 条的预算、输出、自动推进与用量规则是该基线的本地落点。本条记录当时范围：只改文档，
     不改脚本、状态机、预算实现、模型路由与 G1–G4；其中「Python 内的旧预算 help / 注释 / 生成提示
     文本仍未修改」已由同日第 21 条取代（其余边界以第 21 条为准）。依据：2026-11-09 用户任务授权与
-    一次真实 SOL PLAN 调用（`6eae8e768f390bbb`）。
+    一次真实 SOL PLAN 调用（`6eae8e768f390bbb`）。**本条记录 v5.3.2 基线批次；现行基线已由第 22 条
+    升级为 v5.3.3。**
 
 21. **运行时提示文本与独立复核轮次改为「证据驱动、无固定上限」（2026-11-09）。**
     调查确认「独立复核最多 2 轮」只存在于 `SKILL.md` 说明文字，代码侧（`copilot_dispatch.py`、
@@ -191,6 +192,19 @@
     SOL 的 CONSULT/PLAN 判断仍不是原生独立复核，也不是授权。依据：2026-11-09 用户任务授权
     与一次真实 SOL CONSULT（本轮决策与工作项）。机制改动已本地提交 `a5c56f2`
     （`fix(copilot): make review continuation evidence-driven`），未 push。
+
+22. **文档现行口径升级到 ChatGPT 自定义指令 v5.3.3（2026-11-09）。**
+    `SKILL.md`、`references/role.md`、项目 `AGENTS.md`、`docs/PROJECT-CHARTER.md` 与
+    `docs/STATUS.md` 的现行协作基线引用由 v5.3.2 更新为 v5.3.3，历史版本记录保留。v5.3.3 与
+    v5.3.2 的协作语义一致，主要消除歧义：ZCode 原生 Agent 是工程执行主体；Copilot 是运行于
+    ZCode 内的协作治理机制；SOL 是 Copilot 按判据调用的大模型决策通道，不是独立执行 Agent；
+    DesignWise 是运行于 ZCode 内的设计方法与质量规范 Skill；ChatGPT 负责产品与业务判断、
+    产品层方案规划、任务交接与结果验收。默认闭环为「ChatGPT 定义目标 → ZCode 原生 Agent 承接
+    工程任务 → Copilot 治理与推进（按需调用 SOL 决策）→ ZCode 原生 Agent 执行与验证 → 证据回传
+    → 验收」，简单任务不强制经过 Copilot、SOL 或正式 REVIEW。
+    `~/.zcode/references/chatgpt-v5.3.3-alignment.md` 是对齐摘要，不是原文，也不是权限来源。
+    不变：自动推进、PARTIAL 修复、SOL 调用判据、正式 REVIEW 授权门、原生独立复核、G1–G4、
+    模型路由与费用口径。依据：2026-11-09 用户任务授权。
 
 ## 建议（未采纳）
 

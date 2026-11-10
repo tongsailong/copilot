@@ -3152,8 +3152,8 @@ def native_review_status(state: dict) -> dict:
 
 def loop_step(path: str, review_ledger: str = "", *, stamp: bool = False,
               prompt: str = "", persist: bool = True) -> dict:
-    """八阶段求值：CLOSED > RECOVER > BLOCKED > QUOTA_WAIT > CLOSURE_CHECK >
-    REJUDGE > EXECUTE > GUIDANCE_NEEDED。
+    """九阶段求值：CLOSED > RECOVER > BLOCKED > REVIEW_PENDING > QUOTA_WAIT >
+    CLOSURE_CHECK > REJUDGE > EXECUTE > GUIDANCE_NEEDED。
 
     本轮补充约束：配额冷却期间若存在 pass_pending，仍优先做**本地**四门核销
     （通过即可直接收口）；四门失败需要在冷却期重新判断时，停在 QUOTA_WAIT，
@@ -4346,7 +4346,7 @@ def main(argv: list[str] | None = None) -> int:
     p_closure.add_argument("--json", action="store_true")
 
     p_loop = sub.add_parser(
-        "loop-step", help="按八阶段给出本轮动作并落盘四门结果（不调用 GPT）")
+        "loop-step", help="按九阶段优先级给出本轮动作并落盘四门结果（不调用 GPT）")
     p_loop.add_argument("--state", required=True)
     p_loop.add_argument("--review-ledger", default="",
                         help="GPT REVIEW 台账路径（仅审计；不改变 G4 判定）")
