@@ -9,6 +9,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -416,7 +417,61 @@ class ReviewTests(NativeBridgeBase):
                 "rm -rf /tmp/workspace",
                 "sed -n '1w /tmp/out' /tmp/input",
                 "find /tmp -fprint /tmp/out",
-                "rg --pre 'rm -rf /tmp/x' pattern /tmp"):
+                "rg --pre 'rm -rf /tmp/x' pattern /tmp",
+                "git grep -O 'rm -rf /tmp/x' pattern /tmp",
+                "git grep -Osh -c 'id' pattern /tmp"):
+            with self.subTest(command=command):
+                review = self.review(self.state, self.dispatch, self.result,
+                                     commands_run=[command])
+                self.assert_bridge_error(
+                    "review_command_not_readonly", NB.validate_review_result,
+                    review, self.native, self.result, self.state)
+
+    def test_review_rejects_quote_hidden_write_arguments(self):
+        # 引号/缩写/clustered 形式在 shell 展开后仍会写文件或执行外部程序；
+        # 只靠纯文本正则会被引号骗过，因此每段还要按 argv 再查一次。
+        for command in (
+                'git grep "-O" \'rm -rf /tmp/x\' pattern /tmp',
+                "git grep '-Osh' -c 'id' pattern /tmp",
+                "git grep --open 'rm -rf /tmp/x' pattern /tmp",
+                "git grep --ope=/bin/echo pattern /tmp",
+                "git grep --op=/bin/echo pattern /tmp",
+                "git grep --textc pattern /tmp",
+                "git grep --tex=pattern /tmp",
+                "rg --hostname-bin=/bin/echo pattern /tmp",
+                "rg --search-zip pattern /tmp",
+                "rg -z pattern /tmp",
+                "rg -nz pattern /tmp",
+                'git diff "--output=/tmp/x"',
+                "git log '--output=/tmp/x'",
+                'sort "-o" "/tmp/out" /tmp/input',
+                "sort --o=/tmp/out /tmp/input",
+                "sort --ou=/tmp/out /tmp/input",
+                "sort --outpu=/tmp/out /tmp/input",
+                "sort --comp=/bin/sh /tmp/input",
+                "sort --temp=/tmp/scratch /tmp/input",
+                "sort -no /tmp/out /tmp/input",
+                "sort -ro /tmp/out /tmp/input",
+                "sort -rTo /tmp/out /tmp/input",
+                "find /tmp '-fprint' /tmp/out",
+                "find /tmp -- -delete",
+                "find -- /tmp -exec rm {} \\;",
+                "find /tmp -print -- -fprint /tmp/out",
+                "find /tmp -name -- -o -execdir rm {} \\;",
+                "find /tmp {-,-}delete",
+                "find /tmp -{delete,print}",
+                "uniq /tmp/sample-*",
+                "uniq /tmp/sample-?",
+                "uniq /tmp/[ab]*",
+                "ls /tmp/*",
+                "uniq /tmp/input /tmp/out",
+                "uniq -- /tmp/input /tmp/out",
+                "uniq -f 2 /tmp/input /tmp/out",
+                "git -c core.pager=sh show HEAD",
+                "git -C /tmp -c core.pager=sh show HEAD",
+                "git -C /tmp commit -m x",
+                "git -C /tmp push",
+                "git -C"):
             with self.subTest(command=command):
                 review = self.review(self.state, self.dispatch, self.result,
                                      commands_run=[command])
@@ -432,6 +487,43 @@ class ReviewTests(NativeBridgeBase):
             'grep -E "foo|bar" /tmp/input',
             "cat /tmp/input | head -n 5",
             "sort",
+            "cd /tmp; git status --porcelain",
+            "ls -la /tmp 2>/dev/null | head -n 5",
+            "sort -k2 /tmp/input >/dev/null",
+            "grep -c x /tmp/input 2>/dev/null",
+            "cat /tmp/input > /dev/null",
+            "sort -k 2 /tmp/input 2>/dev/null | uniq",
+            # 空格被转义：`2` 属于普通参数 `/tmp/input 2`，不是 fd 编号。
+            "cat /tmp/input\\ 2>/dev/null /tmp/other",
+            # 转义的反斜杠 + 裸空格：`2` 仍是 fd 编号，正常消费。
+            "cat /tmp/input\\\\ 2>/dev/null",
+            # U+00A0 不是 shell 分隔符，属于普通参数字符，必须原样保留。
+            "cat /tmp/input\u00a0 2>/dev/null",
+            "cat /tmp/input\u00a0",
+            "grep -o 'x' /tmp/input | sort | uniq -c | sort -rn | head -n 20",
+            "git grep -n 'pattern' -- scripts/",
+            "git diff HEAD -- scripts/native_bridge.py",
+            "sort -k1,1 /tmp/input | uniq -c",
+            "uniq -f 2 /tmp/input",
+            "uniq -s 1 -w 3 /tmp/input",
+            "uniq /tmp/input -",
+            "git grep -eO pattern -- scripts/",
+            "git grep --only-matching pattern -- scripts/",
+            "git grep -e '-O' pattern /tmp",
+            "git grep -- -O",
+            "rg -n pattern /tmp",
+            "rg -e --hostname-bin /tmp",
+            "sort --check /tmp/input",
+            "sort -t: -k1,1 /tmp/input",
+            "sort -t -o /tmp/input",
+            "sort -t-o /tmp/input",
+            "uniq /tmp/input /dev/stdout",
+            "grep -F '{}' /tmp/input",
+            "grep -F 'a*b' /tmp/input",
+            "ls '/tmp/*.py'",
+            "git -C /tmp show --stat HEAD",
+            "git -C '/tmp/dir' log --oneline -2",
+            "git -C /tmp -C /tmp show HEAD",
         ]
         review = self.review(self.state, self.dispatch, self.result,
                              commands_run=commands)
@@ -439,6 +531,32 @@ class ReviewTests(NativeBridgeBase):
             review, self.native, self.result, self.state)
         # 原始命令文本必须保留：review 信封摘要绑定的是 Reviewer 的原始输出。
         self.assertEqual(validated["commands_run"], commands)
+
+    def test_review_redirect_preserves_escaped_whitespace_argument(self):
+        """消费 `/dev/null` 重定向不得删除普通 argv 字符。
+
+        空格被反斜杠转义时 `2` 是普通参数的一部分（bash 实测 argv 为
+        `['cat', '/tmp/input 2', '/tmp/other']`）；只有未转义空白前的 `2`
+        才是文件描述符编号。这里同时固定校验结果与实际 shell argv 一致。
+        """
+        for command, argv in (
+                ("cat /tmp/input\\ 2>/dev/null /tmp/other",
+                 ["cat", "/tmp/input 2", "/tmp/other"]),
+                ("cat /tmp/input 2>/dev/null", ["cat", "/tmp/input"]),
+                ("cat /tmp/input 2 >/dev/null", ["cat", "/tmp/input", "2"]),
+                ("sort -k2 /tmp/input >/dev/null",
+                 ["sort", "-k2", "/tmp/input"]),
+                # U+00A0 是词内字符：保持原样，且不因 `.strip()` 被裁掉。
+                ("cat /tmp/input\u00a0 2>/dev/null", ["cat", "/tmp/input\u00a0"]),
+                ("cat /tmp/input\u00a0", ["cat", "/tmp/input\u00a0"]),
+        ):
+            with self.subTest(command=command):
+                review = self.review(self.state, self.dispatch, self.result,
+                                     commands_run=[command])
+                NB.validate_review_result(
+                    review, self.native, self.result, self.state)
+                segments = NB._split_readonly_segments(command, "commands_run[0]")
+                self.assertEqual(shlex.split(" ".join(segments)), argv)
 
     def test_review_rejects_unsafe_compound_commands(self):
         for command in (
@@ -454,6 +572,25 @@ class ReviewTests(NativeBridgeBase):
                 "cat \"$(id)\"",
                 "sort -o /tmp/out /tmp/input",
                 "sort --compress-program=sh /tmp/input",
+                "cd /tmp; rm -rf /tmp/workspace",
+                "cat /tmp/input 2>/dev/null > /tmp/out",
+                "2>/dev/null",
+                # 紧贴参数的重定向：`2` 属于 `-k2`，整体替换会让校验 argv 与实际不一致。
+                "sort -k2>/dev/null -o /tmp/out /tmp/input",
+                "sort -k2 >/dev/null -o /tmp/out /tmp/input",
+                "cat /tmp/input>/dev/null",
+                "uniq /tmp/input>/dev/null",
+                "cat /tmp/input >/dev/nullx",
+                # 转义空白后的重定向仍必须是合法 `/dev/null` 目标。
+                "cat /tmp/input\\ 2>/dev/nullx",
+                # 反斜杠转义的 `2` 不是 fd 编号，也不是合法 token 边界。
+                "cat /tmp/\\2>/dev/null",
+                # 非 Shell 空白（U+00A0、U+000B）不是分词边界：紧贴 `2` 时按
+                # 「紧贴参数」拒绝，不能把它当 fd 删掉普通参数字符。
+                "cat /tmp/input\u00a02>/dev/null",
+                "cat /tmp/input\u000b2>/dev/null",
+                # 非 Shell 空白紧贴 `>` 同样从严拒绝，避免校验 argv 与 Bash 解析歧义。
+                "cat /tmp/input\u00a0>/dev/null",
                 "ls;",
                 ";ls",
                 "ls;;stat /tmp",

@@ -26,6 +26,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 from datetime import datetime
 
 DISPATCH_SCHEMA = "copilot-native-dispatch/v1"
@@ -47,20 +48,67 @@ _READONLY_COMMAND_PREFIXES = (
     "git diff", "git status", "git log", "git show", "git grep",
     "git rev-parse", "git ls-files", "rg ", "grep ", "cat ",
     "head ", "tail ", "wc ", "ls ", "find ", "stat ", "sha256sum ",
-    "diff ", "cmp ", "sort ",
+    "diff ", "cmp ", "sort ", "cd ", "uniq ", "cut ", "tr ", "nl ",
+    "basename ", "dirname ", "realpath ", "readlink ", "md5sum ", "sha1sum ",
 )
 # 分号/管道是只读复核里常见的组合形式（`find ... | sort; stat ...`）。这里按
 # **引号感知**拆分后逐段校验，只把顶层 `;` / `|` 当作分隔符；`&&`、重定向、
-# 命令替换、反引号、换行一律拒绝。拆分不改变只读边界：每一段仍走同一白名单。
-_COMMAND_SHELL_META = "&><`$\n\r"
-_COMMAND_DENY_RE = re.compile(
-    r"(?:^|\s)(?:-delete|-exec|-execdir|-ok|-fprint|-fprint0|-fprintf|-fls|"
-    r"--output|--output-file|--ext-diff|--textconv|--open-files-in-pager|"
-    r"--pre|--pre-glob|tee|truncate|chmod|chown|rm|mv|cp|install|dd)(?:\s|=|$)")
-# sort 默认只读，但 -o/--output 会写文件，--compress-program 会执行外部程序。
-_SORT_WRITE_RE = re.compile(
-    r"(?:^|\s)(?:-o|--output(?:=|\s)|--compress-program(?:=|\s)|"
-    r"-T|--temporary-directory(?:=|\s))")
+# 命令替换、反引号、换行一律拒绝。花括号也拒绝：bash 的 brace expansion 会把
+# `{-,-}delete` 展开成 `-delete`，校验时看不到危险谓词。未引用的 `*`/`?`/`[`
+# 同样拒绝：文件名展开会改变实际参数（`uniq a-*` 可能展开成输入+输出文件），
+# 校验参数/参数个数就不再等于实际执行参数。拆分不改变只读边界：每一段仍走
+# 同一白名单。
+_COMMAND_SHELL_META = "&><`$\n\r{}*?["
+# Shell 的 token 分隔空白**只有**空格与制表符（换行已被拒绝）。Python 的
+# `str.isspace()` 还认 U+00A0、U+000B 等 Unicode 空白，但 bash 会把它们当作普通
+# 词内字符：`input<NBSP>2>/dev/null` 的 `2` 属于参数，按 isspace 判定会再次删掉
+# 普通 argv 字符。所有 token 边界与分段裁剪统一用这个集合。
+_SHELL_SPACE = " \t"
+# `git -C <dir>` 只切换目录，不写文件；只剥离大写 `-C` 及其路径值，后续子命令
+# 仍由白名单校验（小写 `-c` 可注入 external pager，必须落回拒绝路径）。
+_GIT_C_PREFIX_RE = re.compile(
+    r"^git[ \t]+-C[ \t]+(?:'[^']*'|\"[^\"]*\"|[^\s'\"]+)[ \t]+")
+# 目标是 /dev/null 的重定向不写工作区，是只读检查里常见的噪声抑制；只放行
+# 独立成 token 的 `>` / `2>` 且目标恰为 /dev/null，其他重定向仍然失败关闭。
+# 必须在 token 边界上匹配：`sort -k2>/dev/null` 里的 `2` 是参数 `-k2` 的一部分，
+# 整体替换会把校验用文本改成 `sort -k -o out`，使真实 argv 里的 `-o` 被当成
+# `-k` 的参数值跳过（校验参数 ≠ 实际 argv）。
+_NULL_REDIRECT_AT_RE = re.compile(r">[ \t]*/dev/null(?=[ \t]|[;|]|$)")
+# 引号会骗过纯文本正则：`git diff "--output=/tmp/x"` 在 shell 展开后仍是写文件。
+# 每段用 shlex 取 argv，对参数 token 做一次与引号无关的拒绝。危险参数只按 argv
+# 判定，不再用纯文本搜整段：否则 `grep -e rm`、`git grep -e '-O'` 这类“参数值”
+# 会被误伤。顶层命令名仍由白名单限制。
+_ARGV_DENY_RE = re.compile(
+    r"^(?:--output(?:=|$)|--output-file(?:=|$)|--ext-diff$|--textconv$|"
+    r"--open-files-in-pager(?:=|$)|--pre(?:=|$)|--pre-glob(?:=|$)|"
+    r"--hostname-bin(?:=|$)|--search-zip(?:=|$)|"
+    r"-delete$|-exec(?:dir)?$|-ok(?:dir)?$|-fprint(?:0|f)?$|-fprintf$|-fls$)")
+# GNU getopt 与 git parse-options 允许长选项唯一前缀缩写：`sort --o=/tmp/x`
+# 会写文件，`git grep --ope='...'` 会执行外部程序。只匹配完整名不够，按命令族
+# 列出危险完整名，token 是其前缀同样拒绝；精确匹配的合法选项先放行。
+_ABBREV_FORBIDDEN = {
+    "git grep": ("--open-files-in-pager", "--textconv"),
+    "sort": ("--output", "--compress-program", "--temporary-directory"),
+}
+_ABBREV_ALLOW_EXACT = {
+    "git grep": ("--only-matching",),
+    "sort": ("--check",),
+}
+# 短选项聚簇：o/T 写文件。t/k/S 自身带参，其后的字符是参数值，不是选项。
+_SORT_SHORT_WRITE = frozenset("oT")
+_SORT_SHORT_VALUE = frozenset("tkS")
+# git grep 短选项带参：e/f/m/A/B/C 之后的字符属于参数值（如 -eO 是匹配 "O"）。
+_GIT_GREP_SHORT_VALUE = frozenset("efmABC")
+# rg 的 -z 会按扩展名调用外部解压程序；e/f/g/t/T/A/B/C/m/j/M/E/r/d 带参。
+_RG_SHORT_VALUE = frozenset("efgtTABCmjMErd")
+# 分离形式（`-e PATTERN`、`sort -t SEP`）的选项参数值不是选项，不再当作命令参数
+# 扫描，避免 `git grep -e '-O'`、`sort -t -o` 这类只读用法被误拒。
+_VALUE_TOKENS = {
+    "sort": frozenset({"-t", "-k", "-S"}),
+    "git grep": frozenset({"-e", "-f", "-m", "-A", "-B", "-C"}),
+    "rg": frozenset({"-e", "-f", "-g", "-t", "-T", "-A", "-B", "-C", "-m",
+                     "-j", "-M", "-E", "-r", "-d"}),
+}
 # 这些路径不得作为 Reviewer 的 inspected 文件：设备/管道/目录不是可复核内容。
 _NON_REGULAR_PREFIXES = ("/dev/", "/proc/", "/sys/")
 
@@ -688,7 +736,32 @@ def _validate_files_inspected(raw: object, *, check_files: bool) -> list[str]:
     return out
 
 
+def _normalize_git_dir(segment: str) -> str:
+    """剥离只切换目录的 `git -C <dir>`，其余子命令仍走只读白名单。
+
+    `-C` 只改变后续 git 命令的工作目录，本身不写文件；不剥离的话
+    `git -C <dir> show` 会被前缀白名单误拒，而子进程无法靠 `cd` 保持目录。
+    只接受大写 `-C <路径>`：小写 `-c <k=v>` 可注入 `core.pager` 等执行外部程序，
+    剥不掉，继续落在白名单外。
+    """
+    while True:
+        match = _GIT_C_PREFIX_RE.match(segment)
+        if not match:
+            return segment
+        segment = "git " + segment[match.end():]
+
+
+def _strip_git_dir(argv: list[str]) -> list[str]:
+    if not argv or os.path.basename(argv[0]) != "git":
+        return argv
+    idx = 1
+    while idx + 1 < len(argv) and argv[idx] == "-C":
+        idx += 2
+    return [argv[0]] + argv[idx:]
+
+
 def _is_readonly_prefix(segment: str) -> bool:
+    segment = _normalize_git_dir(segment)
     for prefix in _READONLY_COMMAND_PREFIXES:
         if prefix.endswith(" "):
             if segment == prefix.rstrip() or segment.startswith(prefix):
@@ -698,14 +771,59 @@ def _is_readonly_prefix(segment: str) -> bool:
     return False
 
 
+def _space_is_escaped(buf: list[str], at: int) -> bool:
+    """`buf[at]` 处的 shell 空白是否被反斜杠转义（连续反斜杠数为奇数）。
+
+    `cat /tmp/input\\ 2>/dev/null` 里空格被转义，shell 词法上 `2` 属于普通参数
+    `/tmp/input 2`，不是文件描述符编号；把它当 fd 删掉会让校验 argv 与实际 argv
+    不一致。`a\\\\ 2>`（转义的反斜杠 + 裸空格）则相反，仍是 fd 编号。
+    """
+    if at < 0 or at >= len(buf) or buf[at] not in _SHELL_SPACE:
+        return False
+    count = 0
+    idx = at - 1
+    while idx >= 0 and buf[idx] == "\\":
+        count += 1
+        idx -= 1
+    return count % 2 == 1
+
+
+def _consume_null_redirect(cmd: str, idx: int, buf: list[str], name: str) -> int:
+    """消费一个独立成 token 的 `>/dev/null` 或 `2>/dev/null`，返回新下标。
+
+    只接受 token 边界上的重定向：`>` 前必须是段首或 shell 空白；`2>` 的 `2` 前也必须是
+    段首或**未转义**的 shell 空白（此时 `2` 是文件描述符编号，从缓冲区移除）。紧贴参数
+    的写法（`sort -k2>/dev/null`）在 shell 中属于参数值，删掉它会让校验用 argv 与
+    实际执行 argv 不一致，直接失败关闭。被转义的空格不构成 token 边界：
+    `input\\ 2>/dev/null` 中的 `2` 属于普通参数，只消费重定向本体。Unicode 空白
+    （如 U+00A0）不是 shell 分隔符，前后紧贴 `2` 同样按「紧贴参数」拒绝。
+    """
+    fd_two = False
+    if buf and buf[-1] == "2" and (len(buf) == 1 or buf[-2] in _SHELL_SPACE):
+        fd_two = len(buf) >= 2 and not _space_is_escaped(buf, len(buf) - 2)
+    elif buf and buf[-1] not in _SHELL_SPACE:
+        _fail("review_command_not_readonly",
+              f"{name} 含紧贴参数的重定向（校验参数会与实际 argv 不一致）：{cmd}")
+    match = _NULL_REDIRECT_AT_RE.match(cmd, idx)
+    if not match:
+        _fail("review_command_not_readonly",
+              f"{name} 只允许指向 /dev/null 的重定向：{cmd}")
+    if fd_two:
+        buf.pop()
+    return match.end()
+
+
 def _split_readonly_segments(cmd: str, name: str) -> list[str]:
     """把顶层 `;` / `|` 拆成独立命令段；引号内的分隔符保持原样。
 
-    只做拆分与拒绝，不做 shell 展开：`&&`、重定向、反引号、`$`、换行和未闭合
-    引号都直接失败关闭。拆分后的每一段仍由 `_validate_commands` 逐段套用只读
+    只做拆分与拒绝，不做 shell 展开：`&&`、指向 /dev/null 之外的重定向、
+    反引号、`$`、换行和未闭合引号都直接失败关闭。拆分后的每一段仍由
+    `_validate_commands` 逐段套用只读
     前缀与破坏性参数校验。
     """
     segments: list[str] = []
+    if not cmd.strip():
+        _fail("review_command_not_readonly", f"{name} 是空命令。")
     buf: list[str] = []
     quote: str | None = None
     idx = 0
@@ -729,11 +847,14 @@ def _split_readonly_segments(cmd: str, name: str) -> list[str]:
                 buf.append(nxt)
                 idx += 2
                 continue
+            if ch == ">":
+                idx = _consume_null_redirect(cmd, idx, buf, name)
+                continue
             if ch in (";", "|"):
                 if ch == "|" and idx + 1 < len(cmd) and cmd[idx + 1] == "|":
                     _fail("review_command_not_readonly",
                           f"{name} 含 `||` 控制操作符：{cmd}")
-                segment = "".join(buf).strip()
+                segment = "".join(buf).strip(_SHELL_SPACE)
                 if not segment:
                     _fail("review_command_not_readonly",
                           f"{name} 含空命令片段（多余分隔符）：{cmd}")
@@ -782,7 +903,7 @@ def _split_readonly_segments(cmd: str, name: str) -> list[str]:
     if quote is not None:
         _fail("review_command_not_readonly",
               f"{name} 的引号未闭合：{cmd}")
-    segment = "".join(buf).strip()
+    segment = "".join(buf).strip(_SHELL_SPACE)
     if not segment:
         _fail("review_command_not_readonly",
               f"{name} 为空或只有空白：{cmd}")
@@ -790,25 +911,147 @@ def _split_readonly_segments(cmd: str, name: str) -> list[str]:
     return segments
 
 
+def _short_option_write_checks(argv: list[str], start: int, *, name: str,
+                               segment: str, value_tokens: frozenset[str],
+                               value_chars: frozenset[str],
+                               write_chars: frozenset[str],
+                               label: str) -> None:
+    """逐字符解析短选项，跳过 `--` 之后与分离形式的选项参数值。"""
+    after_dd = False
+    skip_next = False
+    for token in argv[start:]:
+        if skip_next:
+            skip_next = False
+            continue
+        if token == "--" and not after_dd:
+            after_dd = True
+            continue
+        if after_dd or not token.startswith("-") or token.startswith("--"):
+            continue
+        if token in value_tokens:
+            skip_next = True
+            continue
+        for ch in token[1:]:
+            if ch in write_chars:
+                _fail("review_command_not_readonly",
+                      f"{name} 的 {label} 含写文件/执行外部程序短选项 "
+                      f"{token!r}（原命令：{segment}）")
+            if ch in value_chars:
+                break
+
+
+def _argv_readonly_checks(segment: str, name: str) -> None:
+    """对 shell 展开后的 argv 做一次引号无关的写操作/外部程序检查。"""
+    try:
+        argv = shlex.split(segment, posix=True)
+    except ValueError as exc:
+        _fail("review_command_not_readonly",
+              f"{name} 的命令无法解析引号：{exc}（原命令：{segment}）")
+    if not argv:
+        _fail("review_command_not_readonly", f"{name} 是空命令。")
+    argv = _strip_git_dir(argv)
+    head = os.path.basename(argv[0])
+    family = f"git {argv[1]}" if head == "git" and len(argv) > 1 else head
+    value_tokens = _VALUE_TOKENS.get(family, frozenset())
+    after_dd = False
+    skip_next = False
+    for token in argv[1:]:
+        if skip_next:
+            skip_next = False
+            continue
+        # find 的 `--` 只是选项终止符，不是表达式终止符：GNU find/bfs 仍会把
+        # 其后的 `-delete`/`-exec`/`-fprint` 当谓词执行，因此 find 不跳过
+        # `--` 之后的 token。其他命令族的 `--` 之后是操作数，按只读放行。
+        if token == "--" and family != "find":
+            after_dd = True
+            continue
+        if after_dd:
+            continue
+        if token in value_tokens:
+            skip_next = True
+            continue
+        if _ARGV_DENY_RE.match(token):
+            _fail("review_command_not_readonly",
+                  f"{name} 含破坏性参数 {token!r}（原命令：{segment}）")
+        if token.startswith("--"):
+            opt = token.split("=", 1)[0]
+            if opt not in _ABBREV_ALLOW_EXACT.get(family, ()):
+                for bad in _ABBREV_FORBIDDEN.get(family, ()):
+                    if bad == opt or bad.startswith(opt):
+                        _fail("review_command_not_readonly",
+                              f"{name} 的 {family} 使用危险长选项缩写/全名 "
+                              f"{token!r}（原命令：{segment}）")
+    if family == "sort":
+        _short_option_write_checks(
+            argv, 1, name=name, segment=segment,
+            value_tokens=_VALUE_TOKENS["sort"],
+            value_chars=_SORT_SHORT_VALUE, write_chars=_SORT_SHORT_WRITE,
+            label="sort")
+    if family == "git grep":
+        _short_option_write_checks(
+            argv, 2, name=name, segment=segment,
+            value_tokens=_VALUE_TOKENS["git grep"],
+            value_chars=_GIT_GREP_SHORT_VALUE,
+            write_chars=frozenset("O"), label="git grep")
+    if family == "rg":
+        _short_option_write_checks(
+            argv, 1, name=name, segment=segment,
+            value_tokens=_VALUE_TOKENS["rg"],
+            value_chars=_RG_SHORT_VALUE, write_chars=frozenset("z"),
+            label="rg")
+    if family == "uniq":
+        # uniq 的第二个位置参数是输出文件；`-`、/dev/stdout 等标准输出仍算只读。
+        # 带参选项（-f/-s/-w 等）先跳过其值，避免把选项参数当成文件。
+        value_opts = {"-f", "-s", "-w", "--skip-fields", "--skip-chars",
+                      "--check-chars"}
+        stdout_targets = {"-", "/dev/stdout", "/dev/fd/1", "/proc/self/fd/1"}
+        positional: list[str] = []
+        after_dd = False
+        idx = 1
+        while idx < len(argv):
+            token = argv[idx]
+            if not after_dd and token == "--":
+                after_dd = True
+                idx += 1
+                continue
+            if not after_dd and token.startswith("-") and token != "-":
+                if token in value_opts and idx + 1 < len(argv):
+                    idx += 2
+                    continue
+                idx += 1
+                continue
+            positional.append(token)
+            idx += 1
+        if len(positional) > 1 and positional[1] not in stdout_targets:
+            _fail("review_command_not_readonly",
+                  f"{name} 的 uniq 带输出文件参数：{positional[1]!r}")
+
+
 def _validate_commands(raw: object) -> list[str]:
     items = _list(raw or [], "commands_run")
     out: list[str] = []
     for idx, value in enumerate(items, 1):
-        cmd = _text(value, f"commands_run[{idx}]")
         name = f"commands_run[{idx}]"
+        if not isinstance(value, str):
+            _fail("schema_invalid", f"{name} 必须是字符串。")
+        # 只裁 Shell 空白：Unicode 空白（如 U+00A0）是 argv 的一部分，通用
+        # `.strip()` 会删除实际参数字符，使校验 argv 与 Bash argv 不一致。
+        cmd = value.strip(_SHELL_SPACE + "\r\n")
+        if not cmd:
+            _fail("schema_invalid", f"{name} 不能为空。")
         for segment in _split_readonly_segments(cmd, name):
             if not _is_readonly_prefix(segment):
                 _fail("review_command_not_readonly",
                       f"{name} 的片段不在只读命令白名单：{segment}（原命令：{cmd}）")
-            if _COMMAND_DENY_RE.search(segment):
-                _fail("review_command_not_readonly",
-                      f"{name} 的片段含破坏性参数：{segment}（原命令：{cmd}）")
-            if segment.startswith("sort ") and _SORT_WRITE_RE.search(segment):
-                _fail("review_command_not_readonly",
-                      f"{name} 的 sort 含写文件/执行外部程序参数：{segment}")
+            _argv_readonly_checks(segment, name)
         # 保留原始命令文本：review 信封的 result_sha256 绑定的是 Reviewer 原始输出。
         out.append(cmd)
     return out
+
+
+def validate_review_commands(raw: object) -> list[str]:
+    """公开只读校验入口：供 native_agent 复核宿主记录的实际 Bash 命令。"""
+    return _validate_commands(raw)
 
 
 def _validate_findings(raw: object, *, check_files: bool) -> list[dict]:

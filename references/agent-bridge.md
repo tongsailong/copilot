@@ -207,16 +207,52 @@ SHA-256。校验时重新计算，任何字段变化都会导致 `result_sha_mis
 - Reviewer 必须是 `kind=subagent`、`profile_id=reviewer`，且 Agent ID / Child Session ID
   不能与执行方任一相同；`model_reported` 必须来自实际 rollout 记录，不能由主代理
   手填或猜测（`native_agent.py` 负责提取）。
-- `changed_files` 必须为空；非空直接判为工作区污染。
+- `changed_files` 必须为空；非空直接判为工作区污染。该字段是 Reviewer 自报，
+  宿主记录只覆盖工具调用、不覆盖文件写入。
 - 至少检查一个实际存在的普通文件；`/dev`、`/proc`、`/sys` 路径拒绝。
-- `commands_run` 只允许只读前缀：`git diff/status/log/show/grep/rev-parse/ls-files`、
+- `files_inspected` 的每一项都必须能在实际工具调用参数里找到对应访问。只按文件名匹配
+  不够：自报 `docs/report.md` 时，调用记录里必须同时出现 `report.md` 与该路径的目录名
+  `docs`（或出现完整路径），避免用另一目录下同名文件的读取记录冒领。这是启发式校验，
+  不是内容级证明。
+- 宿主输出原则上必须是纯 JSON；仅兼容「整段输出被包在**单个** ```json（或 ```）围栏里」
+  的形式（允许围栏前后空白），围栏内的唯一对象按严格 JSON 解析。多围栏、围栏外带叙述
+  文字、对象前后有额外内容一律 `review_output_unparsable` 失败关闭。
+- `commands_run` 只允许只读前缀：`git diff/status/log/show/grep/rev-parse/ls-files`
+  （也允许 `git -C <dir> <只读子命令>` 只切换目录；小写 `-c` 可注入 external pager，
+  不剥离并继续拒绝）、
   `rg`、`grep`、`cat`、`head`、`tail`、`wc`、`ls`、`find`
-  （拒绝 `-delete` / `-exec` / `-fprint` / `-fprintf` / `-fls`）、`stat`、
+  （拒绝 `-delete` / `-exec` / `-fprint` / `-fprintf` / `-fls`；`find` 的 `--`
+  只是选项终止符，不是表达式终止符，其后的谓词仍检查）、`stat`、
   `sha256sum`、`diff`、`cmp`、`sort`（拒绝 `-o` / `--output` /
-  `--compress-program` / `-T`）。
+  `--compress-program` / `-T`）、`cd`、`uniq`、`cut`、`tr`、`nl`、
+  `basename`、`dirname`、`realpath`、`readlink`、`md5sum`、`sha1sum`。
+  `git grep -O`、`git grep --open-files-in-pager` 与 `git grep --textconv`
+  拒绝（会执行外部程序或 textconv 驱动）。
+  `rg` 也拒绝 `--pre`/`--pre-glob`、`--hostname-bin`、`-z`/`--search-zip`
+  （都会启动外部程序）。
+  `uniq` 只允许一个输入操作数；`uniq INPUT OUTPUT` 会写文件，拒绝（`uniq INPUT -`
+  输出到 stdout，仍允许）。
+  花括号在引号外一律拒绝：bash 的 brace expansion 会把 `{-,-}delete` 展开成
+  `-delete`，校验时看不到危险谓词。未引用的 `*`/`?`/`[` 也拒绝：文件名展开会改变
+  实际参数（`uniq a-*` 可能展开成输入+输出文件），使校验参数与实际执行参数不一致；
+  需要通配时由 Reviewer 显式加引号。纯文本正则会被引号骗过，因此每一段还会用
+  `shlex` 还原 argv 再查一次：引号包裹、
+  `--output=...` 等写参数在展开后一律拒绝。长选项唯一前缀缩写与短选项聚簇同样检查：
+  `git grep --ope`/`--op`/`--textc`（等价 `--open-files-in-pager`/`--textconv`）、
+  `sort --o=`/`--co=`/`--t=`（等价 `--output`/`--compress-program`/
+  `--temporary-directory`）、`sort -no`/`-ro` 均拒绝；`git diff --text`、
+  `git grep --only-matching`、`sort --check` 等精确匹配的合法选项不受影响。分离形式
+  （`git grep -e '-O'`、`sort -t -o`）与 `--` 之后的操作数按参数值处理，不当作选项；
+  但 `find` 例外：`find ... -- -delete`/`-exec`/`-fprint` 仍会执行，继续拒绝。
+- **实际调用也校验**：`native_agent.py review` 从同一 rollout 读取 Reviewer 的
+  真实工具调用，要求工具名只能是 `Read/Grep/Glob/Bash`、每条实际 Bash 命令通过
+  上述只读校验、调用条目数等于 `metadata.totalToolUseCount`；自报 `commands_run`
+  的每条必须与实际命令原文完全一致。任何一项不满足都拒绝生成复核信封。这是
+  **事后记录校验**，不是执行前拦截或操作系统沙箱。
 - 顶层 `;` / `|` 允许用于组合只读命令，但会按引号感知拆分后**逐段**套用同一
-  白名单与破坏性参数校验；`&&`、`||`、重定向、反引号、`$()`、换行和未闭合
-  引号一律失败关闭。拆分不改变 Reviewer 原始命令文本，`result_sha256` 仍绑定
+  白名单与破坏性参数校验；`&&`、`||`、指向 `/dev/null` 之外的重定向、反引号、
+  `$()`、换行和未闭合引号一律失败关闭。`2>/dev/null` / `>/dev/null` 只丢弃输出，
+  不写工作区，按允许处理。拆分不改变 Reviewer 原始命令文本，`result_sha256` 仍绑定
   原始输出。这是第二道失败关闭，不是操作系统沙箱。
 - `blocking` / `major` finding 必须给 `file` 和 `evidence`。
 - `pass` 不能带 blocking finding 或任何 `unverified` 项；不能猜 PASS。
@@ -239,6 +275,8 @@ SHA-256。校验时重新计算，任何字段变化都会导致 `result_sha_mis
 - 复核：`review_before_execution`、`executor_reviewer_same`、`review_contaminated`、
   `review_inspection_missing`、`review_inspection_invalid`、`reviewer_invalid`、
   `reviewer_profile_invalid`、`review_command_not_readonly`、`review_finding_invalid`、
+  `review_tool_not_allowed`、`review_toolcalls_incomplete`、
+  `review_rollout_duplicate_call`、`review_command_not_executed`、
   `pass_with_blocking_finding`、`pass_with_unverified`、`g4_eligible_forbidden`。
 - 完整性：`schema_invalid`、`hash_invalid`、`result_sha_mismatch`。
 

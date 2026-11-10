@@ -38,8 +38,13 @@ class NativeAgentBase(NativeBridgeBase):
                   model_record: dict | None = None,
                   snapshot_name: str | None = None,
                   metadata_file: str | None = None,
-                  usage: dict | None = None) -> tuple[str, str]:
+                  usage: dict | None = None,
+                  tool_calls: list[dict] | None = None,
+                  total_tool_uses: int | None = None,
+                  output: object = None) -> tuple[str, str]:
         path = os.path.join(self.dir, f"{name}.metadata.json")
+        if total_tool_uses is None:
+            total_tool_uses = len(tool_calls) if tool_calls is not None else 3
         payload = {
             "agentId": agent_id,
             "childSessionId": child,
@@ -49,13 +54,18 @@ class NativeAgentBase(NativeBridgeBase):
             "createdAt": "2026-11-02T10:00:00.000Z",
             "completedAt": "2026-11-02T10:00:05.000Z",
             "totalDurationMs": 5000,
-            "totalToolUseCount": 3,
+            "totalToolUseCount": total_tool_uses,
             "usage": usage or {
                 "inputTokens": 100, "outputTokens": 20, "totalTokens": 120,
             },
         }
         if metadata_file is not None:
             payload["metadataFile"] = metadata_file
+        if output is not None:
+            output_path = os.path.join(self.dir, f"{name}.output.json")
+            with open(output_path, "w", encoding="utf-8") as fh:
+                json.dump(output, fh, ensure_ascii=False, indent=2)
+            payload["outputFile"] = output_path
         with open(path, "w", encoding="utf-8") as fh:
             json.dump(payload, fh, ensure_ascii=False, indent=2)
         rollout = os.path.join(self.dir, f"model-io-{child}.jsonl")
@@ -66,6 +76,13 @@ class NativeAgentBase(NativeBridgeBase):
         }
         with open(rollout, "w", encoding="utf-8") as fh:
             fh.write(json.dumps(row) + "\n")
+            for idx, call in enumerate(tool_calls or [], 1):
+                entry = dict(call)
+                entry.setdefault("id", f"call-{name}-{idx}")
+                fh.write(json.dumps({
+                    "sessionId": child,
+                    "response": {"toolCalls": [entry]},
+                }) + "\n")
         return path, rollout
 
     def _dispatch_file(self) -> tuple[dict, str]:
@@ -221,23 +238,57 @@ class ReviewEnvelopeTests(NativeAgentBase):
             self.exec_rollout))
         A._apply_native_execution(self.state_path, self.state, self.execution)
         self.state = D.load_state(self.state_path)
-        self.rev_metadata, self.rev_rollout = self._metadata(
-            "reviewer", agent_id="agent-rev", child="sess_subagent_agent-rev",
-            profile="reviewer")
-        self.review_input = self._write_json("review.raw.json", {
+        self.reported_command = (
+            "find /tmp -maxdepth 1 -printf '%p\\n' | sort; "
+            "stat -c '%a %n' /tmp")
+        # 宿主实际输出（outputFile）才是正式结论来源；--input 只是副本，需与它一致。
+        self.conclusion = {
             "verdict": "pass",
             "findings": [],
             "files_inspected": [self.evidence_path],
-            "commands_run": [
-                "find /tmp -maxdepth 1 -printf '%p\\n' | sort; "
-                "stat -c '%a %n' /tmp"],
+            "commands_run": [self.reported_command],
             "changed_files": [],
             "unverified": [],
             "residual_risks": [],
+        }
+        self.rev_metadata, self.rev_rollout = self._metadata(
+            "reviewer", agent_id="agent-rev", child="sess_subagent_agent-rev",
+            profile="reviewer", output={
+                **self.conclusion,
+                "schema": "copilot-native-review/v1",
+                "task_id": self.state["task_id"],
+                "work_item_id": "T1",
+                "execution_result_sha256": self.execution["result_sha256"],
+                "reviewer": {"agent_id": "forged", "profile_id": "general-purpose"},
+            }, tool_calls=[
+                {"name": "Read", "input": {"file_path": self.evidence_path}},
+                {"name": "Bash", "input": {"command": self.reported_command}},
+            ])
+        self.review_input = self._write_json("review.raw.json", {
+            **self.conclusion,
             # 调用方伪造的绑定/身份必须被忽略，而不是被采信。
             "reviewer": {"agent_id": "forged", "profile_id": "general-purpose"},
             "execution_result_sha256": "0" * 64,
         })
+
+    def _sync_host_output(self, metadata: str, payload_path: str) -> None:
+        """把宿主输出改成与 `--input` 相同，模拟「正常一致」的调用方副本。"""
+        with open(metadata, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        output = str(data.get("outputFile") or "")
+        if not output:
+            return
+        with open(payload_path, "r", encoding="utf-8") as fh:
+            payload = json.load(fh)
+        if isinstance(payload, dict):
+            payload = {
+                "schema": "copilot-native-review/v1",
+                "work_item_id": "T1",
+                "execution_result_sha256": self.execution["result_sha256"],
+                **payload,
+            }
+        with open(output, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, ensure_ascii=False, indent=2)
 
     def _review_args(self, **overrides) -> argparse.Namespace:
         execution_path = self._write_json("execution.json", self.execution)
@@ -252,7 +303,23 @@ class ReviewEnvelopeTests(NativeAgentBase):
             "output": "",
         }
         values.update(overrides)
+        if "input" in overrides:
+            # 用 --input 覆盖结论时，宿主输出同步成同一份内容（正常一致场景）；
+            # 需要测不一致时直接用 _write_json 另写宿主输出。
+            self._sync_host_output(values["metadata"], values["input"])
         return argparse.Namespace(**values)
+
+    def _reviewer_with(self, *, tool_calls: list[dict],
+                       total_tool_uses: int | None = None) -> tuple[str, str]:
+        return self._metadata(
+            "reviewer-extra", agent_id="agent-rev2",
+            child="sess_subagent_agent-rev2", profile="reviewer",
+            output={
+                **self.conclusion,
+                "work_item_id": "T1",
+                "execution_result_sha256": self.execution["result_sha256"],
+            },
+            tool_calls=tool_calls, total_tool_uses=total_tool_uses)
 
     def test_builds_review_envelope_from_runtime_records(self):
         env = G.build_review(self._review_args())
@@ -280,13 +347,156 @@ class ReviewEnvelopeTests(NativeAgentBase):
         self.assertEqual(env["reviewer"]["agent_id"], "agent-rev")
         self.assertNotEqual(env["execution_result_sha256"], "0" * 64)
 
+    def test_rejects_missing_host_output(self):
+        # 没有宿主 outputFile 时不得退回调用方副本。
+        metadata, rollout = self._metadata(
+            "reviewer-no-output", agent_id="agent-r3",
+            child="sess_subagent_agent-r3", profile="reviewer",
+            tool_calls=[{"name": "Read",
+                         "input": {"file_path": self.evidence_path}}])
+        with self.assertRaises(G.AgentRecordError) as ctx:
+            G.build_review(self._review_args(metadata=metadata,
+                                             model_rollout=rollout))
+        self.assertIn("review_output_missing", str(ctx.exception))
+
+    def test_rejects_caller_copy_that_rewrites_host_verdict(self):
+        # 宿主实际输出 partial，调用方副本写成 pass：必须拒绝，不能采信副本。
+        with open(self.rev_metadata, "r", encoding="utf-8") as fh:
+            output_path = json.load(fh)["outputFile"]
+        with open(output_path, "w", encoding="utf-8") as fh:
+            json.dump({**self.conclusion, "verdict": "partial",
+                       "unverified": ["关键日志缺失"],
+                       "work_item_id": "T1",
+                       "execution_result_sha256":
+                           self.execution["result_sha256"]}, fh)
+        with self.assertRaises(G.AgentRecordError) as ctx:
+            G.build_review(self._review_args())
+        self.assertIn("review_input_mismatch", str(ctx.exception))
+
+    def test_rejects_host_output_bound_to_other_execution(self):
+        with open(self.rev_metadata, "r", encoding="utf-8") as fh:
+            output_path = json.load(fh)["outputFile"]
+        with open(output_path, "w", encoding="utf-8") as fh:
+            json.dump({**self.conclusion, "work_item_id": "T1",
+                       "execution_result_sha256": "f" * 64}, fh)
+        with self.assertRaises(G.AgentRecordError) as ctx:
+            G.build_review(self._review_args())
+        self.assertIn("review_output_binding_mismatch", str(ctx.exception))
+
+    def test_rejects_output_file_outside_metadata_dir(self):
+        outside = os.path.join(os.path.dirname(self.dir), "elsewhere-output.json")
+        with open(outside, "w", encoding="utf-8") as fh:
+            json.dump(self.conclusion, fh)
+        path = os.path.join(self.dir, "reviewer-moved.metadata.json")
+        with open(self.rev_metadata, "r", encoding="utf-8") as fh:
+            payload = json.load(fh)
+        payload["outputFile"] = outside
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh)
+        with self.assertRaises(G.AgentRecordError) as ctx:
+            G.build_review(self._review_args(metadata=path))
+        self.assertIn("review_output_misplaced", str(ctx.exception))
+
+    def test_rejects_claimed_file_without_actual_access(self):
+        # 自报了没被任何实际调用访问过的文件，属于未复核即声明。
+        other = os.path.join(self.dir, "never-opened.txt")
+        with open(other, "w", encoding="utf-8") as fh:
+            fh.write("x\n")
+        metadata, rollout = self._reviewer_with(tool_calls=[
+            {"name": "Read", "input": {"file_path": self.evidence_path}},
+            {"name": "Bash", "input": {"command": self.reported_command}}])
+        with open(metadata, "r", encoding="utf-8") as fh:
+            output_path = json.load(fh)["outputFile"]
+        claimed = {**self.conclusion,
+                   "files_inspected": [self.evidence_path, other],
+                   "work_item_id": "T1",
+                   "execution_result_sha256": self.execution["result_sha256"]}
+        with open(output_path, "w", encoding="utf-8") as fh:
+            json.dump(claimed, fh)
+        copy_path = self._write_json("review.claimed.json", claimed)
+        with self.assertRaises(G.AgentRecordError) as ctx:
+            G.build_review(self._review_args(metadata=metadata,
+                                             model_rollout=rollout,
+                                             input=copy_path))
+        self.assertIn("review_file_not_inspected", str(ctx.exception))
+
+    def test_rejects_claimed_file_with_common_basename_elsewhere(self):
+        """同名不同目录不算访问过：docs/report.md 不能借 report.md 的读取记录过关。"""
+        decoy_dir = os.path.join(self.dir, "docs")
+        os.makedirs(decoy_dir, exist_ok=True)
+        decoy = os.path.join(decoy_dir, "report.md")
+        with open(decoy, "w", encoding="utf-8") as fh:
+            fh.write("decoy\n")
+        actual = os.path.join(self.dir, "report.md")
+        with open(actual, "w", encoding="utf-8") as fh:
+            fh.write("actual\n")
+        metadata, rollout = self._reviewer_with(tool_calls=[
+            {"name": "Read", "input": {"file_path": actual}},
+            {"name": "Bash", "input": {"command": self.reported_command}}])
+        with open(metadata, "r", encoding="utf-8") as fh:
+            output_path = json.load(fh)["outputFile"]
+        claimed = {**self.conclusion,
+                   "files_inspected": [actual, decoy],
+                   "work_item_id": "T1",
+                   "execution_result_sha256": self.execution["result_sha256"]}
+        with open(output_path, "w", encoding="utf-8") as fh:
+            json.dump(claimed, fh)
+        copy_path = self._write_json("review.decoy.json", claimed)
+        with self.assertRaises(G.AgentRecordError) as ctx:
+            G.build_review(self._review_args(metadata=metadata,
+                                             model_rollout=rollout,
+                                             input=copy_path))
+        self.assertIn("review_file_not_inspected", str(ctx.exception))
+
+    def test_rejects_basename_plus_dirname_split_across_bash_segments(self):
+        """目录名与文件名分处两条 Bash 命令时不算读过：不能拼凑两块无关访问。"""
+        docs_dir = os.path.join(self.dir, "docs")
+        other_dir = os.path.join(self.dir, "other")
+        os.makedirs(docs_dir, exist_ok=True)
+        os.makedirs(other_dir, exist_ok=True)
+        decoy = os.path.join(docs_dir, "report.md")
+        actual = os.path.join(other_dir, "report.md")
+        for path in (decoy, actual):
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(path + "\n")
+        commands = ["ls docs; cat other/report.md"]
+        metadata, rollout = self._reviewer_with(tool_calls=[
+            {"name": "Bash", "input": {"command": commands[0]}}])
+        with open(metadata, "r", encoding="utf-8") as fh:
+            output_path = json.load(fh)["outputFile"]
+        claimed = {**self.conclusion,
+                   "files_inspected": [actual, decoy],
+                   "commands_run": commands,
+                   "work_item_id": "T1",
+                   "execution_result_sha256": self.execution["result_sha256"]}
+        with open(output_path, "w", encoding="utf-8") as fh:
+            json.dump(claimed, fh)
+        copy_path = self._write_json("review.split.json", claimed)
+        with self.assertRaises(G.AgentRecordError) as ctx:
+            G.build_review(self._review_args(metadata=metadata,
+                                             model_rollout=rollout,
+                                             input=copy_path))
+        self.assertIn("review_file_not_inspected", str(ctx.exception))
+
+    def test_allows_relative_read_for_absolute_claim(self):
+        """合法场景不误拒：实际用相对路径读，自报绝对路径仍应通过。"""
+        parent = os.path.basename(os.path.dirname(self.evidence_path))
+        relative = os.path.join(parent, os.path.basename(self.evidence_path))
+        metadata, rollout = self._reviewer_with(tool_calls=[
+            {"name": "Read", "input": {"file_path": relative}},
+            {"name": "Bash", "input": {"command": self.reported_command}}])
+        env = G.build_review(self._review_args(metadata=metadata,
+                                               model_rollout=rollout))
+        self.assertIn(self.evidence_path, str(env.get("files_inspected")))
+
     def test_rejects_non_reviewer_profile(self):
         metadata, rollout = self._metadata(
             "wrong-profile", agent_id="agent-w", child="sess_subagent_agent-w",
             profile="general-purpose")
-        with self.assertRaises(G.AgentRecordError):
+        with self.assertRaises(G.AgentRecordError) as ctx:
             G.build_review(self._review_args(metadata=metadata,
                                              model_rollout=rollout))
+        self.assertIn("不是 reviewer", str(ctx.exception))
 
     def test_rejects_execution_not_ingested(self):
         path = os.path.join(self.dir, "not-ingested.json")
@@ -317,6 +527,109 @@ class ReviewEnvelopeTests(NativeAgentBase):
             G.build_review(self._review_args(input=bad))
         self.assertIn("review_command_not_readonly", str(ctx.exception))
 
+    def test_rejects_self_reported_command_without_actual_call(self):
+        metadata, rollout = self._reviewer_with(tool_calls=[
+            {"name": "Read", "input": {"file_path": self.evidence_path}}])
+        with self.assertRaises(G.AgentRecordError) as ctx:
+            G.build_review(self._review_args(metadata=metadata,
+                                             model_rollout=rollout))
+        self.assertIn("review_command_not_executed", str(ctx.exception))
+
+    def test_rejects_non_readonly_actual_command(self):
+        command = "rm -rf /tmp/workspace"
+        metadata, rollout = self._reviewer_with(tool_calls=[
+            {"name": "Bash", "input": {"command": command}}])
+        bad = self._write_json("review.bad-actual.json", {
+            "verdict": "blocked", "findings": [],
+            "files_inspected": [self.evidence_path],
+            "commands_run": [command], "changed_files": [],
+            "unverified": [], "residual_risks": [],
+        })
+        with self.assertRaises(G.AgentRecordError) as ctx:
+            G.build_review(self._review_args(metadata=metadata,
+                                             model_rollout=rollout, input=bad))
+        self.assertIn("review_command_not_readonly", str(ctx.exception))
+
+    def test_rejects_tool_outside_reviewer_profile(self):
+        metadata, rollout = self._reviewer_with(tool_calls=[
+            {"name": "Edit", "input": {"file_path": self.evidence_path,
+                                       "old_string": "a", "new_string": "b"}}])
+        with self.assertRaises(G.AgentRecordError) as ctx:
+            G.build_review(self._review_args(metadata=metadata,
+                                             model_rollout=rollout))
+        self.assertIn("review_tool_not_allowed", str(ctx.exception))
+
+    def test_rejects_incomplete_tool_call_record(self):
+        metadata, rollout = self._reviewer_with(
+            tool_calls=[{"name": "Read",
+                         "input": {"file_path": self.evidence_path}}],
+            total_tool_uses=2)
+        with self.assertRaises(G.AgentRecordError) as ctx:
+            G.build_review(self._review_args(metadata=metadata,
+                                             model_rollout=rollout))
+        self.assertIn("review_toolcalls_incomplete", str(ctx.exception))
+
+    def test_rejects_duplicate_tool_call_ids(self):
+        metadata, rollout = self._reviewer_with(tool_calls=[
+            {"id": "dup", "name": "Read",
+             "input": {"file_path": self.evidence_path}},
+            {"id": "dup", "name": "Bash",
+             "input": {"command": self.reported_command}}])
+        with self.assertRaises(G.AgentRecordError) as ctx:
+            G.build_review(self._review_args(metadata=metadata,
+                                             model_rollout=rollout))
+        self.assertIn("review_rollout_duplicate_call", str(ctx.exception))
+
+    def test_allows_extra_actual_readonly_commands(self):
+        metadata, rollout = self._reviewer_with(tool_calls=[
+            {"name": "Read", "input": {"file_path": self.evidence_path}},
+            {"name": "Bash", "input": {"command": self.reported_command}},
+            {"name": "Bash", "input": {"command": "ls -la /tmp"}}])
+        env = G.build_review(self._review_args(metadata=metadata,
+                                               model_rollout=rollout))
+        # 自报不必复述每次调用，但每条自报都必须有实际调用支持。
+        self.assertEqual(env["commands_run"], [self.reported_command])
+
+    def test_rejects_missing_rollout(self):
+        metadata, rollout = self._reviewer_with(tool_calls=[
+            {"name": "Bash", "input": {"command": self.reported_command}}])
+        os.remove(rollout)
+        with self.assertRaises(G.AgentRecordError) as ctx:
+            G.build_review(self._review_args(metadata=metadata,
+                                             model_rollout=rollout))
+        # 模型记录读取先于调用记录校验，同样失败关闭；错误需点明 rollout。
+        self.assertIn("rollout", str(ctx.exception))
+
+    def test_rejects_rollout_from_another_session(self):
+        metadata, rollout = self._reviewer_with(tool_calls=[
+            {"name": "Bash", "input": {"command": self.reported_command}}])
+        # 首行（模型记录）属于本会话，后续调用行却来自别的会话：模型读取
+        # 不会发现，必须由实际调用校验拒绝。
+        with open(rollout, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps({
+                "sessionId": "sess_subagent_agent-someone-else",
+                "response": {"toolCalls": [
+                    {"id": "c-other", "name": "Bash",
+                     "input": {"command": "ls -la /tmp"}}]},
+            }) + "\n")
+        with self.assertRaises(G.AgentRecordError) as ctx:
+            G.build_review(self._review_args(metadata=metadata,
+                                             model_rollout=rollout))
+        self.assertIn("review_session_mismatch", str(ctx.exception))
+
+    def test_rejects_metadata_without_tool_count(self):
+        metadata, rollout = self._reviewer_with(tool_calls=[
+            {"name": "Bash", "input": {"command": self.reported_command}}])
+        with open(metadata, "r", encoding="utf-8") as fh:
+            payload = json.load(fh)
+        payload.pop("totalToolUseCount", None)
+        with open(metadata, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh)
+        with self.assertRaises(G.AgentRecordError) as ctx:
+            G.build_review(self._review_args(metadata=metadata,
+                                             model_rollout=rollout))
+        self.assertIn("review_tool_count_missing", str(ctx.exception))
+
     def test_does_not_write_output_on_validation_failure(self):
         output = os.path.join(self.dir, "must-not-exist.json")
         bad = self._write_json("review.bad2.json", {
@@ -329,6 +642,23 @@ class ReviewEnvelopeTests(NativeAgentBase):
             "residual_risks": [],
         })
         args = self._review_args(input=bad, output=output)
+        rc = G.main([
+            "review", "--state", args.state, "--dispatch", args.dispatch,
+            "--execution", args.execution, "--work-item", args.work_item,
+            "--metadata", args.metadata, "--input", args.input,
+            "--model-rollout", args.model_rollout, "--output", output,
+        ])
+        self.assertEqual(rc, G.EXIT_USAGE)
+        self.assertFalse(os.path.exists(output))
+
+    def test_does_not_write_output_when_actual_tool_calls_invalid(self):
+        # 失败点在实际调用校验（非 bridge 校验），同样不得留下半个信封。
+        output = os.path.join(self.dir, "must-not-exist-2.json")
+        metadata, rollout = self._reviewer_with(tool_calls=[
+            {"name": "Edit", "input": {"file_path": self.evidence_path,
+                                       "old_string": "a", "new_string": "b"}}])
+        args = self._review_args(metadata=metadata, model_rollout=rollout,
+                                 output=output)
         rc = G.main([
             "review", "--state", args.state, "--dispatch", args.dispatch,
             "--execution", args.execution, "--work-item", args.work_item,

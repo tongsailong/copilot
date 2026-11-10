@@ -34,15 +34,39 @@ You may use `Read`, `Grep`, `Glob`, and **read-only** `Bash` commands. Allowed B
 limited to inspection, for example:
 
 `git diff`, `git status`, `git log`, `git show`, `git grep`, `git rev-parse`,
-`git ls-files`, `rg`, `grep`, `cat`, `head`, `tail`, `wc`, `ls`,
-`find` without `-delete`/`-exec`/`-fprint`/`-fprintf`/`-fls`, `stat`, `sha256sum`,
-`diff`, `cmp`, `sort` (without `-o`/`--output`/`--compress-program`).
+`git ls-files`, `git -C <dir> <read-only subcommand>` (uppercase `-C`; lowercase `-c`
+config injection is rejected), `rg` (without `--pre`/`--pre-glob`/`--hostname-bin`/`-z`/`--search-zip`),
+`grep`, `cat`, `head`, `tail`, `wc`, `ls`,
+`find` without `-delete`/`-exec`/`-fprint`/`-fprintf`/`-fls` (also after `--`),
+`stat`, `sha256sum`,
+`diff`, `cmp`, `sort` (without `-o`/`--output`/`--compress-program`/`-T`), `uniq` (single
+input), `cut`, `tr`, `nl`, `basename`, `dirname`, `realpath`, `readlink`, `md5sum`,
+`sha1sum`, and `cd` to change the inspection directory. Output suppression to
+`/dev/null` (`2>/dev/null` or `>/dev/null`) is allowed; every other redirection is not.
+Arguments are also re-parsed
+without shell quoting and checked for unique long-option abbreviations and short-option
+clusters: quoting or abbreviating a write option does not hide it (`git grep "-O"`,
+`--ope`, `--textc`, `--output=...`, `sort -no`, `--o=` are all rejected).
 
 Read-only commands may be combined with top-level `;` or `|`, for example
-`find . -maxdepth 1 -printf '%p\n' | sort; stat -c '%a %n' .`. The host validates every
-segment against the same allowlist. Do not use `&&`, `||`, redirection (`>`, `>>`, `<`),
-command substitution (`$(...)`, backticks), or newlines to join commands. Quoted `;`/`|`
-inside a single argument (for example `grep -E 'a|b' file`) is allowed.
+`find . -maxdepth 1 -printf '%p\n' | sort; stat -c '%a %n' .`. The host records every
+tool call in its rollout; after your run the Copilot bridge re-checks **every actual Bash
+command** against the same allowlist and rejects the review if any actual command is not
+read-only. This is after-the-fact detection, not an OS sandbox: a disallowed command would
+still execute before the review is rejected. Do not use `&&`, `||`, redirection other
+than `/dev/null` suppression (`>`, `>>`, `<` to other targets), command substitution
+(`$(...)`, backticks), brace
+expansion (`{a,b}`, which can hide a predicate such as `-delete`), unquoted filename
+expansion (`*`, `?`, `[`; quote the pattern instead), or newlines to join commands. Quoted `;`/`|` inside a single argument (for example
+`grep -E 'a|b' file`) is allowed.
+
+This Profile exposes only `Read`, `Grep`, `Glob`, and `Bash`; `Write` and `Edit` are
+removed. Bash is not sandboxed, so treat the boundary as a hard rule, not a suggestion:
+any non-read-only actual command makes the review unusable and must be reported as a
+blocking finding. Report `commands_run` with the exact command text you executed, because
+every self-reported command must match an actual recorded call. Host records cover tool
+calls, not file mutations: `changed_files: []` remains your own declaration, so report
+any accidental change explicitly.
 
 Never use `Write` or `Edit`. Never run commands that can change the workspace, including
 redirection (`>`, `>>`), `tee`, `rm`, `mv`, `cp`, `chmod`, `chown`, `truncate`, `dd`,
