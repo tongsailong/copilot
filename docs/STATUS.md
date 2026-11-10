@@ -28,7 +28,7 @@
 | 分发的 Reviewer 文件 | 1 个（`agents/reviewer.md`） |
 | 首次同步 | 2026-11-02 20:25–20:26 CST |
 | 同步前备份 | `/home/ctyun/.zcode/backups/copilot-presync-20261102-202527` |
-| 最近同步 | 2026-11-09（维护清理：`SKILL.md`、`references/history.md`、`references/role.md`、`scripts/copilot_auto.py`、`scripts/copilot_dispatch.py` 共 5 个文件；同日早先为 v5.3.3 对齐 2 个文件与代码文本收口 4 个文件） |
+| 最近同步 | 2026-11-10（自评审整改后四次 `--apply`：① `SKILL.md`、`scripts/call_gpt.py`、`scripts/copilot_auto.py`、`scripts/copilot_dispatch.py`；② R2 补同步 `references/agent-bridge.md`、`agents/reviewer.md`、`scripts/native_bridge.py`、`scripts/review_ledger.py`（该次未逐条登记，据运行时与源码逐字节一致复原）；③ `references/agent-bridge.md`、`scripts/copilot_auto.py`、`scripts/copilot_dispatch.py`、`scripts/native_agent.py`；④ `SKILL.md` 精简后再次下发。最终 `--check` 缺失 0 / 不同 0，Reviewer `same`；相对 HEAD 变更的 9 个分发文件运行时全部一致） |
 
 首次同步结果：
 
@@ -42,8 +42,16 @@
 
 ## 测试基线
 
-- 源码仓库：**728 tests OK**（`python3 -B -m unittest discover -s tests -p 'test_*.py'`，
-  2026-11-09；本轮新增 1 项「旧额度上限之外仍可凭新证据复核」）。此前基线 727（2026-11-08）。
+- 源码仓库：**793 tests OK**（`python3 -B -m unittest discover -s tests -p 'test_*.py'`，
+  进程退出码 0，2026-11-11；自评审整改新增回归测试并更新 2 项预算断言，Reviewer 加固再加围栏/完整围栏解析/
+  BOM/散文声明/大写 schema 键/围栏形态/声明位置/同名重复键/空白键名 9 项回归）。口径：R1–R3 后
+  779，R4 增补 2 项复核文件校验用例后 781；F2 围栏收口 782；多轮独立复核指出项补齐后 788；
+  第四轮独立复核指出项补齐后 790；第二轮正式 REVIEW 整改（重定向 token 边界、schema 逐值校验）后
+  791；第三轮整改（重复键一律拒绝 + legacy 重复键用例）后 792；第四轮整改（重定向转义空白边界 +
+  argv 保真用例）后 793。
+- 自评审前基线：**728 tests OK**（同一命令，提交 `8ebf299` 的干净检出实测）；
+  其中 `tests/test_sync_runtime.py` 19 项只按一次计入。此前记录的「747」是重复计入
+  该 19 项（728 + 19）的错误口径，本次以实测 728 为准。
 - 迁移前运行时基线：561 tests OK；新增 `tests/test_sync_runtime.py` 19 项。
 - 迁移适配：7 个测试原先从自身文件位置推断宿主目录，源码移出 `~/.zcode` 后失败；
   已改为显式 `~/.zcode/references`、`~/.zcode/skills`，并断言导入模块来自当前 checkout。
@@ -457,6 +465,197 @@
 - **执行侧浪费（非 Copilot 机制）**：2026-11-10 09:46:27 与 09:46:58 两次成功 CONSULT 同
   subject、同 6 份证据，合计约 57.8k tokens；现行「无新增证据不重复请求」规则已覆盖该场景，
   未新增机制。
+
+## 自评审与整改（2026-11-10）
+
+- **组织方式**：先冻结稳定基线（本地 `main` 8ebf299、运行时 4 文件 `--check` 0/0、728 tests OK），
+  用稳定基线 Copilot 对自身源码组织**一轮正式 REVIEW**：17 条证据包（源码/测试/运行时/真实审计与
+  台账样本，均重新校验摘要）。SOL 首轮裁决 **PARTIAL**，给出 R1–R4 整改要求与验收口径；随后由
+  ZCode 原生 Agent 修复、测试与取证，未让在改的源码进入该轮评审证据。
+- **已修缺陷（均已复现 → 修复 → 回归测试锁定）**：
+  ① 裁决解析（否定词黑名单可被「裁决：PASS（…）」绕过 → 独立、唯一、精确三态词文法）；
+  ② 四门轮次（最新 PARTIAL 仍可用旧 PASS 收口 → `latest_judgment_not_pass`，与 `pass_pending` 同源）；
+  ③ 恢复 CAS（`load_state` 补默认键导致旧状态必然「被外部修改」→ 基线改取磁盘原文，审计记录两种指纹）；
+  ④ 原生复核来源（调用方副本可改写裁决 → 以宿主 `metadata.outputFile` 为唯一真值并绑定
+  `task_id/work_item_id/execution_result_sha256`；`files_inspected` 必须对应真实工具调用）；
+  ⑤ 回填门禁（`REVIEW_PENDING/QUOTA_WAIT/BLOCKED` 下仍会先写盘 → 预检在 `_apply_manifest` 之前）；
+  ⑥ 上下文预算（目标/条件 1500 字符即截断、条件段可被「其余 N 条省略」→ 保护段 6000、单条 800、
+  条目永不省略、超限失败关闭；最低档压缩已终态工作项而非抛错）；
+  ⑦ 真实性杂项（HTTP 200 携带配额体 → 退出 8 不重发；`--segmentation-plan` 与输入/审计路径别名；
+  `include` 只接受 JSON 布尔；自动追加理由不再自称「新增证据」；本地子进程超时不重试）。
+  ⑧ 已收口任务回填（`CLOSED` 时 `--result-file` 被静默忽略仍 exit 0 → 整轮拒绝并明确未写入）；
+  ⑨ 恢复窗口（调用方 `load → 取基线` 之间的外部写入会被恢复覆盖 → 先取磁盘基线再重载，
+  窗口内写入被读入、基线后写入仍由 CAS 拒绝）；
+  ⑩ 复核文件冒领（`files_inspected` 仅按文件名匹配，`docs/report.md` 可借同名文件过关 →
+  文件名与所在目录名需出现在同一调用记录，或出现完整路径）。第二轮独立复核进一步指出
+  单条复合命令可拼凑（`ls docs; cat other/report.md`），已改为按 `;`/`|`/换行拆分的
+  **同一命令段**内匹配，并补「复合命令拼凑必须拒绝」「相对路径读取不得误拒」两项用例。
+  另修正原生复核测试资产：恢复此前被覆盖丢失的 `test_rejects_non_reviewer_profile`（断言
+  改为校验「不是 reviewer」，避免删掉校验仍通过的空转），并补齐同名不同目录的冒领回归；
+  `references/agent-bridge.md` 记录单围栏 JSON 容忍边界与文件校验口径；`agents/reviewer.md`
+  与实现的 `/dev/null` 允许范围对齐（`2>/dev/null` 与 `>/dev/null`）。
+- **未改（有证据的否决）**：`evidence` / `evidence_ids` 是 `reply_protocol` 明示的兼容别名
+  （`reply-protocol/v2`），不是缺陷；G4 仍 fail-closed；状态机、证据协议、模型路由、fail-fast 与
+  timeout 口径不变（见 `DECISIONS.md` 第 23、24 条）。
+- **运行时验证**：`sync_runtime.py --apply` 后 `--check` 缺失 0 / 不同 0、Reviewer `same`；在新进程
+  用运行时副本跑通 `start → brief → loop-step → closure-check`（九段齐全、无 PASS 时四门失败关闭，
+  返回 `no_pass_round / criteria_missing / criteria_unconfirmed`），并确认运行时 `parse_verdict`
+  的严格文法与 `MAX_PROTECTED_SECTION_CHARS=6000` 生效。**本轮 0 次真实 SOL 调用**。
+- **独立复核（两轮，均只读新上下文）**：第一轮提出 7 项（CLOSED 回填被静默忽略、恢复
+  `load→基线`窗口、`files_inspected` 同名冒领、丢失的 profile 测试、文档与 STATUS 口径冲突），
+  已逐项核实并修复；第二轮聚焦增量修复，确认 CLOSED 拒绝先于写盘、CAS 两窗口方向正确、
+  冒领拒绝有效、G4/裁决文法/`include`/阶段门禁未被削弱，并额外指出复合命令拼凑、恢复测试
+  空转、`DECISIONS` 与 `STATUS` 数字及「严格 JSON」表述矛盾、同步记录不实，均已修复。
+  两轮报告**都不能作为 G4 复核信封**：第一轮使用非白名单命令；第二轮虽未改文件
+  （`changed_files=[]`、未跟踪文件 0），但取证时使用了 `sed -n`，按 Profile 规则自报为
+  blocking。故它们只是独立复核意见，G4 仍 fail-closed。
+
+## SKILL.md 精简（2026-11-10）
+
+- **动机**：精简前 99,487 字节，距 ZCode 正文上限 100,000 只剩 513 字节；再有任何中等规模文档改动
+  都会触发**静默截断头部**（加载器行为），属于真实可用性风险，与规则内容无关。
+- **方法**：只删重复描述与可由既有权威文本覆盖的复述，**不外移规则、不新增机制、不改脚本行为**，
+  也不动触发条件与安全约束本身。
+- **五处改动**：
+  ① 「六角色边界」中的逐条职责改为指向 `~/.zcode/AGENTS.md` §1 与上文「角色映射」，保留本通道
+  必须显式声明的边界（Copilot 不做代码实施 / 不派原生子 Agent、SOL 输出不是授权或复核、drive 单轮
+  节流不等于预算）；
+  ② 原生 Bridge 只读白名单的示例矩阵（`git grep --ope`、`find -- -delete`、`git -C/-c` 等）指向
+  `references/agent-bridge.md`；失败关闭类别、事后 rollout 校验与 `changed_files` 口径原样保留；
+  ③ 「判断质量与收口」的 v5.3.3 基线段与调用条件段去重（v5.1.1 及更早统一归历史对照）；
+  ④ 「REVIEW 收敛」台账标准日志子条目删去重复推理，保留「非标准日志拒绝新建 / 绑定后不改绑」规则；
+  ⑤ 「整改期间的验证效率」删去与「评审档位与缺陷处置」重复的步骤描述，保留基线失败引用、
+  既有 E 编号复用与「关键条件必须真实取证」。
+- **结果**：99,487 → **98,030 字节**（−1,457），余量 **1,970 字节**；随后按独立复核意见把裁决
+  契约文案与 `parse_verdict` 语义对齐（+21 字节），现行 **98,051 字节**、余量 **1,949 字节**。
+- **未退化核验**：`781 tests OK`（精简时点计数；现行 793，见上节新增用例。含 `SKILL.md`
+  ≤100,000 字节、`description` ≤1024 字符、
+  v5.0 六条渠道条款、三档评审、独立复核无固定上限、审计必读与退出码 7 等文档一致性断言）；
+  被删的命令矩阵在 `references/agent-bridge.md:221–253` 仍有完整定义；`--check` 缺失 0 / 不同 0。
+
+## Reviewer 加固正式 REVIEW 与整改（2026-11-10）
+
+- **评审对象与基线**：本轮 Reviewer 加固的 18 个未提交修改文件（HEAD `8ebf299`），先冻结在
+  781 tests OK、`--check` 0/0、基线 14/14 的快照上再取证；评审期间不改源码。
+- **首轮正式 REVIEW（PARTIAL）**：台账 `copilot-native-reviewer-upgrade-v1`，call
+  `fe1b0abdac569fc0`，17 条证据。未闭合三项：
+  - **F1** 未引用 Shell 通配符（`uniq /tmp/sample-*`）在 `shlex` 解析后仍是单参数，实际执行
+    展开成「输入 + 输出」，可绕过只读校验覆盖文件。
+  - **F2** 截断的结构化复核报告若用任意合法 JSON 转义写 schema 标识，匹配不到明文标识，
+    被降级为 legacy 文本，跳过原始 verdict 一致性检查。
+  - **F3** 最终版本的真实 Reviewer 链路与非 Reviewer 独立复核缺可核对原始材料。
+- **整改（F1/F2 已关闭）**：F1 改为拒绝引号外一切 shell 元字符并保留引号内字面量与合规复合
+  只读命令；F2 改为「声明层 + 格式边界」：整份报告是纯 JSON，或单个代码围栏包裹报告本体（信息串
+  不限、收尾围栏同字符且不短于开头、之后只允许空白）；声明了 native schema 的报告在解析失败
+  （截断/缺收尾/多围栏/围栏外夹散文）时拒绝且状态不变，解析后没有保留任何 native 声明（如同名
+  重复键被 JSON 折叠）同样拒绝；完整围栏内的合法 native JSON 按原始 verdict 约束登记，schema
+  字段名与值都忽略大小写与首尾空白，BOM 前缀在解析前剥离。均带回归测试，现行
+  **793 tests OK**（详见 `DECISIONS.md` 第 25 条）。
+- **独立复核（非 G4；一次定向预检 + 五份只读复核报告，按落盘文件编号）**：
+  - 预检（定向，未单独落盘）：核对 F2 围栏判定、F1 元字符范围与 Reviewer 只读 Profile，三项均成立。
+  - `independent-review-1.md`（完整 A–E 清单）裁决 **PARTIAL**，7 项未闭合；其中围栏内完整 native
+    JSON 被误拒、BOM 前缀被误拒、错误信息把「声明 schema」误称「JSON 形态」、`DECISIONS` 对「散文
+    报告」的表述过强、裁决契约文案与 `parse_verdict` 语义不一致，均已修正。
+  - `independent-review-2.md`（复验 4 项声明修复 + 3 项残余）**PARTIAL**：指出 `Schema`/`SCHEMA`
+    大写键在解析成功后只认精确小写键（可把 `blocked` 登记成 `pass`）、非标准围栏信息串
+    （`` ```json extra ``）的截断报告不被识别、闭栏后空行被过度拒绝、闭栏宽度/字符未校验。
+  - `independent-review-3.md`（复验 ①②③）**PARTIAL**：指出重复 schema 键只认第一个（大写键声明的
+    native schema 被忽略）、围栏前后夹散文或围栏字符混用时转义声明被降级为 legacy、tab 缩进裁决行
+    仍被接受。已按「格式边界 + 声明层（转义解码、全量同名键、引号内空白）」统一修复，并补
+    `~~~`/四反引号/信息串/空行/大写键/位置用例。
+  - `independent-review-4.md`（delta 复验）**PARTIAL**：指出**完全同名**重复键（`{"schema": native,
+    "schema": "junk"}`，`json.loads` 折叠为后者）在解析后没有保留声明时直接返回 None；带首尾空白的
+    schema 键（`"schema "`）在声明层识别不到；另指出 `DECISIONS` 的「不能靠重复键降级」承诺未实现、
+    `STATUS` 的「多围栏拒绝」缺少「声明了 native schema」限定。已实现解析后声明层兜底拒绝、声明层
+    字段名允许引号内空白，并同步修正两处文档措辞、补同名重复键与空白键名用例。该轮另确认 A/C/D/F
+    成立、无新增自动派发与越界改动。
+  - `independent-review-5.md`（收口前 delta 复验）裁决 **PASS**：第 4 份报告两项 fail-open 的修复均
+    实测生效（同名重复键 pass/blocked 两种登记都被拒绝、junk-first 对照组仍按 native 约束、空白键名
+    截断拒绝且合法空白键按原 verdict 登记），未发现新 fail-open，790 tests OK、18 文件、`--check`
+    0/0、基线 14/14。非阻塞观察：兜底分支错误信息对「schema 自报其它值但正文出现标识」诊断不准
+    （已改为不断定单一成因的措辞）；散文引用带引号声明仍拒（fail-closed，与既有口径一致）。
+  - 未修（记录为残余风险）：rollout 行 `sessionId` 为空仍被容忍（`native_agent.py:231`，真实 rollout
+    均带 `sessionId`，未测到利用路径）；`git -C <dir>` 实测可触发目标仓库的 `core.fsmonitor` 脚本
+    （`cd <dir>; git status` 同样可达，属 git 自身行为，本次不封堵，需沙箱才能消除）；长选项前缀缩写
+    按命令家族登记；`changed_files` 仍是 Reviewer 自报口径（既有边界，未改）。
+- **第二轮正式 REVIEW（BLOCKED）与整改**：同台账第 2 轮，call `d5eceae51f98ae65`，21 条新证据
+  （33 条合并，208,818 字符），裁决 **BLOCKED**。未闭合三项：
+  - **F1（代码）** `/dev/null` 重定向在引号解析前用正则整体替换，`sort -k2>/dev/null -o out in`
+    会被改成 `sort -k -o out in`，真实 argv 的 `-o` 被当成 `-k` 的参数值跳过。已改为**只在 token
+    边界**消费重定向（`>` 前必须段首/空白，`2>` 的 `2` 前亦然），紧贴参数的写法直接拒绝，不再
+    改写命令文本。
+  - **F2（代码）** 多个 schema 声明用「最后一个 native 值」决定，`"…/v1 extra"` 可被后续合法声明
+    掩盖（顺序相关）。已改为逐值校验：任一含标识的字符串必须精确等于该标识，任一非字符串值含标识
+    即拒绝，与键序无关。
+  - **F3（缺证/授权）** 最终版本真实 Reviewer 链路（metadata、完整 rollout、调用计数、信封生成与
+    接纳记录）仍未提供。SOL 明确这不因「已声明外部前提」自动降为非阻塞，需用户决定：授权最小
+    必要的真实绑定调用，或明确调整本次完成条件。
+  非阻塞观察已处理：统一 `git -C` fsmonitor 口径（实测可触发）、把独立复核改为按落盘文件编号。
+- **F3 已按用户授权补齐（2026-11-11）**：用户选择「授权最小真实链路验证」。真实执行链为
+  PLAN（SOL 1 次，`b1bd513bc390ef46`，审计 `call_requested`/`call_result` 各一条、`http 200`、
+  `reply_sha256` 与 dispatch 登记值相同）→ 工作项 T1（`d-b4acbe7248864a22ad135832`）→
+  Executor 子代理（`agent_4d5a76ce…`，59 次调用）→ `native_agent.py review` 生成
+  `copilot-native-review/v1` 信封（`verdict=pass`、`g4_eligible=false`、`result_sha256=a9b036e1…`）
+  → `copilot_auto.py ingest` 接纳（`native_reviews` 1 条）。Reviewer 用 `agent_73ba505e…`
+  （`reviewer` Profile、16 次宿主记录调用、模型取自 rollout）。前 3 次 Reviewer 运行被
+  fail-closed 拒绝（`echo`/`sed` 不在只读白名单、同 agent 续跑导致工具计数不符、findings 路径
+  不存在），未登记任何信封；没有修改 Reviewer 输出或手填绑定。
+  - **执行偏离（如实记录，不追认为合规）**：T1 的 dispatch `goal` 明写「不导入或执行测试代码」
+    并把实测留给 T2，但合同完成条件要求记录 `Ran N` / `OK` 行，执行方据此运行了一次全量测试。
+    该动作**没有**覆盖它的既有授权，属计划内的边界冲突导致的偏离；副作用经前后全仓 SHA-256、
+    mtime 与 `git status` 比对为空，但不改变「越界执行」的性质。
+- **第三轮正式 REVIEW（PARTIAL）与整改**：同台账第 3 轮，24 条新证据（62,581 字符），裁决
+  **PARTIAL**。未闭合三项及处理：
+  - **F1（缺证）** 上轮只内联了正则与 argv 检查，未给实际消费重定向的 `_split_readonly_segments`；
+    要求补完整实现、测试正文，并用公开入口展示边界矩阵。已在第 4 轮证据补齐（完整函数、测试、
+    `validate_review_commands` 实际判定矩阵）。
+  - **F2（代码，已修）** 完全同名重复键折叠仍可掩盖非法声明
+    （`{"schema": "…/v1 extra", "schema": "…/v1"}`）。现登记前用 `object_pairs_hook` 保留原始
+    键值对，任意层级重复键一律失败关闭（`verdict` 重复同样拒绝，legacy JSON 亦适用），补 4 个
+    反例与 792 项回归。
+  - **F3（缺证）** 主体绑定成立，要求离线补取 PLAN 原始来源与审计、Reviewer 完整调用记录与
+    调用 ID、宿主原始 stdout、信封生成与接纳的命令/输出/退出码。已在第 4 轮证据补齐（未新增
+    PLAN 或 Reviewer 派发；信封重生成与登记文件逐字节相同，ingest 在状态副本上验证幂等后重跑，
+    `native_reviews` 仍为 1）。
+  - **F4（缺证）** 最终指纹上的 `--check` 与基线需重跑：已重跑，缺失 0 / 不同 0、基线 14/14、
+    全量 792 OK。
+- **第四轮正式 REVIEW（PARTIAL）与整改**：同台账第 4 轮，27 条新证据，裁决 **PARTIAL**。未闭合
+  四项及处理：
+  - **F1（代码，已修）** 转义空白被误当 token 边界：`cat /tmp/input\ 2>/dev/null` 中空格被反斜杠
+    转义，shell 词法上 `2` 属于普通参数 `/tmp/input 2`，旧实现凭 `buf[-2].isspace()` 判为 fd 2 并
+    `pop()`，删除了真实参数字符。现以连续反斜杠奇偶判定空白是否被转义，被转义时只消费重定向本体、
+    保留 `2`；`a\\ 2>`（裸空格）仍按 fd 处理，紧贴参数与非法目标继续失败关闭。回归新增 argv
+    保真用例（与 bash 实测 argv 逐项比对）与 2 个拒绝用例。
+  - **F2（来源，已解释）** PLAN 审计 `reply_sha256=36af7dbc…` 与 `round-1-reply.md`
+    `746aa618…` 并非矛盾：审计摘要计算的是 `extract_text()` 返回值，该函数对拼接结果
+    `.strip()`；`--out` 落盘写 `text + "\n"`。文件 4,722 字节，去掉唯一尾部 LF 后为 4,721 字节，
+    摘要恰为 `36af7dbc…`（`reply_chars=2,299` 是字符数，非字节数）。未改动任何历史记录。
+  - **F3（缺证，已补）** rollout 第 16 次调用曾被截断在 `/media/vdb/project`：本轮按未截断原文
+    导出全部 16 次调用（含 `call_id` 与完整命令）。信封重生成、`cmp`、`ingest` 均给出完整 argv、
+    工作目录与独立退出码（0/0/0）；`ingest` 在状态副本上重放得 `duplicate=true`，副本摘要前后
+    一致，`native_reviews` 仍为 1。
+  - **F4（验证矛盾，已澄清）** 上轮 `TESTS_SUMMARY` 的退出码 1 来自末尾 `grep -c 'Traceback'`
+    零命中，不是 unittest 失败：本轮分开记录测试进程退出码（0）、`Ran 793 tests` / `OK` 与
+    Traceback 计数（0）。E68 中 `before` 属上一条测试方法的局部变量（`test_schema_declaration_
+    cannot_hide_in_odd_shapes` 第 328 行定义、第 385 行使用），`test_multiple_valid_schema_
+    declarations_stay_native` 本身不含该断言——上轮证据按行号切片跨过了方法边界，本轮按完整
+    方法正文呈现。最终 `--check` 原始输出与退出码随本轮证据提交。
+- **第五轮正式 REVIEW（PARTIAL）与整改**：同台账第 5 轮。该轮确认来源摘要、过程记录、测试
+  作用域与最终同步补证均已闭合，仅剩一项：`str.isspace()` 把 U+00A0、U+000B 等**非 Shell 空白**
+  当作 token 边界，仍会删除普通参数字符 `2`。已把边界判定、转义判定与分段裁剪统一到
+  `_SHELL_SPACE`（只有空格与制表符），非 Shell 空白紧贴重定向按「紧贴参数」从严拒绝；新增
+  U+00A0/U+000B 的允许（argv 与 bash 逐项一致、字符保留）与拒绝用例，全量 793 项通过。
+- **第六轮正式 REVIEW（PASS）**：同台账第 6 轮，15 条证据（27,085 字符）。裁决 **PASS**：
+  「R5-LEX 已闭合，无剩余阻塞发现」，此前已确认的来源摘要、过程记录、测试作用域与 SKILL 承载沿用。
+  非阻塞限制保持不变：命令校验是事后检测而非执行前沙箱；`changed_files` 仍是 Reviewer 自报；
+  NUL 的传输与运行行为未由该轮矩阵验证。该裁决是隔离证据裁决，**不等于 G4 满足**，也不等于
+  任务状态 CLOSED；本轮未提交、未推送。
+- **F3 保留为已声明缺口（历史）**：生成 `copilot-native-review/v1` 信封需要真实 native dispatch 的
+  `plan_call_id` / `plan_reply_sha256` / `work_item_id` 绑定；第 1–2 轮授权不含该调用，因此当时
+  不伪造绑定。第 3 轮前用户已明确授权最小真实链路，上述缺口按该授权补齐。
+- **运行时**：`--apply` 后 `--check` 缺失 0 / 不同 0、Reviewer `same`、基线 14/14；运行时
+  `SKILL.md` 与源码同摘要（98,051 字节、余量 1,949），frontmatter、十二个二级标题、尾段完整，
+  新进程探针确认 `MAX_PROTECTED_SECTION_CHARS=6000` 与严格裁决文法生效。
 
 ## 未验证 / 未完成
 

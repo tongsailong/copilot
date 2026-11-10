@@ -46,29 +46,24 @@ copilot 是本宿主（ZCode）内的 **SOL 高级工程决策通道**：任务�
 REVIEW 模式是**隔离证据上的裁决能力（历史兼容）**，不是独立复核，两者不得互相冒充。
 
 **角色映射（对齐 ChatGPT 自定义指令 v5.3.3，当前协作基线）**：本 Skill 名下有两个可区分的角色——
-**Copilot 协作层**（运行于 ZCode 内、由主代理实际执行的协作治理机制：任务承接、任务合同与状态、
-门禁、证据桥接、结果回传，由主代理按本 Skill 的 `copilot_dispatch.py` / `copilot_auto.py` /
-`call_gpt.py` 执行）与 **SOL 决策角色**（`gpt-6.1-sol` + `reasoning.effort=high`，Copilot 按判据
-进入的高级工程决策通道，承担授权范围内的高级工程判断与工程结果判断）。
-Copilot 的核心高级决策只走 SOL 通道，不以工程执行模型替代；ZCode 原生 Agent 是工程执行主体，
-负责现场实施与验证；用户决定业务目标与关键取舍。Skill 名称沿用 `copilot`，不表示两个角色合并。
-执行与回传以执行方实际回报为准，不假定接口、后台任务或通知必然可用。
+**Copilot 协作层**（运行于 ZCode 内、由主代理按本 Skill 的 `copilot_dispatch.py` /
+`copilot_auto.py` / `call_gpt.py` 实际执行的协作治理机制：任务承接、任务合同与状态、门禁、证据
+桥接、结果回传）与 **SOL 决策角色**（`gpt-6.1-sol` + `reasoning.effort=high`，承担授权范围内的高级
+工程判断与工程结果判断）。Copilot 的核心高级决策只走 SOL 通道，不以工程执行模型替代；ZCode 原生
+Agent 是工程执行主体，负责现场实施与验证；用户决定业务目标与关键取舍。Skill 名称沿用 `copilot`，
+不表示两个角色合并。执行与回传以执行方实际回报为准，不假定接口、后台任务或通知必然可用。
 
-**六角色边界（v5.3.3）**：用户负责业务目标、优先级、重大取舍与授权；ChatGPT（用户侧）负责需求
-理解、产品与业务判断、目标定义、产品层方案规划、任务交接与结果验收；Copilot 是运行于 ZCode 内的
-协作治理机制，负责任务承接、状态与证据桥接、审计与持续推进；SOL 是 Copilot 按判据进入的高级工程
-决策通道，只承担授权范围内的高级工程判断、技术方案取舍、风险分析与工程结果判断；ZCode 原生 Agent
-是工程执行主体，负责现场调查、工程规划、实施、测试、验证与原生子 Agent 调度；DesignWise 是运行于
-ZCode 内的设计方法与质量规范 Skill，负责专业设计方法与设计质量。Copilot 与 DesignWise 都由 ZCode
-主代理实际执行，不是独立的工程执行 Agent；Copilot 不做代码实施、不代替 ZCode 执行工作项、不擅自
-调度原生子 Agent（`copilot-plan` 是工作安排输入，具体实施与原生派发由主代理在授权范围内落实）；
-SOL 不是 ZCode 原生 Agent，无工具、不读本地工作区、不调度 Agent，其输出是高级决策输入，不构成
-授权、执行结果或独立复核。SOL 通道可以回答产品问题，但那是认知分析，不构成产品/业务决策，也不把
-ChatGPT 的产品职责并入 SOL；重大取舍仍由用户决定。任务承接与自动驱动不扩大授权：是否进入 SOL
-决策通道按「何时调用」判断（有高级工程决策需求即进入，简单明确任务不调用），REVIEW 三态裁决仍须
-用户显式要求，独立复核仍走原生子智能体。付费调用受用户显式限额、服务商配额与限流、审计与授权
-边界约束；一次 drive 至多发起一次 SOL 判断调用，这是单轮驱动节流，不是任务总轮次或 HTTP 请求
-总数上限，也不构成人为预算。
+**六角色边界（v5.3.3）**：六角色（用户 / ChatGPT 用户侧 / Copilot / SOL / ZCode 原生 Agent /
+DesignWise）的职责以 `~/.zcode/AGENTS.md` §1 为准，本 Skill 的「角色映射」只区分 Copilot 协作层
+与 SOL 决策角色。这里只补本通道必须显式声明的边界：Copilot 与 DesignWise 都由 ZCode 主代理实际
+执行，不是独立的工程执行 Agent——Copilot 不做代码实施、不代替 ZCode 执行工作项、不擅自调度原生
+子 Agent（`copilot-plan` 是工作安排输入，具体实施与原生派发由主代理在授权范围内落实）；SOL 不是
+ZCode 原生 Agent，无工具、不读本地工作区、不调度 Agent，其输出是高级决策输入，不构成授权、执行
+结果或独立复核，可以回答产品问题但那只是认知分析，不构成产品/业务决策，重大取舍仍由用户决定。
+任务承接与自动驱动不扩大授权：是否进入 SOL 决策通道按「何时调用」判断，REVIEW 三态裁决仍须用户
+显式要求，独立复核仍走原生子智能体。付费调用受用户显式限额、服务商配额与限流、审计与授权边界
+约束；一次 drive 至多发起一次 SOL 判断调用，这是单轮驱动节流，不是任务总轮次或 HTTP 请求总数
+上限，也不构成人为预算。
 
 **默认协作闭环（v5.3.3）**：ChatGPT 定义目标 → ZCode 原生 Agent 承接工程任务 → Copilot 治理与
 推进（按需调用 SOL 决策）→ ZCode 原生 Agent 执行与验证 → 证据回传 → 验收。简单任务不强制经过
@@ -112,7 +107,9 @@ CONSULT / PLAN / REVIEW 是**内部模式**，不是调用范围：它们只决�
 | REVIEW | 对交付物或改动做 PASS / PARTIAL / BLOCKED 证据裁决与收口判断（历史兼容） | 三态裁决 + 最小整改项 + 是否收口 | 主代理承接整改 |
 
 REVIEW 的正式裁决必须是回复中**独立、唯一**的一行 `裁决：PASS|PARTIAL|BLOCKED`；
-`最终裁决：` / `整体结论：` 只在明确且唯一时兼容。代码块、引用块、示例里的裁决不算，
+`最终裁决：` / `整体结论：` 只在明确且唯一时兼容。裁决值必须是精确三态词，只允许首尾的
+标点/强调符号修饰；同一行再附叙述（如 `裁决：PASS（证据充分）`）或全篇出现多行裁决行
+（含重复同一裁决）时按「无裁决」处理，不靠否定词黑名单猜极性。代码块、引用块、缩进代码、示例里的裁决不算，
 裸 `结论：` 与 `copilot-plan` 的 decision 也不是三态裁决。`call_gpt.py` 默认注入这段输出契约；
 解析不到或出现冲突时按「无裁决」记录（不得当 PASS），也不自动重发付费调用。
 
@@ -254,6 +251,11 @@ python3 ~/.zcode/skills/copilot/scripts/call_gpt.py \
 时追加 `call_post_failure` 并以退出码 2 结束；同一 `call_id` 至多一条 `call_result`（结果记录本身
 写失败时为 0 条）。`--dry-run` 不出站、不写审计，但会读取或**创建/更新 GPT REVIEW 台账**并写入
 `subject` / `audit_log` 绑定；它没有完全副作用隔离，正式复核前不要当成「只读预检」。
+
+**输出路径不得与输入或审计指向同一文件。** `--audit-log`、`--out`、`--dump-request`、
+`--review-ledger`、`--dispatch-state`、`--segmentation-plan` 之间，以及它们与 `--role-file` /
+`--prompt-file` / `--evidence` 之间若解析到同一 inode（含符号链接、硬链接），出站前直接拒绝
+（退出码 2）：这些输出是截断写或原子替换写，会破坏审计、台账、交接状态或覆盖本轮输入证据。
 
 **复核用量只读预检**：正式准备证据包前，可先用 `review_ledger.py --budget` 查看
 `subject / risk / used / pending / ordinary_used / security_used / extra_reasons / next_action`
@@ -423,7 +425,11 @@ python3 ~/.zcode/skills/copilot/scripts/copilot_dispatch.py recover-reply \
 
 恢复会重新校验任务凭证、原调用审计、模型身份与回复内容，然后以原子写盘应用安排；
 成功后复用原 `call_id`，**不会新增 SOL 请求或 REVIEW 轮次**，原回复文件、审计记录与
-回复摘要保持不变，重复执行按 `already_applied` 幂等处理。以下情况仍 fail-closed：
+回复摘要保持不变，重复执行按 `already_applied` 幂等处理。写盘前的并发基线取**磁盘原文**
+摘要（不是 `load_state` 补过默认键的内存态），因此缺默认节的旧状态照常可恢复；恢复审计
+同时记录 `before_state_sha256_basis=disk-raw` 与 `loaded_state_sha256`，两者不同正是
+「加载时补默认键」的现场。真正的外部写入仍被 CAS 拒绝，恢复不会覆盖他人改动。
+以下情况仍 fail-closed：
 字段含义冲突（如 `evidence` 与 `evidence_ids` 同时出现且不等）、空 `id`、语义错误、
 未知字段冲突、任务/轮次/合同/身份校验失败。`copilot_auto.py drive` 在 `call_gpt.py`
 返回退出码 2 且最近失败确为本次 `dispatch_plan_rejected` 时，会自动先 dry-run 再应用；
@@ -499,7 +505,14 @@ expected_evidence / depends_on**；每个工作项已有稳定的 `dispatch_id` 
   `pending_call`；重复信封按结果 SHA 幂等；CLOSED 或存在 pending 时拒绝写入。SOL 的最终判断
   只能由随后**显式**运行的 `drive` 发起（`drive --native-result` 已停用）。
 - `commands_run` 允许顶层 `;` / `|` 组合只读命令，Bridge 按引号感知拆分后逐段校验；
-  `&&`、`||`、重定向、反引号、`$()`、换行和未闭合引号仍失败关闭。
+  `&&`、`||`、指向 `/dev/null` 之外的重定向、反引号、`$()`、换行、未闭合引号、
+  引号外的花括号（brace expansion 可合成 `-delete`）和未引用通配符（文件名展开会
+  改变实际参数，如 `uniq a-*`）仍失败关闭。长选项唯一前缀缩写、短选项聚簇、`find`
+  的 `--` 后谓词与小写 `git -c` 注入同样拒绝——不能靠缩写、引号或目录切换隐藏写参数
+  （完整命令矩阵见 `references/agent-bridge.md`）。`native_agent.py review` 还会从同一
+  rollout 校验 **实际** 工具调用：只允许 `Read/Grep/Glob/Bash`、实际 Bash 命令逐条通过
+  只读校验、调用数与 `metadata.totalToolUseCount` 一致、自报命令必须与实际命令原文一致。
+  这是事后记录校验，不是执行前拦截；不把 `changed_files=[]` 说成已由宿主证明。
   `ingest --dry-run` 只校验不写盘；`--native-result` 只接受 native 状态，legacy 状态继续用
   `ingest --result-file`，两者不能混用。
 - **复核顺序**：执行结果回填后阶段为 `REVIEW_PENDING`；复核未回填时，即使 SOL 已给出
@@ -592,6 +605,9 @@ copilot_dispatch.py report --state S --kind review --file reviewer-report.md \
 - 复核报告必须提供原始报告文件，登记为 `legacy-review-report` 证据并保存 SHA-256、任务归属、
   轮次和 `review_of_kind`；`review_source=legacy`，**不冒充** native Reviewer。同一文件与
   绑定重复登记幂等；缺失文件、摘要不符、跨任务、错误绑定或同一对象换报告都被拒绝。
+- 原始报告若声明 `copilot-native-review/v1`，其 `verdict` 必须与登记/报告 verdict 一致；
+  声明了该 schema 但正文不是合法 JSON、或 verdict 缺失/非法时失败关闭。schema 比较忽略
+  大小写与首尾空白，不能借写法差异绕过原始结论一致性检查。
 - native 任务不得用 legacy 报告混入复核权威；native 复核必须走 `ingest --native-result`。
 - `record --evidence-id` 只能引用**已登记、属于当前任务、未被归档**的证据；文件型证据会重读
   并校验摘要。任一引用无效时整次回填失败，工作项状态、产出与证据列表都不改变。
@@ -603,6 +619,8 @@ copilot_dispatch.py report --state S --kind review --file reviewer-report.md \
 - **配额/冷却的调用契约（T4）**：上游错误体明确给出 `usage_limit_reached` 或
   `model_cooldown`（`code` 或 `type` 任一）时，调用以退出码 8 结束，并把等待状态写入任务状态；
   普通 HTTP 429（没有上述显式配额码）仍按上游错误返回 3，不误判为配额耗尽。
+  HTTP 200 的响应体同样可能携带该错误体（代理把业务错误包在成功状态里）：命中时走**同一**
+  配额通道（写等待、退出 8、不自动重发），不能当普通结构错误立即重试。
   `waiting` 期间发送前直接拒绝：不创建 pending、不发 HTTP、不改轮次与工作项。
   `reset_at` 到期后可以继续原任务，但不得自动重放此前失败的请求；`reset_seconds` 缺失或
   不可解析时按未知冷却保守阻塞，需人工核实。`/v1/models` 能列出模型不证明额度已恢复，冷却未结束
@@ -615,8 +633,14 @@ copilot_dispatch.py report --state S --kind review --file reviewer-report.md \
 有判断价值的摘要，不整段堆叠。
 
 - 总预算 `MAX_RENDER_CHARS=20000`；超预算按固定阶梯裁剪：证据索引 20→10→5→0，
-  往轮摘要 1200→400，工作项结果 600→200，决策 8→3。
-- 目标、完成条件、边界、收口状态、阻断原因**永不裁剪**；裁剪量与省略原因会标注。
+  往轮摘要 1200→400，工作项结果 600→200，决策 8→3；最低档把**已终态**工作项压成
+  `id(status)` 汇总（未终态项仍完整保留，含执行反馈与阻断原因），历史只在状态文件里保留，
+  不删除。任何阶梯仍超预算时失败关闭并提示精简合同，不静默丢弃保护段。
+- 保护段（目标、完成条件、边界、收口状态、阻断原因）按
+  `MAX_PROTECTED_SECTION_CHARS=6000` 完整注入；单条条件描述超 `MAX_CRITERION_CHARS=800`
+  只截断该条并标注，但**条目一条都不省略**；条件段整体超 6000 字符时明确拒绝渲染
+  （提示 `contract --amend` 精简或拆分任务），不在不完整合同上做判断。工作项标题与
+  预期证据分别以 300/400 字符为限，超出同样显式标注。
 - `brief --no-stamp` 只预览，不更新无进展指纹；正常 `brief` 记录本轮问题摘要与六维进展，
   但不递增 `round_seq`（轮次只由真实调用推进）。`loop-step --stamp` 也可更新该指纹。
 
@@ -635,7 +659,9 @@ copilot_dispatch.py report --state S --kind review --file reviewer-report.md \
 `closure --close` 要求最近 PASS 轮且四门全过。
 
 - **G1 工作项**：全部终态；`dropped` 必须有原因。
-- **G2 逐条条件**：条件已 confirmed 且 `criteria_sha256` 未漂移；全部 `met`；每条证据已登记、
+- **G2 逐条条件**：核销轮次取**最近一次带判断的已验证轮**且该轮 verdict=pass；若最新判断是
+  partial/blocked，旧 PASS 已被覆盖，`closure-check` 追加 `latest_judgment_not_pass` 并失败。
+  条件已 confirmed 且 `criteria_sha256` 未漂移；全部 `met`；每条证据已登记、
   属于当前任务、摘要一致、文件存在可重读、未归档；且 `updated_round_id` 等于本 PASS 轮
   （旧轮判断不算本轮核销）。合同指纹须与当前目标/合同正文/条件集合一致：旧版本状态或
   未走 amend 的改动会报 `contract_fingerprint_mismatch`。不做 evidence 时效检查，时效由条件本身判断。
@@ -752,7 +778,10 @@ ready_actions、stalled、criteria 计数、gate、notes 与 next_commands；按
   REVIEW 自动闭环必须显式 `--auto-review`（表示用户已明确要求连续正式 REVIEW）；未显式授权时 `drive` 拒绝 REVIEW，
   仍走复核台账人工路径。启用后每轮走 `call_gpt.py --review-ledger`（默认
   `<work-dir>/review-ledger.json`），第 2 轮起由驱动自动生成 `--extra-round-reason` 并绑定
-  `new-evidence`，不要求用户逐轮传话。成本与 Token 只记录，不作为停止门。
+  `new-evidence`，不要求用户逐轮传话。自动生成的文字只陈述事实（第几轮、上一轮裁决、本轮
+  实际提交了哪些 manifest 证据、仍未闭合的条件），**不预先断言「新增/哈希变化」**——是否构成
+  新增证据由台账按内容哈希判定，自动文字不能替调用方取得新增证据资格。成本与 Token 只记录，
+  不作为停止门。
 - `execution_backend=native` 时 `--result-file` 关闭，执行/复核分别用
   `copilot_auto.py ingest --native-result` 纯本地回填（0 请求、不改轮次），复核回填后再由显式 `drive`
   让 SOL 判断；`drive` 不自动派发 Reviewer、不自动生成复核信封，也不把普通原生复核升级为 G4。
@@ -791,10 +820,15 @@ ready_actions、stalled、criteria 计数、gate、notes 与 next_commands；按
 
 - `actions` 非空；id 必须已存在且未终态；`status` 只能是 `done/failed/blocked/dropped`，
   且必须给出 `result` 或 `result_file`。自动驱动要求同步执行完成，不接受 `running`。
-- `evidence[].id` 形如 `E1`；`file` 与 `text` 二选一；`include=false` 只登记、不进证据包。
+- `evidence[].id` 形如 `E1`；`file` 与 `text` 二选一；`include` 只接受 JSON 布尔
+  （字符串 `"false"`、`0`、`null` 一律拒绝，避免静默把要求排除的证据放进 SOL 上下文）；
+  `include=false` 只登记、不进证据包。
 - 任一校验失败整次不写盘（退出码 2），不会出现半更新。
 - 只能回填最近已验证轮次；`pass_pending` 期间或最近 decision 为 `stop/blocked` 时拒绝
   普通回填，必须先完成四门核销或由 GPT 重新判断。
+- **阶段门禁先于回填**：回填前只读预检当前阶段，处于 `CLOSED`/`RECOVER`/`BLOCKED`/
+  `QUOTA_WAIT`/`REVIEW_PENDING` 时整轮拒绝（退出码 2，提示先处理该阶段），不写任何状态；
+  被复核的执行快照不会因新证据或新报告被污染。
 
 ### 4. 返回状态与退出码
 
@@ -810,6 +844,9 @@ ready_actions、stalled、criteria 计数、gate、notes 与 next_commands；按
 | `failed` | 2–9 | 沿用 `call_gpt.py` 退出码（用法/上游/超时/审计/配额/身份） |
 
 `--dry-run` 只校验 manifest、求值与生成 Prompt，不写状态、不建目录、不调用 GPT。
+带 `--result-file` 时它只做只读预演（返回 `phase=DRY_RUN` 与 `state_phase`），
+**不会生成证据包、不重读复核原文、不校验 bridge 侧摘要**：预览通过只说明 manifest 与阶段
+可接受，不等于真实回填与入包一定成功。
 
 ### 5. 停止条件
 
@@ -869,10 +906,9 @@ REVIEW 的目标是用证据收敛到一个可交付裁决，不是无限补证�
   使用的审计日志（规范化绝对路径）。同一交付物只能有一份台账在推进：换台账路径、删台账重建、复制
   台账另起一份或更换审计日志都不会把轮次归零——前三种被拒绝并指出已有台账，换日志被拒绝并指出台账
   绑定的日志；新建台账会丢掉往轮裁决与证据指纹，不能用来重置轮次。
-  - **新建台账只接受标准审计日志**（`~/.zcode/skills/copilot/.audit/copilot.jsonl`）。轮次核对只能
-    覆盖「本次日志 + 标准日志」；若允许其他日志建账，先用日志 A 复核、删掉台账、再用日志 B 建账
-    就会查不到 A 的历史，把轮次重置为第 1 轮。因此非标准日志新建时直接拒绝，已有台账也只能继续用
-    其绑定的日志；台账创建时记录的日志就是绑定，之后每次正式复核必须使用同一份，不会静默改绑。
+  - **新建台账只接受标准审计日志**（`~/.zcode/skills/copilot/.audit/copilot.jsonl`）：轮次核对只能
+    覆盖「本次日志 + 标准日志」，允许其他日志建账就能删台账后换日志把轮次重置为第 1 轮，因此非标准
+    日志新建时直接拒绝。台账创建时记录的日志就是绑定，之后每次正式复核必须使用同一份，不会静默改绑。
   - 证据包丢失不构成新建台账的理由，先恢复证据包；恢复不了按 PARTIAL（缺证）/ BLOCKED 汇报。
   - 确认是新的交付物时，用新的 `--subject` 与新的台账路径正常新建。新建台账必须给 `--subject`；
     早期台账（无 `subject`）首次正式使用时必须补一次，之后沿用同一个值（只读查看不需要）。
@@ -927,12 +963,12 @@ REVIEW 的目标是用证据收敛到一个可交付裁决，不是无限补证�
   一轮完整复核」；先判断缺的是否关键、执行方能否补、是否只能由用户动作闭合。同一问题再次出现时先查
   合并包是否已含该证据，已含就引用编号；任务文本只用包内 E 编号，不引用来源文件的内部标签。
 
-**整改期间的验证效率（不降低验收标准）**：首轮前一次性取全可取得的关键证据，避免每修一处就重采整包、
-重跑全量；多缺陷先集中分级，批量修完后用定向证据（失败点 + 受影响关键路径）自检，再提交复核。基线
-已知的失败（与本次整改无关、数量稳定）引用首次完整输出即可；全量回归在最终交付前跑一次，diff 变化后
-再重跑。同一事实已验证且现场未变化（有 sha256 / 时间戳可比）时引用既有 E 编号；现场变化、版本漂移或
-证据过期才重采。续轮只提交新增/变化证据，不把整份历史重复塞回上下文。这些都不改变「关键条件必须
-真实取证」的要求，只是去掉重复劳动。
+**整改期间的验证效率（不降低验收标准）**：首轮前一次性取全关键证据，多缺陷先集中分级，批量修完后
+用定向证据（失败点 + 受影响关键路径）自检，再提交复核；全量回归在最终交付前跑一次，diff 变化后再
+重跑。基线已知的失败（与本次整改无关、数量稳定）引用首次完整输出；同一事实已验证且现场未变化
+（有 sha256 / 时间戳可比）时引用既有 E 编号，现场变化、版本漂移或证据过期才重采；续轮只提交
+新增/变化证据，不把整份历史重复塞回上下文。这些都不改变「关键条件必须真实取证」的要求，只是
+去掉重复劳动。
 
 ## 评审档位与缺陷处置
 
@@ -995,20 +1031,17 @@ REVIEW 的**评审深度与证据范围**。不因任务名称含 REVIEW 就套�
 完整原文见 `~/.zcode/references/chatgpt-custom-instructions-v5.0.md`；本 Skill 只选择性融入，不是复制。
 
 **协作语义基线是 v5.3.3**（`~/.zcode/references/chatgpt-v5.3.3-alignment.md` 是对齐摘要，不是原文
-全文、不是权限来源）。六角色（用户 / ChatGPT 用户侧 / Copilot / SOL / ZCode 原生 Agent / DesignWise）
-与「不因人为默认轮次、Token 预算或内部费用阈值提前停止」「PARTIAL 不是默认终点」「五种机制不混同」
-的现行口径见 `~/.zcode/AGENTS.md` §1、§2、§5 与本 Skill「角色映射」；v5.2.0 的产品设计层要求
-（「有意义」含自主感 / 掌控感 / 成长感，游戏化是手段，避免操纵性设计）由 `AGENTS.md` §1 产品设计
+全文、不是权限来源）。六角色分工、「不因人为默认轮次、Token 预算或内部费用阈值提前停止」「PARTIAL
+不是默认终点」与「五种机制不混同」的现行口径见 `~/.zcode/AGENTS.md` §1、§2、§5 与上文「角色映射」；
+产品设计层要求（自主感 / 掌控感 / 成长感，游戏化是手段，避免操纵性设计）由 `AGENTS.md` §1 产品设计
 与 `references/role.md`《产品设计》承载，产品与业务取舍归用户及 ChatGPT 侧，**不改变授权、独立复核
-与 G4 边界**。v5.1.1 引入的协作角色分工、自动协作与持续推进、协作接口不可用处理，由 `AGENTS.md`
-《判断与执行》与既有自动驱动 / 恢复规则承载；v5.2.0 及其之前的版本只作历史对照。
+与 G4 边界**；v5.3.2 及更早版本只作历史对照。
 
-**调用条件以本 Skill「何时调用」为准**：SOL 决策由 Copilot 按任务是否需要高级工程判断及现有门禁
-决定，不要求用户重复点名，REVIEW 三态裁决仍须用户显式要求。ChatGPT 自定义指令 v5.0
-（2026-11-01 逐字落盘）只是判断原则的对照基线，不构成调用授权。下面是**依据 v5.0 原则制定的
-本地实施规则**，不是 v5.0 原文逐字规定：能自己做就直接做；原生能力先行；任务复杂 / 多文件 /
-多代理 / 存在可选模式本身不构成调用理由；只有出现「何时调用」所列的高级工程决策需求时才进入
-SOL。复核原则上单轮完成，按风险独立决定；无新增证据不重复 REVIEW。
+**调用条件以本 Skill「何时调用」为准**：SOL 决策由 Copilot 判断，不要求用户重复点名，REVIEW 三态
+裁决仍须用户显式要求；ChatGPT 自定义指令 v5.0（2026-11-01 逐字落盘）只是判断原则的对照基线，
+不构成调用授权。下面是**依据 v5.0 原则制定的本地实施规则**，不是 v5.0 原文逐字规定：能自己做就
+直接做；原生能力先行；任务复杂 / 多文件 / 多代理 / 存在可选模式本身不构成调用理由。复核原则上
+单轮完成，按风险独立决定；无新增证据不重复 REVIEW。
 
 通用原则（目标与价值优先、事实优先、简单可靠优先、最小充分执行、安全与授权优先）
 的主干已在 `~/.zcode/AGENTS.md` §1 / §2 / §4 生效，本 Skill 不再整条复述。下面六条是
