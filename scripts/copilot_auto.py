@@ -1360,7 +1360,9 @@ NEXT_STEPS = {
     "quota_wait": "配额/冷却中：不调用、不执行，恢复后再继续",
     "recover": "先按 pending_call 恢复，不重新发起请求",
     "review_pending": "先回填独立复核，再显式 drive",
-    "failed": "调用失败：按退出码处理，不自动重发",
+    "failed": "调用失败：按退出码处理，同一请求不在调用内自动重发。有 pending 先按 "
+              "pending_call 恢复；退出码 8 等配额恢复；3/4 且无 pending 时核对上游错误后可显式"
+              "再次 drive；7 不得重试；9 须先修正 CPA 路由，再由人工决定是否重新发起",
     "segmentation_required": "输出预算达到真实上限：按 segmentation_plan 逐段处理证据，"
                              "再提交新的复核；不要重发完全相同请求",
     "budget_exhausted": "仅当显式运营上限被触及时出现；不是默认预算",
@@ -1854,7 +1856,7 @@ def drive(args) -> int:
             elif isinstance(pending, dict):
                 reason += "存在 pending，下一轮先 recover。"
             else:
-                reason += "未写入任务状态。"
+                reason += "本轮未入账：轮次与工作项未变（调用前的无进展指纹已落盘）。"
             return _emit(_result(
                 "failed", state, loop, **common, call=call_info,
                 reason=reason), call["exit"])
