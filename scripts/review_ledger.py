@@ -88,6 +88,20 @@ TRUNCATED_RE = re.compile(r"^-\s*截断：省略\s*(\d+)\s*字符")
 # 否则历史图片证据会在合并时静默降级为纯文本元数据。
 IMAGE_MARKER_PREFIXES = ("<!-- copilot-image ", "<!-- gpt-assist-image ")
 
+# ── 历史证据投影 ────────────────────────────────────────────────────────────
+# 合并包此前每轮都把全部历史证据正文重新注入：第 14 轮实测 200 条 / 680,140 字符，
+# 其中本轮新增只有 13 条 / 52,624 字符。投影只改**本轮合并包的渲染**：
+# 已闭合的背景条目改为「身份 + 完整性」记录，正文不注入；原始证据包与台账一字不改。
+# 投影不是原始证据，也不能替代原始证据：记录只含程序可核的字段（编号 / 轮次 / 位置 /
+# 正文 SHA-256 / 长度 / 内容键），不含任何模型撰写的摘要。恢复按 E 编号从原始证据包
+# 重新读取并校验摘要，因此同一台账 + 同一策略 + 同一版本得到逐字相同的投影结果。
+PROJECTION_VERSION = 1
+PROJECTION_HEADING = "历史证据投影（非原始证据）"
+# 投影记录本身约 400–700 字符。正文不比记录大出这个倍数时，投影只会把「可判断的内容」
+# 换成「索引」，省不下有意义的空间却削弱证据——这类条目保留全文。
+PROJECTION_MIN_SAVING_RATIO = 2
+EVIDENCE_ID_RE = re.compile(r"(?<![\w/])E(\d+)(?!\.\d)")
+
 # 标准审计日志：正式复核的权威留痕。新建台账时除传入日志外也核对它，
 # 避免「删掉台账 + 换一份空日志」把已有轮次重置。
 # ZCode 侧路径（迁移自 ~/.reasonix/skills/copilot/.audit/copilot.jsonl）：
@@ -799,7 +813,308 @@ def _read_prior_pack(pack: dict) -> str:
         return fh.read()
 
 
-# ── 合并、变更识别与轮次闸门 ─────────────────────────────────────────────────
+# ── 历史证据投影：计划、记录与原始恢复 ──────────────────────────────────────
+def _verified_pass_round(ledger: dict) -> int | None:
+    """最近一次「通过模型身份验证的 PASS」轮次；没有则返回 None。
+
+    投影的闭合依据只能是这种轮次：P0 之前没有身份凭证的 PASS 不能证明裁决来自
+    指定模型，也不能证明交付物真的被复核过。缺少该依据时不做任何投影（全量兜底）。
+    """
+    rounds = [int(rnd.get("n") or 0) for rnd in ledger.get("rounds", [])
+              if isinstance(rnd, dict) and rnd.get("verdict") == "PASS"
+              and rnd.get("model_identity_ok") is True]
+    return max(rounds) if rounds else None
+
+
+def _latest_recorded_reply(ledger: dict) -> tuple[int, str] | None:
+    """最近一轮的裁决原文。它是当前未闭合项的来源，用于确定必须给全的条目。
+
+    回复缺失时返回 None：无法确定「本轮问题依赖哪些历史条目」，此时不投影。
+    """
+    rounds = [rnd for rnd in (ledger.get("rounds") or []) if isinstance(rnd, dict)]
+    if not rounds:
+        return None
+    latest = max(rounds, key=lambda rnd: int(rnd.get("n") or 0))
+    reply = str(latest.get("reply") or "").strip()
+    if not reply:
+        return None
+    return int(latest.get("n") or 0), reply
+
+
+def _round_verdict(ledger: dict, round_no: int) -> str:
+    for rnd in ledger.get("rounds", []):
+        if isinstance(rnd, dict) and int(rnd.get("n") or 0) == int(round_no):
+            return str(rnd.get("verdict") or "UNPARSED")
+    return "UNKNOWN"
+
+
+def _item_method(item: dict) -> str:
+    """读取条目元数据区的「采集方式」；只认包裹围栏之前的控制行。"""
+    for raw in item.get("lines") or []:
+        stripped = raw.strip()
+        if re.match(r"^(`{3,}|~{3,})", stripped):
+            break
+        hit = re.match(r"^-\s*采集方式\s*[：:]\s*(.+)$", stripped)
+        if hit:
+            return hit.group(1).strip()
+    return ""
+
+
+def _absorbed_history(ledger: dict) -> tuple[list[dict], list[dict], dict]:
+    """按轮次顺序重放历史证据包，去重后返回（条目, 未纳入项, 已见键）。
+
+    这是合并与恢复共用的唯一历史重放路径：投影记录、恢复映射与 `merge_and_guard`
+    的本轮编号因此逐条一致。只读原始证据包，不写台账；条目保留来源包路径与包摘要，
+    投影记录据此给出原始位置。
+    """
+    merged: list[dict] = []
+    merged_omitted: list[dict] = []
+    seen: dict[str, int] = {}
+    for pack in _prior_pack_entries(ledger):
+        text = _read_prior_pack(pack)
+        items, omitted = split_pack(text)
+        for it in items:
+            key = it.get("content_key") or it["digest"]
+            idx = seen.get(key)
+            if idx is not None:
+                holder = merged[idx]
+                src = it.get("kind_source", "")
+                if src and src not in holder["sources"]:
+                    holder["sources"].append(src)
+                continue
+            seen[key] = len(merged)
+            merged.append({
+                **it,
+                "origin_round": pack.get("round", 0),
+                "is_new": False,
+                "pack_path": pack.get("path", ""),
+                "pack_sha256": pack.get("sha256", ""),
+            })
+        for om in omitted:
+            if om["digest"] in seen:
+                continue
+            seen[om["digest"]] = len(merged_omitted)
+            merged_omitted.append({**om, "origin_round": pack.get("round", 0)})
+    return merged, merged_omitted, seen
+
+
+def _split_evidence_ids(raw_ids: list[str], *, where: str) -> list[int]:
+    ids: list[int] = []
+    for raw in raw_ids or []:
+        for token in re.split(r"[,\s]+", str(raw)):
+            token = token.strip()
+            if not token:
+                continue
+            hit = re.fullmatch(r"E(\d+)", token, re.I)
+            if not hit:
+                raise LedgerError(
+                    f"{where} 只接受 E 编号（如 E5，可用逗号分隔），收到 {token!r}。")
+            ids.append(int(hit.group(1)))
+    return ids
+
+
+def _projection_plan(ledger: dict, merged: list[dict], *, current_round: int,
+                     focus_text: str, full_evidence: list[str],
+                     enabled: bool) -> dict:
+    """决定本轮哪些历史条目只给投影、哪些必须给原始正文。
+
+    闭合依据：最近一次通过身份验证的 PASS。只有该轮及之前提交的条目算「已闭合背景」；
+    之后再提交的条目属于当前前沿，始终给全文。必须给全文的还有：
+    最近一轮回复或本轮任务文本引用的编号、来源被点名的条目、显式 `--full-evidence`、
+    图片条目和被采集器截断的条目（正文本身不完整，投影会进一步误导）。
+    任何依据不足都退回全文，而不是猜。
+    """
+    pass_round = _verified_pass_round(ledger)
+    latest = _latest_recorded_reply(ledger)
+    latest_round = latest[0] if latest else 0
+    latest_text = latest[1] if latest else ""
+    focus = focus_text or ""
+    plan = {
+        "version": PROJECTION_VERSION,
+        "enabled": bool(enabled),
+        "reason": "",
+        "pass_round": pass_round,
+        "latest_round": latest_round,
+        "restored_ids": [],
+        "restored_sources": [],
+        "projected": {},
+        "fallback_full": [],
+        "small_kept_full": [],
+    }
+    # 恢复集先算出来：审计要能回答「为什么这一条没投影」。
+    cited = {int(m.group(1)) for m in EVIDENCE_ID_RE.finditer(focus)}
+    cited |= {int(m.group(1)) for m in EVIDENCE_ID_RE.finditer(latest_text)}
+    explicit = _split_evidence_ids(full_evidence, where="--full-evidence")
+    unknown = [i for i in explicit if i < 1 or i > len(merged)]
+    if unknown:
+        raise LedgerError(
+            "--full-evidence 指定的编号不在本轮合并证据中："
+            f"{', '.join(f'E{i}' for i in sorted(set(unknown)))}"
+            f"（当前编号 E1–E{len(merged)}）。请核对编号后再提交。")
+    restore = cited | set(explicit)
+    plan["restored_ids"] = sorted(restore)
+    if not enabled:
+        plan["reason"] = "projection_disabled"
+        return plan
+    if pass_round is None:
+        plan["reason"] = "no_verified_pass_round"
+        return plan
+    if latest is None:
+        plan["reason"] = "no_recorded_reply"
+        return plan
+
+    mentioned = f"{focus}\n{latest_text}"
+    for idx, it in enumerate(merged, 1):
+        if it.get("is_new"):
+            continue
+        origin = int(it.get("origin_round") or 0)
+        if origin <= 0 or origin >= current_round:
+            continue
+        if origin > pass_round:
+            plan["fallback_full"].append(f"E{idx}")
+            continue
+        if _is_image_item(it.get("kind_source", "")):
+            plan["fallback_full"].append(f"E{idx}")
+            continue
+        if it.get("truncated"):
+            plan["fallback_full"].append(f"E{idx}")
+            continue
+        if idx in restore:
+            continue
+        source = _kind_source(it)[1]
+        if source and _source_mentioned(source, mentioned):
+            if source not in plan["restored_sources"]:
+                plan["restored_sources"].append(source)
+            continue
+        record = _projection_record(idx, it, ledger, pass_round, latest_round)
+        if record is None:
+            plan["fallback_full"].append(f"E{idx}")
+            continue
+        # 正文不够大时投影没有收益：保留全文比换成索引更安全。
+        if record["chars"] < PROJECTION_MIN_SAVING_RATIO * len(record["text"]):
+            plan["small_kept_full"].append(f"E{idx}")
+            continue
+        plan["projected"][idx] = record
+    return plan
+
+
+def _source_mentioned(source: str, text: str) -> bool:
+    """来源是否被任务文本/最近回复点名（整条路径或文件名）。
+
+    命中即恢复全文：这里宁可多给正文，也不能让 SOL 在「看起来相关」的问题上
+    只看到投影。文件名匹配短到 3 个字符也接受，因为多恢复只增加成本、不降低可信度。
+    """
+    if not source or not text:
+        return False
+    if source in text:
+        return True
+    base = os.path.basename(source)
+    return bool(base) and base in text
+
+
+def _projection_record(idx: int, item: dict, ledger: dict,
+                       pass_round: int, latest_round: int) -> dict | None:
+    """生成一条投影记录（纯函数：只依赖条目字段、台账轮次与版本）。
+
+    返回 None 表示字段不足，调用方按全文处理。这里不含时间戳、不含模型撰写的摘要，
+    因此同一台账 + 同一策略 + 同一版本重复组装结果逐字相同。
+    """
+    origin = int(item.get("origin_round") or 0)
+    pack_path = str(item.get("pack_path") or "")
+    digest = str(item.get("digest") or "")
+    old_id = str(item.get("old_id") or "")
+    if not (origin and pack_path and digest and old_id):
+        return None
+    body = str(item.get("body") or "")
+    payload = body[body.find("\n") + 1:] if "\n" in body else ""
+    kind, source = _kind_source(item)
+    method = _item_method(item)
+    verdict = _round_verdict(ledger, origin)
+    pack_sha = str(item.get("pack_sha256") or "")
+    content_key = str(item.get("content_key") or digest)
+    text = "\n".join([
+        f"### E{idx} — {PROJECTION_HEADING}",
+        "",
+        f"- 投影格式版本：{PROJECTION_VERSION}；原始编号：第 {origin} 轮 {old_id}",
+        f"- 原始位置：`{pack_path}`（包 SHA-256 `{pack_sha[:12]}…`）",
+        f"- 原始来源：`{source}`；采集方式：{method or '（采集器未标注）'}",
+        f"- 原始正文：SHA-256 `{digest}`；{len(payload)} 字符 / {len(payload.splitlines())} 行；"
+        f"内容键 `{content_key}`",
+        f"- 提交轮次与裁决：第 {origin} 轮 `{verdict}`；闭合依据：第 {pass_round} 轮 PASS"
+        "（模型身份已验证）",
+        f"- 关联关系：未被第 {latest_round} 轮复核回复与本轮任务文本引用；"
+        "正文摘要与台账指纹一致（未变化）",
+        "- 恢复条件：该问题被重新打开 / 当前问题依赖该条目 / SOL 要求原始依据 / "
+        "G2 需要原始条目 / 投影充分性无法确认",
+        "- 纪律：本记录不是证据正文，不能据此判断条目内容、缺陷是否闭合或是否缺证。",
+    ])
+    return {
+        "text": text,
+        "chars": len(payload),
+        "lines": len(payload.splitlines()),
+        "mapping": {
+            "id": f"E{idx}",
+            "origin_round": origin,
+            "original_id": old_id,
+            "pack": pack_path,
+            "pack_sha256": pack_sha,
+            "digest": digest,
+            "chars": len(payload),
+            "lines": len(payload.splitlines()),
+            "content_key": content_key,
+            "source": source,
+            "kind": kind,
+        },
+    }
+
+
+def recover_evidence(ledger: dict, evidence_ids: list[str] | str) -> list[dict]:
+    """按本轮统一编号从原始证据包恢复原始正文（只读，校验摘要）。
+
+    合并包里的投影只是索引；真实正文永远来自原始证据包。恢复逐条校验：
+    编号存在、正文摘要与台账 `all_item_hashes` 一致、按当前解析规则可复现。
+    任一项不成立即失败关闭，不用「看起来差不多」的正文替代原始证据。
+    """
+    merged, _omitted, _seen = _absorbed_history(ledger)
+    stored = {str(h) for rnd in ledger.get("rounds", [])
+              for h in (rnd.get("all_item_hashes") or [])}
+    if isinstance(evidence_ids, str):
+        evidence_ids = [evidence_ids]
+    wanted = _split_evidence_ids(evidence_ids, where="恢复原始证据")
+    if not wanted:
+        raise LedgerError("恢复原始证据至少需要一个 E 编号（如 E5）。")
+    out: list[dict] = []
+    for idx in sorted(set(wanted)):
+        if idx < 1 or idx > len(merged):
+            raise LedgerError(
+                f"E{idx} 不在历史证据中（当前历史条目为 E1–E{len(merged)}）。")
+        item = merged[idx - 1]
+        digest = str(item.get("digest") or "")
+        body = str(item.get("body") or "")
+        payload = body[body.find("\n") + 1:] if "\n" in body else ""
+        if sha256_text(payload.strip()) != digest:
+            raise LedgerError(
+                f"E{idx} 的原始正文无法按当前解析规则复现（摘要不符）；拒绝恢复。")
+        if not stored:
+            raise LedgerError(
+                "台账没有任何历史条目指纹（all_item_hashes）；无法确认该正文属于本台账，拒绝恢复。")
+        if digest not in stored:
+            raise LedgerError(
+                f"E{idx} 的正文摘要不在台账记录中（{digest[:12]}…）；"
+                "该条目不是这份台账登记过的证据，拒绝恢复。")
+        out.append({
+            "id": f"E{idx}",
+            "origin_round": item.get("origin_round", 0),
+            "original_id": item.get("old_id", ""),
+            "pack": item.get("pack_path", ""),
+            "pack_sha256": item.get("pack_sha256", ""),
+            "digest": digest,
+            "chars": len(payload),
+            "lines": len(payload.splitlines()),
+            "body": re.sub(r"^### E\d+ — ", f"### E{idx} — ", body, count=1, flags=re.M),
+        })
+    return out
+
 def _remediation_used(ledger: dict, pending: list[dict]) -> bool:
     """整改定向复核是否已用过：已入账轮次与「成功但未入账」的调用都算。"""
     return (
@@ -899,6 +1214,10 @@ def merge_and_guard(
     extra_basis: str = "",
     audit_log: str = "",
     ledger_path: str = "",
+    *,
+    focus_text: str = "",
+    full_evidence: list[str] | None = None,
+    history_projection: bool = True,
 ) -> tuple[str, dict]:
     """合并历史与本轮证据，并执行新增证据/复核依据/重复证据闸门（轮次数字只作观察）。
 
@@ -906,6 +1225,10 @@ def merge_and_guard(
 
     `audit_log` 用于把「GPT 已返回但台账未入账」的调用计入已用轮次：
     台账落盘失败或台账被回滚时，后续复核不能因此免费多拿一轮。
+
+    `focus_text` 是本轮任务文本、`full_evidence` 是显式要求原始正文的 E 编号，
+    两者与最近一轮回复一起决定哪些历史条目必须给全文（见 `_projection_plan`）。
+    `history_projection=False` 时按旧行为注入全部历史正文，用于回滚与离线对照。
     """
     if extra_basis and extra_basis not in EXTRA_BASES:
         raise LedgerError(f"extra_basis 只能是 {', '.join(EXTRA_BASES)}，收到 {extra_basis!r}")
@@ -984,8 +1307,13 @@ def merge_and_guard(
     merged_omitted: list[dict] = []
     seen: dict[str, int] = {}
 
-    def _absorb(item: dict, origin_round: int, is_new: bool) -> dict | None:
-        """把一条证据并入合并集；新内容返回合并后的条目，重复返回 None。
+    # 历史重放只有一条路径（`_absorbed_history`）：投影映射与恢复都按这里的编号，
+    # 不会因为「组装」与「恢复」各写一套遍历而错位。
+    merged, merged_omitted, seen = _absorbed_history(ledger)
+
+    def _absorb(item: dict, origin_round: int, is_new: bool,
+                pack: dict | None = None) -> dict | None:
+        """把一条本轮证据并入合并集；新内容返回合并后的条目，重复返回 None。
 
         用 `content_key`（只含围栏内的正文）而非 `digest` 判定重复：
         `digest` 含包裹围栏行，改一下围栏长度就能把同一份证据伪装成新证据。
@@ -1000,19 +1328,11 @@ def merge_and_guard(
             return None
         seen[key] = len(merged)
         entry = {**item, "origin_round": origin_round, "is_new": is_new}
+        if pack is not None:
+            entry["pack_path"] = pack.get("path", "")
+            entry["pack_sha256"] = pack.get("sha256", "")
         merged.append(entry)
         return entry
-
-    for pack in prior_entries:
-        text = _read_prior_pack(pack)
-        items, omitted = split_pack(text)
-        for it in items:
-            _absorb(it, pack.get("round", 0), False)
-        for om in omitted:
-            if om["digest"] in seen:
-                continue
-            seen[om["digest"]] = len(merged_omitted)
-            merged_omitted.append({**om, "origin_round": pack.get("round", 0)})
 
     # 历史证据必须能按当前解析规则完整复现。旧采集器用固定三反引号包裹，正文自带围栏
     # 时会提前闭合，包本身就有歧义；解析规则收紧后同一份文件会少算条目。若继续合并，
@@ -1024,7 +1344,7 @@ def merge_and_guard(
     duplicate_current = 0
     for pack in current_packs:
         for it in pack["items"]:
-            entry = _absorb(it, current_round, True)
+            entry = _absorb(it, current_round, True, pack)
             if entry is None:
                 duplicate_current += 1
                 continue
@@ -1091,7 +1411,12 @@ def merge_and_guard(
             "直接修正并记录，不重新调用。"
         )
 
-    merged_text = _render_merged(merged, merged_omitted, current_round, new_items, duplicate_current)
+    projection = _projection_plan(
+        ledger, merged, current_round=current_round, focus_text=focus_text,
+        full_evidence=list(full_evidence or []), enabled=history_projection)
+    merged_text = _render_merged(merged, merged_omitted, current_round, new_items,
+                                 duplicate_current, projected=projection["projected"])
+    projected = projection["projected"]
     truncated = [
         {"id": f"E{idx}", "source": _kind_source(it)[1],
          "omitted_chars": it.get("omitted_chars", 0),
@@ -1166,6 +1491,25 @@ def merge_and_guard(
         "carried_count": len(merged) - len(new_items),
         "duplicate_count": duplicate_current,
         "merged_chars": len(merged_text),
+        # 历史证据投影：哪些条目只给了「身份 + 完整性」记录、为什么，以及投影 ↔ 原始
+        # 条目的显式映射（编号 / 轮次 / 原始包与摘要）。投影不是证据正文，原始台账与
+        # 证据包未被改写；恢复按 E 编号 + SHA-256 回读原始包（`recover_evidence`）。
+        "projection": {
+            "version": PROJECTION_VERSION,
+            "enabled": projection["enabled"],
+            "reason": projection["reason"],
+            "pass_round": projection["pass_round"],
+            "latest_round": projection["latest_round"],
+            "projected_ids": [f"E{idx}" for idx in sorted(projected)],
+            "projected_count": len(projected),
+            "projected_source_chars": sum(r["chars"] for r in projected.values()),
+            "projected_record_chars": sum(len(r["text"]) for r in projected.values()),
+            "restored_ids": [f"E{idx}" for idx in projection["restored_ids"]],
+            "restored_sources": projection["restored_sources"],
+            "full_fallback_ids": projection["fallback_full"],
+            "kept_full_small_ids": projection["small_kept_full"],
+            "mapping": [projected[idx]["mapping"] for idx in sorted(projected)],
+        },
         # 被采集器截断的条目：正文不完整，SOL 据此得出的“缺证”结论不可靠。
         # 只做机器可读登记，是否放行由调用方（call_gpt）按显式理由决定。
         # `truncated_new` 只含本轮新提交的条目：拦的是“明知不完整还送审”，
@@ -1222,12 +1566,20 @@ def _render_merged(
     round_no: int,
     new_items: list[dict],
     duplicate_current: int,
+    projected: dict[int, dict] | None = None,
+    generated_at: str | None = None,
 ) -> str:
+    """渲染本轮合并包。`projected` 是 1 起编号 → 投影记录；命中的条目只给投影。
+
+    `generated_at` 仅供确定性测试固定时间戳；默认取当前时间。投影记录本身不含时间，
+    因此同一台账 + 同一策略 + 同一版本重复组装的投影结果逐字相同。
+    """
+    projected = projected or {}
     lines = [
         f"# copilot 复核合并证据包（第 {round_no} 轮）",
         "",
         f"- {PACK_FORMAT_FIELD}：{PACK_FORMAT_VERSION}",
-        f"- 生成时间：{now_iso()}",
+        f"- 生成时间：{generated_at or now_iso()}",
         f"- 本轮：新增/变化 {len(new_items)} 条；沿用此前 {len(items) - len(new_items)} 条；"
         f"当前包内与历史重复、已去重 {duplicate_current} 条；未纳入 {len(omitted)} 条。",
         f"- 统一编号：E1–E{len(items)}"
@@ -1237,12 +1589,23 @@ def _render_merged(
         "- 历史纪律：此前证据按提交轮次保留。若后提交的证据与先前矛盾，**不要默认采信任何一方**；"
         "保留双方来源，判断是对象状态变化、条件差异还是真正矛盾，并说明采信理由；"
         "无法解释的矛盾按未闭合处理。",
-        "",
-        "## 证据条目",
-        "",
     ]
+    if projected:
+        lines += [
+            f"- 历史证据投影：{len(projected)} 条（版本 {PROJECTION_VERSION}；正文未注入，"
+            "可按原始编号 + SHA-256 从原始证据包恢复；投影不是证据正文）。",
+            "- 投影纪律：带「历史证据投影」标题的条目只有身份与完整性记录，不含正文。"
+            "不得据此判断其内容、缺陷是否闭合或是否缺证；当前判断必须依赖其正文时，"
+            "按「缺证」写明条目编号，由执行侧以原始正文重新组装后提交。",
+        ]
+    lines += ["", "## 证据条目", ""]
     for idx, it in enumerate(items, 1):
         eid = f"E{idx}"
+        record = projected.get(idx)
+        if record is not None:
+            lines.append(record["text"].rstrip("\n"))
+            lines.append("")
+            continue
         body = re.sub(r"^### E\d+ — ", f"### {eid} — ", it["body"], count=1, flags=re.M)
         # 只有图片条目才重写控制标记；文本正文里的同名注释是数据，改写会破坏证据保真。
         if _is_image_item(it.get("kind_source", "")):
@@ -1284,6 +1647,14 @@ def render_ledger(ledger: dict, meta: dict) -> str:
         f"- 本轮证据：新增/变化 {meta['new_count']} 条；沿用此前 {meta['carried_count']} 条；"
         f"当前包内与历史重复去重 {meta['duplicate_count']} 条。",
     ]
+    proj = meta.get("projection") or {}
+    if proj.get("projected_count"):
+        lines.append(
+            f"- 历史证据投影：{proj['projected_count']} 条正文未注入（版本 {proj.get('version')}；"
+            "按原始编号 + SHA-256 可恢复）。投影不是证据正文，不能替代原始证据。"
+            + (f" 因当前问题相关而保留原文：{', '.join(proj['restored_ids'])}。"
+               if proj.get("restored_ids") else "")
+        )
     if meta.get("pending_calls"):
         lines.append(
             f"- 未入账调用：{meta['pending_calls']} 次（GPT 已返回但台账未记录，"
@@ -1390,6 +1761,9 @@ def render_ledger(ledger: dict, meta: dict) -> str:
         "仍可把 `security` 作为本轮依据再次复核，但不得把同一问题、同一组证据"
         "重复当成本轮新风险。",
         "8. 引用证据一律用本轮合并包编号；往轮回复中的编号只作历史参考。",
+        "9. 带「历史证据投影」标题的条目不是证据正文：只能确认该条目存在、编号、来源与"
+        "摘要未变化；不得据此判断其内容、缺陷是否闭合或是否缺证。某项判断必须依赖其正文时，"
+        "写明「缺证：E<n> 原始正文未注入」，不得用投影替代原始依据。",
         "",
     ]
     return "\n".join(lines)
@@ -1484,6 +1858,10 @@ def record_round(
         "security_remaining_after": meta.get("security_remaining_after"),
         "risk": ledger.get("risk"),
     }
+    # 投影 ↔ 原始条目的显式映射随轮次入账：事后可核对「这一轮哪些条目只给了投影、
+    # 原始编号/包/摘要是什么」。投影只影响渲染，台账与原始证据包都没有被改写。
+    if isinstance(meta.get("projection"), dict) and meta["projection"].get("projected_count"):
+        record["projection"] = meta["projection"]
     previous_updated = ledger.get("updated_at")
     ledger.setdefault("rounds", []).append(record)
     ledger["updated_at"] = now_iso()
@@ -1635,6 +2013,62 @@ def budget_status(path: str, *, audit_log: str = "", risk: str = "normal",
 
 
 # ── 只读 CLI（排查台账用）────────────────────────────────────────────────────
+def _offline_main(args) -> int:
+    """离线组装 / 恢复：只读台账与原始证据包，不调用 GPT、不入账、不写台账。"""
+    if not os.path.isfile(args.file):
+        print(f"copilot: 离线组装/恢复要求台账已存在：{args.file}", file=sys.stderr)
+        return 2
+    try:
+        ledger = load_or_init(args.file, risk=None)
+    except LedgerError as exc:
+        print(f"copilot: {exc}", file=sys.stderr)
+        return 2
+    if args.recover:
+        try:
+            records = recover_evidence(ledger, [args.recover])
+        except LedgerError as exc:
+            print(f"copilot: {exc}", file=sys.stderr)
+            return 2
+        if args.json:
+            print(json.dumps(records, ensure_ascii=False, indent=2))
+        else:
+            for rec in records:
+                print(f"<!-- 恢复 {rec['id']}：第 {rec['origin_round']} 轮 {rec['original_id']}；"
+                      f"包 {rec['pack']}；SHA-256 {rec['digest']} -->")
+                print(rec["body"].rstrip("\n") + "\n")
+        return 0
+    if not args.evidence:
+        print("copilot: --assemble 需要至少一个 --evidence 证据包。", file=sys.stderr)
+        return 2
+    focus = ""
+    if args.focus_text_file:
+        try:
+            with open(args.focus_text_file, "r", encoding="utf-8") as fh:
+                focus = fh.read()
+        except OSError as exc:
+            print(f"copilot: 本轮任务文本读取失败：{exc}", file=sys.stderr)
+            return 2
+    try:
+        text, meta = merge_and_guard(
+            ledger, args.evidence, args.extra_round_reason, args.extra_round_basis,
+            audit_log=args.audit_log or str(ledger.get("audit_log") or ""),
+            ledger_path=args.file, focus_text=focus,
+            full_evidence=args.full_evidence,
+            history_projection=not args.no_history_projection)
+    except LedgerError as exc:
+        print(f"copilot: {exc}", file=sys.stderr)
+        return 2
+    if args.meta_out:
+        with open(args.meta_out, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(meta, ensure_ascii=False, indent=2) + "\n")
+    if args.out:
+        with open(args.out, "w", encoding="utf-8") as fh:
+            fh.write(text)
+    else:
+        sys.stdout.write(text)
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="查看 copilot REVIEW 复核台账（只读）")
     ap.add_argument("--file", required=True, help="台账 JSON 路径")
@@ -1647,7 +2081,27 @@ def main() -> int:
                     help="台账不存在时的计划风险（默认 normal）")
     ap.add_argument("--subject", default="",
                     help="台账不存在时的交付物标识（仅显示，不建账）")
+    # 离线证据包组装 / 恢复：只读台账与原始证据包，不发起调用、不入账、不写台账。
+    ap.add_argument("--assemble", action="store_true",
+                    help="离线组装本轮合并证据包（不调用 GPT、不新增轮次）")
+    ap.add_argument("--evidence", action="append", default=[],
+                    help="--assemble 的本轮证据包（可重复）")
+    ap.add_argument("--extra-round-reason", default="", help="--assemble 的本轮复核理由")
+    ap.add_argument("--extra-round-basis", default="", choices=("",) + EXTRA_BASES,
+                    help="--assemble 的本轮依据标签")
+    ap.add_argument("--focus-text-file", default="",
+                    help="--assemble 的本轮任务文本；其中的 E 编号/来源会恢复为全文")
+    ap.add_argument("--full-evidence", action="append", default=[],
+                    help="强制注入原始正文的 E 编号（可重复/逗号分隔）")
+    ap.add_argument("--no-history-projection", action="store_true",
+                    help="--assemble 关闭历史证据投影（全量正文对照）")
+    ap.add_argument("--out", default="", help="--assemble 输出证据包路径；缺省打印到 stdout")
+    ap.add_argument("--meta-out", default="", help="--assemble 输出元数据 JSON 路径")
+    ap.add_argument("--recover", default="",
+                    help="按 E 编号恢复原始正文（逗号分隔，如 E5,E9）")
     args = ap.parse_args()
+    if args.assemble or args.recover:
+        return _offline_main(args)
     if args.budget:
         try:
             info = budget_status(args.file, audit_log=args.audit_log,

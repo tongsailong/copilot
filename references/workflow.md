@@ -75,6 +75,12 @@ python3 ~/.zcode/skills/copilot/scripts/call_gpt.py \
 哪些是原始记录、哪些是解释。**不要把「PASS / 已完成」当材料**；只有自评、没有原始材料时先补证，
 补不到就写明缺失。
 
+**角色指令按模式组装**：默认不传 `--role-file`，脚本把共享核心 `references/role.md` 与当前模式的
+专业补充（`role-consult.md` / `role-plan.md` / `role-review.md`）以空行连接后作为 `instructions`
+注入；同一组文件内容产生同一份指令。显式 `--role-file <路径>` 时只注入该文件，不追加模式补充
+（用于回滚、离线对照或自定义角色）。审计记录实际注入的文件路径、各自 SHA-256 与总字符数，
+不记录正文。
+
 **审计日志是正式调用的必需参数。** 缺 `--audit-log` 或路径写不进去时，脚本在出站前失败（退出码 2，
 请求未发出）。每次调用先落盘一条 `call_requested`（含 `call_id`、`fsync`），再发请求，最后写
 `call_result`；两者靠 `call_id` 关联。结果记录写不进去时返回退出码 7，**按「审计不完整」报告：
@@ -139,6 +145,10 @@ REVIEW 一律要求证据包；没有证据时不要调用，直接按 `PARTIAL�
 还必须带 `--review-ledger`（GPT REVIEW 审计记录，**不构成 G4 依据**），否则发送前拒绝（退出码 2）；
 唯一例外是显式 `--one-shot-visual-review` 且证据含图片的一次性视觉评审，它不携带跨轮状态，不得用于
 续轮。CONSULT / PLAN 不需要台账。
+
+续轮合并包默认对已验证 PASS 之前、未被引用的背景证据做**历史证据投影**（见
+`references/review-ledger.md`）：投影条目只有编号与 SHA-256 等身份记录，不是证据正文；`--full-evidence`
+按编号强制原文、`--no-history-projection` 退回全量。两者都只影响渲染，不改台账与历史包。
 
 CPA 响应可能超过前台 2 分钟：优先以后台任务运行（如 run_in_background），等宿主完成通知再读输出，
 不要用固定 `sleep` 反复轮询；需要主动检查时有界等待（先等 60–120 秒，再查进程、审计与输出各一次）。

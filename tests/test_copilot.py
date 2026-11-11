@@ -3672,6 +3672,89 @@ class ReviewAccountingTests(unittest.TestCase):
         self.assertEqual(len(self.rounds()), 1)
 
 
+class RoleCompositionTests(unittest.TestCase):
+    """SOL 指令按模式确定性组装：共享核心 + 本模式补充，不丢规则、不跨模式夹带。"""
+
+    MODES = ("CONSULT", "PLAN", "REVIEW")
+
+    def setUp(self):
+        self.base = os.path.dirname(HERE)
+        with open(os.path.join(self.base, "references", "role.md"),
+                  encoding="utf-8") as fh:
+            self.core = fh.read()
+        self.supplements = {}
+        for mode in self.MODES:
+            path = os.path.join(self.base, "references",
+                                call_gpt.MODE_ROLE_FILES[mode])
+            with open(path, encoding="utf-8") as fh:
+                self.supplements[mode] = fh.read()
+
+    def test_default_composition_is_deterministic_and_ordered(self):
+        for mode in self.MODES:
+            with self.subTest(mode=mode):
+                text_a, files_a = call_gpt.load_instructions("", mode)
+                text_b, files_b = call_gpt.load_instructions("", mode)
+                self.assertEqual(text_a, text_b, "同一组文件必须产生同一份指令")
+                self.assertEqual(files_a, files_b)
+                self.assertEqual(len(files_a), 2)
+                self.assertTrue(files_a[0].endswith(os.path.join("references", "role.md")))
+                self.assertTrue(files_a[1].endswith(
+                    call_gpt.MODE_ROLE_FILES[mode]))
+                self.assertTrue(text_a.startswith(self.core.rstrip()),
+                                "模式补充必须追加在共享核心之后")
+                self.assertIn(self.supplements[mode].strip(), text_a)
+
+    def test_mode_supplements_do_not_leak_review_contract(self):
+        consult, _ = call_gpt.load_instructions("", "CONSULT")
+        plan, _ = call_gpt.load_instructions("", "PLAN")
+        for label, text in (("CONSULT", consult), ("PLAN", plan)):
+            with self.subTest(mode=label):
+                for review_only in ("PASS 四门", "pass_pending", "**REJUDGE**",
+                                    "裁决行契约", "原生 Agent Bridge（阶段 0–3）"):
+                    self.assertNotIn(review_only, text,
+                                     f"{label} 不应携带 REVIEW 专用契约：{review_only}")
+        review, _ = call_gpt.load_instructions("", "REVIEW")
+        for anchor in ("PASS 四门", "pass_pending", "REJUDGE", "裁决行契约",
+                       "原生 Agent Bridge（阶段 0–3）", "只重判变化项"):
+            self.assertIn(anchor, review, f"REVIEW 缺少专用规则：{anchor}")
+        # 合同确认（PLAN 的 criteria_confirmed）属共享核心，不能在任何模式下丢失
+        self.assertIn("criteria_confirmed: true", self.core)
+        self.assertIn("### PLAN", plan)
+
+    def test_shared_rules_and_all_30_v50_items_survive_split(self):
+        for anchor in ("你指挥，但你不动手", "你不是调查者", "没有第四种模式",
+                       "原 DECIDE 已合并", "copilot-plan", "不构成授权",
+                       "固定任务接口", "三态与来源"):
+            self.assertIn(anchor, self.core, f"共享核心缺少规则：{anchor}")
+        for n in range(1, 31):
+            self.assertRegex(self.core, rf"(?m)^{n}\. ",
+                             f"v5.0 第 {n} 条不在共享核心中")
+        # 运行时契约 1–16 条在核心或模式补充中恰好各存在一次
+        composed = self.core + "\n" + "\n".join(self.supplements.values())
+        contract_titles = {
+            1: "任务启动与合同确认", 2: "结构化完成条件", 3: "状态命令的边界",
+            4: "九段上下文与预算", 5: "三态协议", 6: "PASS 四门",
+            7: "`pass_pending` 锁", 8: "G4 高风险原生独立复核",
+            9: "阶段优先级", 10: "REJUDGE", 11: "8 轮检查点（观察信号）",
+            12: "无进展恢复", 13: "CLOSED 后停止", 14: "中断恢复与配额等待",
+            15: "自动驱动通道（阶段 4）", 16: "原生 Agent Bridge（阶段 0–3）",
+        }
+        for n, title in contract_titles.items():
+            marker = f"{n}. **{title}"
+            self.assertEqual(composed.count(marker), 1,
+                             f"运行时契约第 {n} 条缺失或重复：{marker}")
+
+    def test_explicit_role_file_is_injected_verbatim(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            custom = os.path.join(tmp, "custom-role.md")
+            body = "# custom\n\n只使用这一个文件。\n"
+            with open(custom, "w", encoding="utf-8") as fh:
+                fh.write(body)
+            text, files = call_gpt.load_instructions(custom, "REVIEW")
+            self.assertEqual(text, body)
+            self.assertEqual(files, [custom])
+
+
 class DocumentRoutingTests(unittest.TestCase):
     """Skill 文档与代码路由必须一致，防止只改文档或只改代码。"""
 
@@ -3993,18 +4076,24 @@ class SingleEntryPointTests(unittest.TestCase):
                              f"v5.0 正文混入 v4.9 已删除条款：{removed}")
 
     def test_role_md_maps_all_v50_rules(self):
-        """role.md 必须逐条映射 v5.0 的 30 条，且标明 v4.9 已删除条款不是 v5.0 要求。"""
+        """v5.0 的 30 条必须逐条映射，且标明 v4.9 已删除条款不是 v5.0 要求。
+
+        映射表是规则完整性文档，已移出运行时注入的 role.md（`role-map.md` 不注入模型），
+        断言内容不变。
+        """
         base = os.path.dirname(HERE)
+        with open(os.path.join(base, "references", "role-map.md"), encoding="utf-8") as fh:
+            mapping = fh.read()
         with open(os.path.join(base, "references", "role.md"), encoding="utf-8") as fh:
             role = fh.read()
-        rows = [ln for ln in role.splitlines() if re.match(r"^\| \d+ \|", ln)]
-        self.assertEqual(len(rows), 30, f"role.md 映射表应有 30 行，实际 {len(rows)}")
+        rows = [ln for ln in mapping.splitlines() if re.match(r"^\| \d+ \|", ln)]
+        self.assertEqual(len(rows), 30, f"role-map.md 映射表应有 30 行，实际 {len(rows)}")
         numbers = [int(re.match(r"^\| (\d+) \|", ln).group(1)) for ln in rows]
-        self.assertEqual(numbers, list(range(1, 31)), "role.md 映射表条目缺失或顺序错乱")
-        self.assertIn("chatgpt-custom-instructions-v5.0.md", role,
-                      "role.md 应指向 v5.0 权威原文")
+        self.assertEqual(numbers, list(range(1, 31)), "role-map.md 映射表条目缺失或顺序错乱")
+        self.assertIn("chatgpt-custom-instructions-v5.0.md", mapping,
+                      "role-map.md 应指向 v5.0 权威原文")
         # 删掉的两条必须被明确标为历史条款，不能以「v5.0 规定」的名义复活
-        self.assertIn("不作为 v5.0 要求", role)
+        self.assertIn("不作为 v5.0 要求", mapping)
         self.assertIn("固定任务接口", role)
 
     def test_chatgpt_versions_are_separated_current_vs_history(self):
@@ -4102,10 +4191,13 @@ class SingleEntryPointTests(unittest.TestCase):
         # front matter 的 description 必须表达「可以多次调用」
         self.assertIn("多次调用", skill.split("---")[1])
 
-        # 代码与文档一致：remediation 是可接受依据，且 role.md 说明该轮不安排下一轮
+        # 代码与文档一致：remediation 是可接受依据，且 REVIEW 补充说明该轮不安排下一轮
         self.assertIn("remediation", review_ledger.EXTRA_BASES)
-        self.assertIn("remediation", role)
-        self.assertIn("不安排下一轮自动复核", role)
+        with open(os.path.join(base, "references", "role-review.md"),
+                  encoding="utf-8") as fh:
+            role_review = fh.read()
+        self.assertIn("remediation", role_review)
+        self.assertIn("不安排下一轮自动复核", role_review)
 
     def test_retired_model_ids_are_not_documented_as_live(self):
         """退役模型 ID 不得在文档里被当作现行路由（复核 2026-10-18 F5/F1）。

@@ -72,7 +72,7 @@ references**，只读当前任务需要的那一份。核心授权、安全、�
 | GPT REVIEW 台账、审计日志机制 | `references/review-ledger.md` | 台账绑定、并发与记账细则 |
 | 原生 Agent Bridge（`--execution-backend native`） | `references/agent-bridge.md` | 信封字段、错误码、Reviewer Profile |
 | 版本沿革与历史对照 | `references/history.md` | 只作历史，不改现行规则 |
-| SOL 侧指令 | `references/role.md` | 由 `call_gpt.py --role-file` 注入，主代理不读取 |
+| SOL 侧指令 | `references/role.md` + `role-consult.md` / `role-plan.md` / `role-review.md` | 由 `call_gpt.py` 按模式确定性组装注入；`role-map.md` 只作规则映射，不注入 |
 
 按任务类型的读取范围：
 
@@ -221,6 +221,12 @@ python3 ~/.zcode/skills/copilot/scripts/call_gpt.py \
 REVIEW 还必须带 `--review-ledger`（GPT REVIEW 审计记录，**不构成 G4 依据**），否则发送前拒绝
 （退出码 2）；唯一例外是显式 `--one-shot-visual-review` 且证据含图片的一次性视觉评审，它不携带
 跨轮状态，不得用于续轮。CONSULT / PLAN 不需要台账。
+
+**历史证据投影不是证据正文。** 续轮合并包默认把已验证 PASS 之前、未被本轮引用的背景证据压成
+「编号 + 原位置 + SHA-256 + 恢复条件」记录；当前轮新增、未闭合、争议与被引用证据仍全量注入。
+投影只由脚本按台账字段生成（不接受模型自写摘要），原始台账与各轮证据包不被改写，按编号 +
+SHA-256 可精确恢复原文。SOL 需要正文时按「缺证：E<n>」写明，执行侧恢复后重新组装；判据、
+回退与恢复机制见 `references/review-ledger.md`「历史证据投影」。
 
 **模型身份是消费前提（硬约束）。** 只有退出码 0 **且**审计 `call_result` 里 `model_identity_ok=true`
 的回复才能作为有效 GPT 指导：请求模型与上游回显 `model` 必须一致（只容忍两端空白）；回显缺失、不可
@@ -394,7 +400,8 @@ SOL 的最终判断只能由随后显式运行的 `drive` 发起。
 
 ## 判断质量与收口
 
-判断原则按 v5.0 的 30 条承载（逐条落点表在 `references/role.md`，无遗漏、无弱化），完整原文见
+判断原则按 v5.0 的 30 条承载（逐条落点表在 `references/role-map.md`，无遗漏、无弱化；该文件不注入
+模型），完整原文见
 `~/.zcode/references/chatgpt-custom-instructions-v5.0.md`；本 Skill 只选择性融入，不是复制。
 **协作语义基线是 v5.3.3**（`~/.zcode/references/chatgpt-v5.3.3-alignment.md` 是对齐摘要，不是原文
 全文、不是权限来源）。六角色分工、「不因人为默认轮次、Token 预算或内部费用阈值提前停止」「PARTIAL

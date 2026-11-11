@@ -138,6 +138,13 @@ API_KEY_ENV = "CUSTOM_127_API_KEY"
 ENDPOINT = "/responses"
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_ROLE_FILE = os.path.join(HERE, "references", "role.md")
+# 模式专业补充：默认注入 = 核心 role.md + 当前模式的补充文件。拆分只移动文本，
+# 不新增、不放宽规则；显式 --role-file 仍按调用方给出的单文件原样注入。
+MODE_ROLE_FILES = {
+    "CONSULT": "role-consult.md",
+    "PLAN": "role-plan.md",
+    "REVIEW": "role-review.md",
+}
 
 # 模式 → 传输通道。copilot 只有三种正式模式，全部走 CPA Responses API。
 # 原 DECIDE 已并入 CONSULT/PLAN/REVIEW；TypeSafe/jev-latest 仍是宿主
@@ -255,6 +262,30 @@ def read_text(path: str) -> str:
             return fh.read()
     except OSError as exc:
         die(EXIT_USAGE, f"无法读取 {path}：{exc}")
+
+
+def resolve_role_files(role_file: str, mode: str) -> list[str]:
+    """本次实际注入的指令文件：显式 --role-file 单文件；默认核心 + 模式补充。"""
+    if role_file:
+        return [role_file]
+    files = [DEFAULT_ROLE_FILE]
+    supplement = MODE_ROLE_FILES.get((mode or "").strip().upper())
+    if supplement:
+        files.append(os.path.join(HERE, "references", supplement))
+    return files
+
+
+def load_instructions(role_file: str, mode: str) -> tuple[str, list[str]]:
+    """确定性组装 instructions；返回正文与参与组装的文件路径。
+
+    显式 `--role-file` 保持原行为（只读该文件，不追加模式补充）；默认路径把核心与
+    当前模式的补充以单个空行连接。同一组文件内容必然产生同一份指令。
+    """
+    files = resolve_role_files(role_file, mode)
+    if role_file:
+        return read_text(role_file), files
+    parts = [read_text(path).rstrip() for path in files]
+    return "\n\n".join(parts) + "\n", files
 
 
 class AuditError(Exception):
@@ -411,9 +442,15 @@ def resolve_route(mode: str, model_flag: str = "") -> tuple[str, str]:
 # ── 证据包自检 ──────────────────────────────────────────────────────────────
 
 
-def evidence_selfcheck_text(text: str, display_path: str) -> tuple[str, dict]:
-    """解析证据包文本，产出交给 GPT 的自检表。缺证在 GPT 侧必须可见。"""
+def evidence_selfcheck_text(text: str, display_path: str,
+                            projected_ids: set[str] | None = None) -> tuple[str, dict]:
+    """解析证据包文本，产出交给 GPT 的自检表。缺证在 GPT 侧必须可见。
+
+    `projected_ids` 是本轮只给了「历史证据投影」的编号：它们不是正文，必须在自检表里
+    显式标注，避免被当成「已提交且内容已知」的证据。
+    """
     items, omitted = split_pack(text)
+    projected = {str(i) for i in (projected_ids or set())}
     entries = [it["old_id"] for it in items]
     entry_map = [(it["old_id"], it["kind_source"]) for it in items]
     refused = [(om["old_id"], om["source"], om["reason"]) for om in omitted]
@@ -422,7 +459,7 @@ def evidence_selfcheck_text(text: str, display_path: str) -> tuple[str, dict]:
     truncated = [
         {"id": it["old_id"], "source": it["kind_source"],
          "omitted_chars": it.get("omitted_chars", 0)}
-        for it in items if it.get("truncated")
+        for it in items if it.get("truncated") and it["old_id"] not in projected
     ]
     stats = {
         "path": display_path,
@@ -434,6 +471,7 @@ def evidence_selfcheck_text(text: str, display_path: str) -> tuple[str, dict]:
         "images": image_ids,
         "unincluded": [{"id": i, "source": s, "reason": r} for i, s, r in refused],
         "truncated": truncated,
+        "projected": sorted(projected),
     }
     lines = [
         "",
@@ -451,6 +489,14 @@ def evidence_selfcheck_text(text: str, display_path: str) -> tuple[str, dict]:
             f"- 图片证据：{len(image_ids)} 条（{', '.join(image_ids)}）——真实像素已作为 `input_image` "
             "内联在本消息中；视觉判断只能依据这些图像本身，文件名、路径与本表元数据都不构成视觉证据。"
         )
+    if projected:
+        lines.append(
+            f"- **历史证据投影 {len(projected)} 条**（正文未注入，只有编号/轮次/来源/"
+            f"SHA-256/长度记录）：{', '.join(sorted(projected, key=lambda x: int(x[1:])))}")
+        lines.append(
+            "  - 投影不是证据正文：不得据此判断内容、缺陷是否闭合或缺证。"
+            "某项判断必须依赖其正文时，写明「缺证：E<n> 原始正文未注入」，"
+            "由执行侧以原始正文重新组装后提交。")
     if truncated:
         lines.append(
             f"- **证据被截断 {len(truncated)} 条**（采集器按上限保留头尾，正文不完整）：")
@@ -1105,7 +1151,9 @@ def assert_distinct_paths(args) -> None:
         # 分段计划用 os.replace 原子写；与上述任一输出同路径会静默覆盖它们。
         ("--segmentation-plan", getattr(args, "segmentation_plan", "")),
     ]
-    inputs = [("--role-file", getattr(args, "role_file", ""))]
+    role_files = resolve_role_files(getattr(args, "role_file", ""),
+                                    getattr(args, "mode", ""))
+    inputs = [("--role-file", path) for path in role_files]
     prompt = str(getattr(args, "prompt_file", "") or "")
     if prompt and prompt != "-":
         inputs.append(("--prompt-file", prompt))
@@ -1132,8 +1180,10 @@ def main() -> int:
     ap.add_argument("--evidence", action="append", default=[],
                     help="bridge_evidence.py 产出的证据包；作为独立章节注入并生成自检表"
                          "（包内图片证据引用会被读取为真实 input_image）")
-    ap.add_argument("--role-file", default=DEFAULT_ROLE_FILE,
-                    help="GPT 的角色/规则文件（默认 copilot/references/role.md）")
+    ap.add_argument("--role-file", default="",
+                    help="显式指定 GPT 的角色/规则文件（单文件原样注入）。缺省时按模式"
+                         "确定性组合 copilot/references/role.md + role-<模式>.md，"
+                         "只携带共享核心与本模式专业补充")
     ap.add_argument("--mode", default="", help="CONSULT/PLAN/REVIEW（留痕 + 证据纪律注入）")
     ap.add_argument("--review-ledger", default="",
                     help="REVIEW 复核台账 JSON：自动合并历史证据、注入往轮裁决，并给本轮"
@@ -1158,6 +1208,12 @@ def main() -> int:
                     help="显式放行被采集器截断的 REVIEW 证据，并写明理由"
                          "（为什么无法重新采集、省略的是哪部分、结论如何不受影响）；"
                          "放行理由随轮次入账，审计可追溯")
+    ap.add_argument("--full-evidence", action="append", default=[],
+                    help="REVIEW：强制注入原始正文的历史证据编号（可重复/逗号分隔，如 E5,E9）；"
+                         "用于问题重开、当前问题依赖历史条目或 SOL 明确要求原始依据")
+    ap.add_argument("--no-history-projection", action="store_true",
+                    help="REVIEW：关闭历史证据投影，合并包按原始正文全量注入（默认开启投影；"
+                         "投影只影响渲染，台账与原始证据包不会被改写）")
     ap.add_argument("--dry-run", action="store_true",
                     help="只构建并检查 prompt/证据/台账，不调用 GPT（不写审计）；"
                          "但会读取或创建复核台账，并可能写入 subject/audit_log 绑定，"
@@ -1252,6 +1308,9 @@ def main() -> int:
               file=sys.stderr)
     if args.review_ledger and mode != "REVIEW":
         die(EXIT_USAGE, "--review-ledger 只用于 REVIEW 模式。")
+    if (args.full_evidence or args.no_history_projection) and not args.review_ledger:
+        die(EXIT_USAGE, "--full-evidence / --no-history-projection 只用于带 --review-ledger "
+                        "的正式 REVIEW：没有台账时全部证据本来就会原样注入。")
     if args.one_shot_visual_review and mode != "REVIEW":
         die(EXIT_USAGE, "--one-shot-visual-review 只用于 REVIEW 模式。")
     if args.one_shot_visual_review and args.review_ledger:
@@ -1288,13 +1347,17 @@ def main() -> int:
                                   subject=args.subject, audit_log=args.audit_log)
             merged_text, merged_meta = merge_and_guard(
                 ledger, args.evidence, args.extra_round_reason, args.extra_round_basis,
-                audit_log=args.audit_log, ledger_path=args.review_ledger)
+                audit_log=args.audit_log, ledger_path=args.review_ledger,
+                focus_text=prompt, full_evidence=args.full_evidence,
+                history_projection=not args.no_history_projection)
         except LedgerError as exc:
             die(EXIT_USAGE, str(exc))
         evidence_block = (f"\n<!-- 复核合并证据包（第 {merged_meta['round']} 轮） -->\n"
                           + merged_text.strip() + "\n")
+        projected_ids = set((merged_meta.get("projection") or {}).get("projected_ids") or [])
         check, stats = evidence_selfcheck_text(
-            merged_text, f"{os.path.abspath(args.review_ledger)}#第{merged_meta['round']}轮")
+            merged_text, f"{os.path.abspath(args.review_ledger)}#第{merged_meta['round']}轮",
+            projected_ids=projected_ids)
         selfchecks.append(check)
         stats_all.append(stats)
         image_refs.extend(parse_image_refs(merged_text, args.review_ledger))
@@ -1428,7 +1491,7 @@ def main() -> int:
             and args.max_output_tokens_ceiling < args.max_output_tokens):
         die(EXIT_USAGE, "--max-output-tokens-ceiling 不能小于初始 --max-output-tokens。")
 
-    instructions = read_text(args.role_file) if args.role_file else ""
+    instructions, instructions_files = load_instructions(args.role_file, mode)
     prompt = build_prompt(prompt, evidence_block, "\n".join(selfchecks), ledger_block,
                           dispatch_block)
     prompt = apply_review_output_contract(mode, prompt)
@@ -1707,6 +1770,11 @@ def main() -> int:
         "evidence_entries": sum(s["entries"] for s in stats_all),
         "evidence_images": sum(len(s["images"]) for s in stats_all),
         "prompt_redacted": bool(redactions),
+        # 指令组装留痕：实际注入的文件、各自指纹与总字符数（不含正文）。
+        "instructions_files": [os.path.abspath(p) for p in instructions_files],
+        "instructions_sha256": [sha256_file(os.path.abspath(p))
+                                for p in instructions_files],
+        "instructions_chars": len(instructions),
         **image_meta,
     }
     if merged_meta:

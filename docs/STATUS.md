@@ -16,6 +16,30 @@
   （`review_ledger.py` / `call_gpt.py` / `copilot_dispatch.py`），并把独立复核的「最多 2 轮；
   到顶即停」改为证据驱动的无固定次数上限；见下文「本轮收口」。
 
+### 2026-11-11 批次：SOL 指令拆分与 REVIEW 历史证据投影
+
+两项改动已完成验证、同步到运行时并随本批次提交入库（父提交 `775731b`）。
+
+- **SOL 指令拆分**：`references/role.md` 拆为核心（32,887 B）+ 三个模式补充
+  （`role-consult.md` 650 B / `role-plan.md` 1,426 B / `role-review.md` 11,699 B），
+  `call_gpt.py` 按模式确定性组装为单份 `instructions`；`role-map.md` 只作 v5.0 映射、不注入。
+  显式 `--role-file` 仍按单文件原样注入。实测 `instructions` Token：14,102 → CONSULT 9,146 /
+  PLAN 9,359 / REVIEW 12,265。原 `role.md` 503 行非空内容逐行核对，除重写后的「判断原则」
+  压缩段与改名标题外无缺失；压缩段涉及的每条硬约束已逐条回补（模拟测试档位、未验证项不得写成
+  通过、不替用户放行高风险、不机械要求多轮、隔离上下文、不自行断言结果）。
+- **历史证据投影**：`review_ledger.py` 渲染层把已验证 PASS 之前的未引用背景证据压成
+  「编号 + 原位置 + SHA-256 + 恢复条件」记录，`PROJECTION_VERSION=1`；原始台账与各轮证据包
+  字节不变，G2 复现检查不变；`--recover` 按编号 + 摘要精确恢复原文。真实第 14 轮台账（200 条 /
+  680,140 字符）实测：全量包 680,488 字符 / `input_tokens` 254,663 → 投影包 158,240 字符 /
+  87,731（−65.6%）；重开一条历史证据后 96,590。同台账 + 同策略 + 同版本两次装配结果一致；
+  篡改证据包、篡改台账摘要、缺包均失败关闭；14 个原始包 SHA 未变，台账仍 14 轮、无投影字段写入。
+  行为探针（非正式 REVIEW）：SOL 对投影条目 E16 回答「正文可见：否」「结论：不能；缺证：E16」。
+- **测试与同步**：`872 tests / OK`（含 19 项投影定向测试）；`sync_runtime.py --apply` 写入 10 个
+  文件，`--check` 缺失 0 / 不同 0 / Reviewer same；全新 headless 进程加载 Skill 成功并读到投影
+  硬约束段与新的引用清单。
+- **未验证**：没有发起新的正式 REVIEW，投影在生产轮次中的裁决质量只有离线场景与行为探针证据；
+  `role.md` 压缩段的行级改写属人工合并，未逐字比对语义等价的独立复核。
+
 ## 源码与运行时
 
 | 项目 | 实际值 |
@@ -24,7 +48,7 @@
 | 运行时 Skill | `/home/ctyun/.zcode/skills/copilot` |
 | Reviewer 运行时 | `/home/ctyun/.zcode/agents/reviewer.md` |
 | 同步工具 | `scripts-sync/sync_runtime.py` |
-| 分发的 Skill 文件 | 13 个（`SKILL.md` + 9 个 `scripts/*.py` + 3 个 `references/*.md`） |
+| 分发的 Skill 文件 | 21 个（`SKILL.md` + 9 个 `scripts/*.py` + 11 个 `references/*.md`） |
 | 分发的 Reviewer 文件 | 1 个（`agents/reviewer.md`） |
 | 首次同步 | 2026-11-02 20:25–20:26 CST |
 | 同步前备份 | `/home/ctyun/.zcode/backups/copilot-presync-20261102-202527` |
