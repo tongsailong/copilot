@@ -478,16 +478,102 @@ class ReviewEnvelopeTests(NativeAgentBase):
                                              input=copy_path))
         self.assertIn("review_file_not_inspected", str(ctx.exception))
 
+    def test_rejects_claimed_file_matched_only_as_path_prefix(self):
+        """读过 x.py.bak 不能算读过 x.py：路径必须按边界匹配，不能靠子串。"""
+        backup = self.evidence_path + ".bak"
+        with open(backup, "w", encoding="utf-8") as fh:
+            fh.write("backup\n")
+        metadata, rollout = self._reviewer_with(tool_calls=[
+            {"name": "Read", "input": {"file_path": backup}},
+            {"name": "Bash", "input": {"command": self.reported_command}}])
+        with open(metadata, "r", encoding="utf-8") as fh:
+            output_path = json.load(fh)["outputFile"]
+        claimed = {**self.conclusion,
+                   "files_inspected": [self.evidence_path],
+                   "work_item_id": "T1",
+                   "execution_result_sha256": self.execution["result_sha256"]}
+        with open(output_path, "w", encoding="utf-8") as fh:
+            json.dump(claimed, fh)
+        with self.assertRaises(G.AgentRecordError) as ctx:
+            G.build_review(self._review_args(metadata=metadata,
+                                             model_rollout=rollout))
+        self.assertIn("review_file_not_inspected", str(ctx.exception))
+
+    def test_rejects_non_object_response_row(self):
+        """rollout 里 response 不是对象时结构化拒绝，不能抛裸 AttributeError。"""
+        metadata, rollout = self._reviewer_with(tool_calls=[
+            {"name": "Read", "input": {"file_path": self.evidence_path}},
+            {"name": "Bash", "input": {"command": self.reported_command}}])
+        with open(rollout, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps({
+                "sessionId": "sess_subagent_agent-rev2",
+                "response": "truncated-record"}) + "\n")
+        with self.assertRaises(G.AgentRecordError) as ctx:
+            G.build_review(self._review_args(metadata=metadata,
+                                             model_rollout=rollout))
+        self.assertIn("review_toolcalls_invalid", str(ctx.exception))
+
     def test_allows_relative_read_for_absolute_claim(self):
-        """合法场景不误拒：实际用相对路径读，自报绝对路径仍应通过。"""
+        """合法场景不误拒：相对路径读（含 `./` 形式）时，自报绝对路径仍应通过。"""
         parent = os.path.basename(os.path.dirname(self.evidence_path))
         relative = os.path.join(parent, os.path.basename(self.evidence_path))
+        for form in (relative, "./" + relative):
+            with self.subTest(read=form):
+                metadata, rollout = self._reviewer_with(tool_calls=[
+                    {"name": "Read", "input": {"file_path": form}},
+                    {"name": "Bash", "input": {"command": self.reported_command}}])
+                env = G.build_review(self._review_args(metadata=metadata,
+                                                       model_rollout=rollout))
+                self.assertIn(self.evidence_path, str(env.get("files_inspected")))
+
+    def test_rejects_nested_directory_for_claimed_path(self):
+        """读过 docs/archive/report.md 不能算读过 docs/report.md：中间插层不是同一路径。"""
+        parent = os.path.dirname(self.evidence_path)
+        base = os.path.basename(self.evidence_path)
+        nested_dir = os.path.join(parent, "archive")
+        os.makedirs(nested_dir, exist_ok=True)
+        nested = os.path.join(nested_dir, base)
+        with open(nested, "w", encoding="utf-8") as fh:
+            fh.write("nested\n")
         metadata, rollout = self._reviewer_with(tool_calls=[
-            {"name": "Read", "input": {"file_path": relative}},
+            {"name": "Read", "input": {"file_path": nested}},
             {"name": "Bash", "input": {"command": self.reported_command}}])
-        env = G.build_review(self._review_args(metadata=metadata,
-                                               model_rollout=rollout))
-        self.assertIn(self.evidence_path, str(env.get("files_inspected")))
+        with open(metadata, "r", encoding="utf-8") as fh:
+            output_path = json.load(fh)["outputFile"]
+        claimed = {**self.conclusion,
+                   "files_inspected": [self.evidence_path],
+                   "work_item_id": "T1",
+                   "execution_result_sha256": self.execution["result_sha256"]}
+        with open(output_path, "w", encoding="utf-8") as fh:
+            json.dump(claimed, fh)
+        with self.assertRaises(G.AgentRecordError) as ctx:
+            G.build_review(self._review_args(metadata=metadata,
+                                             model_rollout=rollout))
+        self.assertIn("review_file_not_inspected", str(ctx.exception))
+
+    def test_mentions_path_accepts_boundary_forms_and_rejects_foreign_roots(self):
+        """完整/直接相对路径命中；不同绝对根、目录插层与 .bak 不命中。"""
+        self.assertTrue(G._mentions_path("docs/report.md", "cat docs/report.md"))
+        self.assertTrue(G._mentions_path("/repo-a/docs/report.md", "cat docs/report.md"))
+        self.assertTrue(G._mentions_path("docs/report.md", "cat /repo-a/docs/report.md"))
+        self.assertFalse(G._mentions_path("/repo-a/docs/report.md",
+                                          "cat /repo-b/docs/report.md"))
+        self.assertFalse(G._mentions_path("docs/report.md", "cat docs/archive/report.md"))
+        self.assertFalse(G._mentions_path("docs/report.md", "cat other/report.md"))
+        self.assertFalse(G._mentions_path("docs/report.md", "cat docs/report.md.bak"))
+        # 分处两个参数不构成一次读取（`cat docs report.md` 读的是目录与另一文件）。
+        self.assertFalse(G._mentions_path("docs/report.md", "cat docs report.md"))
+
+    def test_mentions_path_keeps_absolute_relative_distinction(self):
+        """绝对声明不能被另一个绝对根或另一条绝对路径满足；./ 等价形式仍通过。"""
+        claim = "/repo-a/docs/report.md"
+        self.assertFalse(G._mentions_path(claim, "cat /docs/report.md"))
+        self.assertFalse(G._mentions_path(claim, "cat /foreign/repo-a/docs/report.md"))
+        self.assertTrue(G._mentions_path(claim, "cat ./docs/report.md"))
+        self.assertTrue(G._mentions_path(claim, "cat /repo-a/docs/report.md"))
+        self.assertTrue(G._mentions_path("docs/report.md", "cat ./docs/report.md"))
+        # `..` 无法在无工作目录时核实：一律不算命中。
+        self.assertFalse(G._mentions_path(claim, "cat ../docs/report.md"))
 
     def test_rejects_non_reviewer_profile(self):
         metadata, rollout = self._metadata(

@@ -1594,6 +1594,9 @@ def _maybe_advance_partial(path: str, state: dict, loop: dict,
     """
     if loop.get("phase") != "GUIDANCE_NEEDED":
         return state, loop, common
+    # loop_step(persist=True) 可能刚写过四门记录：调用方手上的 state 已过期，
+    # 派生前必须重读，否则保存会覆盖（或被 save_seq 拒绝）那次写入。
+    state = D.load_state(path)
     latest = _partial_without_actions(state)
     if latest is None:
         return state, loop, common
@@ -1711,6 +1714,9 @@ def drive(args) -> int:
         state = D.load_state(path)
 
     loop = D.loop_step(path, persist=not args.dry_run)
+    # loop_step 可能刚写入四门记录（persist=True）：重新加载，避免后续用旧快照
+    # 保存时覆盖或被 save_seq 拒绝。
+    state = D.load_state(path)
     phase = loop.get("phase")
     common = {"dry_run": bool(args.dry_run), "manifest": manifest_info,
               "state_path": path}
@@ -1938,6 +1944,8 @@ def drive(args) -> int:
         D.save_state(path, state, expect=snapshot)
         state = D.load_state(path)
     loop = D.loop_step(path, persist=True)
+    # 与出站前同理：loop_step 可能落盘四门记录，后续写入必须基于重读后的状态。
+    state = D.load_state(path)
     phase = loop.get("phase")
     # 本轮 SOL 若给出 PARTIAL 但没有可执行安排，同样立刻派生下一步工作项，
     # 让循环继续到 EXECUTE，而不是以 guidance_without_actions 停下。

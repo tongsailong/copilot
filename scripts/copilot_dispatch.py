@@ -350,8 +350,22 @@ def _fsync_dir(path: str) -> None:
         os.close(fd)
 
 
+def _state_save_seq(state: dict) -> int:
+    """状态的单调写入序号；旧状态没有该字段（或值非法）时视为 0。"""
+    value = state.get("save_seq") if isinstance(state, dict) else 0
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return 0
+    return value
+
+
 def _check_expect(path: str, expect: dict) -> None:
     """比较交换：磁盘状态与调用方加载时不一致就拒绝写入（并发自动调用防护）。"""
+    if expect.get("absent"):
+        # 初始化专用：文件必须仍然不存在。`start` 的存在性检查在加锁之外，
+        # 这里补上锁内判定，避免两个并发 start 静默互相覆盖 task_id/合同。
+        if os.path.exists(path):
+            raise DispatchError(
+                f"交接状态在初始化落盘前已被创建：{path}；拒绝覆盖已有任务。")
     try:
         with open(path, "r", encoding="utf-8") as fh:
             current = json.load(fh)
@@ -395,14 +409,42 @@ def _check_expect(path: str, expect: dict) -> None:
             raise DispatchError(
                 "交接状态的配额节已被外部修改：本次配额写入未落盘；"
                 "请重新读取状态后再记录，避免覆盖他人的配额结论。")
+    if "save_seq" in expect:
+        # 单调写入序号：任何一次落盘都会递增，因此它能发现「加载后被别的进程/
+        # 人工改过」的整类情况（新增证据、工作项、报告、四门记录、收口状态），
+        # 而不只是轮次号或 pending。只在前面更具体的字段校验通过后才检查，
+        # 让并发失败仍报最贴近调用方的那个字段。
+        actual = _state_save_seq(current)
+        want = _state_save_seq({"save_seq": expect["save_seq"]})
+        if actual != want:
+            raise DispatchError(
+                f"交接状态已被其他进程写入（save_seq {want} → {actual}）：本次未写入；"
+                "请重新读取状态后再提交，避免用旧快照覆盖他人的证据/工作项/收口结果。")
+
+
+def _same_state_content(path: str, payload: dict) -> bool:
+    """磁盘状态与待写入内容是否等价（忽略 updated/save_seq 这两个写入元数据）。"""
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            current = json.load(fh)
+    except (OSError, ValueError):
+        return False
+    if not isinstance(current, dict):
+        return False
+    keys = ("updated", "save_seq")
+    left = {k: v for k, v in current.items() if k not in keys}
+    right = {k: v for k, v in payload.items() if k not in keys}
+    return left == right
 
 
 def save_state(path: str, state: dict, expect: dict | None = None) -> None:
     """原子写盘（mkstemp + fsync + os.replace）。
 
-    `expect` 给定时，在同一把文件锁内先做比较交换：`round_seq` 或
-    `pending_call_id` 与磁盘不一致即失败，避免两次并发自动调用共用同一轮次号、
-    后写覆盖前者已提交的轮次。
+    `expect` 给定时，在同一把文件锁内先做比较交换：`round_seq`、`pending_call_id`
+    与磁盘不一致即失败；同时总是比较单调写入序号 `save_seq`，因此任何「加载后
+    被其他进程改过」的旧快照都无法整文件覆盖对方的证据、工作项或收口结果。
+    省略 `expect` 时仍默认按调用方快照里的 `save_seq` 校验（存在即启用），
+    避免不带显式 CAS 的旧式整文件写入悄悄退回「后写覆盖」。
     """
     target = os.path.abspath(path)
     directory = os.path.dirname(target) or "."
@@ -412,12 +454,27 @@ def save_state(path: str, state: dict, expect: dict | None = None) -> None:
         _lock_state_file(lock_fh)
         try:
             if expect is not None:
+                expect = dict(expect)
+                expect.setdefault("save_seq", _state_save_seq(state))
                 _check_expect(target, expect)
-            state["updated"] = now_iso()
+            elif os.path.exists(target):
+                # 无显式 CAS 时，对**已存在**的状态默认按快照序号校验。旧格式状态
+                # 没有 `save_seq` 按 0 处理——不能因为「快照里没有序号」就跳过校验，
+                # 否则两个旧快照仍可互相覆盖。写到新路径是派生/复制语义（没有可被
+                # 覆盖的他人写入），允许不带基线。
+                _check_expect(target, {"save_seq": _state_save_seq(state)})
+            # 序号写进落盘副本，失败时内存状态保持原值，避免下次保存误判 CAS。
+            payload = dict(state)
+            payload["save_seq"] = _state_save_seq(state) + 1
+            payload["updated"] = now_iso()
+            if _same_state_content(target, payload):
+                # 没有任何内容变化时不重写文件：幂等回填（如重复登记同一复核
+                # 报告）不推进写入序号，避免制造「看起来被另一个进程改过」的假象。
+                return
             fd, tmp = tempfile.mkstemp(prefix=".copilot-dispatch-", dir=directory, text=True)
             try:
                 with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                    json.dump(state, fh, ensure_ascii=False, indent=2, sort_keys=True)
+                    json.dump(payload, fh, ensure_ascii=False, indent=2, sort_keys=True)
                     fh.write("\n")
                     fh.flush()
                     os.fsync(fh.fileno())
@@ -429,6 +486,8 @@ def save_state(path: str, state: dict, expect: dict | None = None) -> None:
                 except OSError:
                     pass
                 raise
+            state["save_seq"] = payload["save_seq"]
+            state["updated"] = payload["updated"]
         finally:
             _unlock_state_file(lock_fh)
 
@@ -621,7 +680,7 @@ def start(path: str, goal: str, mode: str = "", note: str = "",
         "review_round": None,
         "review_consumed": [],
     }
-    save_state(path, state)
+    save_state(path, state, expect={"absent": True})
     return state
 
 
@@ -2599,6 +2658,9 @@ def _patch_quota_state(path: str, mutate) -> dict:
             # 凭证）必须基于锁内最新轮次，不能用进程里的旧快照。
             mutate(quota, current)
             current["quota"] = quota
+            # 配额写入同样递增 save_seq：否则持有旧快照的写入方看不出这次改动，
+            # 会在随后的整文件写回里把刚记录的配额覆盖掉。
+            current["save_seq"] = _state_save_seq(current) + 1
             current["updated"] = now_iso()
             fd, tmp = tempfile.mkstemp(prefix=".copilot-dispatch-", dir=directory,
                                        text=True)

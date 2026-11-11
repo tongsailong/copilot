@@ -77,9 +77,11 @@ import base64
 import hashlib
 import http.client
 import json
+import math
 import os
 import re
 import shlex
+import socket
 import sys
 import time
 import urllib.error
@@ -322,7 +324,7 @@ def append_audit(path: str, record: dict) -> None:
     data = line.encode("utf-8")
     created = not os.path.exists(path)
     try:
-        fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        fd = os.open(path, os.O_RDWR | os.O_APPEND | os.O_CREAT, 0o600)
     except OSError as exc:
         raise AuditError(f"审计日志无法打开：{path}（{exc}）") from exc
     if fcntl is not None:
@@ -340,6 +342,16 @@ def append_audit(path: str, record: dict) -> None:
             start = os.fstat(fd).st_size
         except OSError as exc:
             raise AuditError(f"审计日志无法读取状态：{path}（{exc}）") from exc
+        if start:
+            try:
+                tail = os.pread(fd, 1, start - 1)
+            except OSError as exc:
+                raise AuditError(f"审计日志尾部无法读取：{path}（{exc}）") from exc
+            if tail != b"\n":
+                # 上一次写入留下残行（进程被杀、ENOSPC 或写入失败后未能回滚）：
+                # 先补一个换行，保证本条记录独立成行。残行本身已不可解析，但如果
+                # 直接追加就会把新记录粘在残行后面，让一条有效记录静默消失。
+                data = b"\n" + data
         written = 0
         try:
             written = os.write(fd, data)
@@ -860,6 +872,29 @@ def next_output_budget(current: int | None, observed: int | None,
     return proposed
 
 
+def _high_water(best: int | None, value: int | None) -> int | None:
+    """历史最高输出（不是「上次增长后的基线」）：小幅增长也抬高比较基准。"""
+    if value is None:
+        return best
+    if best is None:
+        return value
+    return max(best, value)
+
+
+def _meaningful_growth(value: int | None, best: int | None) -> bool | None:
+    """截断输出是否比此前最高水平有实质增长（10% 以上）。
+
+    返回 None 表示还看不到进展（有值但历史最高为空或本值缺失），True/False 表示
+    是否跨过历史最高值。按历史最高而不是相邻一次比较：固定上限下输出会在上限
+    附近抖动（1000 → 999 → 1000），只比相邻值会把抖动当成一次「增长」。
+    """
+    if value is None:
+        return None
+    if best is None:
+        return True
+    return value > best * 1.1
+
+
 def output_limit_rejected(status: int, raw: str) -> bool:
     """4xx 是否明确指向「输出/上下文上限不可用」（模型真实边界被越过）。
 
@@ -1175,6 +1210,22 @@ def main() -> int:
                          "PLAN 或多阶段任务建议使用；一次性 REVIEW 不需要")
     args = ap.parse_args()
 
+    # 超时必须是可用的正有限秒数：负数/NaN/inf 会在 socket 层抛 ValueError/
+    # OverflowError，绕过全部失败分支（退出 1 + 已落盘 pending），必须在任何
+    # 状态或审计写入之前拒绝。有限但超出 socket 可表示范围的值（如 1e300）同样
+    # 会在出站时抛 OverflowError，这里用一次本地 socket 设置验证可表示性。
+    if not math.isfinite(args.timeout) or args.timeout <= 0:
+        die(EXIT_USAGE,
+            f"--timeout 必须是大于 0 的有限秒数（收到 {args.timeout!r}）；"
+            "未创建 pending_call、未写审计、未发出请求。")
+    try:
+        with socket.socket() as probe:
+            probe.settimeout(args.timeout)
+    except (OverflowError, ValueError, OSError) as exc:
+        die(EXIT_USAGE,
+            f"--timeout={args.timeout!r} 超出本机 socket 可表示范围（{exc}）；"
+            "未创建 pending_call、未写审计、未发出请求。请改用秒数更小的有效值。")
+
     # 任何破坏性写入之前先拒绝路径别名（同一文件被当成两个用途）。
     assert_distinct_paths(args)
 
@@ -1403,7 +1454,7 @@ def main() -> int:
     # 截断恢复只在本进程内升档重发，不改变任务状态、证据包或复核轮次。
     output_budget = payload.get("max_output_tokens")
     output_budget_initial = output_budget
-    last_truncated_output_tokens = None
+    last_truncated_count = None
     # 审计记「实际发出的档位」而不是命令行原值：默认值也必须在留痕里看得见。
     effort_sent = str((payload.get("reasoning") or {}).get("effort") or "")
 
@@ -1425,7 +1476,7 @@ def main() -> int:
             "initial": output_budget_initial,
             "last_sent": output_budget,
             "rejected": rejected_budget,
-            "observed_output_tokens": last_truncated_output_tokens,
+            "observed_output_tokens": last_truncated_count,
             "escalations": output_escalations,
             "explicit_retry_limit": args.max_output_retries,
             "explicit_ceiling": args.max_output_tokens_ceiling,
@@ -1679,6 +1730,14 @@ def main() -> int:
     # 提高输出预算后重发。这类重发不占用网络重试额度：它不是因为链路失败，而是
     # 因为回复被截断（请求已送达并计费）。每一次真实请求都留审计与 usage。
     output_escalations = 0
+    # 连续「提高预算但没有突破既有最高输出」的次数。上游若静默压住
+    # max_output_tokens（200 + incomplete + 固定上限），只按预算推算的升档会无限
+    # 重发已计费请求。判定按**历史最高**输出而不是相邻一次：固定上限附近常有抖动
+    # （1000 → 999 → 1000），只比相邻值会把抖动当成进展；要求超过最高值的 10%
+    # 才算实质增长，连续两次没有实质增长即转入分段。
+    stalled_escalations = 0
+    best_output_count = None
+    best_char_count = None
     while True:
         attempts = attempt + 1
         result_unknown = False
@@ -1805,19 +1864,41 @@ def main() -> int:
                             if isinstance(value, int) and not isinstance(value, bool):
                                 observed = value
                                 break
-                    last_truncated_output_tokens = observed
+                    chars = len(partial_text)
+                    if observed is not None:
+                        progressed = _meaningful_growth(observed,
+                                                        best_output_count)
+                        best_output_count = _high_water(best_output_count, observed)
+                    else:
+                        progressed = _meaningful_growth(chars, best_char_count)
+                        best_char_count = _high_water(best_char_count, chars)
+                    if progressed is False:
+                        stalled_escalations += 1
+                    elif progressed:
+                        stalled_escalations = 0
+                    last_truncated_count = observed
                     nxt = next_output_budget(output_budget, observed,
                                              args.max_output_tokens_ceiling)
                     # 默认不限制升档次数：只有调用方显式给出 --max-output-retries
                     # 才形成运营上限；否则一直按实际输出量提高预算，直到成功、到达
-                    # 显式 ceiling，或服务商拒绝该预算（真实边界）。
+                    # 显式 ceiling，或服务商拒绝该预算（真实边界）。上游若在高预算
+                    # 下仍没有突破既有最高输出（含在固定上限附近抖动），说明它没有
+                    # 按请求放宽上限；连续两次即视为真实固定上限，不继续重发已计费请求。
                     limit_hit = (args.max_output_retries is not None
                                  and output_escalations >= args.max_output_retries)
-                    if limit_hit or nxt is None:
-                        why = ("本轮已达调用方显式设置的升档次数上限"
-                               f"（{args.max_output_retries} 次）" if limit_hit and nxt is not None
-                               else "输出预算已达调用方显式上界（--max-output-tokens-ceiling）"
-                               if nxt is None else "输出预算无法继续提高")
+                    stalled = stalled_escalations >= 2
+                    if limit_hit or nxt is None or stalled:
+                        if stalled and not limit_hit and nxt is not None:
+                            why = ("上游在更高输出预算下仍未突破既有最高输出"
+                                   f"（连续 {stalled_escalations} 次；疑似静默截断或固定上限），"
+                                   "继续升档不会产生完整回复")
+                        else:
+                            why = ("本轮已达调用方显式设置的升档次数上限"
+                                   f"（{args.max_output_retries} 次）"
+                                   if limit_hit and nxt is not None
+                                   else "输出预算已达调用方显式上界"
+                                   "（--max-output-tokens-ceiling）"
+                                   if nxt is None else "输出预算无法继续提高")
                         seg = emit_segmentation_plan(
                             "output_budget_exhausted", rejected_budget=None)
                         aud({
@@ -2199,7 +2280,7 @@ def main() -> int:
                     "max_output_tokens_initial": output_budget_initial,
                     "max_output_tokens_sent": output_budget,
                     "output_escalation_index": output_escalations,
-                    "observed_output_tokens": last_truncated_output_tokens,
+                    "observed_output_tokens": last_truncated_count,
                     "segmentation_plan": seg.get("path"),
                     "segmentation_plan_sha256": seg.get("sha256"),
                     "segmentation_segments": seg.get("segments"),

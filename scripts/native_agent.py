@@ -233,7 +233,14 @@ def _review_tool_calls(meta: dict, override: str = "") -> list[tuple[str, str, d
                     raise AgentRecordError(
                         f"[review_session_mismatch] rollout {path} 第 {idx} 行 sessionId={session!r} 与 "
                         f"Child Session {child!r} 不一致；拒绝把别的会话调用当作本复核。")
-                raw_calls = (row.get("response") or {}).get("toolCalls")
+                response = row.get("response")
+                if response is None:
+                    continue
+                if not isinstance(response, dict):
+                    raise AgentRecordError(
+                        f"[review_toolcalls_invalid] rollout {path} 第 {idx} 行 response "
+                        "不是对象；无法校验工具调用记录，拒绝复核信封。")
+                raw_calls = response.get("toolCalls")
                 if raw_calls is None:
                     continue
                 if not isinstance(raw_calls, list):
@@ -532,6 +539,54 @@ def _assert_input_matches_host(fields: dict, host: dict) -> None:
                 "复核结论只以宿主记录为准，拒绝使用被改写的副本。")
 
 
+_TOKEN_SPLIT_RE = re.compile(r"[\s'\"`=,;:()\[\]{}<>|]+")
+
+
+def _path_components(value: str) -> list[str]:
+    """拆路径组件：去掉空段与 `.`（两者都不改变指向），保留 `..` 供调用方拒绝。"""
+    return [part for part in value.split("/") if part not in ("", ".")]
+
+
+def _mentions_path(path: str, blob: str) -> bool:
+    """blob 是否在**路径组件边界**上引用了 path。
+
+    单纯子串匹配会把 `x.py.bak`、`old/x.py` 之类的读取记录算成读过 `x.py`。
+    先保留声明与读取各自的绝对/相对属性，再按形式比较：
+    1. 读取是绝对路径：声明也是绝对路径时要求组件**完全相同**（`/repo-a/docs/x`
+       不能由 `/foreign/repo-a/docs/x` 满足）；声明是相对路径时允许读取以它结尾
+       （工作区相对路径映射到绝对读取）。
+    2. 读取是相对路径：允许它以完整声明路径结尾；也允许它是声明的**直接**相对
+       形式（组件更少且直接父目录同名）。`..` 无法在无工作目录时核实，一律不算。
+    因此目录插层（`docs/archive/report.md`）、不同绝对根（`/repo-b/docs/report.md`）、
+    `x.py.bak` 与 `..` 形式都不命中；`./docs/report.md` 与 `docs/report.md` 等价。
+    只按单个路径 token 比较，不把「父目录名 + 文件名分处两个参数」拼成一次读取。
+    """
+    claim_abs = path.strip().startswith("/")
+    claim = _path_components(path)
+    if not claim:
+        return False
+    parent = claim[-2] if len(claim) >= 2 else ""
+    for token in _TOKEN_SPLIT_RE.split(blob):
+        read_abs = token.strip().startswith("/")
+        parts = _path_components(token)
+        if not parts or ".." in parts:
+            continue
+        if read_abs:
+            if claim_abs:
+                if parts == claim:
+                    return True
+            elif len(parts) >= len(claim) and parts[-len(claim):] == claim:
+                return True
+            continue
+        # 相对读取：以声明结尾，或是组件更少的直接相对形式。
+        if len(parts) >= len(claim) and parts[-len(claim):] == claim:
+            return True
+        if len(parts) >= 2 and len(parts) < len(claim) and claim[-len(parts):] == parts:
+            if not parent or parts[-2] == parent:
+                return True
+    return False
+
+
 def _assert_files_inspected(files: object, calls: list[tuple[str, str, dict]]) -> None:
     """`files_inspected` 必须能在实际工具调用里找到对应访问。
 
@@ -541,9 +596,12 @@ def _assert_files_inspected(files: object, calls: list[tuple[str, str, dict]]) -
     `Read`——Bash 读取与 git diff 同样是有效访问。Glob/列目录不算读过内容，
     但仍要求该文件出现在调用参数里。
 
-    仅凭文件名相同不算：自报 `docs/report.md` 时，文件名与它所在目录名必须出现在
-    **同一条命令段**（Bash 按 `;`/`|`/换行拆分），避免用另一目录下同名文件的读取
-    记录冒领，也避免 `ls docs; cat other/report.md` 这类复合命令拼凑过关。
+    仅凭文件名相同不算：自报 `docs/report.md` 时，读取路径必须以它结尾（组件边界），
+    或是它的直接相对形式（组件更少且直接父目录同名）。目录插层
+    （`docs/archive/report.md`）、不同绝对根（`/repo-b/docs/report.md`）与
+    `docs/report.md.bak` 都不算命中；父目录名与文件名分处两个参数也不算一次读取。
+    这避免借别处的同名文件冒领，也避免 `ls docs; cat other/report.md` 这类复合命令
+    拼凑过关（Bash 按 `;`/`|`/换行拆分后逐段比较）。
     """
     if not isinstance(files, list):
         return
@@ -556,15 +614,10 @@ def _assert_files_inspected(files: object, calls: list[tuple[str, str, dict]]) -
         else:
             blobs.append(json.dumps(payload, ensure_ascii=False))
     for raw in files:
-        path = str(raw or "").strip()
+        path = str(raw or "").strip().rstrip("/")
         if not path:
             continue
-        base = os.path.basename(path.rstrip("/"))
-        parent = os.path.basename(os.path.dirname(path.rstrip("/")))
-        if not any(
-                path in blob
-                or (base and base in blob and (not parent or parent in blob))
-                for blob in blobs):
+        if not any(_mentions_path(path, blob) for blob in blobs):
             raise AgentRecordError(
                 f"[review_file_not_inspected] 自报检查过 {path}，但实际工具调用中"
                 "没有任何访问该路径的记录；不能把未打开的文件算作已复核。")

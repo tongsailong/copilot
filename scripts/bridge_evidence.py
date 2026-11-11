@@ -69,6 +69,9 @@ class Item:
         self.reason = ""
         self.sensitive = False
         self.image: dict | None = None
+        # 出站脱敏改写了哪些行（1 起）。被改写却不声明，复核会把包里的代码
+        # 当成磁盘上的代码。
+        self.redacted_lines: list[int] = []
 
     def as_manifest(self, idx: int) -> dict:
         return {
@@ -85,6 +88,8 @@ class Item:
             "sensitive": self.sensitive,
             "reason": self.reason,
             "image": self.image,
+            "redacted_lines": self.redacted_lines,
+            "redacted_lines_coordinate": "pre-clip" if self.truncated else "body",
         }
 
 
@@ -139,6 +144,42 @@ def _escape_structure(text: str) -> str:
             line = indent + "\\" + line[len(indent):]
         out.append(line)
     return "\n".join(out)
+
+
+def _ranges(nums: list[int]) -> str:
+    """把行号压成区间文本（`3-5, 9`），避免披露行自己撑长证据包。"""
+    out: list[str] = []
+    start = prev = None
+    for n in sorted(set(nums)):
+        if start is None:
+            start = prev = n
+            continue
+        if n == prev + 1:
+            prev = n
+            continue
+        out.append(f"{start}" if start == prev else f"{start}-{prev}")
+        start = prev = n
+    if start is not None:
+        out.append(f"{start}" if start == prev else f"{start}-{prev}")
+    return ", ".join(out)
+
+
+def _redact_with_lines(text: str) -> tuple[str, list[int]]:
+    """脱敏并记录被改写的行号（1 起）。
+
+    脱敏是出站硬要求，但它是**有损**的：源码注释里举的凭据例子、测试夹具里
+    拼出来的合成串，都会被当作凭据改写。包内内容因此可能与磁盘不一致。
+    不声明这一点，复核就会把包里的代码当成原始代码，据此得出的结论没有依据。
+    这里只记录行号，原文件指纹仍由条目 sha256 / `--attest` 独立给出。
+    """
+    cleaned = redact(text)
+    if cleaned == text:
+        return cleaned, []
+    before, after = text.split("\n"), cleaned.split("\n")
+    if len(before) != len(after):
+        # 行数变了就无法逐行对齐，保守地把整段标为已改写。
+        return cleaned, list(range(1, len(after) + 1))
+    return cleaned, [i for i, (a, b) in enumerate(zip(before, after), 1) if a != b]
 
 
 def _marker(total: int, omitted: int, head: int, tail: int) -> str:
@@ -397,24 +438,30 @@ def collect_cmd(args, spec: str) -> Item:
     out = out or ""
     err = err or ""
     text = out + (("\n[stderr]\n" + err) if err else "")
+    # 实际执行的命令写进正文：条目标题只是标签（长命令会被截断），复核光看标题
+    # 无法还原参数、重定向与退出码传播方式，也就无法判断这段输出到底是谁产生的。
+    # 命令压成单行：多行命令的第二行可能形如 `### E9 — …`，在包里伪造条目边界。
+    body = f"$ {_one_line(cmd)}\n{text}" if text else f"$ {_one_line(cmd)}\n（无输出）"
     if timed_out:
         it = Item("cmd", label, f"真实执行（超时 {args.timeout}s，已终止进程组）")
         # 超时输出是不完整的：可以被诊断引用，但不能作为「任务通过」的证据。
         # 与旧行为一致，放到「未纳入证据」；同时如实写明是否已产生输出。
         it.included = False
-        it.text = text
-        it.lines = text.count("\n")
-        it.bytes = len(text.encode("utf-8"))
-        it.digest = sha256_text(text)
+        it.text = body
+        it.lines = body.count("\n")
+        it.bytes = len(body.encode("utf-8"))
+        it.digest = sha256_text(body)
         it.reason = ("命令超时，已终止本轮派生的进程组；"
                      + (f"已产生 {len(text)} 字符输出，因不完整未纳入证据，不得作为通过依据"
                         if text else "未产生任何输出"))
         return it
     it = Item("cmd", label, f"真实执行，退出码 {proc.returncode}；cwd={args.cwd or os.getcwd()}")
-    it.text = out
-    it.lines = out.count("\n")
-    it.bytes = len(out.encode("utf-8"))
-    it.digest = sha256_text(out)
+    # stdout 与 stderr 都要入包：测试框架、告警、`copilot:` 诊断普遍写 stderr，
+    # 只收 stdout 会得到「退出码 0、0B」的空条目，看起来像「命令没有输出」。
+    it.text = body
+    it.lines = body.count("\n")
+    it.bytes = len(body.encode("utf-8"))
+    it.digest = sha256_text(body)
     it.reason = "" if proc.returncode == 0 else f"非零退出码 {proc.returncode}（原始输出如上）"
     return it
 
@@ -670,6 +717,14 @@ def render(items: list[Item], goal: str, notes: list[str], cwd: str) -> tuple[st
             out.append(f"- sha256：`{it.digest}`")
         if it.truncated:
             out.append(f"- 截断：省略 {it.omitted_chars} 字符（见正文标注）")
+        if it.redacted_lines:
+            # 行号在脱敏时按采集正文计算；裁剪会插入省略标记并丢掉中段，因此条目被截断时
+            # 必须写明坐标是「裁剪前」，不能继续标成当前正文的行号（会指错行）。
+            scope = "裁剪前采集正文行号" if it.truncated else "采集正文行号"
+            out.append(f"- 脱敏改写：第 {_ranges(it.redacted_lines)} 行（{scope}）"
+                       "与原始内容不一致，凭据形态片段与凭据键下的容器叶子被遮蔽"
+                       "（括号、键名、布尔/空值、注释与行数保留；代码容器内的裸标识符"
+                       "与括号内调用实参不遮蔽）；原文件指纹见 sha256 / --attest")
         if it.reason:
             out.append(f"- 备注：{_one_line(redact(it.reason))}")
         fence = _fence_for(it.text)
@@ -750,10 +805,10 @@ def main() -> int:
               "（--file/--image/--cmd/--dir/--json/--attest/--stdin）。", file=sys.stderr)
         return EXIT_USAGE
 
-    # 脱敏 → 单源裁剪
+    # 脱敏（记录被改写的行）→ 单源裁剪
     for it in items:
         if it.text:
-            it.text = redact(it.text)
+            it.text, it.redacted_lines = _redact_with_lines(it.text)
             it.text, it.truncated, it.omitted_chars = clip(it.text, args.per_source_chars)
 
     # 总预算：按顺序纳入；整条放不下的来源整体移出并记录（不静默丢弃、不半截截取）

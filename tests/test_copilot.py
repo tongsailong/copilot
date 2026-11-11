@@ -922,7 +922,9 @@ class SolHighContractTests(unittest.TestCase):
 
     def test_truncation_default_escalation_is_unlimited_until_success(self):
         """默认没有固定重试次数：连续截断时继续升档，直到完整响应或真实上限。"""
-        self.responses = [self._truncated_response(1000) for _ in range(4)]
+        # 每次截断都按新预算返回更多输出：这是升档确实生效的正常形态。
+        self.responses = [self._truncated_response(n)
+                          for n in (1000, 4096, 8192, 16384)]
         self.assertEqual(self.run_main("--mode", "CONSULT"), 0)
         self.assertEqual(len(self.calls), 5, "4 次截断 + 1 次成功")
         self.assertEqual([c["payload"].get("max_output_tokens")
@@ -931,6 +933,53 @@ class SolHighContractTests(unittest.TestCase):
         # 每次重发都换了更大的预算，没有发送完全相同的失败请求。
         self.assertEqual(len({c["payload"].get("max_output_tokens")
                               for c in self.calls}), 5)
+
+    def test_truncation_escalation_stops_when_upstream_ignores_larger_budget(self):
+        """上游在高预算下仍只返回同样多的输出：判定为固定上限，不无限重发计费请求。"""
+        self.responses = [self._truncated_response(1000) for _ in range(6)]
+        with self.assertRaises(SystemExit) as ctx:
+            self.run_main("--mode", "CONSULT")
+        self.assertEqual(ctx.exception.code, call_gpt.EXIT_SHAPE)
+        self.assertEqual(len(self.calls), 3, "首次 + 2 次升档后判定升档无效")
+        self.assertEqual([c["payload"].get("max_output_tokens")
+                          for c in self.calls], [None, 4096, 8192])
+        record = self.last_record()
+        self.assertEqual(record["error"], "output_truncated_exhausted")
+        self.assertIn("固定上限", record["detail"])
+        self.assertFalse(os.path.exists(os.path.join(self.tmp.name, "reply.md")))
+
+    def test_truncation_stops_when_output_oscillates_below_high_water_mark(self):
+        """固定上限下输出在上限附近抖动（1000 → 999 → 1000）也算停滞，不得无限升档。"""
+        self.responses = [self._truncated_response(n) for n in (1000, 999, 1000, 999)]
+        with self.assertRaises(SystemExit) as ctx:
+            self.run_main("--mode", "CONSULT")
+        self.assertEqual(ctx.exception.code, call_gpt.EXIT_SHAPE)
+        self.assertEqual(len(self.calls), 3, "首次 + 2 次升档后判定无实质增长")
+        self.assertEqual([c["payload"].get("max_output_tokens")
+                          for c in self.calls], [None, 4096, 8192])
+        record = self.last_record()
+        self.assertEqual(record["error"], "output_truncated_exhausted")
+        self.assertIn("最高输出", record["detail"])
+        self.assertFalse(os.path.exists(os.path.join(self.tmp.name, "reply.md")))
+
+    def test_truncation_stall_detection_falls_back_to_output_chars(self):
+        """没有 usage 时按实际字符数判断是否突破历史最高。"""
+        responses = []
+        for text in ("x" * 100, "x" * 99, "x" * 100, "x" * 99):
+            responses.append({
+                "id": "resp_cut", "status": "incomplete",
+                "model": call_gpt.DEFAULT_MODEL,
+                "incomplete_details": {"reason": "max_output_tokens"},
+                "output": [{"type": "message", "content": [
+                    {"type": "output_text", "text": text}]}],
+            })
+        self.responses = responses
+        with self.assertRaises(SystemExit) as ctx:
+            self.run_main("--mode", "CONSULT", "--max-output-tokens", "4096")
+        self.assertEqual(ctx.exception.code, call_gpt.EXIT_SHAPE)
+        self.assertEqual(len(self.calls), 3)
+        self.assertEqual([c["payload"].get("max_output_tokens")
+                          for c in self.calls], [4096, 8192, 16384])
 
     def test_provider_output_limit_rejection_transitions_to_segmentation(self):
         """服务商拒绝输出预算时，不再盲目重发，自动生成分段证据计划。"""
@@ -963,6 +1012,29 @@ class SolHighContractTests(unittest.TestCase):
             self.assertIn(key, record, f"审计缺少阶段 1 字段：{key}")
         self.assertEqual(record["reasoning_effort"], "high")
         self.assertGreaterEqual(record["elapsed_ms"], 0)
+
+    def test_invalid_timeout_fails_before_any_request_or_audit(self):
+        """负数/0/NaN/inf 超时在 socket 层会抛未捕获异常：必须出站前用退出 2 拒绝。"""
+        for bad in ("-1", "0", "nan", "inf"):
+            with self.subTest(timeout=bad):
+                with self.assertRaises(SystemExit) as ctx:
+                    self.run_main("--mode", "CONSULT", "--timeout", bad)
+                self.assertEqual(ctx.exception.code, call_gpt.EXIT_USAGE)
+                self.assertIn("--timeout", self.err.getvalue())
+        self.assertEqual(self.calls, [], "非法超时不得发出请求")
+        self.assertFalse(os.path.exists(self.audit), "非法超时不得写审计")
+
+    def test_unrepresentable_finite_timeout_is_rejected_before_any_write(self):
+        """正且有限但超出本机 socket 可表示范围（1e300）同样必须出站前拒绝。"""
+        with self.assertRaises(SystemExit) as ctx:
+            self.run_main("--mode", "CONSULT", "--timeout", "1e300")
+        self.assertEqual(ctx.exception.code, call_gpt.EXIT_USAGE)
+        self.assertIn("可表示范围", self.err.getvalue())
+        self.assertEqual(self.calls, [])
+        self.assertFalse(os.path.exists(self.audit))
+        # 正常值不受影响：本次运行真的发出了一次请求并正常收尾。
+        self.assertEqual(self.run_main("--mode", "CONSULT", "--timeout", "30"), 0)
+        self.assertEqual(len(self.calls), 1)
 
 
 class ZeroToolTests(unittest.TestCase):
@@ -1948,6 +2020,27 @@ class LedgerIdentityTests(unittest.TestCase):
             self.create(path=other)
         self.assertIn("不能新建台账重置轮次", str(ctx2.exception))
         self.assertIn(os.path.abspath(self.ledger_path), str(ctx2.exception))
+
+    def test_rewriting_a_historical_pack_is_refused_and_ledger_untouched(self):
+        """历史证据包被改写后不得当作同一轮证据；台账也不得被自动「修好」。"""
+        ledger = self.create()
+        self.finish_round(ledger, "r1.md", "one", "c1")
+        _, pack = self.finish_round(ledger, "r2.md", "two", "c2", "新增证据 two")
+        with open(self.ledger_path, "rb") as fh:
+            before = fh.read()
+        with open(pack, "a", encoding="utf-8") as fh:
+            fh.write("\n补写一行\n")
+        pack3 = write_pack(self.tmp.name, "r3.md", [("b.txt", "three")])
+        with self.assertRaises(review_ledger.LedgerError) as ctx:
+            review_ledger.merge_and_guard(
+                ledger, [pack3], "补证", "new-evidence",
+                audit_log=self.audit, ledger_path=self.ledger_path)
+        message = str(ctx.exception)
+        self.assertIn("内容已变化", message)
+        self.assertIn("不得用改写后的文件冒充历史证据", message)
+        # 失败关闭不能顺手改写历史：台账内容与异常前逐字节一致。
+        with open(self.ledger_path, "rb") as fh:
+            self.assertEqual(fh.read(), before)
 
     def test_ledger_path_switch_is_refused(self):
         ledger = self.create()
@@ -3390,6 +3483,19 @@ class AuditRequiredTests(unittest.TestCase):
             call_gpt.fcntl.flock = real_flock
             os.close = real_close
         self.assertEqual(os.path.getsize(path), 0, "双重失败时不得写入任何记录")
+
+    def test_partial_tail_does_not_swallow_next_record(self):
+        """历史残行（无换行结尾）不能把下一条有效记录粘成不可解析的一行。"""
+        path = os.path.join(self.tmp.name, "partial-tail.jsonl")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write('{"event": "call_started", "call_id": "half')
+        call_gpt.append_audit(path, {"event": "call_result", "call_id": "c1"})
+        with open(path, encoding="utf-8") as fh:
+            lines = [line for line in fh.read().splitlines() if line.strip()]
+        self.assertEqual(len(lines), 2, "残行与新记录必须各自独立成行")
+        self.assertEqual(json.loads(lines[-1])["call_id"], "c1")
+        with self.assertRaises(ValueError):
+            json.loads(lines[0])  # 残行保持不可解析，不被误当成有效记录
 
 
 class ReviewAccountingTests(unittest.TestCase):
@@ -5093,6 +5199,692 @@ class ReviewHardeningTests(VerifiedIngestMixin, unittest.TestCase):
         # 未加引号的取值表达式仍放行
         self.assertIn("os.environ.get", redact("password=os.environ.get('P')"))
 
+    def test_token_statistics_are_readable_and_ambiguous_tokens_stay_masked(self):
+        """计数不是凭据（遮蔽会让证据不可读）；但豁免只认明确的统计字段。"""
+        for text in ("max_output_tokens = None",
+                     "    previous_truncated_output_tokens = 8192",
+                     "    best_truncated_output_tokens = 4096",
+                     "max_output_tokens_sent = 8192",
+                     "output_tokens: 1024",
+                     "    last_truncated_output_tokens = None",
+                     "    max_output_tokens_sent: output_budget",
+                     "observed_output_tokens: last_truncated_output_tokens",
+                     "'input_tokens': 55690, 'output_tokens': 3682"):
+            self.assertEqual(redact(text), text)
+        # 任意 `*_tokens` 后缀不能证明是统计量：数字形式的认证材料仍遮蔽。
+        for text, secret in [("access_tokens = 12345678901234567890",
+                              "12345678901234567890"),
+                             ("auth_tokens = 987654321", "987654321"),
+                             ("access_tokens = observed_budget", "observed_budget")]:
+            out = redact(text)
+            self.assertNotIn(secret, out, f"非统计字段的凭据未遮蔽：{text}")
+            self.assertIn("<redacted:", out)
+        # 真正的凭据仍然遮蔽：带引号的字面量与敏感键名的非数值值。
+        self.assertIn("<redacted:", redact('access_tokens = "abc12345"'))
+        self.assertIn("<redacted:", redact("api_key = abc12345"))
+
+    def test_lambda_literals_are_masked_without_hiding_the_expression(self):
+        """函数是表达式不等于函数体没有凭据：只遮蔽字面量，保留函数体代码。"""
+        for text, secret in [
+            ('resolve_api_key = lambda name: "hunter2secret"', "hunter2secret"),
+            ("api_key = lambda: 'plain-credential-value'", "plain-credential-value"),
+            # 括号内的多行函数体同样在语句边界内。
+            ('api_key = lambda: (\n    "hunter2secret"\n)', "hunter2secret"),
+            ('api_key = lambda: get({"k": "hunter2secret"})', "hunter2secret"),
+        ]:
+            out = redact(text)
+            self.assertNotIn(secret, out, f"lambda 函数体里的凭据未遮蔽：{text}")
+            self.assertIn("lambda", out)
+            self.assertIn("<redacted:", out)
+        # 已遮蔽标记保持幂等；没有字面量的函数体不受影响。
+        for text in ('api_key = lambda: "<redacted:12>"',
+                     "api_key = lambda: os.environ.get(NAME)"):
+            self.assertEqual(redact(text), text)
+
+    def test_lambda_statement_does_not_swallow_later_assignments(self):
+        """语句边界只到引号外的 `;`：同一行后面的敏感赋值仍须遮蔽。"""
+        text = "api_key = lambda: os.environ.get(NAME); auth_tokens = 987654321"
+        out = redact(text)
+        self.assertNotIn("987654321", out)
+        self.assertIn("lambda", out)
+        self.assertIn("auth_tokens = <redacted:", out)
+        text = 'api_key = lambda: os.environ.get(NAME); password = "Abc 123"'
+        out = redact(text)
+        self.assertNotIn("Abc 123", out)
+        self.assertIn('password = "<redacted:', out)
+        # 引号内的 `;` 不是语句边界。
+        out = redact('api_key = lambda: "a;hunter2secret"')
+        self.assertNotIn("hunter2secret", out)
+
+    def test_redaction_marker_exemption_requires_a_complete_marker(self):
+        """幂等只放行完整的 `<redacted:数字>`：带附加内容的伪标记仍须遮蔽。"""
+        self.assertEqual(redact('api_key = lambda: "<redacted:12>"'),
+                         'api_key = lambda: "<redacted:12>"')
+        out = redact('api_key = lambda: "<redacted:12>plain-credential-value>"')
+        self.assertNotIn("plain-credential-value", out)
+        out = redact('api_key = "<redacted:x>plain-credential-value"')
+        self.assertNotIn("plain-credential-value", out)
+
+    def test_escaped_quotes_in_json_text_are_masked_and_stay_parseable(self):
+        """JSON 里转义过的 `\"` 不能成为绕过口；脱敏也不得破坏 JSON 结构与行数。"""
+        text = '{"stdout": "api_key = \\"hunter2secret\\""}'
+        out = redact(text)
+        self.assertNotIn("hunter2secret", out)
+        self.assertIn('\\"<redacted:', out)
+        self.assertEqual(json.loads(out)["stdout"].count('"'), 2)
+        # 已遮蔽标记连同转义收尾引号一起保持原样（幂等）。
+        stable = '"output": "resolve_api_key = lambda name: \\"<redacted:10>\\""'
+        self.assertEqual(redact(stable), stable)
+
+    def test_redaction_never_changes_line_count(self):
+        """披露按行号给出：脱敏一旦跨行就会把行号与磁盘对错位。"""
+        samples = [
+            json.dumps({"shape": 'api_key = lambda name: "SYN-0001"'}, indent=2),
+            'api_key = lambda: (\n    "SYN-0002"\n)',
+            '{"a": "auth_tokens = \\"SYN-0003\\""}\nnext line\n',
+        ]
+        for text in samples:
+            self.assertEqual(redact(text).count("\n"), text.count("\n"), text)
+        # 行尾未闭合的引号（非 Python 文本）不得把后续语句卷进 lambda 函数体。
+        text = 'api_key = lambda: "unterminated\nauth_tokens = 987654321'
+        out = redact(text)
+        self.assertNotIn("987654321", out)
+
+    def test_lambda_scan_handles_comments_and_triple_quoted_bodies(self):
+        """括号内注释里的撇号不能当字符串起点；三引号跨行字面量仍须遮蔽。"""
+        comment = ('api_key = lambda: (\n'
+                   "    # don't parse this comment as a string\n"
+                   '    "SYN-COMMENT-A"\n)')
+        out = redact(comment)
+        self.assertNotIn("SYN-COMMENT-A", out)
+        self.assertIn("don't parse this comment", out)  # 注释本身仍可读
+        self.assertEqual(out.count("\n"), comment.count("\n"))
+        for text, secret in [
+            ('api_key = lambda: ("""\nSYN-TRIPLE-B\n""")', "SYN-TRIPLE-B"),
+            ("api_key = lambda: ('''\nSYN-TRIPLE-C\n''')", "SYN-TRIPLE-C"),
+            ('api_key = lambda: 1  # inline "SYN-COMMENT-D"', "SYN-COMMENT-D"),
+        ]:
+            out = redact(text)
+            self.assertNotIn(secret, out, text)
+            self.assertEqual(redact(out), out, text)
+            self.assertEqual(out.count("\n"), text.count("\n"), text)
+
+    def test_escaped_value_internal_quotes_do_not_truncate_the_mask(self):
+        """JSON 值内部更深一层的转义引号不能成为遮蔽的结束边界（否则后缀仍可见）。"""
+        text = '{"stdout": "api_key = \\"AAA\\\\\\"SYN-ESC-D\\""}'
+        out = redact(text)
+        self.assertNotIn("SYN-ESC-D", out)
+        self.assertNotIn("AAA", out)
+        self.assertEqual(json.loads(out)["stdout"].count('"'), 2)
+        self.assertEqual(redact(out), out)
+        self.assertEqual(out.count("\n"), text.count("\n"))
+
+    def test_explicit_backslash_continuation_masks_lambda_body(self):
+        """`\\` + 换行是合法续行：函数体在续行处被截断会漏遮下一行的字面量。"""
+        key = "api_" + "key"
+        for body in ('"SYN-CONT-0001"', "'SYN-CONT-0001'"):
+            text = f"{key} = lambda: \\\n    {body}\n"
+            out = redact(text)
+            self.assertNotIn("SYN-CONT-0001", out)
+            self.assertIn("<redacted:", out)
+            self.assertEqual(redact(out), out)
+            self.assertEqual(out.count("\n"), text.count("\n"))
+        # 续行之后的下一条语句仍要按赋值形态独立遮蔽，不能当成函数体吞掉。
+        out = redact("api_" + "key = lambda: \\\n    \"SYN-CONT-0002\"\n"
+                     "auth_" + "tokens = 987654321\n")
+        self.assertNotIn("SYN-CONT-0002", out)
+        self.assertNotIn("987654321", out)
+
+    def test_json_document_redaction_preserves_structure_and_fields(self):
+        """二次脱敏不能把 JSON 报告改成不可解析文本：`\\"` 是内容，不是定界符。"""
+        doc = {
+            "shape": 'api_key = lambda name: "SYN-JSON-0001"',
+            "output": 'api_key = lambda name: "<redacted:14>"',
+            "leaked": False,
+            "ok": True,
+            "rows": [{"shape": 'api_key = lambda: ("SYN-JSON-0001")'}],
+        }
+        text = json.dumps(doc, ensure_ascii=False, indent=2) + "\n"
+        out = redact(text)
+        self.assertEqual(redact(out), out)
+        self.assertEqual(out.count("\n"), text.count("\n"))
+        parsed = json.loads(out)
+        self.assertNotIn("SYN-JSON-0001", out)
+        # 键、非敏感字段与布尔判定必须原样保留：复核靠它们核对结论。
+        self.assertEqual(parsed["leaked"], False)
+        self.assertEqual(parsed["ok"], True)
+        self.assertEqual(parsed["output"], doc["output"])
+        self.assertIn("<redacted:", parsed["shape"])
+        self.assertIn("<redacted:", parsed["rows"][0]["shape"])
+        self.assertNotIn("SYN-JSON-0001", parsed["rows"][0]["shape"])
+
+    def test_cmd_wrapped_json_report_keeps_structure(self):
+        """`--cmd` 条目是「$ 命令 + 报告 + 退出码」：报告部分仍必须可解析。
+
+        第 7 轮复核的失败入口：整份判定被命令行与退出码破坏，报告退回词法路径后
+        被改写成非法 JSON，`output` 与判定布尔也被替换。
+        """
+        report = json.dumps({
+            "shape": 'api_key = lambda: ("SYN-CMD-0001")',
+            "output": 'api_key = lambda: "<redacted:12>"',
+            "leaked": False, "ok": True,
+        }, ensure_ascii=False, indent=2)
+        body = f"$ python3 -I probe.py; echo EXIT=$?\n{report}\nEXIT=0\n"
+        out = redact(body)
+        self.assertEqual(redact(out), out)
+        self.assertEqual(out.count("\n"), body.count("\n"))
+        start, end = out.index("{"), out.rindex("}") + 1
+        parsed = json.loads(out[start:end])
+        self.assertEqual(parsed["ok"], True)
+        self.assertEqual(parsed["leaked"], False)
+        self.assertEqual(parsed["output"], json.loads(report)["output"])
+        self.assertIn("<redacted:", parsed["shape"])
+        self.assertNotIn("SYN-CMD-0001", out)
+        # 命令与退出码行保持原样：它们是复核追溯执行入口的依据。
+        self.assertTrue(out.startswith("$ python3 -I probe.py; echo EXIT=$?\n"))
+        self.assertTrue(out.endswith("\nEXIT=0\n"))
+
+    def test_many_embedded_json_blocks_all_keep_structure(self):
+        """靠后的 JSON 块也必须走结构化路径。
+
+        合并证据包动辄上百条，每条都带报告；旧实现「取最长块后对左右递归」每下沉一块
+        `depth + 1`，第 8 块之后退回词法路径，字符串边界与键名被改坏——正好落在
+        最终合并包靠后的条目上（第 8 轮复核 F2）。
+        """
+        report = json.dumps({
+            "rows": [{"case": "x", "shape": 'api_key = lambda: ("SYN-MANY-0001")',
+                      "leaked": False, "masked": True, "idempotent": True,
+                      "lines_stable": True, "shape_stable": False, "ok": True}],
+            "all_ok": True, "report_still_parses": True,
+        }, ensure_ascii=False, indent=2)
+        text = "\n".join(
+            f"### E{i}\n\n```text\n$ cmd{i}; echo EXIT=$?\n{report}\nEXIT=0\n```\n"
+            for i in range(24))
+        out = redact(text)
+        self.assertEqual(out.count("\n"), text.count("\n"))
+        self.assertNotIn("SYN-MANY-0001", out)
+        blocks = [b for b in re.findall(r"(?ms)^\{.*?^\}", out)]
+        self.assertEqual(len(blocks), 24)
+        for block in blocks:
+            parsed = json.loads(block)
+            self.assertIs(parsed["all_ok"], True)
+            self.assertIs(parsed["report_still_parses"], True)
+            row = parsed["rows"][0]
+            self.assertEqual(list(row), ["case", "shape", "leaked", "masked",
+                                         "idempotent", "lines_stable",
+                                         "shape_stable", "ok"])
+            self.assertIs(row["ok"], True)
+            self.assertIs(row["leaked"], False)
+            # 逐字符比较：只查「含 <redacted:」的话，词法路径把收尾的 `")` 吞掉也照样
+            # 通过——那样这条用例就没有区分力（第 11 轮独立复核）。
+            self.assertEqual(row["shape"], 'api_key = lambda: ("<redacted:13>")')
+        # 最后一个块（旧实现里最深的一块）同样保持结构
+        self.assertIn('"all_ok": true', blocks[-1])
+
+    def test_json_document_sensitive_key_scalar_is_masked(self):
+        """结构化路径不得因为「值只是一个字符串」而放过凭据键下的取值。"""
+        text = json.dumps({"api_key": "SYN-JK-0001",
+                           "access_tokens": 12345678901234567890,
+                           "max_output_tokens": 8192, "note": "ok"},
+                          ensure_ascii=False, indent=2)
+        parsed = json.loads(redact(text))
+        self.assertEqual(parsed["api_key"], "<redacted:11>")
+        self.assertEqual(parsed["access_tokens"], "<redacted:20>")
+        # 白名单统计键的数值仍可读（文本路径同口径）
+        self.assertEqual(parsed["max_output_tokens"], 8192)
+        self.assertEqual(parsed["note"], "ok")
+
+    def test_noncanonical_json_falls_back_to_text_path(self):
+        """无法逐字节还原的 JSON（自定义空格）不能重排：行号会变。"""
+        text = '{"api_key": "SYN-FB-0001"  ,  "ok": true}'
+        out = redact(text)
+        self.assertNotIn("SYN-FB-0001", out)
+        self.assertEqual(redact(out), out)
+        self.assertEqual(out.count("\n"), text.count("\n"))
+
+    def test_noncanonical_block_does_not_disable_other_blocks(self):
+        """单个块不可还原时只让该块退词法路径，不能连累同一文本里其它 JSON 块。
+
+        合并证据包里有几十个块（脚本片段、清单、报告）；一个块的序列化风格不规整，
+        不应让其余所有报告都失去结构保护（第 8 轮复核 F2 的合并包就是这样坏掉的）。
+        """
+        loose = '{"api_key": "SYN-LOOSE-0001"  ,  "ok": true}'
+        strict = json.dumps({"api_key": "SYN-STRICT-0001",
+                             "shape": 'api_key = lambda: ("SYN-STRICT-0002")',
+                             "ok": True}, ensure_ascii=False, indent=2)
+        text = f"### E1\n\n```text\n{loose}\n```\n\n### E2\n\n```text\n{strict}\n```\n"
+        out = redact(text)
+        self.assertNotIn("SYN-LOOSE-0001", out)
+        self.assertNotIn("SYN-STRICT-0001", out)
+        self.assertNotIn("SYN-STRICT-0002", out)
+        self.assertEqual(out.count("\n"), text.count("\n"))
+        start = out.index("{", out.index("### E2"))
+        _, end = json.JSONDecoder().raw_decode(out, start)
+        parsed = json.loads(out[start:end])
+        self.assertEqual(list(parsed), ["api_key", "shape", "ok"])
+        self.assertIs(parsed["ok"], True)
+        # 该块走的是结构路径：转义引号不被吞掉，值形态逐字符可比（区分力所在）。
+        self.assertEqual(parsed["shape"], 'api_key = lambda: ("<redacted:15>")')
+
+    def test_json_key_shaped_as_token_is_masked(self):
+        """键名本身是凭据形态时也要遮：结构路径只处理值，不补这一步就是新泄漏。
+
+        基线（纯词法）会对文本任意位置的 `sk-…` 遮蔽；改为结构化路径后，键名若原样
+        出站就是相对基线的回退。
+        """
+        text = json.dumps({"sk-ABCDEFGH12345678": "value-one",
+                           "Bearer abcdefghijklmnop": 1,
+                           "api_key": "SYN-KEY-0001"}, ensure_ascii=False, indent=2)
+        out = redact(text)
+        self.assertNotIn("sk-ABCDEFGH12345678", out)
+        self.assertNotIn("abcdefghijklmnop", out)
+        self.assertNotIn("SYN-KEY-0001", out)
+        parsed = json.loads(out)
+        self.assertIn("<redacted:19>", parsed)
+        self.assertIn("<redacted:23>", parsed)
+        self.assertEqual(parsed["api_key"], "<redacted:12>")
+        self.assertEqual(redact(out), out)
+        self.assertEqual(out.count("\n"), text.count("\n"))
+
+    def test_default_separator_json_keeps_structure(self):
+        """`json.dumps(x)` 默认风格（`, `/`: `）也要走结构路径。
+
+        审计 JSONL 与临时脚本直接打印都是这个形态；漏掉该风格会退到词法路径，把
+        `"ok"`/`"leaked"` 这样的检测键一起改坏（正是第 8 轮记录的症状）。
+        """
+        text = json.dumps({"shape": 'api_key = lambda: "SYN-DEF-0001"',
+                           "ok": True, "leaked": False, "all_ok": True})
+        out = redact(text)
+        self.assertEqual(out.count("\n"), text.count("\n"))
+        parsed = json.loads(out)
+        self.assertEqual(list(parsed), ["shape", "ok", "leaked", "all_ok"])
+        self.assertIs(parsed["ok"], True)
+        self.assertIs(parsed["leaked"], False)
+        self.assertIs(parsed["all_ok"], True)
+        self.assertEqual(parsed["shape"],
+                         'api_key = lambda: "<redacted:12>"')
+        self.assertEqual(redact(out), out)
+
+    def test_sensitive_key_container_masks_leaves(self):
+        """凭据键下是容器时，逐个叶子遮蔽，容器与行数保留。
+
+        只处理标量会让 `{"api_key": {"v": "真值"}}` 原样出站；整棵子树换成一个标记
+        又会改变物理行数（披露按行号给出）。
+        """
+        text = json.dumps({"api_key": {"nested": "SYN-NEST-0001"},
+                           "access_token": [{"v": "SYN-NEST-0002"}, "SYN-NEST-0003"],
+                           "max_output_tokens": 8192}, ensure_ascii=False, indent=2)
+        out = redact(text)
+        self.assertNotIn("SYN-NEST-", out)
+        self.assertEqual(out.count("\n"), text.count("\n"))
+        parsed = json.loads(out)
+        self.assertEqual(parsed["api_key"], {"nested": "<redacted:13>"})
+        self.assertEqual(parsed["access_token"],
+                         [{"v": "<redacted:13>"}, "<redacted:13>"])
+        self.assertEqual(parsed["max_output_tokens"], 8192)
+        self.assertEqual(redact(out), out)
+
+    def test_sensitive_key_boolean_result_stays_readable(self):
+        """`secret_free: true` 这类检测结果字段不能被遮成 `<redacted:4>`。
+
+        布尔与空值不可能承载凭据；遮掉它们让复核读不出判定，证据反而失去可核性
+        （第 11 轮探针输出就是这样被自己的脱敏改坏的）。
+        """
+        text = json.dumps({"secret_free": True, "has_token": False,
+                           "api_key": "SYN-BOOL-0001"}, ensure_ascii=False, indent=2)
+        out = redact(text)
+        parsed = json.loads(out)
+        self.assertIs(parsed["secret_free"], True)
+        self.assertIs(parsed["has_token"], False)
+        self.assertEqual(parsed["api_key"], "<redacted:13>")
+        # 文本路径同口径
+        self.assertEqual(redact("secret_free: true"), "secret_free: true")
+        self.assertEqual(redact(out), out)
+
+    def test_noncanonical_json_sensitive_container_masks_leaves(self):
+        """非规范排版的 JSON 退词法路径时，凭据键下的容器仍须逐叶子遮蔽。
+
+        结构化路径只接受能逐字节还原的标准序列化风格；任意空格、Tab、Python repr
+        都会退回词法路径，而 `_ASSIGN` 的取值分支不匹配开括号，整棵容器原样出站。
+        这里逐风格断言：秘密消失、内层键保留、容器形态与行数不变、二次脱敏幂等。
+        """
+        for text in (
+            '{"api_key" : {"v": "SYN-NC-0001"}}',
+            '{ "api_key":  {"v":"SYN-NC-0001"} }',
+            '{"api_key":\t{"v":\t"SYN-NC-0001"}}',
+            "{'api_key': {'v': 'SYN-NC-0001'}}",
+        ):
+            out = redact(text)
+            self.assertNotIn("SYN-NC-0001", out, text)
+            self.assertIn("<redacted:11>", out, text)
+            self.assertIn("'v'" if text.startswith("{'") else '"v"', out, text)
+            self.assertEqual(out.count("\n"), text.count("\n"), text)
+            self.assertEqual(redact(out), out, text)
+
+    def test_noncanonical_json_container_keeps_keys_booleans_and_outer_fields(self):
+        """容器内只遮值：键名、布尔/空值与容器之外的非敏感字段必须原样保留。
+
+        排版故意非规范（冒号前有空格、Tab），否则整份文本会被结构化路径接管，
+        这条用例就测不到词法容器扫描器。
+        """
+        text = ('{"access_tokens" :\t{"input" : 12345, "ok" : true, '
+                '"none" : null, "id" : "abc"}, "note" : "keep-me"}')
+        out = redact(text)
+        self.assertNotIn("12345", out)
+        self.assertNotIn('"abc"', out)
+        self.assertIn('"ok" : true', out)
+        self.assertIn('"none" : null', out)
+        self.assertIn('"input"', out)
+        self.assertIn('"note" : "keep-me"', out)
+        self.assertEqual(out.count("\n"), text.count("\n"))
+        self.assertEqual(redact(out), out)
+
+    def test_container_masking_keeps_structure_and_is_idempotent(self):
+        """容器遮蔽后不得吞掉紧跟标记的 `}`/`,`，否则括号丢失、二次脱敏形态不同。
+
+        回归：`_ASSIGN` 的裸值分支曾把 `<redacted:1>}` 整体当值再遮一次。
+        """
+        text = '{"api_key" : {"token": 5}, "note": "keep"}'
+        out = redact(text)
+        self.assertEqual(out, '{"api_key" : {"token": <redacted:1>}, "note": "keep"}')
+        self.assertEqual(out.count("}"), text.count("}"))
+        self.assertEqual(redact(out), out)
+        # 布尔值在容器里也不能被二次改写（`has_token` 键名命中敏感词，但值是判定）
+        self.assertEqual(redact('{"api_key" : {"has_token": true}}'),
+                         '{"api_key" : {"has_token": true}}')
+
+    def test_container_masking_agrees_with_structured_path_on_stat_keys(self):
+        """同一条文本的两条路径对统计键数值必须同口径：8192 是计数，不是凭据。"""
+        lexical = redact('{"api_key" : {"max_output_tokens": 8192}}')
+        structured = redact(json.dumps({"api_key": {"max_output_tokens": 8192}}))
+        self.assertIn("8192", lexical)
+        self.assertIn("8192", structured)
+        self.assertNotIn("<redacted:", lexical.split("max_output_tokens", 1)[1])
+
+    def test_container_masking_handles_newline_separator_and_comments(self):
+        """键与容器之间可换行；`//`、`/* */` 注释里的括号不是结构符号。
+
+        否则扫描在注释里的 `}` 处提前收手，后面的真实内容整段留在可见区。
+        """
+        for text, secret in (
+            ('{"api_key":\n  {"v": "SYN-NL-0001"}}', "SYN-NL-0001"),
+            ('{"api_key"\n: {"v": "SYN-NL-0002"}}', "SYN-NL-0002"),
+            # 容器在**行首**、键在上一行：嵌入块解析曾把它当独立 JSON 文档，
+            # 看不到外层凭据键而整块漏遮。
+            ('api_key:\n{"v": "SYN-NL-0003"}', "SYN-NL-0003"),
+            ('$ cmd\napi_key:\n  {"v": "SYN-NL-0004"}\nEXIT=0\n', "SYN-NL-0004"),
+            ('{"api_key": { // }\n  "v": "SYN-CMT-0001"}}', "SYN-CMT-0001"),
+            ('{"api_key": { /* } */ "v": "SYN-CMT-0002" }}', "SYN-CMT-0002"),
+            # 键与行首容器块之间夹注释/空行：嵌入块解析曾把块当独立 JSON 文档，
+            # 只看块内非敏感键，凭据随块外间隙出站。
+            ('api_key:  # c\n{"v": "SYN-CMT-0003"}', "SYN-CMT-0003"),
+            ('api_key: // c\n{"v": "SYN-CMT-0004"}', "SYN-CMT-0004"),
+            ('api_key: /* c */\n{"v": "SYN-CMT-0005"}', "SYN-CMT-0005"),
+            ('api_key:\n# a\n\n{"v": "SYN-CMT-0006"}', "SYN-CMT-0006"),
+            # 键与块之间隔很多空行：回看窗口 8 行耗尽后曾判成无关文档，块按独立
+            # JSON 解析、块内非敏感键的字面量原样出站。
+            ('api_key:\n' + "\n" * 9 + '{"v": "SYN-CMT-0007"}', "SYN-CMT-0007"),
+            ('api_key:\n' + "\n" * 100 + '{"v": "SYN-CMT-0008"}', "SYN-CMT-0008"),
+            # 多行块注释：中间行既不是空行也不是注释起始，逐行回看曾直接判成无关。
+            ('api_key:\n/*\n  说明\n*/\n{"v": "SYN-CMT-0009"}', "SYN-CMT-0009"),
+            # 行尾未闭合块注释：键头之后只有注释文本，容器在下一行。
+            ('api_key: /* c\n{"v": "SYN-CMT-0010"}', "SYN-CMT-0010"),
+            # `//` 注释里又有 `#`：先按 `#` 截断会读不到键头。
+            ('api_key: // note # 3\n{"v": "SYN-CMT-0011"}', "SYN-CMT-0011"),
+        ):
+            out = redact(text)
+            self.assertNotIn(secret, out, text)
+            self.assertEqual(out.count("\n"), text.count("\n"), text)
+            self.assertEqual(redact(out), out, text)
+        # 协议前缀 `https://` 不是注释：`//` 之后的路径不能被当注释整段跳过。
+        # 凭据键下的 URL 属数据内容，按裸标量遮蔽（只保留 `://` 结构），不留主机与路径。
+        out = redact('{"api_key": {"url": https://example.test/x}}')
+        self.assertIn('"url"', out)
+        self.assertIn("://", out)
+        self.assertNotIn("example.test", out)
+
+    def test_container_masking_keeps_code_structure_readable(self):
+        """凭据命名的**代码容器**原样保留：裸标识符与调用实参是代码，不是字面量内容。
+
+        回归：整段换成 `<redacted:N>` 会让复核读不出 `tokens` 的构建逻辑与检测规则，
+        且与 `bridge_evidence` 的披露文案自相矛盾。与 `_ASSIGN` 的表达式豁免同口径。
+        """
+        for code in (
+            'tokens = [t for t in porcelain.split("\\0") if t]',
+            '_VALUE_TOKENS = {"sort": frozenset({"-t", "-k"})}',
+            '_TOKEN_PATTERNS = [re.compile(r"(?i)\\bBearer\\s+[A-Za-z0-9._\\-]{12,}")]',
+        ):
+            self.assertEqual(redact(code), code)
+        # 同一容器里既有代码调用又有数据字面量时，字面量仍按凭据遮蔽
+        mixed = 'cfg = {"api_key": {"v": "SYN-MIX-0001"}, "f": foo()}'
+        out = redact(mixed)
+        self.assertNotIn("SYN-MIX-0001", out)
+        self.assertIn('"f": foo()', out)
+
+    def test_container_masking_masks_data_bare_scalars(self):
+        """数据容器的裸标量按内容遮蔽：YAML flow / JSON5 的未加引号值也是凭据。
+
+        回归：裸词分支曾一律当代码放行，`api_key: {v: hunter2secret}` 与
+        `tokens: [abc123def, xyz789]` 原样出站；同位置的数字却会被遮，口径不一致。
+        """
+        for text, secret in (
+            ('api_key: {v: hunter2secret}', "hunter2secret"),
+            ('tokens: [abc123def, xyz789]', "abc123def"),
+            ('api_key: {v: hunter2secret, n: 7}', "hunter2secret"),
+        ):
+            out = redact(text)
+            self.assertNotIn(secret, out, text)
+            self.assertEqual(out.count("\n"), text.count("\n"), text)
+            self.assertEqual(redact(out), out, text)
+        # 容器里有代码关键字时整体按代码处理（推导式变量不是字面量）
+        code = 'tokens = [t for t in porcelain.split("\\0") if t]'
+        self.assertEqual(redact(code), code)
+
+    def test_container_masking_handles_unclosed_comment_and_division(self):
+        """未闭合 `/*` 不能吞到末尾；`1024//2` 是除号不是行注释。
+
+        回归：注释分支曾把剩余内容原样输出——`{/* "v": "…"}` 整段可见，
+        `1024//2, "v": "…"` 之后的内容被当注释跳过。
+        """
+        for text, secret in (
+            ('{"api_key": {/* "v": "SYN-DIV-0001"}}', "SYN-DIV-0001"),
+            ('{"api_key": {"n": 1024//2, "v": "SYN-DIV-0002"}}', "SYN-DIV-0002"),
+        ):
+            out = redact(text)
+            self.assertNotIn(secret, out, text)
+            self.assertEqual(out.count("\n"), text.count("\n"), text)
+            # 键名必须仍在可见区：把 `//` 当行注释会把 `"v"` 一起吞进注释，
+            # 秘密虽被注释规则遮住，复核却读不出这是哪个字段。
+            self.assertIn('"v"', out, text)
+            self.assertEqual(redact(out), out, text)
+        # 协议相对 URL 的 `//` 不是注释（路径不被整段跳过）；凭据键下的 URL 按数据遮蔽
+        out = redact('{"api_key": {"u": https://h.test/a}}')
+        self.assertIn('"u"', out)
+        self.assertIn("://", out)
+        self.assertNotIn("h.test", out)
+
+    def test_container_masking_handles_value_position_and_hash_boundaries(self):
+        """裸标量边界：值位上的冒号不是键、标量内的 `#` 不是注释。
+
+        回归：
+        - `{v: hunter2:x}` 曾把 `hunter2` 当键名放行，值的前缀可见；
+        - `{v: abc#def, w: 真值}` 曾把 `#` 当行注释起点，同一行后面的键值对整段留
+          在可见区（且行数不变式被破坏前的形态无法自证）；
+        - 凭据键下的 URL 曾整体保留（主机、路径、userinfo 中的口令都可见）。
+        """
+        out = redact('{"api_key": {v: hunter2:x}}')
+        self.assertNotIn("hunter2", out)
+        self.assertIn("v", out)  # 键名可读，值不泄漏
+        self.assertEqual(redact(out), out)
+
+        out = redact('{"api_key": {v: abc#def, w: SYN-VPH-0001}}')
+        self.assertNotIn("abc", out)
+        self.assertNotIn("SYN-VPH-0001", out)
+        self.assertIn('w', out)  # 同一行的后续键没有被当注释吞掉
+        self.assertEqual(redact(out), out)
+
+        out = redact('{"api_key": {"u": https://user:SYN-VPH-0002@h.test/a}}')
+        self.assertNotIn("SYN-VPH-0002", out)
+        self.assertNotIn("user", out)
+        self.assertIn("://", out)
+        self.assertEqual(redact(out), out)
+
+        # 键与块之间的间隔超过词法容器扫描上限（`_CONTAINER_GAP_LIMIT`）时，块直接按
+        # 结构以「凭据键之下」整棵处理：两条路径不能同时放弃。
+        text = 'api_key:\n/* ' + "x" * 70000 + " */\n{\"v\": \"SYN-GAP-0001\"}\n"
+        out = redact(text)
+        self.assertNotIn("SYN-GAP-0001", out)
+        self.assertEqual(out.count("\n"), text.count("\n"))
+        self.assertEqual(redact(out), out)
+
+        # 边界（已知且刻意）：键的同一行已有完整值（`api_key: "x"`）时，后面独立行首的
+        # JSON 块不属于该键，仍按独立文档结构化处理——不能把普通报告整块遮掉。
+        text = 'api_key: "x"\n\n{"report": "PASS"}\n'
+        self.assertIn('"PASS"', redact(text))
+
+    def test_container_masking_only_accepts_complete_redaction_markers(self):
+        """容器扫描只放行本模块产出的完整标记（`<redacted:数字>`）。
+
+        回归：标记分支曾只凭 `<redacted:` 前缀就原样追加到下一个 `>`，容器里的秘密只要
+        包一层伪标记（`<redacted:SYN-MARK-13>`、`<redacted:13>载荷`）就能原样出站；
+        `v` 不是敏感键，后续敏感赋值规则也补不上。
+        """
+        # 合法标记：幂等放行，内容不被二次改写
+        text = '{"api_key": {"v": "<redacted:12>"}}'
+        self.assertEqual(redact(text), text)
+        out = redact("api_key: {v: <redacted:12>}")
+        self.assertIn("<redacted:12>", out)
+        self.assertIn("v", out)
+
+        # 伪标记：中间不是数字 → 按数据标量遮蔽
+        text = '{"api_key": {v: <redacted:SYN-MARK-13>}}'
+        out = redact(text)
+        self.assertNotIn("SYN-MARK-13", out)
+        self.assertEqual(out.count("\n"), text.count("\n"))
+        self.assertEqual(redact(out), out)
+
+        # 伪标记：带额外载荷 → 载荷不能留在可见区
+        text = '{"api_key": {v: <redacted:13>SYN-MARK-14}}'
+        out = redact(text)
+        self.assertNotIn("SYN-MARK-14", out)
+        self.assertEqual(redact(out), out)
+
+        # 同一个伪标记写成字符串值：走字符串分支时也必须重遮
+        text = '{"api_key": {"v": "<redacted:SYN-MARK-15>"}}'
+        out = redact(text)
+        self.assertNotIn("SYN-MARK-15", out)
+        self.assertEqual(redact(out), out)
+
+    def test_container_head_inside_string_literal_is_bounded(self):
+        """键头写在字符串字面量内部时，只在字面量里脱敏，不能吞掉后续条目。
+
+        回归：证据包里的测试源码片段 `('{"api_key": { // }\\n …'` 会命中容器键头；扫描
+        不认字面量边界，`//` 又只认真实换行（样例里是转义的两个字符），于是越过字面量
+        扫到远处真正的闭括号，把后续条目连元数据整段吞进遮蔽区间（采集行段、大小、
+        sha256 被改写）。
+        """
+        text = ('  (\'{"api_key": { // }\\n  "v": "SYN-LIT-IN-0001"}}\', expected_secret),\n'
+                '  采集行段: 1-2\n'
+                '  sha256: abcdef\n')
+        out = redact(text)
+        self.assertNotIn("SYN-LIT-IN-0001", out)  # 字面量内容被遮蔽
+        self.assertIn("采集行段: 1-2", out)  # 后续条目元数据不越过字面量
+        self.assertIn("abcdef", out)
+        self.assertIn("expected_secret", out)  # 字面量外的普通标识符不动
+        self.assertEqual(out.count("'"), text.count("'"))  # 闭引号不能被吞掉
+        self.assertEqual(out.count("\n"), text.count("\n"))
+        self.assertEqual(redact(out), out)
+
+    def test_assignment_masking_keeps_trailing_container_structure(self):
+        """裸值遮蔽只替换值本身，尾部 `,`/`}` 结构原样保留（证据结构不被改写）。"""
+        text = "{password: hunter2, token: xyz}"
+        out = redact(text)
+        self.assertNotIn("hunter2", out)
+        self.assertNotIn("xyz", out)
+        self.assertEqual(out, "{password: <redacted:7>, token: <redacted:3>}")
+        self.assertEqual(redact(out), out)
+
+    def test_lexical_path_stays_linear_on_long_runs(self):
+        """长字母数字串不能触发二次方回溯：16K 单行哈希曾让 `redact` 跑到 40s+。"""
+        for text in ("A" * 16384, "ab12" * 4096):
+            started = time.monotonic()
+            redact(text)
+            self.assertLess(time.monotonic() - started, 5.0)
+
+    def test_noncanonical_json_container_preserves_line_count(self):
+        """多行非规范 JSON：缩进、换行与键名都要保留，行号披露才不失真。"""
+        text = ('{"api_key":{\n'
+                '  "v":"SYN-NC-LINE-0001",\n'
+                '  "n":2,\n'
+                '  "present":true\n'
+                '}}')
+        out = redact(text)
+        self.assertNotIn("SYN-NC-LINE-0001", out)
+        self.assertEqual(out.count("\n"), text.count("\n"))
+        self.assertIn('  "v":"<redacted:16>"', out)
+        self.assertIn('  "present":true', out)
+        self.assertEqual(redact(out), out)
+
+    def test_bearer_match_across_lines_keeps_line_count(self):
+        """`Bearer\\s+` 可跨行匹配折叠的 HTTP 头；替换不得吞掉换行、让行号错位。"""
+        secret = "abcdefghijklmnop1234"
+        text = f"curl -H 'Authorization: Bearer\n  {secret}' https://x\nnext line\n"
+        out = redact(text)
+        self.assertNotIn(secret, out)
+        self.assertEqual(out.count("\n"), text.count("\n"))
+        self.assertEqual(redact(out), out)
+
+    def test_embedded_block_limit_does_not_disable_container_masking(self):
+        """块数超过 512 / 候选超过 4096 时，结构化解析会提前收手；词法容器遮蔽仍须生效。
+
+        上限只防病态输入，不能成为「靠后的块不再遮蔽」的理由。
+        """
+        block = '{"api_key": {"v": "SYN-LIMIT-0001"}}'
+        text = "\n".join(f"### E{i}\n{block}" for i in range(520))
+        out = redact(text)
+        self.assertNotIn("SYN-LIMIT-0001", out)
+        self.assertEqual(out.count("\n"), text.count("\n"))
+        self.assertEqual(redact(out), out)
+        # 海量伪块（每行都以 `{` 开头但不可解析）也不能让真正的报告漏遮。
+        junk = "\n".join("{" * 1 for _ in range(4200))
+        text2 = junk + "\n" + '{"password":    {"v":"SYN-LIMIT-0002"}}\n'
+        out2 = redact(text2)
+        self.assertNotIn("SYN-LIMIT-0002", out2)
+        self.assertEqual(out2.count("\n"), text2.count("\n"))
+
+    def test_cmd_evidence_noncanonical_report_is_redacted(self):
+        """`--cmd` 端到端：非规范排版报告里的凭据键容器不得随证据包出站。"""
+        body = ('$ probe; echo EXIT=$?\n'
+                '{"api_key" : {"v":"SYN-CMD-NC-0001"}, "ok": true}\n'
+                'EXIT=0\n')
+        cleaned, lines = bridge_evidence._redact_with_lines(body)
+        self.assertNotIn("SYN-CMD-NC-0001", cleaned)
+        self.assertEqual(cleaned.count("\n"), body.count("\n"))
+        self.assertEqual(lines, [2])
+        item = bridge_evidence.Item("cmd", "probe", "真实执行，退出码 0；cwd=/tmp")
+        item.text = cleaned
+        item.lines = cleaned.count("\n")
+        item.bytes = len(cleaned.encode("utf-8"))
+        item.digest = "a" * 64
+        item.redacted_lines = lines
+        rendered, manifest = bridge_evidence.render([item], "", [], "/tmp")
+        self.assertNotIn("SYN-CMD-NC-0001", rendered)
+        self.assertNotIn("SYN-CMD-NC-0001", json.dumps(manifest, ensure_ascii=False))
+        self.assertIn('"ok": true', rendered)
+
+    def test_cmd_evidence_keeps_stderr(self):
+        """命令输出常写 stderr：只收 stdout 会得到「退出码 0、0B」的假空证据。"""
+        args = types.SimpleNamespace(cwd=None, timeout=30)
+        item = bridge_evidence.collect_cmd(
+            args, "stderr-check::python3 -c \"import sys; print('out'); "
+                  "print('err', file=sys.stderr)\"")
+        self.assertIn("out", item.text)
+        self.assertIn("[stderr]", item.text)
+        self.assertIn("err", item.text)
+        # 实际执行的命令必须在正文里：标题只是标签，复核无法据此还原参数与重定向。
+        self.assertTrue(item.text.startswith("$ python3 -c"), item.text)
+        self.assertEqual(item.method, "真实执行，退出码 0；cwd=" + os.getcwd())
+
     def test_render_redacts_metadata_and_manifest(self):
         token = "sk-THISISFAKE12345678"
         item = bridge_evidence.Item("cmd", f"curl -H 'Authorization: Bearer {token}'",
@@ -5107,6 +5899,36 @@ class ReviewHardeningTests(VerifiedIngestMixin, unittest.TestCase):
         self.assertNotIn(token, body)
         self.assertNotIn(token, json.dumps(manifest, ensure_ascii=False))
         self.assertIn("<redacted:", body)
+
+    def test_redaction_rewrites_are_disclosed_per_item(self):
+        """脱敏是有损的：包内代码被改写时必须声明行号，否则复核会把改写稿当原始代码。"""
+        item = bridge_evidence.Item("file:scripts/x.py", "scripts/x.py", "全文")
+        raw = "a = 1\napi_key = 12345678\nb = 2\nc = 3\nauth_tokens = 987654321\n"
+        item.text, item.redacted_lines = bridge_evidence._redact_with_lines(raw)
+        body, manifest = bridge_evidence.render([item], "", [], "/tmp")
+        self.assertEqual(item.redacted_lines, [2, 5])
+        self.assertIn("脱敏改写：第 2, 5 行（采集正文行号）", body)
+        self.assertIn("与原始内容不一致", body)
+        self.assertEqual(manifest[0]["redacted_lines"], [2, 5])
+        self.assertEqual(manifest[0]["redacted_lines_coordinate"], "body")
+        # 被裁剪的条目：行号是裁剪前的坐标，披露必须写明，不能标成当前正文行号。
+        cut = bridge_evidence.Item("file:scripts/z.py", "scripts/z.py", "全文")
+        cut.text = "".join(f"line{i} = 1\n" for i in range(1, 40))
+        cut.text, cut.redacted_lines = bridge_evidence._redact_with_lines(cut.text)
+        cut.text, cut.truncated, cut.omitted_chars = bridge_evidence.clip(cut.text, 120)
+        cut.redacted_lines = [3]
+        body3, manifest3 = bridge_evidence.render([cut], "", [], "/tmp")
+        self.assertIn("裁剪前采集正文行号", body3)
+        self.assertEqual(manifest3[0]["redacted_lines_coordinate"], "pre-clip")
+        # 连续行压成区间，避免披露行自己撑长证据包。
+        self.assertEqual(bridge_evidence._ranges([2, 3, 4, 9]), "2-4, 9")
+        # 未被改写的条目不得出现披露行（避免把一切证据都标成不可信）。
+        clean = bridge_evidence.Item("file:scripts/y.py", "scripts/y.py", "全文")
+        clean.text, clean.redacted_lines = bridge_evidence._redact_with_lines("b = 2\n")
+        self.assertEqual(clean.redacted_lines, [])
+        body2, manifest2 = bridge_evidence.render([clean], "", [], "/tmp")
+        self.assertNotIn("脱敏改写", body2)
+        self.assertEqual(manifest2[0]["redacted_lines"], [])
 
     def test_image_note_is_redacted_in_comment_and_manifest(self):
         token = "sk-THISISFAKE12345678"
@@ -6035,6 +6857,10 @@ class StateV2MigrationTests(unittest.TestCase):
         again = copilot_dispatch.load_state(self.state_path)
         first.pop("updated", None)
         again.pop("updated", None)
+        # save_seq 是每次落盘递增的写入序号（并发 CAS 用），不参与迁移幂等；
+        # 这里只比较迁移补齐后的字段。
+        first.pop("save_seq", None)
+        again.pop("save_seq", None)
         self.assertEqual(first, again)
 
     def test_partial_v2_state_is_filled_not_rejected(self):
@@ -6082,6 +6908,88 @@ class StateV2MigrationTests(unittest.TestCase):
         with open(self.state_path, "rb") as fh:
             after = fh.read()
         self.assertEqual(before, after, "load_state 不得隐式写盘")
+
+
+class StateWriteCasTests(unittest.TestCase):
+    """整文件写回的并发保护：任何旧快照都不能覆盖别人已提交的状态。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.state_path = os.path.join(self.tmp.name, "state.json")
+        self.state = copilot_dispatch.start(
+            self.state_path, "验证写回 CAS", task_id="task-cas")
+
+    def _snapshot(self, state=None):
+        state = state or copilot_dispatch.load_state(self.state_path)
+        return {"round_seq": state.get("round_seq", 0), "pending_call_id": ""}
+
+    def test_stale_snapshot_cannot_drop_new_evidence(self):
+        """round_seq/pending 都没变时，旧快照仍不能覆盖新登记的证据。"""
+        stale = copilot_dispatch.load_state(self.state_path)
+        fresh = copilot_dispatch.load_state(self.state_path)
+        copilot_dispatch.register_evidence(fresh, "E1", text="原始日志")
+        copilot_dispatch.save_state(self.state_path, fresh, expect=self._snapshot(fresh))
+        stale["note"] = "旧快照写入"
+        with self.assertRaises(copilot_dispatch.DispatchError) as ctx:
+            copilot_dispatch.save_state(self.state_path, stale, expect=self._snapshot())
+        self.assertIn("save_seq", str(ctx.exception))
+        disk = copilot_dispatch.load_state(self.state_path)
+        self.assertEqual([e["id"] for e in disk["evidence"]], ["E1"])
+        self.assertEqual(disk["note"], "")
+
+    def test_stale_snapshot_cannot_resurrect_closed_task(self):
+        """收口后，加载早于收口的写入方不能把 closed 改回 false。"""
+        stale = copilot_dispatch.load_state(self.state_path)
+        copilot_dispatch.close_task(self.state_path, force=True, reason="用户终止")
+        stale["note"] = "收口后的旧写入"
+        with self.assertRaises(copilot_dispatch.DispatchError) as ctx:
+            copilot_dispatch.save_state(self.state_path, stale, expect=self._snapshot())
+        self.assertIn("save_seq", str(ctx.exception))
+        self.assertTrue(copilot_dispatch.load_state(self.state_path)["closure"]["closed"])
+
+    def test_identical_save_does_not_advance_write_seq(self):
+        """幂等回填（内容没变）不推进 save_seq，也不制造并发冲突。"""
+        before = copilot_dispatch.load_state(self.state_path)["save_seq"]
+        state = copilot_dispatch.load_state(self.state_path)
+        copilot_dispatch.save_state(self.state_path, state, expect=self._snapshot(state))
+        self.assertEqual(
+            copilot_dispatch.load_state(self.state_path)["save_seq"], before)
+
+    def test_absent_expect_rejects_existing_state(self):
+        """初始化落盘在锁内要求文件仍不存在，避免并发 start 互相覆盖。"""
+        with self.assertRaises(copilot_dispatch.DispatchError) as ctx:
+            copilot_dispatch.save_state(
+                self.state_path, dict(self.state), expect={"absent": True})
+        self.assertIn("已被创建", str(ctx.exception))
+
+    def test_legacy_snapshot_without_save_seq_cannot_overwrite(self):
+        """旧格式状态（无 save_seq）不能靠「缺序号」跳过默认 CAS。"""
+        with open(self.state_path, encoding="utf-8") as fh:
+            legacy = json.load(fh)
+        legacy.pop("save_seq", None)
+        with open(self.state_path, "w", encoding="utf-8") as fh:
+            json.dump(legacy, fh, ensure_ascii=False, indent=2, sort_keys=True)
+        stale = copilot_dispatch.load_state(self.state_path)
+        fresh = copilot_dispatch.load_state(self.state_path)
+        self.assertNotIn("save_seq", stale)
+        fresh.setdefault("evidence", []).append({"id": "E9"})
+        copilot_dispatch.save_state(self.state_path, fresh)
+        stale["note"] = "旧格式旧快照"
+        with self.assertRaises(copilot_dispatch.DispatchError) as ctx:
+            copilot_dispatch.save_state(self.state_path, stale)
+        self.assertIn("save_seq", str(ctx.exception))
+        disk = copilot_dispatch.load_state(self.state_path)
+        self.assertEqual([e["id"] for e in disk["evidence"]], ["E9"])
+        self.assertEqual(disk["note"], "")
+
+    def test_snapshot_can_be_copied_to_a_new_path(self):
+        """把已有快照写到新路径是派生语义：没有可被覆盖的他人写入。"""
+        state = copilot_dispatch.load_state(self.state_path)
+        other = os.path.join(self.tmp.name, "copy.json")
+        copilot_dispatch.save_state(other, state)
+        self.assertEqual(copilot_dispatch.load_state(other)["task_id"],
+                         state["task_id"])
 
 
 class CriteriaStructureTests(unittest.TestCase):
