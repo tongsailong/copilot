@@ -4084,17 +4084,21 @@ class SingleEntryPointTests(unittest.TestCase):
             skill = fh.read()
         with open(os.path.join(base, "references", "role.md"), encoding="utf-8") as fh:
             role = fh.read()
+        # 多阶段规则在核心；调用/交接的完整命令矩阵在 workflow.md（按路由必读）。
+        with open(os.path.join(base, "references", "workflow.md"), encoding="utf-8") as fh:
+            workflow = fh.read()
+        docs = skill + "\n" + workflow
 
-        # SKILL.md：多阶段协作与「复用同一台账 / 交接状态」
-        self.assertIn("长任务的多阶段协作", skill)
-        self.assertIn("--extra-round-basis new-evidence|remediation|security", skill)
-        self.assertIn("没有固定轮次上限", skill)
-        self.assertIn("一律拒绝重复复核", skill)
-        self.assertIn("按需建立交接状态", skill)
-        self.assertIn("一次性 REVIEW 不强制创建 dispatch", skill)
-        self.assertIn("ingest --reply-file", skill)
-        self.assertIn("--call-id", skill)
-        self.assertIn("model_identity_ok=true", skill)
+        # 多阶段协作与「复用同一台账 / 交接状态」
+        self.assertIn("长任务的多阶段协作", docs)
+        self.assertIn("--extra-round-basis new-evidence|remediation|security", docs)
+        self.assertIn("没有固定轮次上限", docs)
+        self.assertIn("一律拒绝重复复核", docs)
+        self.assertIn("按需建立交接状态", docs)
+        self.assertIn("一次性 REVIEW 不强制创建 dispatch", docs)
+        self.assertIn("ingest --reply-file", docs)
+        self.assertIn("--call-id", docs)
+        self.assertIn("model_identity_ok=true", docs)
         # front matter 的 description 必须表达「可以多次调用」
         self.assertIn("多次调用", skill.split("---")[1])
 
@@ -4191,70 +4195,76 @@ class HostLanguageTests(unittest.TestCase):
 
 
 class WorkflowTierTests(unittest.TestCase):
-    """评审档位、缺陷分级与独立复核预算必须在 SKILL.md 里可判定。
+    """评审档位、缺陷分级与独立复核预算必须可判定。
 
     这些是流程规则，不是新机制：路由仍只有三种模式，脚本参数不变。
-    测试只锁「规则存在且不越界」，不锁具体排版。
+    核心约束在 SKILL.md；REVIEW 细则按路由拆到 references/review.md，两者共同构成
+    REVIEW 的权威文档。测试只锁「规则存在且不越界」，不锁具体排版。
     """
 
     def setUp(self):
-        with open(os.path.join(os.path.dirname(HERE), "SKILL.md"), encoding="utf-8") as fh:
+        base = os.path.dirname(HERE)
+        with open(os.path.join(base, "SKILL.md"), encoding="utf-8") as fh:
             self.skill = fh.read()
+        with open(os.path.join(base, "references", "review.md"),
+                  encoding="utf-8") as fh:
+            self.review = fh.read()
+        self.docs = self.skill + "\n" + self.review
 
     def test_three_tiers_have_explicit_triggers(self):
         """三档评审各有明确的适用范围，且明确「不按任务名称选」。"""
         for tier in ("**快速**", "**标准**", "**安全**"):
-            self.assertIn(tier, self.skill, f"缺少评审档位：{tier}")
-        self.assertIn("不因任务名称含 REVIEW 就套用最重流程", self.skill)
-        self.assertIn("拿不准时按更高一档", self.skill)
+            self.assertIn(tier, self.docs, f"缺少评审档位：{tier}")
+        self.assertIn("不因任务名称含 REVIEW 就套用最重流程", self.docs)
+        self.assertIn("拿不准时按更高一档", self.docs)
         # 安全档必须点名攻击矩阵与失败路径，不能被简化成「跑一下测试」
         for token in ("安全不变量", "攻击测试矩阵", "失败路径"):
-            self.assertIn(token, self.skill, f"安全档缺少要素：{token}")
-        self.assertIn("档位高不等于可以扩大改动范围", self.skill)
+            self.assertIn(token, self.docs, f"安全档缺少要素：{token}")
+        self.assertIn("档位高不等于可以扩大改动范围", self.docs)
         # 档位与台账 risk 是两个维度：该判 high 的仍按影响判 high
-        self.assertIn("档位与台账的 `--risk` 是两个维度", self.skill)
-        self.assertIn("该判 `high` 的仍按影响判 `high`", self.skill)
+        self.assertIn("档位与台账的 `--risk` 是两个维度", self.docs)
+        self.assertIn("该判 `high` 的仍按影响判 `high`", self.docs)
 
     def test_defects_are_graded_and_consolidated_before_fixing(self):
         """首轮评审后先合并去重、分级、三分，再批量修复。"""
         for anchor in ("合并去重", "P0", "P1", "P2", "误报", "可延后观察",
                        "最小复现", "验收标准", "攻击测试矩阵"):
-            self.assertIn(anchor, self.skill, f"缺少缺陷处置要素：{anchor}")
-        self.assertIn("修复前先写两张清单", self.skill)
-        self.assertIn("P2 默认只登记，不驱动修复", self.skill)
+            self.assertIn(anchor, self.docs, f"缺少缺陷处置要素：{anchor}")
+        self.assertIn("修复前先写两张清单", self.docs)
+        self.assertIn("P2 默认只登记，不驱动修复", self.docs)
         # 批量修复，且不为减少轮次省略关键攻击测试
-        self.assertIn("一批改完再跑必要全量测试", self.skill)
-        self.assertIn("不顺手扩大范围", self.skill)
-        self.assertIn("不省略关键攻击测试", self.skill)
+        self.assertIn("一批改完再跑必要全量测试", self.docs)
+        self.assertIn("不顺手扩大范围", self.docs)
+        self.assertIn("不省略关键攻击测试", self.docs)
 
     def test_independent_review_is_evidence_driven_without_fixed_cap(self):
         """独立复核默认 1 次终审、无固定次数上限；追加须有新证据，P0/P1 不得被放过。"""
-        self.assertIn("默认 1 次只读终审", self.skill)
-        self.assertIn("独立复核没有固定次数上限", self.skill)
-        self.assertIn("取代此前「最多 2 轮；到顶即停」", self.skill)
-        self.assertIn("新的 P0/P1、关键不变量失效、或证据不足以判断安全性", self.skill)
-        self.assertIn("不得把未解决的 P0/P1 标成 PASS", self.skill)
-        self.assertIn("PARTIAL 不是默认终态", self.skill)
-        self.assertIn("不重跑未变更区域的完整调查", self.skill)
-        self.assertIn("P2 在有依据时可延后", self.skill)
+        self.assertIn("默认 1 次只读终审", self.docs)
+        self.assertIn("独立复核没有固定次数上限", self.docs)
+        self.assertIn("取代此前「最多 2 轮；到顶即停」", self.docs)
+        self.assertIn("新的 P0/P1、关键不变量失效、或证据不足以判断安全性", self.docs)
+        self.assertIn("不得把未解决的 P0/P1 标成 PASS", self.docs)
+        self.assertIn("PARTIAL 不是默认终态", self.docs)
+        self.assertIn("不重跑未变更区域的完整调查", self.docs)
+        self.assertIn("P2 在有依据时可延后", self.docs)
         # 追加复核仍受证据闸门约束：同组证据 / 只改措辞不算再次复核理由
-        self.assertIn("新增或变化证据", self.skill)
-        self.assertIn("同一问题、同一组证据", self.skill)
-        self.assertIn("不构成再次复核的理由", self.skill)
+        self.assertIn("新增或变化证据", self.docs)
+        self.assertIn("同一问题、同一组证据", self.docs)
+        self.assertIn("不构成再次复核的理由", self.docs)
         # 独立复核的执行者不是「本通道付费调用」
-        self.assertIn("档位不构成调用理由", self.skill)
+        self.assertIn("档位不构成调用理由", self.docs)
         # 与台账付费轮次是两回事，不能被混用
-        self.assertIn("互不替代", self.skill)
-        self.assertIn("也不互相豁免", self.skill)
-        self.assertIn("台账不能用来绕过", self.skill)
-        self.assertIn("G4 可信复核门禁", self.skill)
+        self.assertIn("互不替代", self.docs)
+        self.assertIn("也不互相豁免", self.docs)
+        self.assertIn("台账不能用来绕过", self.docs)
+        self.assertIn("G4 可信复核门禁", self.docs)
         # 文档层不得再出现固定的独立复核次数停止门
-        self.assertNotIn("独立复核最多 2 轮", self.skill)
-        self.assertNotIn("2 轮上限本阶段不变", self.skill)
+        self.assertNotIn("独立复核最多 2 轮", self.docs)
+        self.assertNotIn("2 轮上限本阶段不变", self.docs)
 
     def test_tiers_do_not_introduce_new_modes(self):
         """档位是评审深度，不是新路由：模式集合与脚本参数保持原样。"""
-        self.assertIn("档位不是新模式", self.skill)
+        self.assertIn("档位不是新模式", self.docs)
         self.assertEqual(set(call_gpt.MODE_ROUTES), {"CONSULT", "PLAN", "REVIEW"})
         # 档位不应带来新的 CLI 参数
         with open(os.path.join(SCRIPTS, "call_gpt.py"), encoding="utf-8") as fh:
@@ -4266,7 +4276,7 @@ class WorkflowTierTests(unittest.TestCase):
         """新增流程不得挤掉既有安全边界表述。"""
         for anchor in ("新建台账只接受标准审计日志", "并发复核被拒绝",
                        "证据包格式版本", "没有新增证据时停止自动循环"):
-            self.assertIn(anchor, self.skill, f"安全边界表述被删除：{anchor}")
+            self.assertIn(anchor, self.docs, f"安全边界表述被删除：{anchor}")
 
 
 class RetrySafetyTests(unittest.TestCase):

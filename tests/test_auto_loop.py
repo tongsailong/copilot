@@ -865,33 +865,41 @@ class AutoLoopBase(unittest.TestCase):
 
 
 class AutoDocsTest(unittest.TestCase):
-    """运行文档必须把自动驱动的边界说清楚，不能只靠实现存在。"""
+    """运行文档必须把自动驱动的边界说清楚，不能只靠实现存在。
+
+    核心约束在 SKILL.md；驱动细则按路由拆到 references/runtime.md，两者共同构成
+    自动协作运行时的权威文档。
+    """
 
     def setUp(self):
         self.base = os.path.dirname(HERE)
         with open(os.path.join(self.base, "SKILL.md"), encoding="utf-8") as fh:
             self.skill = fh.read()
+        with open(os.path.join(self.base, "references", "runtime.md"),
+                  encoding="utf-8") as fh:
+            self.runtime = fh.read()
+        self.docs = self.skill + "\n" + self.runtime
         with open(os.path.join(self.base, "references", "role.md"),
                   encoding="utf-8") as fh:
             self.role = fh.read()
 
     def test_docs_declare_driver_and_no_user_relay(self):
-        self.assertIn("copilot_auto.py drive", self.skill)
-        self.assertIn("一次 `drive` 至多发起一次真实 GPT 调用", self.skill)
-        self.assertIn("不需要用户转发", self.skill)
-        self.assertIn("主代理仍是唯一执行方", self.skill)
+        self.assertIn("copilot_auto.py drive", self.docs)
+        self.assertIn("一次 `drive` 至多发起一次真实 GPT 调用", self.docs)
+        self.assertIn("不需要用户转发", self.docs)
+        self.assertIn("主代理仍是唯一执行方", self.docs)
         self.assertIn("不需要用户转发", self.role)
         self.assertIn("自动驱动通道（阶段 4）", self.role)
 
     def test_docs_keep_safety_and_test_boundaries(self):
         # 自动循环不得被写成能绕过 G4、授权或冒充独立复核。
-        for text in (self.skill, self.role):
+        for text in (self.docs, self.role):
             self.assertIn("G4", text)
             self.assertIn("独立复核", text)
-        self.assertIn("Fake Upstream", self.skill)
-        self.assertIn("不等于真实 GPT 调用验证", self.skill)
-        self.assertIn("必须显式 `--auto-review`", self.skill)
-        self.assertIn("未显式授权时 `drive` 拒绝 REVIEW", self.skill)
+        self.assertIn("Fake Upstream", self.docs)
+        self.assertIn("不等于真实 GPT 调用验证", self.docs)
+        self.assertIn("必须显式 `--auto-review`", self.docs)
+        self.assertIn("未显式授权时 `drive` 拒绝 REVIEW", self.docs)
 
 
 class AutoExtraRoundReasonTests(unittest.TestCase):
