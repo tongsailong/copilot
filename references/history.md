@@ -1,59 +1,70 @@
 # Copilot Skill 版本与历史（历史记录）
 
-> 本文件由 `SKILL.md` 的「版本与历史」段迁出（2026-11-09），保留原文与版本沿革供追溯；
-> 它不是当前规则的权威来源：现行协作基线、调用判据与边界以 `SKILL.md` 为准。
-> 当前协作基线：ChatGPT 自定义指令 v5.3.3（2026-11-09 对齐）。
+> 本文件记录版本沿革与 SOL 通道退役过程，供追溯，**不是当前规则来源**。现行规则见
+> `SKILL.md`、`references/workflow.md`、`runtime.md`、`review.md`、`agent-bridge.md`。
+> **SOL 决策通道已于 v6.0.0（2026-11-12）退役**；下文涉及 SOL 的段落全部是历史事实描述。
 
-## 版本与历史
+## v6.0.0（2026-11-12）ZCode Autonomous Development Edition
 
-- **当前对照**：ChatGPT 自定义指令 **v5.3.3**（2026-11-09 按用户提供全文对齐，为本仓文档的现行
-  协作基线；`~/.zcode/references/chatgpt-v5.3.3-alignment.md` 是**对齐摘要，不是原文全文**，
-  需要原文时以用户侧自定义指令为准）。角色分工、授权边界与「不因人为默认轮次 / Token 预算 /
-  内部费用阈值提前停止」的现行口径以它为准；判断原则的 30 条逐条映射仍以 **v5.0**
-  （2026-11-01 逐字落盘）为历史粒度参考（`references/role.md`）。**引用层级要分清**：v5.0 原文只
-  给出原则（原生能力优先、按风险决定复核范围、复核者与执行上下文隔离、原则上单轮复核），本 Skill
-  的**具体调用判据是本地的实施规则**，依据这些原则制定，不是原文逐字规定；两者表述不一致时以
-  「何时调用」的本地判据执行，并如实标注它是本地规则。v5.3.2 与 v5.2.0 对齐文件
-  （`chatgpt-v5.3.2-alignment.md`、`chatgpt-v5.2.0-alignment.md`）自 v5.3.3 起仅作历史对照。
-- **模型基线**：`gpt-6.1-sol` + 请求体显式 `reasoning.effort="high"`。2026-11-01 单次真实调用已验证：
-  请求名与响应 `model` 字段完全一致、上游接受该参数并产出独立 reasoning 条目、零工具、无回退。
-  **未验证**：High 相对低档位的实际能力增益（缺对照实验），不得据 `reasoning_tokens > 0` 宣称
-  High 已生效。
-- **2026-11-04 调用门槛修正**：SOL 决策通道不再要求用户显式点名；Copilot 在需要高级工程决策时按
-  「何时调用」自主进入，简单明确任务不调用，高级工程决策不得由工程执行模型替代；REVIEW 三态裁决
-  仍须用户显式要求，独立复核与 G4 的授权边界不变。
-- **2026-11-08 全局门槛对齐（已收口）**：用户确认上述授权，并把 `~/.zcode/AGENTS.md` §5 的显式点名
-  要求收窄为仅正式 REVIEW；§5 已按同一口径改写（正式 REVIEW 含隔离证据下的三态裁决须用户明确要求，
-  运行时 verdict 不算正式 REVIEW；SOL 通道由 Copilot 按「何时调用」判据自主进入；独立复核请求、
-  风险升级、原生复核失败、其他 Skill 的评审门不构成进入理由）。**该条中「仍受次数、预算、配额与
-  授权边界约束」是当时的表述，已由 2026-11-09 的现行口径取代**：默认不设轮次、请求数或累计 Token
-  上限，只保留用户显式限额、服务商配额与限流、审计与授权边界；独立复核与 G4 规则未变。
-- **2026-11-09 文档一致性对齐**：本 Skill 与 `references/role.md`、项目 `AGENTS.md`、
-  `docs/PROJECT-CHARTER.md` 的现行文本统一到 v5.3.2 六角色口径；删除「每轮一次 / 预算 / 配额」这类
-  把默认观察值写成停止门的表述，保留显式限额与真实恢复门禁。历史记录（旧预算方案、当时的调用门槛）
-  保留原文并加替代注，不改写当时事实。
-- **2026-11-09 协作基线升级到 v5.3.3**：本 Skill、`references/role.md`、项目 `AGENTS.md`、
-  `docs/PROJECT-CHARTER.md` 与相关引用统一到 v5.3.3；明确 ZCode 原生 Agent 为工程执行主体，
-  Copilot 与 DesignWise 是运行于 ZCode 内的机制 / Skill，SOL 是 Copilot 按判据进入的决策通道，
-  默认闭环与「简单任务不强制经过 Copilot / SOL / 正式 REVIEW」按 v5.3.3 表述；v5.3.2 只保留为
-  历史对照。授权、独立复核、G1–G4、模型路由、调用判据与费用口径均未改变。
-- **2026-11-09 代码文本与独立复核口径收口**：同一口径下清理了 Python 侧仍会误导的旧文字——
-  `review_ledger.py` 模块说明/常量注释/`render_ledger` 生成给 SOL 的提示不再展示「默认预算剩余」
-  「弹性追加第 N/M 轮」「额度用尽必须停下等待授权」，改为「轮次与历史额度只用于审计观察，不是继续
-  或停止条件」，实际闸门仍是「本轮新增/变化证据 + 追加理由」；`call_gpt.py` 与
-  `copilot_dispatch.py` 的参数 help 与 docstring 改到与实际默认（请求数/Token 默认不设限、
-  `rounds_limit` 只作观察）一致。独立复核的「最多 2 轮；到顶即停」同日改为**无固定次数上限 +
-  证据驱动**（见「评审档位与缺陷处置」§4）；旧默认 2/3 轮、+2/+3、Security +1/+2 只保留为
-  历史追溯与用量观察。
-- **历史**：v5.1.1（2026-11-04 逐字落盘，`chatgpt-custom-instructions-v5.1.1.md`，上一版协作基线，
-  现仅作历史对照）；v4.3（2026-10-23 的调用口径，未落盘为独立原文，其历史门槛已由 2026-11-04 的
-  SOL 决策职责修正取代）；v4.5（2026-10-25 的对照版本）；历史版本文件
-  `chatgpt-custom-instructions-v4.5.md`、`chatgpt-custom-instructions-v4.2.md`、
-  `chatgpt-custom-instructions-v4.0.md`、`chatgpt-custom-instructions-v3.4.md` 只作历史保留，不再是
-  当前依据；早期按用户提供的 v3.9 原则做定向融合（v3.9 无本地原文，已由后续版本依次取代）。
-- ChatGPT 自定义指令只是行为理念的对照来源，**不是权限来源**，不高于宿主系统指令、用户授权或
-  全局工作规范。`gpt-cpa` 与 `gpt-director` 已并入本技能并从技能目录删除（2026-10-18），保持退役，
-  不重新引入；历史审计归档在 `~/.reasonix/archive/removed-skills-20261018/`（历史记录）。
-- 本技能原名 `gpt-assist`（2026-10-19 更名 `copilot`；2026-11-01 从「GPT 判断与指挥通道」升级为
-  「GPT-6.1-SOL 完整认知角色通道」），是唯一正式 GPT 助理入口。上述历史名称只记录沿革；现行职责
-  按 v5.3.3 收窄为高级工程决策通道——产品与业务层判断归用户与用户侧 ChatGPT（见开头「角色映射」）。
+- **SOL 退役**：活动执行路径不再有 `gpt-6.1-sol` 调用、SOL 决策节点、等待 SOL 返回的状态
+  门禁、仅为 SOL 服务的调度/重试/配额代码。`call_gpt.py`、`review_ledger.py`、
+  `reply_protocol.py` 移入仓库 `legacy/`，不再分发；历史调用记录、REVIEW 裁决、任务台账、
+  证据与 SHA-256 原样保留，经 `legacy-status` 只读查看。
+- **ZCode 原生 Agent 成为唯一工程执行与技术决策主体**：计划、拆分、实施、调试、测试、
+  验证与复核组织都由 ZCode 决定；Copilot 只做本地治理。
+- **状态机收敛**为 RUNNING / PARTIAL / PASS / BLOCKED / CLOSED，移除 `pending_call`、
+  `quota`、`round_seq`、`budget`、`pass_pending` 等远程判定字段；v1/v2 状态只读。
+- **PARTIAL 持续推进**：本地派生 `AUTO-C<n>` / `AUTO-R-<id>` / `AUTO-G4` / `AUTO-REPLAN` /
+  `AUTO-NEXT`，禁止因轮次、预算、费用、等待模型、重复评审、子 Agent PARTIAL 或普通失败停止。
+- **CONSULT / PLAN / REVIEW 重新定位**：本地工作模式；PLAN 由 ZCode 决定并只被记录；正式
+  REVIEW 仅在用户明确授权时进行，不是普通开发门禁。
+- **G1–G4 保留**：G4 仍要求原生独立只读复核、宿主记录重核、目标摘要绑定与 fail-closed。
+- **证据/审计保留**：先登记后引用、SHA-256、文件重读校验、脱敏采集、只增不改的 history、
+  收口不可改、reopen 保留旧 closure 快照。
+
+## 2026-11-11：SOL 指令拆分与 REVIEW 历史证据投影（已退役实现）
+
+- `references/role.md` 拆为核心 + `role-consult.md` / `role-plan.md` / `role-review.md`，
+  `call_gpt.py` 按模式组装，`role-map.md` 只作 v5.0 映射。指令 Token 14,102 → 9,146 / 9,359 /
+  12,265（CONSULT / PLAN / REVIEW）。
+- `review_ledger.py` 把历史背景证据投影为“编号 + 位置 + SHA-256 + 恢复条件”，全量包
+  254,663 → 87,731 input tokens（−65.6%）；原始台账与证据包字节不变。
+- 该批实现随 v6 一并归档到 `legacy/`；历史台账与证据文件保留。
+
+## 2026-11-09：v5.3.3 对齐
+
+- 本 Skill、`references/role.md`、项目 `AGENTS.md`、`docs/PROJECT-CHARTER.md` 统一到
+  ChatGPT 自定义指令 v5.3.3：ZCode 原生 Agent 为工程执行主体，SOL 为 Copilot 按判据进入的
+  决策通道，简单任务不强制经过 Copilot / SOL / 正式 REVIEW。
+- 默认不设轮次、请求数或累计 Token 上限；只保留用户显式限额、服务商配额/限流与授权边界。
+- 独立复核由“最多 2 轮、到顶即停”改为证据驱动的无固定次数上限。
+
+## 2026-11-04～11-08：调用门槛与预算口径调整（历史）
+
+- 2026-11-04：SOL 决策通道不再要求用户显式点名，由 Copilot 按“何时调用”判据自主进入；
+  REVIEW 三态裁决仍须用户显式要求。
+- 2026-11-08：全局门槛对齐，仅正式 REVIEW 保留显式点名要求；当时的“仍受次数、预算、配额
+  约束”表述已被 2026-11-09 的无上限口径取代。
+- 旧“默认 2/3 轮 + 弹性追加”预算方案只作历史追溯，不再是任何停止条件。
+
+## 更早沿革
+
+- **v5.1.1**（2026-11-04 逐字落盘）为上一版协作基线，现仅作历史对照；v4.3 / v4.5 / v4.2 /
+  v4.0 / v3.4 等历史指令文件只作保留。
+- **模型基线（历史）**：v5 时代使用 `gpt-6.1-sol` + `reasoning.effort=high`，2026-11-01 单次
+  真实调用验证过模型名与响应一致、零工具、无回退；High 相对低档的实际增益**从未验证**。
+  v6 起该通道退役，本段只说明历史事实。
+- 本技能原名 `gpt-assist`（2026-10-19 更名 `copilot`）；`gpt-cpa`、`gpt-director` 已于
+  2026-10-18 并入并从技能目录删除，保持退役，不重新引入；历史审计归档在
+  `~/.reasonix/archive/removed-skills-20261018/`。
+- ChatGPT 自定义指令是行为理念的对照来源，**不是权限来源**，不高于宿主系统指令、用户授权或
+  全局工作规范。
+
+## 历史材料位置
+
+| 材料 | 位置 | 状态 |
+|---|---|---|
+| v5 SOL 实现（`call_gpt.py`、`review_ledger.py`、`reply_protocol.py`） | 仓库 `legacy/` | 已退役，不分发 |
+| v5 历史测试（853 项） | 仓库 `legacy/tests/` | 仅回归历史行为 |
+| 历史审计 JSONL / REVIEW 台账 / 旧任务状态 | 原路径保留 | 只读，`legacy-status` 查看 |
+| 旧角色与协议文档（`role.md`、`role-*.md`、`role-map.md`、`review-ledger.md`） | `references/` | 带历史横幅，仅作追溯 |

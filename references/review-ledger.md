@@ -1,4 +1,9 @@
-# GPT REVIEW 台账与审计日志：机制细则
+# GPT REVIEW 台账与审计日志：机制细则（历史文档，已退役）
+
+> **历史文档（v5 SOL 时代，已退役）**：本文件描述 `review_ledger.py` 的台账/审计机制，该脚本
+> 已于 v6.0.0 移入仓库 `legacy/` 并不再分发。历史台账与审计日志原样保留，只读查看用
+> `copilot_dispatch.py legacy-status --ledger/--audit-log`。当前证据与审计规则见
+> `SKILL.md`「证据与审计」与 `references/workflow.md`。
 
 本文件承载台账 / 审计日志的**机制细节**，权威绑定规则（同一交付物一份台账、非标准日志拒绝新建、
 历史证据包必须保留、不得换台账或换日志重置轮次）见 `SKILL.md`「REVIEW 收敛」。按需读取，不改变

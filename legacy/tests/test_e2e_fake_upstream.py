@@ -20,9 +20,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from queue import Empty, Queue
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-SCRIPTS = os.path.join(os.path.dirname(HERE), "scripts")
-CALL = os.path.join(SCRIPTS, "call_gpt.py")
-DISPATCH = os.path.join(SCRIPTS, "copilot_dispatch.py")
+LEGACY = os.path.dirname(HERE)
+SCRIPTS = os.path.join(os.path.dirname(LEGACY), "scripts")
+sys.path.insert(0, SCRIPTS)
+sys.path.insert(0, LEGACY)
+CALL = os.path.join(LEGACY, "call_gpt.py")
+DISPATCH = os.path.join(LEGACY, "copilot_dispatch.py")
 MODEL = "gpt-6.1-sol"
 
 

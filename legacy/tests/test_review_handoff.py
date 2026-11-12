@@ -13,8 +13,10 @@ import tempfile
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-SCRIPTS = os.path.join(os.path.dirname(HERE), "scripts")
+LEGACY = os.path.dirname(HERE)
+SCRIPTS = os.path.join(os.path.dirname(LEGACY), "scripts")
 sys.path.insert(0, SCRIPTS)
+sys.path.insert(0, LEGACY)
 sys.path.insert(0, HERE)
 
 from test_native_bridge import NativeBridgeBase  # noqa: E402
@@ -23,7 +25,7 @@ import copilot_auto as A  # noqa: E402
 import copilot_dispatch as D  # noqa: E402
 from lib_common import sha256_file  # noqa: E402
 
-DISPATCH = os.path.join(SCRIPTS, "copilot_dispatch.py")
+DISPATCH = os.path.join(LEGACY, "copilot_dispatch.py")
 
 
 class ReviewHandoffBase(NativeBridgeBase):

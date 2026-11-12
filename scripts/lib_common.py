@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""copilot 共享工具：脱敏、证据指纹、敏感路径判定、凭据解析。
+"""copilot 共享工具：脱敏、证据指纹、敏感路径判定。
 
-被 bridge_evidence.py 与 call_gpt.py 共同导入。只提供纯函数，不产生副作用。
+被 bridge_evidence.py 等 v6 脚本导入。只提供纯函数，不产生副作用；
+不读取任何 Provider 配置或凭据内容（v5 的凭据解析链已随 SOL 通道移入 legacy/）。
 """
 from __future__ import annotations
 
@@ -10,37 +11,6 @@ import json
 import os
 import re
 from datetime import datetime, timezone
-
-# 凭据解析链（按序尝试，只返回值，绝不回显、绝不进 argv）：
-#   1. 环境变量（调用方传入的名字，如 CUSTOM_127_API_KEY）
-#   2. Reasonix 全局 .env（迁移兼容：本机两套宿主共存，同一把 CPA 网关钥匙）
-#   3. ZCode 原生 provider 配置：取指向本机 CPA（baseUrl 含 8317 或规则体含 cpa）
-#      的规则的 apiKey 字段，与 designwise/scripts/zcode_image.py 同一套匹配口径。
-ENV_FILE = os.path.expanduser("~/.reasonix/.env")
-ZCODE_PROVIDER_FILE = os.path.expanduser("~/.zcode/v2/provider_config.json")
-
-
-def read_zcode_provider_key(config_path: str | None = None) -> str | None:
-    """从 ZCode provider 配置解析本机 CPA 网关的 apiKey；找不到返回 None。"""
-    path = config_path or ZCODE_PROVIDER_FILE
-    try:
-        with open(path, "r", encoding="utf-8") as fh:
-            config = json.load(fh)
-    except (OSError, ValueError):
-        return None
-    cfg = config.get("config") if isinstance(config, dict) else None
-    rules = ((cfg or {}).get("providerConfigRules") or {}).get("providerRules") or []
-    for rule in rules:
-        if not isinstance(rule, dict):
-            continue
-        rule_config = rule.get("config") or {}
-        base_url = str((rule_config.get("api") or {}).get("baseUrl") or "")
-        if "8317" not in base_url and "cpa" not in json.dumps(rule, ensure_ascii=False).lower():
-            continue
-        key = str((rule_config.get("access") or {}).get("apiKey") or "").strip()
-        if key:
-            return key
-    return None
 
 # ── 脱敏 ────────────────────────────────────────────────────────────────────
 # 明确形态的凭据串：整体遮蔽。
@@ -1059,8 +1029,9 @@ def audit_path_trusted(path: str) -> bool:
 
 
 # ── 图片证据：按魔数嗅探（不信任扩展名）──────────────────────────────────────
-# 白名单依据：2026-10-16 对 CPA 127.0.0.1:8317 /v1/responses 的实测
-# （当时请求模型为 gpt-6.1-sol-high，该 ID 已退役；当前 copilot 的 CPA 角色模型为 gpt-6-astra-high）。
+# 白名单依据：2026-10-16 在本地 CPA 网关的 Responses 接口对四种图片格式的实测
+# （当时使用的远程模型与调用通道均已随 v6 退役；本条只记录上游格式支持事实，
+# 具体记录见 references/history.md 与 legacy/）。
 # 每格式一次最小 input_image 请求；实测支持 png/jpeg/webp/gif；
 # bmp 被上游拒绝：`input_image image_url unsupported image format: image/bmp`。
 # 该白名单按文件头魔数判定，与模型选择无关；通道或上游变化后需重新实测格式支持。
@@ -1101,27 +1072,3 @@ def image_dimensions(path: str) -> tuple[int, int, str | None]:
         return 0, 0, f"图片解码失败（{type(exc).__name__}）：文件可能损坏或不是有效图像"
 
 
-# ── 凭据解析（绝不回显、绝不进 argv）─────────────────────────────────────────
-def read_env_value(path: str, key: str) -> str | None:
-    try:
-        with open(path, "r", encoding="utf-8") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                k, _, v = line.partition("=")
-                if k.strip() == key:
-                    v = v.strip()
-                    if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
-                        v = v[1:-1]
-                    return v or None
-    except FileNotFoundError:
-        return None
-    return None
-
-
-def resolve_api_key(env_name: str) -> str | None:
-    """环境变量 → Reasonix .env（迁移兼容）→ ZCode provider 配置。只返回值，由调用方决定如何失败。"""
-    return (os.environ.get(env_name)
-            or read_env_value(ENV_FILE, env_name)
-            or read_zcode_provider_key())

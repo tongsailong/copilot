@@ -1,24 +1,27 @@
 #!/usr/bin/env python3
-"""Agent Bridge：SOL 安排 → ZCode 原生执行/复核 → Copilot 状态回填。
+"""Agent Bridge v2：ZCode 本地计划 → 原生执行/复核 → 治理状态。
 
 本模块只做**协议结构与绑定校验**，不调度子代理、不调用模型、不改任务状态：
 
-* DISPATCH：把已验证 SOL 轮次里的工作项交给宿主，保留原字段并加唯一
-  `dispatch_id` / `idempotency_key`；
+* DISPATCH：把 `governance.py` 中已登记的计划工作项交给宿主，绑定
+  task / contract / plan（不再绑定任何远程模型轮次）；
 * RESULT：执行方回传实际结果、原始证据文件及其 SHA-256、运行元数据；
-* REVIEW：独立 Reviewer 回传复核结论，并绑定它检查过的执行结果 SHA。
+* REVIEW：独立 Reviewer 回传复核结论，绑定它检查过的执行结果 SHA；G4 资格
+  由宿主运行记录（Profile、实际工具调用、独立子会话）计算，不由 Reviewer
+  自述。
 
 安全边界
 --------
-1. 所有信封都绑定 task_id / round_id / contract_sha256；执行与复核还绑定
-   dispatch_id / work_item_id。
+1. 所有信封都绑定 task_id / contract_sha256 / plan_id / plan_sha256；执行与
+   复核还绑定 dispatch_id / work_item_id。
 2. 执行结果必须由当前 dispatch 的工作项产生；证据文件必须存在且 SHA-256 一致。
 3. 复核必须晚于对应执行结果，且 Reviewer 不能是执行方本人（Agent ID /
    Child Session ID 任一相同即拒绝）。
 4. Reviewer 不得改动文件；`changed_files` 非空即视为污染并拒绝。
-5. PASS 不得带 blocking finding 或未验证事项；`g4_eligible` 必须为 false。
+5. PASS 不得带 blocking finding 或未验证事项。
 6. 本模块的校验是**本地完整性与绑定校验**，不是密码学签名，也不是宿主可信
-   身份证明；普通原生复核的 PASS 不等于 G4。
+   身份证明；`g4_eligible` 在 ingest 时由 `native_agent.py` 按宿主 metadata/rollout
+   重新计算，治理层收口时再核对固化下来的宿主记录摘要与身份一致性。
 """
 from __future__ import annotations
 
@@ -29,16 +32,19 @@ import re
 import shlex
 from datetime import datetime
 
-DISPATCH_SCHEMA = "copilot-native-dispatch/v1"
-RESULT_SCHEMA = "copilot-native-result/v1"
-REVIEW_SCHEMA = "copilot-native-review/v1"
+DISPATCH_SCHEMA = "copilot-native-dispatch/v2"
+RESULT_SCHEMA = "copilot-native-result/v2"
+REVIEW_SCHEMA = "copilot-native-review/v2"
 SCHEMAS = (DISPATCH_SCHEMA, RESULT_SCHEMA, REVIEW_SCHEMA)
+LEGACY_SCHEMAS = ("copilot-native-dispatch/v1", "copilot-native-result/v1",
+                  "copilot-native-review/v1")
 
 EXECUTION_STATUSES = ("done", "failed", "blocked", "dropped")
 REVIEW_VERDICTS = ("pass", "partial", "blocked")
 FINDING_SEVERITIES = ("blocking", "major", "minor", "info")
 NATIVE_ASSIGNEES = ("zcode", "deepseek")
 EXECUTOR_KINDS = ("main", "subagent")
+REVIEWER_TOOLS = ("Read", "Grep", "Glob", "Bash")
 
 EVIDENCE_ID_RE = re.compile(r"^E[1-9][0-9]{0,3}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -194,8 +200,11 @@ def classify_native_result(envelope: object) -> str:
         return "execution"
     if schema == REVIEW_SCHEMA:
         return "review"
+    if schema in LEGACY_SCHEMAS:
+        _fail("schema_retired",
+              f"{schema} 属于 v1 SOL 通道，已退役；历史记录请用 legacy-status 只读查看。")
     if schema == DISPATCH_SCHEMA:
-        _fail("schema_invalid", "dispatch 信封不能用 --native-result 回填。")
+        _fail("schema_invalid", "dispatch 信封不能作为结果回填。")
     _fail("schema_invalid", f"未知 native result schema：{schema or '-'}。")
 
 
@@ -207,110 +216,93 @@ def _state_action(state: dict, work_item_id: str) -> dict:
     return {}
 
 
-def _verified_rounds(state: dict) -> list[dict]:
-    return [rnd for rnd in (state.get("rounds") or [])
-            if isinstance(rnd, dict) and rnd.get("model_identity_ok") is True]
-
-
-def _latest_verified_round(state: dict) -> dict:
-    rounds = _verified_rounds(state)
-    if not rounds:
-        _fail("round_unverified", "没有通过模型身份验证的 SOL 轮次，不能生成/校验原生安排。")
-    return rounds[-1]
-
-
 def _require_state_credential(state: dict) -> tuple[str, str]:
     task_id = str(state.get("task_id") or "").strip()
     contract = str(state.get("contract_sha256") or "").strip()
     if not task_id or not contract:
-        _fail("credential_missing", "状态缺少 task_id / contract_sha256，不能使用 Agent Bridge。")
+        _fail("credential_missing",
+              "状态缺少 task_id / contract_sha256，不能使用 Agent Bridge。")
     return task_id, contract
 
 
-def _check_dispatch_action(item: dict, action: dict, name: str,
-                           verified_rounds: set[str]) -> dict:
-    """校验 dispatch 项没有改写 SOL 工作项的目标/约束/证据/执行方。"""
-    wid = _text(item.get("work_item_id"), f"{name}.work_item_id")
-    _text(item.get("dispatch_id"), f"{name}.dispatch_id")
-    _text(item.get("idempotency_key"), f"{name}.idempotency_key")
-    title = _text(item.get("title"), f"{name}.title")
-    assignee = _text(item.get("assignee"), f"{name}.assignee").lower()
-    if assignee not in NATIVE_ASSIGNEES:
-        _fail("assignee_unsupported",
-              f"{wid} 的 assignee={assignee!r} 不能走原生后端；只允许 "
-              f"{' / '.join(NATIVE_ASSIGNEES)}。")
-    goal = _text(item.get("goal"), f"{name}.goal", allow_empty=True)
-    constraints = _text(item.get("constraints"), f"{name}.constraints", allow_empty=True)
-    expected = _text(item.get("expected_evidence"), f"{name}.expected_evidence",
-                     allow_empty=True)
-    deps = _list(item.get("depends_on") or [], f"{name}.depends_on")
-    deps = [str(d).strip() for d in deps if str(d).strip()]
-    expected_action = {
-        "title": title,
-        "assignee": assignee,
-        "goal": goal,
-        "constraints": constraints,
-        "expected_evidence": expected,
-        "depends_on": deps,
-    }
-    for key, value in expected_action.items():
-        if key == "depends_on":
-            actual = [str(d).strip() for d in (action.get("depends_on") or [])]
-        else:
-            actual = str(action.get(key) or "").strip()
-        if actual != value:
-            _fail("dispatch_action_mismatch",
-                  f"{wid} 的 {key} 与已验证 SOL 工作项不一致；主代理不得改写安排。")
-    source_round = str(action.get("source_round_id") or "").strip()
-    if not source_round or source_round not in verified_rounds:
-        _fail("work_item_unverified",
-              f"{wid} 没有绑定已验证 SOL 轮次（source_round_id={source_round or '-'}），"
-              "不能进入原生执行。")
-    return {"work_item_id": wid, **expected_action,
-            "dispatch_id": str(item["dispatch_id"]).strip(),
-            "idempotency_key": str(item["idempotency_key"]).strip()}
+def _plan_record(state: dict, plan_id: str) -> dict:
+    for plan in state.get("plans") or []:
+        if isinstance(plan, dict) and str(plan.get("plan_id") or "") == plan_id:
+            return plan
+    _fail("plan_unknown", f"状态中没有计划 {plan_id}。")
+    return {}
 
 
-def build_dispatch(state: dict, actions: list[dict], round_info: dict,
+def _plan_payload(state: dict, plan: dict) -> dict:
+    """按计划登记顺序重建计划正文，用于重算摘要、发现状态被改写。"""
+    by_id = {str(a.get("id") or ""): a for a in state.get("actions") or []
+             if isinstance(a, dict)}
+    actions = []
+    for aid in plan.get("action_ids") or []:
+        action = by_id.get(str(aid))
+        if not isinstance(action, dict):
+            _fail("plan_drift", f"计划 {plan.get('plan_id')} 的工作项 {aid} 已不存在。")
+        actions.append({
+            "id": str(action.get("id") or ""),
+            "title": str(action.get("title") or ""),
+            "assignee": str(action.get("assignee") or ""),
+            "goal": str(action.get("goal") or ""),
+            "constraints": str(action.get("constraints") or ""),
+            "expected_evidence": str(action.get("expected_evidence") or ""),
+            "depends_on": [str(d) for d in action.get("depends_on") or []],
+        })
+    return {"summary": str(plan.get("summary") or ""), "actions": actions}
+
+
+def _plan_sha(state: dict, plan: dict) -> str:
+    return sha256_text(canonical_json(_plan_payload(state, plan)))
+
+
+def _check_plan(state: dict, plan_id: object, plan_sha: object) -> dict:
+    pid = _text(plan_id, "plan_id")
+    sha = _sha(plan_sha, "plan_sha256")
+    plan = _plan_record(state, pid)
+    if str(plan.get("sha256") or "") != sha:
+        _fail("plan_mismatch", f"计划 {pid} 的摘要与登记不一致。")
+    actual = _plan_sha(state, plan)
+    if actual != sha:
+        _fail("plan_drift",
+              f"计划 {pid} 的工作项在登记后被改写；拒绝按漂移后的计划执行。")
+    return plan
+
+
+def _latest_plan(state: dict) -> dict:
+    plans = [p for p in state.get("plans") or [] if isinstance(p, dict)]
+    if not plans:
+        _fail("plan_missing", "状态没有已登记计划；请先 plan 再生成派发。")
+    return plans[-1]
+
+
+def _dispatch_ids(task_id: str, plan_id: str, plan_sha: str, wid: str) -> tuple[str, str]:
+    binding = [task_id, plan_id, plan_sha, wid]
+    return ("d-" + sha256_text(canonical_json(binding))[:24],
+            "ik-" + sha256_text(canonical_json(binding + ["idempotency"]))[:32])
+
+
+def build_dispatch(state: dict, actions: list[dict], plan: dict | None = None,
                    existing: dict | None = None, *, created_at: str = "") -> dict:
-    """生成一个绑定已验证 SOL 轮次的 dispatch 信封。
+    """生成绑定本地计划的 dispatch 信封。
 
     `actions` 必须来自 `ready_actions(state)`（或同样经过状态校验的工作项）。
-    每个工作项得到稳定且唯一的 `dispatch_id` / `idempotency_key`；同一轮重复
-    生成时复用既有 ID，保证幂等。`existing` 是状态中的 `native_dispatch`。
+    每个工作项得到稳定且唯一的 `dispatch_id` / `idempotency_key`。
     """
     if state.get("execution_backend") != "native":
         _fail("backend_not_native",
               "只有 execution_backend=native 的任务才能生成原生 dispatch。")
     task_id, contract = _require_state_credential(state)
-    rid = _text(round_info.get("round_id"), "round_info.round_id")
-    plan_call = _text(round_info.get("plan_call_id"), "round_info.plan_call_id")
-    plan_reply = _sha(round_info.get("plan_reply_sha256"), "round_info.plan_reply_sha256")
-    latest = _latest_verified_round(state)
-    if rid != str(latest.get("round_id") or ""):
-        _fail("round_mismatch",
-              f"dispatch 轮次 {rid} 不是最近已验证轮次 {latest.get('round_id')}。")
-    if plan_call != str(latest.get("call_id") or ""):
-        _fail("plan_call_mismatch",
-              f"plan_call_id {plan_call} 与最近已验证调用 "
-              f"{latest.get('call_id') or '-'} 不一致。")
-    if plan_reply != str(latest.get("reply_sha256") or "").lower():
-        _fail("plan_reply_mismatch",
-              "plan_reply_sha256 与最近已验证 SOL 回复摘要不一致。")
+    plan = plan or _latest_plan(state)
+    plan_id = _text(plan.get("plan_id"), "plan.plan_id")
+    plan_sha = _sha(plan.get("sha256"), "plan.sha256")
+    _check_plan(state, plan_id, plan_sha)
     if not isinstance(actions, list) or not actions:
         _fail("dispatch_empty", "没有可派发的工作项；不能生成空 dispatch。")
+    iteration_id = f"I{int(state.get('iteration_seq') or 0)}"
 
-    previous_items: dict = {}
-    if isinstance(existing, dict) and (
-            str(existing.get("round_id") or "") == rid
-            and str(existing.get("contract_sha256") or "") == contract
-            and str(existing.get("plan_call_id") or "") == plan_call):
-        raw_items = existing.get("items")
-        if isinstance(raw_items, dict):
-            previous_items = {str(k): v for k, v in raw_items.items()
-                              if isinstance(v, dict)}
-
-    verified_rounds = {str(r.get("round_id") or "") for r in _verified_rounds(state)}
     items: list[dict] = []
     seen: set[str] = set()
     for idx, action in enumerate(actions, 1):
@@ -320,24 +312,14 @@ def build_dispatch(state: dict, actions: list[dict], round_info: dict,
         if wid in seen:
             _fail("dispatch_duplicate", f"工作项 {wid} 在同一 dispatch 中重复。")
         seen.add(wid)
-        binding = [task_id, rid, contract, plan_call, wid]
-        item_dispatch_id = "d-" + sha256_text(canonical_json(binding))[:24]
-        idempotency_key = "ik-" + sha256_text(
-            canonical_json(binding + ["idempotency"]))[:32]
-        prev = previous_items.get(wid)
-        if isinstance(prev, dict):
-            # 同轮同合同同计划：沿用既有 ID；若既有 ID 与当前绑定不一致，说明
-            # 状态被改写，失败关闭而不是悄悄生成第二份派发。
-            if str(prev.get("dispatch_id") or "") not in ("", item_dispatch_id):
-                _fail("dispatch_id_drift",
-                      f"{wid} 既有 dispatch_id 与当前绑定不一致；拒绝覆盖。")
-            if str(prev.get("idempotency_key") or "") not in ("", idempotency_key):
-                _fail("idempotency_drift",
-                      f"{wid} 既有 idempotency_key 与当前绑定不一致；拒绝覆盖。")
+        state_action = _state_action(state, wid)
+        if str(state_action.get("plan_id") or "") != plan_id:
+            _fail("plan_mismatch", f"{wid} 不属于计划 {plan_id}。")
+        item_did, idem = _dispatch_ids(task_id, plan_id, plan_sha, wid)
         item = {
             "work_item_id": wid,
-            "dispatch_id": item_dispatch_id,
-            "idempotency_key": idempotency_key,
+            "dispatch_id": item_did,
+            "idempotency_key": idem,
             "title": str(action.get("title") or "").strip(),
             "assignee": str(action.get("assignee") or "zcode").strip().lower(),
             "goal": str(action.get("goal") or "").strip(),
@@ -351,125 +333,51 @@ def build_dispatch(state: dict, actions: list[dict], round_info: dict,
         if item["assignee"] not in NATIVE_ASSIGNEES:
             _fail("assignee_unsupported",
                   f"{wid} 的 assignee={item['assignee']!r} 不能走原生后端。")
-        # 复核没有改写权限：这里只校验字段一致性，不修改 action。
-        _check_dispatch_action({**item, "work_item_id": wid}, action,
-                               f"actions[{idx}]", verified_rounds)
         items.append(item)
+    if isinstance(existing, dict):
+        prev = {str(i.get("work_item_id") or ""): i
+                for i in existing.get("actions") or [] if isinstance(i, dict)}
+        for item in items:
+            old = prev.get(item["work_item_id"])
+            if isinstance(old, dict) and str(old.get("dispatch_id") or "") not in (
+                    "", item["dispatch_id"]):
+                _fail("dispatch_id_drift",
+                      f"{item['work_item_id']} 既有 dispatch_id 与当前计划绑定不一致；"
+                      "拒绝覆盖。")
 
-    all_ids = sorted({i["dispatch_id"] for i in items})
-    batch_id = "b-" + sha256_text(canonical_json(
-        [task_id, rid, contract, plan_call, all_ids]))[:24]
-    envelope = {
+    batch = "b-" + sha256_text(canonical_json(
+        [task_id, plan_id, plan_sha, sorted(i["dispatch_id"] for i in items)]))[:24]
+    return {
         "schema": DISPATCH_SCHEMA,
-        "dispatch_id": batch_id,
+        "dispatch_id": batch,
         "task_id": task_id,
-        "round_id": rid,
         "contract_sha256": contract,
-        "plan_call_id": plan_call,
-        "plan_reply_sha256": plan_reply,
+        "plan_id": plan_id,
+        "plan_sha256": plan_sha,
+        "iteration_id": iteration_id,
         "created_at": created_at or _now(),
         "actions": items,
-    }
-    return envelope
-
-
-def dispatch_state(envelope: dict, previous: dict | None = None) -> dict:
-    """把 dispatch 信封转成状态中的 `native_dispatch`；保留既有结果/复核记录。"""
-    env = validate_dispatch(envelope, _state_for_validation(envelope), require_state=False)
-    # validate_dispatch 在 require_state=False 时只做结构校验；上面传入的伪状态
-    # 不会用于写盘。真正的状态绑定由调用方在生成时保证。
-    rid = env["round_id"]
-    prev = previous if isinstance(previous, dict) else {}
-    same_binding = (str(prev.get("round_id") or "") == rid
-                    and str(prev.get("contract_sha256") or "")
-                    == env["contract_sha256"]
-                    and str(prev.get("plan_call_id") or "") == env["plan_call_id"])
-    old_items = prev.get("items") if same_binding else {}
-    if not isinstance(old_items, dict):
-        old_items = {}
-    items: dict[str, dict] = {}
-    for action in env["actions"]:
-        wid = action["work_item_id"]
-        old = old_items.get(wid) if isinstance(old_items.get(wid), dict) else {}
-        items[wid] = {
-            "dispatch_id": action["dispatch_id"],
-            "idempotency_key": action["idempotency_key"],
-            "assignee": action["assignee"],
-            "status": str(old.get("status") or "dispatched"),
-            "results": list(old.get("results") or []),
-            "latest_result_sha256": old.get("latest_result_sha256"),
-            "review_result_sha256": old.get("review_result_sha256"),
-            "review_verdict": old.get("review_verdict"),
-            "created_at": str(old.get("created_at") or _now()),
-            "updated_at": _now(),
-        }
-    # 同轮旧项保留（例如依赖尚未满足、本次不在 ready 列表里的工作项）。
-    for wid, old in old_items.items():
-        if wid not in items and isinstance(old, dict):
-            items[wid] = dict(old)
-    return {
-        "dispatch_id": env["dispatch_id"],
-        "task_id": env["task_id"],
-        "round_id": env["round_id"],
-        "contract_sha256": env["contract_sha256"],
-        "plan_call_id": env["plan_call_id"],
-        "plan_reply_sha256": env["plan_reply_sha256"],
-        "created_at": env["created_at"],
-        "updated_at": _now(),
-        "items": items,
-    }
-
-
-def _state_for_validation(envelope: dict) -> dict:
-    """仅用于 dispatch_state 的结构校验占位；不提供任何现场事实。"""
-    actions = []
-    for item in envelope.get("actions") or []:
-        if isinstance(item, dict):
-            actions.append({
-                "id": item.get("work_item_id"),
-                "title": item.get("title"),
-                "assignee": item.get("assignee"),
-                "goal": item.get("goal"),
-                "constraints": item.get("constraints"),
-                "expected_evidence": item.get("expected_evidence"),
-                "depends_on": item.get("depends_on") or [],
-                "source_round_id": envelope.get("round_id"),
-            })
-    return {
-        "task_id": envelope.get("task_id"),
-        "contract_sha256": envelope.get("contract_sha256"),
-        "execution_backend": "native",
-        "rounds": [{
-            "round_id": envelope.get("round_id"),
-            "call_id": envelope.get("plan_call_id"),
-            "reply_sha256": envelope.get("plan_reply_sha256"),
-            "model_identity_ok": True,
-        }],
-        "actions": actions,
     }
 
 
 def validate_dispatch(envelope: object, state: dict, *,
                       require_state: bool = True) -> dict:
-    """校验 dispatch 结构、轮次/计划绑定，以及工作项是否被改写。"""
+    """校验 dispatch 结构、计划绑定，以及工作项是否被改写。"""
     env = _obj(envelope, "dispatch")
-    if str(env.get("schema") or "").strip() != DISPATCH_SCHEMA:
+    schema = str(env.get("schema") or "").strip()
+    if schema in LEGACY_SCHEMAS:
+        _fail("schema_retired",
+              f"{schema} 属于 v1 SOL 通道，已退役；不能用于 v6 派发。")
+    if schema != DISPATCH_SCHEMA:
         _fail("schema_invalid", f"dispatch schema 必须是 {DISPATCH_SCHEMA}。")
     task_id, contract = _require_state_credential(state)
     if str(env.get("task_id") or "").strip() != task_id:
         _fail("task_mismatch", "dispatch.task_id 与当前任务不一致。")
     if str(env.get("contract_sha256") or "").strip() != contract:
         _fail("contract_mismatch", "dispatch.contract_sha256 与当前合同不一致。")
-    rid = _text(env.get("round_id"), "dispatch.round_id")
-    latest = _latest_verified_round(state)
-    verified_rounds = {str(r.get("round_id") or "") for r in _verified_rounds(state)}
-    if rid != str(latest.get("round_id") or ""):
-        _fail("round_mismatch", f"dispatch.round_id={rid} 不是最近已验证轮次。")
-    if str(env.get("plan_call_id") or "").strip() != str(latest.get("call_id") or ""):
-        _fail("plan_call_mismatch", "dispatch.plan_call_id 与最近已验证调用不一致。")
-    if str(env.get("plan_reply_sha256") or "").lower() != str(
-            latest.get("reply_sha256") or "").lower():
-        _fail("plan_reply_mismatch", "dispatch.plan_reply_sha256 与已验证回复不一致。")
+    plan = _check_plan(state, env.get("plan_id"), env.get("plan_sha256"))
+    plan_id = str(plan["plan_id"])
+    plan_sha = str(plan["sha256"])
     _text(env.get("dispatch_id"), "dispatch.dispatch_id")
     _text(env.get("created_at"), "dispatch.created_at", allow_empty=True)
     raw_actions = _list(env.get("actions"), "dispatch.actions")
@@ -494,30 +402,53 @@ def validate_dispatch(envelope: object, state: dict, *,
         seen_wid.add(wid)
         seen_did.add(did)
         seen_key.add(key)
+        action = _state_action(state, wid) if require_state else None
         if require_state:
-            action = _state_action(state, wid)
-            normalized = _check_dispatch_action(
-                item, action, f"dispatch.actions[{idx}]", verified_rounds)
-        else:
-            normalized = _check_dispatch_action(item, {
-                "id": wid,
-                "title": item.get("title"),
-                "assignee": item.get("assignee"),
-                "goal": item.get("goal"),
-                "constraints": item.get("constraints"),
-                "expected_evidence": item.get("expected_evidence"),
-                "depends_on": item.get("depends_on") or [],
-                "source_round_id": rid,
-            }, f"dispatch.actions[{idx}]", verified_rounds)
-        out_actions.append(normalized)
+            if str(action.get("plan_id") or "") != plan_id:
+                _fail("plan_mismatch", f"{wid} 不属于计划 {plan_id}。")
+        expect_did, expect_key = _dispatch_ids(task_id, plan_id, plan_sha, wid)
+        if did != expect_did or key != expect_key:
+            _fail("dispatch_id_drift",
+                  f"{wid} 的 dispatch_id / idempotency_key 与计划绑定不一致。")
+        fields = {
+            "title": _text(item.get("title"), f"dispatch.actions[{idx}].title"),
+            "assignee": _text(item.get("assignee"),
+                              f"dispatch.actions[{idx}].assignee").lower(),
+            "goal": _text(item.get("goal"), f"dispatch.actions[{idx}].goal",
+                          allow_empty=True),
+            "constraints": _text(item.get("constraints"),
+                                 f"dispatch.actions[{idx}].constraints",
+                                 allow_empty=True),
+            "expected_evidence": _text(item.get("expected_evidence"),
+                                       f"dispatch.actions[{idx}].expected_evidence",
+                                       allow_empty=True),
+            "depends_on": [str(d).strip() for d in
+                           _list(item.get("depends_on") or [],
+                                 f"dispatch.actions[{idx}].depends_on")
+                           if str(d).strip()],
+        }
+        if fields["assignee"] not in NATIVE_ASSIGNEES:
+            _fail("assignee_unsupported",
+                  f"{wid} 的 assignee={fields['assignee']!r} 不能走原生后端。")
+        if require_state:
+            for key_name, value in fields.items():
+                actual = ([str(d).strip() for d in action.get("depends_on") or []]
+                          if key_name == "depends_on"
+                          else str(action.get(key_name) or "").strip())
+                if actual != value:
+                    _fail("dispatch_action_mismatch",
+                          f"{wid} 的 {key_name} 与已登记工作项不一致；"
+                          "主代理不得改写计划内容。")
+        out_actions.append({"work_item_id": wid, "dispatch_id": did,
+                            "idempotency_key": key, **fields})
     return {
         "schema": DISPATCH_SCHEMA,
         "dispatch_id": str(env["dispatch_id"]).strip(),
         "task_id": task_id,
-        "round_id": rid,
         "contract_sha256": contract,
-        "plan_call_id": str(env["plan_call_id"]).strip(),
-        "plan_reply_sha256": str(env["plan_reply_sha256"]).lower(),
+        "plan_id": plan_id,
+        "plan_sha256": plan_sha,
+        "iteration_id": str(env.get("iteration_id") or "").strip(),
         "created_at": str(env.get("created_at") or ""),
         "actions": out_actions,
     }
@@ -615,103 +546,6 @@ def _validate_evidence(raw: object, state: dict, *, check_files: bool) -> list[d
                     "kind": kind or "file", "note": note})
     return out
 
-
-def validate_execution_result(envelope: object, dispatch: dict | None, state: dict, *,
-                              check_files: bool = True) -> dict:
-    """校验执行结果：绑定、结果摘要、证据文件、执行方元数据。"""
-    env = _obj(envelope, "execution result")
-    if str(env.get("schema") or "").strip() != RESULT_SCHEMA:
-        _fail("schema_invalid", f"execution schema 必须是 {RESULT_SCHEMA}。")
-    if not isinstance(dispatch, dict):
-        _fail("dispatch_missing", "状态没有 native_dispatch；不能回填执行结果。")
-    task_id, contract = _require_state_credential(state)
-    if str(env.get("task_id") or "").strip() != task_id:
-        _fail("task_mismatch", "执行结果 task_id 与当前任务不一致。")
-    if str(env.get("contract_sha256") or "").strip() != contract:
-        _fail("contract_mismatch", "执行结果 contract_sha256 与当前合同不一致。")
-    rid = _text(env.get("round_id"), "execution.round_id")
-    if rid != str(dispatch.get("round_id") or ""):
-        _fail("round_mismatch", "执行结果 round_id 与当前 dispatch 不一致。")
-    if str(env.get("contract_sha256") or "").strip() != str(
-            dispatch.get("contract_sha256") or ""):
-        _fail("contract_mismatch", "执行结果合同与当前 dispatch 不一致。")
-    wid = _text(env.get("work_item_id"), "execution.work_item_id")
-    did = _text(env.get("dispatch_id"), "execution.dispatch_id")
-    items = dispatch.get("items")
-    item = items.get(wid) if isinstance(items, dict) else None
-    if not isinstance(item, dict):
-        _fail("work_item_unknown", f"当前 dispatch 不含工作项 {wid}。")
-    if str(item.get("dispatch_id") or "") != did:
-        _fail("dispatch_mismatch",
-              f"执行结果 dispatch_id={did} 与工作项 {wid} 的派发 ID 不一致。")
-    # C2：执行结果必须携带完整计划/幂等绑定，且与当前 dispatch、已验证 SOL
-    # 轮次三方一致。只有 task/round/contract 不足以证明结果属于本次派发。
-    plan_call = _text(env.get("plan_call_id"), "execution.plan_call_id")
-    plan_reply = _sha(env.get("plan_reply_sha256"), "execution.plan_reply_sha256")
-    idem_key = _text(env.get("idempotency_key"), "execution.idempotency_key")
-    if plan_call != str(dispatch.get("plan_call_id") or ""):
-        _fail("plan_call_mismatch",
-              "执行结果 plan_call_id 与当前 dispatch 不一致。")
-    if plan_reply != str(dispatch.get("plan_reply_sha256") or "").lower():
-        _fail("plan_reply_mismatch",
-              "执行结果 plan_reply_sha256 与当前 dispatch 不一致。")
-    latest = _latest_verified_round(state)
-    if plan_call != str(latest.get("call_id") or ""):
-        _fail("plan_call_mismatch",
-              "执行结果 plan_call_id 与最近已验证 SOL 调用不一致。")
-    if plan_reply != str(latest.get("reply_sha256") or "").lower():
-        _fail("plan_reply_mismatch",
-              "执行结果 plan_reply_sha256 与最近已验证 SOL 回复摘要不一致。")
-    if idem_key != str(item.get("idempotency_key") or ""):
-        _fail("idempotency_mismatch",
-              f"执行结果 idempotency_key 与工作项 {wid} 的派发键不一致。")
-    action = _state_action(state, wid)
-    if str(action.get("status") or "") in ("done", "dropped"):
-        old_shas = {
-            str(rec.get("result_sha256") or "")
-            for rec in state.get("native_results") or []
-            if isinstance(rec, dict) and str(rec.get("work_item_id") or "") == wid
-        }
-        declared = str(env.get("result_sha256") or "").lower()
-        if declared not in old_shas:
-            _fail("work_item_terminal",
-                  f"{wid} 已终结（{action.get('status')}）；不同结果不得覆盖历史。")
-    status = _text(env.get("status"), "execution.status").lower()
-    if status not in EXECUTION_STATUSES:
-        _fail("invalid_status",
-              f"执行结果 status={status!r} 非法；只能是 {', '.join(EXECUTION_STATUSES)}。")
-    summary = _text(env.get("summary"), "execution.summary")
-    result = _text(env.get("result"), "execution.result")
-    executor = _validate_executor(env.get("executor"), "execution.executor")
-    timing = _validate_timing(env.get("timing"))
-    usage = _validate_usage(env.get("usage"))
-    evidence = _validate_evidence(env.get("evidence"), state, check_files=check_files)
-    declared_sha = _sha(env.get("result_sha256"), "execution.result_sha256")
-    actual_sha = envelope_sha256(env)
-    if declared_sha != actual_sha:
-        _fail("result_sha_mismatch",
-              "执行结果 result_sha256 与信封内容不一致（可能被篡改）。")
-    # 同一执行结果重复回填是幂等的；同一工作项的不同结果是否允许由 integration
-    # 层按 failed/blocked 重试语义处理，协议层只检查终态。
-    return {
-        "schema": RESULT_SCHEMA,
-        "task_id": task_id,
-        "round_id": rid,
-        "contract_sha256": contract,
-        "plan_call_id": plan_call,
-        "plan_reply_sha256": plan_reply,
-        "dispatch_id": did,
-        "idempotency_key": idem_key,
-        "work_item_id": wid,
-        "status": status,
-        "summary": summary,
-        "result": result,
-        "evidence": evidence,
-        "executor": executor,
-        "timing": timing,
-        "usage": usage,
-        "result_sha256": declared_sha,
-    }
 
 
 def _validate_files_inspected(raw: object, *, check_files: bool) -> list[str]:
@@ -1102,11 +936,140 @@ def _validate_reviewer(reviewer: object) -> dict:
     }
 
 
+
+def validate_execution_result(envelope: object, dispatch: dict | None, state: dict, *,
+                              check_files: bool = True) -> dict:
+    """校验执行结果：计划绑定、结果摘要、证据文件、执行方元数据。"""
+    env = _obj(envelope, "execution result")
+    schema = str(env.get("schema") or "").strip()
+    if schema in LEGACY_SCHEMAS:
+        _fail("schema_retired",
+              f"{schema} 属于 v1 SOL 通道，已退役；不能用于 v6 回填。")
+    if schema != RESULT_SCHEMA:
+        _fail("schema_invalid", f"execution schema 必须是 {RESULT_SCHEMA}。")
+    if not isinstance(dispatch, dict):
+        _fail("dispatch_missing", "状态没有 native_dispatch；不能回填执行结果。")
+    task_id, contract = _require_state_credential(state)
+    if str(env.get("task_id") or "").strip() != task_id:
+        _fail("task_mismatch", "执行结果 task_id 与当前任务不一致。")
+    if str(env.get("contract_sha256") or "").strip() != contract:
+        _fail("contract_mismatch", "执行结果 contract_sha256 与当前合同不一致。")
+    plan_id = _text(env.get("plan_id"), "execution.plan_id")
+    plan_sha = _sha(env.get("plan_sha256"), "execution.plan_sha256")
+    if plan_id != str(dispatch.get("plan_id") or ""):
+        _fail("plan_mismatch", "执行结果 plan_id 与当前 dispatch 不一致。")
+    if plan_sha != str(dispatch.get("plan_sha256") or "").lower():
+        _fail("plan_mismatch", "执行结果 plan_sha256 与当前 dispatch 不一致。")
+    _check_plan(state, plan_id, plan_sha)
+    wid = _text(env.get("work_item_id"), "execution.work_item_id")
+    did = _text(env.get("dispatch_id"), "execution.dispatch_id")
+    items = {str(i.get("work_item_id") or ""): i
+             for i in dispatch.get("actions") or [] if isinstance(i, dict)}
+    item = items.get(wid)
+    if not isinstance(item, dict):
+        _fail("work_item_unknown", f"当前 dispatch 不含工作项 {wid}。")
+    if str(item.get("dispatch_id") or "") != did:
+        _fail("dispatch_mismatch",
+              f"执行结果 dispatch_id={did} 与工作项 {wid} 的派发 ID 不一致。")
+    idem_key = _text(env.get("idempotency_key"), "execution.idempotency_key")
+    if idem_key != str(item.get("idempotency_key") or ""):
+        _fail("idempotency_mismatch",
+              f"执行结果 idempotency_key 与工作项 {wid} 的派发键不一致。")
+    iteration_id = str(env.get("iteration_id") or "").strip()
+    if iteration_id != str(dispatch.get("iteration_id") or ""):
+        _fail("iteration_mismatch", "执行结果 iteration_id 与当前 dispatch 不一致。")
+    action = _state_action(state, wid)
+    if str(action.get("status") or "") in ("done", "dropped"):
+        old_shas = {
+            str(rec.get("result_sha256") or "")
+            for rec in state.get("native_results") or []
+            if isinstance(rec, dict) and str(rec.get("work_item_id") or "") == wid
+        }
+        declared = str(env.get("result_sha256") or "").lower()
+        if declared not in old_shas:
+            _fail("work_item_terminal",
+                  f"{wid} 已终结（{action.get('status')}）；不同结果不得覆盖历史。")
+    status = _text(env.get("status"), "execution.status").lower()
+    if status not in EXECUTION_STATUSES:
+        _fail("invalid_status",
+              f"执行结果 status={status!r} 非法；只能是 {', '.join(EXECUTION_STATUSES)}。")
+    summary = _text(env.get("summary"), "execution.summary")
+    result = _text(env.get("result"), "execution.result")
+    executor = _validate_executor(env.get("executor"), "execution.executor")
+    timing = _validate_timing(env.get("timing"))
+    usage = _validate_usage(env.get("usage"))
+    evidence = _validate_evidence(env.get("evidence"), state, check_files=check_files)
+    declared_sha = _sha(env.get("result_sha256"), "execution.result_sha256")
+    actual_sha = envelope_sha256(env)
+    if declared_sha != actual_sha:
+        _fail("result_sha_mismatch",
+              "执行结果 result_sha256 与信封内容不一致（可能被篡改）。")
+    return {
+        "schema": RESULT_SCHEMA,
+        "task_id": task_id,
+        "contract_sha256": contract,
+        "plan_id": plan_id,
+        "plan_sha256": plan_sha,
+        "iteration_id": iteration_id,
+        "dispatch_id": did,
+        "idempotency_key": idem_key,
+        "work_item_id": wid,
+        "status": status,
+        "summary": summary,
+        "result": result,
+        "evidence": evidence,
+        "executor": executor,
+        "timing": timing,
+        "usage": usage,
+        "result_sha256": declared_sha,
+    }
+
+
+def _validate_host_record(raw: object, *, required: bool) -> dict:
+    """校验宿主运行记录引用；G4 复核必须有可重新核对的宿主文件。"""
+    if raw is None:
+        if required:
+            _fail("g4_host_record_missing",
+                  "g4_eligible=true 的复核必须附宿主 metadata/outputFile/rollout 记录。")
+        return {}
+    obj = _obj(raw, "host")
+    out: dict = {}
+    for key in ("metadata_path", "output_file", "rollout_path"):
+        path = _text(obj.get(key), f"host.{key}")
+        if not os.path.isabs(path):
+            _fail("g4_host_record_invalid", f"host.{key} 必须是绝对路径：{path}")
+        if not os.path.isfile(path):
+            _fail("g4_host_record_invalid", f"host.{key} 不存在：{path}")
+        out[key] = path
+    calls = _list(obj.get("tool_calls"), "host.tool_calls")
+    if required and not calls:
+        _fail("g4_tool_calls_missing",
+              "G4 复核必须提供 Reviewer 实际工具调用记录；不能只有自述。")
+    normalized = []
+    for idx, call in enumerate(calls, 1):
+        item = _obj(call, f"host.tool_calls[{idx}]")
+        name = _text(item.get("name"), f"host.tool_calls[{idx}].name")
+        if name not in REVIEWER_TOOLS:
+            _fail("g4_tool_not_readonly",
+                  f"G4 复核出现非只读工具 {name!r}；只允许 {', '.join(REVIEWER_TOOLS)}。")
+        normalized.append({"name": name,
+                           "count": _int(item.get("count") or 0,
+                                         f"host.tool_calls[{idx}].count")})
+    out["tool_calls"] = normalized
+    out["agent_id"] = str(obj.get("agent_id") or "").strip()
+    out["child_session_id"] = str(obj.get("child_session_id") or "").strip()
+    return out
+
+
 def validate_review_result(envelope: object, dispatch: dict | None, execution: dict,
                            state: dict, *, check_files: bool = True) -> dict:
     """校验独立复核：绑定执行结果 SHA、Reviewer 独立性、只读性与 PASS 门槛。"""
     env = _obj(envelope, "review result")
-    if str(env.get("schema") or "").strip() != REVIEW_SCHEMA:
+    schema = str(env.get("schema") or "").strip()
+    if schema in LEGACY_SCHEMAS:
+        _fail("schema_retired",
+              f"{schema} 属于 v1 SOL 通道，已退役；不能用于 v6 复核。")
+    if schema != REVIEW_SCHEMA:
         _fail("schema_invalid", f"review schema 必须是 {REVIEW_SCHEMA}。")
     if not isinstance(dispatch, dict):
         _fail("dispatch_missing", "状态没有 native_dispatch；不能回填复核结果。")
@@ -1115,13 +1078,18 @@ def validate_review_result(envelope: object, dispatch: dict | None, execution: d
         _fail("task_mismatch", "复核结果 task_id 与当前任务不一致。")
     if str(env.get("contract_sha256") or "").strip() != contract:
         _fail("contract_mismatch", "复核结果 contract_sha256 与当前合同不一致。")
-    rid = _text(env.get("round_id"), "review.round_id")
-    if rid != str(dispatch.get("round_id") or ""):
-        _fail("round_mismatch", "复核结果 round_id 与当前 dispatch 不一致。")
+    plan_id = _text(env.get("plan_id"), "review.plan_id")
+    plan_sha = _sha(env.get("plan_sha256"), "review.plan_sha256")
+    if plan_id != str(dispatch.get("plan_id") or ""):
+        _fail("plan_mismatch", "复核结果 plan_id 与当前 dispatch 不一致。")
+    if plan_sha != str(dispatch.get("plan_sha256") or "").lower():
+        _fail("plan_mismatch", "复核结果 plan_sha256 与当前 dispatch 不一致。")
+    _check_plan(state, plan_id, plan_sha)
     wid = _text(env.get("work_item_id"), "review.work_item_id")
     did = _text(env.get("dispatch_id"), "review.dispatch_id")
-    items = dispatch.get("items")
-    item = items.get(wid) if isinstance(items, dict) else None
+    items = {str(i.get("work_item_id") or ""): i
+             for i in dispatch.get("actions") or [] if isinstance(i, dict)}
+    item = items.get(wid)
     if not isinstance(item, dict):
         _fail("work_item_unknown", f"当前 dispatch 不含工作项 {wid}。")
     if str(item.get("dispatch_id") or "") != did:
@@ -1165,9 +1133,19 @@ def validate_review_result(envelope: object, dispatch: dict | None, execution: d
     if verdict not in REVIEW_VERDICTS:
         _fail("invalid_verdict",
               f"复核 verdict={verdict!r} 只能是 {', '.join(REVIEW_VERDICTS)}。")
-    if env.get("g4_eligible") is not False:
-        _fail("g4_eligible_forbidden",
-              "普通原生复核的 g4_eligible 必须显式为 false；不得冒充 G4。")
+    g4_eligible = env.get("g4_eligible")
+    if not isinstance(g4_eligible, bool):
+        _fail("schema_invalid", "review.g4_eligible 必须是布尔值。")
+    target_sha = ""
+    if g4_eligible:
+        target_sha = _sha(env.get("target_sha256"), "review.target_sha256")
+        if verdict != "pass":
+            _fail("g4_requires_pass", "g4_eligible=true 的复核必须 verdict=pass。")
+        if unverified:
+            _fail("g4_with_unverified", "G4 复核仍有未验证事项；不能标记可用。")
+        if any(f["severity"] == "blocking" for f in findings):
+            _fail("g4_with_blocking", "G4 复核存在 blocking finding；不能标记可用。")
+    host = _validate_host_record(env.get("host"), required=g4_eligible)
     if verdict == "pass" and any(f["severity"] == "blocking" for f in findings):
         _fail("pass_with_blocking_finding",
               "复核 verdict=pass 但存在 blocking finding；必须改判或补齐。")
@@ -1182,12 +1160,15 @@ def validate_review_result(envelope: object, dispatch: dict | None, execution: d
     return {
         "schema": REVIEW_SCHEMA,
         "task_id": task_id,
-        "round_id": rid,
         "contract_sha256": contract,
+        "plan_id": plan_id,
+        "plan_sha256": plan_sha,
         "dispatch_id": did,
         "work_item_id": wid,
         "execution_result_sha256": exec_sha,
+        "target_sha256": target_sha,
         "reviewer": reviewer,
+        "host": host,
         "verdict": verdict,
         "findings": findings,
         "files_inspected": files,
@@ -1195,6 +1176,6 @@ def validate_review_result(envelope: object, dispatch: dict | None, execution: d
         "changed_files": [],
         "unverified": unverified,
         "residual_risks": residual,
-        "g4_eligible": False,
+        "g4_eligible": g4_eligible,
         "result_sha256": declared_sha,
     }

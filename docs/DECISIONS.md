@@ -90,7 +90,7 @@
     不变：普通默认预算与普通追加额度、G1–G4 fail-closed、Reviewer 独立性与身份验证、
     SOL 模型（`gpt-6.1-sol` + `reasoning.effort=high`）与 CPA 路由。
 
-15. **截断证据不得直接用于 REVIEW；代码状态必须机器绑定。** 采集器按预算保留头尾时，
+15. **[原则继续有效；`call_gpt.py` 相关机制已退役] 截断证据不得直接用于 REVIEW；代码状态必须机器绑定。** 采集器按预算保留头尾时，
     条目元数据会写「- 截断：省略 N 字符」；`call_gpt.py` 解析并在自检表列出，且本轮
     **新提交**的截断条目在 REVIEW 前失败关闭（未发请求、未计轮次），需重新采集或用
     `--accept-evidence-truncation <理由>` 显式放行并随轮次/审计留痕。已入账轮次的截断
@@ -153,7 +153,7 @@
     解除 PARTIAL 后的人工中转与无进展即停。不变：G1–G4、独立复核、授权边界、PASS 语义
     （SOL PASS 仍需本地四门与 native 复核完成度）。
 
-19. **未知用量单列，不与已知用量混算。**
+19. **[历史实现，`task_spend_from_audit` 已随 v6 退役] 未知用量单列，不与已知用量混算。**
     `copilot_dispatch.task_spend_from_audit` 按审计逐条分类：成功且有 `usage` 计真实 Token；
     成功但无 `usage`、已送达/可能送达的失败（HTTP 响应、超时、连接中断）无 `usage` 时计入
     `unknown_usage_calls`；能确认未送达的传输失败只计 `not_delivered_calls`；失败但返回部分
@@ -162,7 +162,7 @@
     未知不当作 0，也不伪造 Token/费用。依据：2026-11-08 真实 REVIEW 中 408 无 usage 却
     `unknown_usage_calls=0`。
 
-20. **文档现行口径统一到 ChatGPT 自定义指令 v5.3.2（2026-11-09）。**
+20. **[历史口径，基线已升级到 v5.4.0] 文档口径统一到 ChatGPT 自定义指令 v5.3.2（2026-11-09）。**
     `SKILL.md`、`references/role.md`、项目 `AGENTS.md`、`docs/PROJECT-CHARTER.md` 的现行角色与
     协作语义以 v5.3.2 为准：六角色（用户 / ChatGPT 用户侧 / Copilot / SOL / ZCode 原生 Agent /
     DesignWise）不混同；SOL 只承担高级工程判断、技术方案取舍、风险分析与工程结果判断，需求理解、
@@ -556,7 +556,63 @@
     成本记入已知限制，不擅自改协议）；④ 不再做低价值测试扩充；⑤ 不重复建设已有复核机制。
     只有真实安全漏洞、证据损坏、实际运行故障或明确新需求才重新立项。
 
+28. **SOL 决策通道退役（2026-11-12，v6.0.0）。** 活动执行路径不再包含 `gpt-6.1-sol` 调用、
+    SOL 作为 CONSULT/PLAN/REVIEW 强制决策节点的机制、等待 SOL 返回的状态门禁，以及仅为该通道
+    服务的自动调度/重试/配额代码。`call_gpt.py`、`review_ledger.py`、`reply_protocol.py`
+    移入仓库 `legacy/`，不再分发。**不得用其他远程大模型替代 SOL 承担强制决策职责。**
+    第 13、16、22–27 条中涉及 SOL 调用、预算与远程 REVIEW 裁决的内容只作历史记录，不再是
+    现行执行依据；模型继承（第 11 条）、native 为 opt-in（第 10 条）、G4 fail-closed 继续有效。
+    补充（2026-11-12 复核后）：第 15、17–21 条只在「截断证据/代码机器绑定」「PARTIAL 不走
+    人肉中转」这些原则上继续有效，其中依赖 SOL 通道、远程预算、`call_gpt.py` 与
+    `task_spend_from_audit` 的具体机制已随本条退役；PARTIAL 持续推进由第 30 条以本地派生
+    承接，文档现行基线以用户级 `AGENTS.md` 与 ChatGPT 自定义指令 v5.4.0 为准（第 20 条的
+    v5.3.2 只作历史）。
+    依据：用户 2026-11-12 任务要求与 ChatGPT 自定义指令 v5.4.0 角色边界。
+
+29. **本地治理引擎（`scripts/governance.py`）是唯一状态权威。** schema
+    `copilot-governance/v1`、`version=1`；纯本地计算，不导入网络客户端、不调用模型、
+    不派发 Agent。状态写入为临时文件 + `fsync` + `os.replace`，`fcntl.flock` 串行化写者，
+    `save_seq` 做 CAS。v1/v2 历史状态不被驱动，只能 `legacy-status` 只读查看。
+    依据：需要可测试、可离线验证的治理层，且不能把 ZCode 的决策搬到脚本里。
+
+30. **状态机收敛为 RUNNING / PARTIAL / PASS / BLOCKED / CLOSED，PARTIAL 必须持续推进。**
+    PARTIAL 不是终点：`drive` 本地派生 `AUTO-C<n>` / `AUTO-R-<id>` / `AUTO-G4` /
+    `AUTO-REPLAN` / `AUTO-NEXT` 并继续。禁止以人为轮次、Token、内部费用、等待远程模型、
+    重复评审、内部状态流转、子 Agent PARTIAL、首次方案失败或普通测试失败作为停止理由。
+    `MAX_DRIVE_STEPS=32` 只是防死循环的本地保护：超限返回内部错误（退出码 12）并保留状态，
+    不是 BLOCKED/PASS。只有缺授权、缺用户决策、缺资源或真实外部限制才允许 `block`。
+    依据：用户要求“PARTIAL 不是任务结束状态”，且不能出现隐藏的审批门。
+
+31. **CONSULT / PLAN / REVIEW 重新定位为本地工作模式。** CONSULT 由主代理本地分析，
+    结论只作审计；PLAN 由 ZCode 决定，Copilot 只登记与校验（拒绝依赖环、计划漂移）；
+    正式 REVIEW 仅在用户明确授权（`authorize-review --authorized-by user`）时登记，授权在
+    同一任务合同内持续，不构成普通开发前置门禁，也不能替代 G4。没有授权时不得伪造正式
+    REVIEW，也不得用自检冒充。依据：v5.4.0 的角色边界与“简单任务不强制经过正式 REVIEW”。
+
+32. **Native Bridge v2 与 G4 宿主记录重核。** 信封为 `copilot-native-dispatch/v2`、
+    `copilot-native-result/v2`、`copilot-native-review/v2`；v1 信封显式退役。派发绑定
+    task / contract / plan / iteration，工作项 id 与幂等键确定性派生。`g4_eligible` 由
+    `native_agent.py` 按宿主 metadata/rollout 计算，Reviewer 不能自述；`ingest` 回填 G4
+    复核前重新读取宿主记录核对（Profile、Agent/Child Session、outputFile、工具调用计数、
+    只读命令），任何不符都拒绝。G4 还要求 `verdict=pass`、无 blocking、`unverified`/
+    `changed_files` 为空、目标摘要等于当前 `final_evidence_digest`。依据：保留高风险门禁的
+    可信度，同时不把“模型自述”当证据。
+
+33. **历史材料只读保留，退役不等于删除。** 历史审计 JSONL、REVIEW 台账、任务状态、证据与
+    SHA-256 原路径保留；v5 SOL 角色/协议文档加历史横幅；`legacy/` 保存旧实现与 853 项历史
+    回归测试。不得为了让检索结果里不再出现 SOL 而删除历史证据。依据：用户明确要求保留历史
+    可读性与版本可追溯性。
+
+34. **运行时分发范围更新。** 继续分发 `SKILL.md`、`scripts/**/*.py`、`references/**/*.md`、
+    `agents/reviewer.md`；`legacy/`、`tests/`、`docs/`、`manifests/`、`scripts-sync/`、
+    `README.md`、`AGENTS.md` 不进入运行时。退役脚本不进入分发清单。依据：第 2 条分发边界
+    在 v6 的延续。
+
 ## 建议（未采纳）
+
+> 以下为 v5 时期记录，保留原文；其中涉及 `call_gpt.py`、SOL 预算或远程 REVIEW 的建议
+> 已随第 28 条失去前提，只作历史，不再构成后续建议。
+
 
 - 每次源码修改通过测试后，按任务授权在本地 Git 提交可回溯版本；未获 commit 授权的
   任务不提交。
@@ -573,12 +629,17 @@
 
 ## 待决
 
-- **Phase 3.6 真实 SOL 端到端调用（Native Bridge C4）**：2026-11-08 已在用户授权下完成 **4 次真实
-  SOL 调用**，局部验证了默认字段省略、截断识别与一次升档恢复；**完整 Native Bridge C4 端到端
-  仍未验证**，需单独授权（模型、请求数、token 预算、`max-retries=0`、用途与成本不确定性）。
-  四次局部调用不能替代 C4 验收。
+> 以下为 v5 时期记录；SOL/Native Bridge C4 相关事项已随第 28 条退役，不再待决。
+
+
+- **[历史] Phase 3.6 真实 SOL 端到端调用（Native Bridge C4）**：2026-11-08 在用户授权下完成
+  4 次真实 SOL 调用，局部验证了字段省略、截断识别与一次升档恢复；完整 C4 未验证。v6 已退役
+  SOL 通道（第 28 条），本项不再是待决事项，只作历史记录。
 - **Git 远程与后续提交策略**：`origin` 已配置为 `https://github.com/tongsailong/copilot.git`
   并用于普通快进推送（第 27 条收尾轮）；何时提交后续变更、是否要求分支保护，仍需用户决定。
+  第 12 条的「不配置远端」指首次基线提交时的约束，其后推送由用户逐次授权，两者不冲突。
+  2026-11-12 的 v6.0.0 变更在完成时为**未提交、未推送**（用户当时明确要求）；同日后续用户已明确
+  授权提交与普通快进推送，本条关于「何时提交」的待决部分已解决，推送目标为 `origin/main`。
 - **运行时残留测试与历史备份的长期保留策略**。
-- **Phase 4 剩余范围**：Reviewer 自动派发、可信复核记录升级仍需单独授权与实现；
-  SOL 自动重判/收口与 PARTIAL 自动推进已按第 18 条落地（本机实现，未经真实长链验证）。
+- **Phase 4 剩余范围**：Reviewer 自动派发与可信复核记录升级仍需单独授权与实现。
+  (v6) PARTIAL 推进已由第 30 条以本地派生实现；SOL 自动重判/收口已退役，不再属于剩余范围。

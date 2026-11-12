@@ -3,8 +3,8 @@
 
 本脚本不派发 Agent、不调用模型、不写任务状态。它只做一件事：把**宿主已经
 产生**的原生运行记录（Agent 的 `metadata.json`、rollout 模型记录、实际证据
-文件、Reviewer 的原始结论）转换成 `copilot-native-result/v1` /
-`copilot-native-review/v1` 信封，并由脚本自己计算所有身份绑定、证据摘要和
+文件、Reviewer 的原始结论）转换成 `copilot-native-result/v2` /
+`copilot-native-review/v2` 信封，并由脚本自己计算所有身份绑定、证据摘要和
 `result_sha256`。
 
 为什么需要它
@@ -16,17 +16,19 @@ SHA-256 或计划绑定写错/编造。这里把这些字段从实际记录中�
 * 执行方身份只来自 `agent-*/metadata.json`；
 * 实际模型只来自 `~/.zcode/cli/rollout/model-io-<childSessionId>.jsonl`；
 * 证据 SHA-256 由脚本读取证据文件计算，不接受调用方传入；
-* `plan_call_id` / `plan_reply_sha256` / `dispatch_id` / `idempotency_key`
-  只从 dispatch 与已验证状态复制；
+* `plan_id` / `plan_sha256` / `dispatch_id` / `idempotency_key` 只从本地计划
+  与 dispatch 复制；
 * 复核身份只来自 Reviewer 的 metadata，Reviewer 原始结论只提供
   verdict/findings/files_inspected/commands_run 等判断内容；
 * 复核实际调用的工具与 Bash 命令只来自 rollout：工具白名单、只读校验、
-  `commands_run` 必须与实际调用一致、调用计数必须与 metadata 相符。
+  `commands_run` 必须与实际调用一致、调用计数必须与 metadata 相符；
+* `g4_eligible` 由本脚本按宿主记录计算（Profile 工具集、实际只读调用、独立
+  Agent/Child Session、最终证据摘要绑定），Reviewer 不能自述。
 
 仍然不是密码学证明
 ------------------
 这些记录仍可能被能写本机文件的人伪造；本脚本保证的是“不靠主代理记忆或手抄
-身份”，不是宿主签名。普通原生复核的 PASS 依然不等于 G4。
+身份”，不是宿主签名。G4 仍是本地可信度最高的原生复核，不等于外部签名。
 
 用法
 ----
@@ -54,7 +56,7 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
-import copilot_dispatch as D  # noqa: E402
+import governance as G  # noqa: E402
 import native_bridge as NB  # noqa: E402
 
 EXIT_OK, EXIT_USAGE = 0, 2
@@ -387,7 +389,7 @@ def _find_action(dispatch_env: dict, work_item: str) -> dict:
 
 
 def build_execution(args) -> dict:
-    state = D.load_state(os.path.abspath(args.state))
+    state = G.load_state(os.path.abspath(args.state))
     dispatch_env, native = _dispatch_for_state(state, args.dispatch)
     action = _find_action(dispatch_env, args.work_item)
     meta = _load_metadata(args.metadata)
@@ -411,10 +413,10 @@ def build_execution(args) -> dict:
     env = {
         "schema": NB.RESULT_SCHEMA,
         "task_id": state["task_id"],
-        "round_id": dispatch_env["round_id"],
         "contract_sha256": state["contract_sha256"],
-        "plan_call_id": dispatch_env["plan_call_id"],
-        "plan_reply_sha256": dispatch_env["plan_reply_sha256"],
+        "plan_id": dispatch_env["plan_id"],
+        "plan_sha256": dispatch_env["plan_sha256"],
+        "iteration_id": dispatch_env.get("iteration_id") or "",
         "dispatch_id": action["dispatch_id"],
         "idempotency_key": action["idempotency_key"],
         "work_item_id": action["work_item_id"],
@@ -502,7 +504,7 @@ def _bind_review_output(data: dict, execution: dict, dispatch_env: dict,
     """宿主输出里必须带有本次执行对象绑定；缺失或指向别处一律拒绝。"""
     expected = {
         "task_id": str(state.get("task_id") or ""),
-        "round_id": str(dispatch_env.get("round_id") or ""),
+        "plan_id": str(dispatch_env.get("plan_id") or ""),
         "dispatch_id": str(execution.get("dispatch_id") or ""),
         "work_item_id": str(execution.get("work_item_id") or ""),
         "execution_result_sha256": str(execution.get("result_sha256") or ""),
@@ -623,14 +625,102 @@ def _assert_files_inspected(files: object, calls: list[tuple[str, str, dict]]) -
                 "没有任何访问该路径的记录；不能把未打开的文件算作已复核。")
 
 
+def _review_profile_problems(meta: dict) -> list[str]:
+    """按宿主快照核对 Reviewer Profile 的工具边界。"""
+    snapshot = meta["profile_snapshot"]
+    tools = snapshot.get("tools")
+    disallowed = snapshot.get("disallowedTools")
+    problems: list[str] = []
+    if not isinstance(tools, list) or not tools:
+        problems.append("profile_tools_missing")
+    else:
+        extra = sorted({str(t) for t in tools} - set(_REVIEW_TOOL_NAMES))
+        if extra:
+            problems.append("profile_tools_not_readonly:" + ",".join(extra))
+    if isinstance(disallowed, list):
+        # disallowedTools 是「被禁用的工具」；Reviewer Profile 必须显式禁用写工具。
+        # （旧实现把只读工具出现在这里当成放宽，语义正好相反。）
+        disabled = {str(t) for t in disallowed}
+        missing = [t for t in ("Write", "Edit") if t not in disabled]
+        if missing:
+            problems.append("profile_disallowed_missing:" + ",".join(missing))
+    return problems
+
+
+def _call_blobs(calls: list[tuple[str, str, dict]]) -> list[str]:
+    blobs: list[str] = []
+    for _tool, command, payload in calls:
+        if command:
+            blobs.extend(part for part in re.split(r"[;|\n]", command) if part.strip())
+        else:
+            blobs.append(json.dumps(payload, ensure_ascii=False))
+    return blobs
+
+
+def _evidence_not_inspected(state: dict,
+                            calls: list[tuple[str, str, dict]]) -> list[str]:
+    """G4 复核必须实际访问当前任务的每一条文件证据。"""
+    blobs = _call_blobs(calls)
+    missing: list[str] = []
+    for entry in state.get("evidence") or []:
+        if not isinstance(entry, dict) or entry.get("dropped"):
+            continue
+        hint = str(entry.get("path_hint") or "")
+        if not hint or hint == "<inline>":
+            continue
+        if not any(_mentions_path(hint, blob) for blob in blobs):
+            missing.append(hint)
+    return missing
+
+
+def _g4_problems(meta: dict, calls: list[tuple[str, str, dict]], raw: dict,
+                 execution: dict, state: dict, target_sha: str) -> list[str]:
+    """按宿主记录计算 G4 资格；任何一项不满足都不得标记 g4_eligible。"""
+    problems = _review_profile_problems(meta)
+    if not calls:
+        problems.append("review_no_tool_calls")
+    if meta["status"] != "completed":
+        problems.append("reviewer_not_completed")
+    verdict = str(raw.get("verdict") or "").strip().lower()
+    if verdict != "pass":
+        problems.append("review_verdict_not_pass")
+    findings = raw.get("findings") or []
+    if isinstance(findings, list) and any(
+            isinstance(f, dict) and str(f.get("severity") or "") == "blocking"
+            for f in findings):
+        problems.append("blocking_findings")
+    if raw.get("unverified"):
+        problems.append("unverified_items")
+    if raw.get("changed_files"):
+        problems.append("changed_files")
+    executor = execution.get("executor") or {}
+    for key in ("agent_id", "child_session_id"):
+        exec_value = str(executor.get(key) or "").strip()
+        rev_value = str(meta.get(key) or "").strip()
+        if exec_value and rev_value and exec_value == rev_value:
+            problems.append(f"reviewer_not_independent:{key}")
+    if str(state.get("risk") or "").lower() != "high":
+        problems.append("risk_not_high")
+    if target_sha != G.final_evidence_digest(state):
+        problems.append("target_stale")
+    if _evidence_not_inspected(state, calls):
+        problems.append("evidence_not_inspected")
+    return problems
+
+
 def build_review(args) -> dict:
-    state = D.load_state(os.path.abspath(args.state))
+    state = G.load_state(os.path.abspath(args.state))
     dispatch_env, native = _dispatch_for_state(state, args.dispatch)
     execution = _load_json(args.execution)
     if not isinstance(execution, dict):
         raise AgentRecordError("execution 文件顶层必须是对象。")
-    if str(execution.get("schema") or "") != NB.RESULT_SCHEMA:
-        raise AgentRecordError("--execution 必须是 copilot-native-result/v1 信封。")
+    schema = str(execution.get("schema") or "")
+    if schema in NB.LEGACY_SCHEMAS:
+        raise AgentRecordError(
+            f"{schema} 属于 v1 SOL 通道，已退役；历史记录请用 legacy-status 查看。")
+    if schema != NB.RESULT_SCHEMA:
+        raise AgentRecordError(
+            f"--execution 必须是 {NB.RESULT_SCHEMA} 信封。")
     exec_sha = str(execution.get("result_sha256") or "").strip().lower()
     if not exec_sha or NB.envelope_sha256(execution) != exec_sha:
         raise AgentRecordError(
@@ -642,7 +732,7 @@ def build_review(args) -> dict:
     ]
     if not recorded:
         raise AgentRecordError(
-            "execution 尚未入账；请先用 drive 回填 execution，再生成复核。")
+            "execution 尚未入账；请先用 auto ingest 回填 execution，再生成复核。")
     if str(execution.get("work_item_id") or "") != str(args.work_item):
         raise AgentRecordError(
             f"execution 工作项 {execution.get('work_item_id')!r} 与 "
@@ -662,14 +752,34 @@ def build_review(args) -> dict:
     raw = _review_fields(host_output)
     if getattr(args, "input", ""):
         _assert_input_matches_host(_review_input(args.input), raw)
+    calls = _review_tool_calls(meta, args.model_rollout)
+    _assert_reported_commands_executed(raw.get("commands_run"), calls)
+    _assert_files_inspected(raw.get("files_inspected"), calls)
+    target_sha = G.final_evidence_digest(state)
+    problems = _g4_problems(meta, calls, raw, execution, state, target_sha)
+    counts: dict[str, int] = {}
+    for name, _command, _payload in calls:
+        counts[name] = counts.get(name, 0) + 1
+    host = {
+        "metadata_path": meta["path"],
+        "output_file": os.path.abspath(
+            os.path.expanduser(str(meta["data"].get("outputFile") or ""))),
+        "rollout_path": os.path.abspath(_rollout_path(meta, args.model_rollout)),
+        "tool_calls": [{"name": name, "count": count}
+                       for name, count in sorted(counts.items())],
+        "agent_id": meta["agent_id"],
+        "child_session_id": meta["child_session_id"],
+    }
     env = {
         "schema": NB.REVIEW_SCHEMA,
         "task_id": state["task_id"],
-        "round_id": dispatch_env["round_id"],
         "contract_sha256": state["contract_sha256"],
+        "plan_id": dispatch_env["plan_id"],
+        "plan_sha256": dispatch_env["plan_sha256"],
         "dispatch_id": execution["dispatch_id"],
         "work_item_id": execution["work_item_id"],
         "execution_result_sha256": exec_sha,
+        "target_sha256": target_sha,
         "reviewer": {
             "kind": "subagent",
             "agent_id": meta["agent_id"],
@@ -677,6 +787,7 @@ def build_review(args) -> dict:
             "profile_id": "reviewer",
             "model_reported": model,
         },
+        "host": host,
         "verdict": raw.get("verdict"),
         "findings": raw.get("findings") or [],
         "files_inspected": raw.get("files_inspected") or [],
@@ -684,7 +795,8 @@ def build_review(args) -> dict:
         "changed_files": raw.get("changed_files") or [],
         "unverified": raw.get("unverified") or [],
         "residual_risks": raw.get("residual_risks") or [],
-        "g4_eligible": False,
+        "g4_eligible": not problems,
+        "g4_reasons": problems,
     }
     env["result_sha256"] = NB.envelope_sha256(env)
     try:
@@ -692,10 +804,52 @@ def build_review(args) -> dict:
     except NB.BridgeError as exc:
         raise AgentRecordError(
             f"生成的信封未通过正式校验 [{exc.code}]：{exc}") from None
-    calls = _review_tool_calls(meta, args.model_rollout)
-    _assert_reported_commands_executed(raw.get("commands_run"), calls)
-    _assert_files_inspected(raw.get("files_inspected"), calls)
     return env
+
+
+def verify_review_host_record(envelope: dict) -> list[str]:
+    """回填前重新核对 G4 复核引用的宿主记录；返回问题列表（空表示可用）。
+
+    只在 `g4_eligible=true` 时调用。重新读取 metadata 与 rollout，确认：
+    Profile 仍是 reviewer 且工具只读、Agent/Child Session 未被改指、实际工具
+    调用计数仍与 metadata 一致、没有出现非只读命令。任何一项失败都拒绝 G4。
+    """
+    if envelope.get("g4_eligible") is not True:
+        return ["g4_not_eligible"]
+    host = envelope.get("host") or {}
+    if not isinstance(host, dict):
+        return ["host_record_invalid"]
+    try:
+        meta = _load_metadata(str(host.get("metadata_path") or ""))
+    except AgentRecordError as exc:
+        return [f"host_metadata_unreadable:{exc}"]
+    problems = []
+    if meta["profile_id"] != "reviewer":
+        problems.append("host_profile_changed")
+    if meta["agent_id"] != str((envelope.get("reviewer") or {}).get("agent_id") or ""):
+        problems.append("host_agent_mismatch")
+    if meta["child_session_id"] != str(
+            (envelope.get("reviewer") or {}).get("child_session_id") or ""):
+        problems.append("host_session_mismatch")
+    if os.path.abspath(str(host.get("output_file") or "")) != os.path.abspath(
+            str(meta["data"].get("outputFile") or "")):
+        problems.append("host_output_mismatch")
+    try:
+        calls = _review_tool_calls(meta, str(host.get("rollout_path") or ""))
+    except AgentRecordError as exc:
+        return problems + [f"host_rollout_unreadable:{exc}"]
+    if not calls:
+        problems.append("host_no_tool_calls")
+    expected = {str(c.get("name")): int(c.get("count") or 0)
+                for c in host.get("tool_calls") or [] if isinstance(c, dict)}
+    actual: dict[str, int] = {}
+    for name, _command, _payload in calls:
+        actual[name] = actual.get(name, 0) + 1
+    if expected != actual:
+        problems.append("host_tool_calls_changed")
+    if _review_profile_problems(meta):
+        problems.extend(_review_profile_problems(meta))
+    return problems
 
 
 def _write_json(path: str, payload: dict) -> None:
@@ -731,7 +885,7 @@ def main(argv: list[str] | None = None) -> int:
         description="从 ZCode 实际运行记录生成 Native Bridge 正式信封")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    p = sub.add_parser("execution", help="生成 copilot-native-result/v1 执行信封")
+    p = sub.add_parser("execution", help="生成 copilot-native-result/v2 执行信封")
     p.add_argument("--state", required=True)
     p.add_argument("--dispatch", required=True,
                    help="drive 输出的 native_dispatch 信封（JSON）")
@@ -749,11 +903,11 @@ def main(argv: list[str] | None = None) -> int:
                    help="仅离线测试/非默认 rollout 路径使用；仍校验 sessionId")
     p.add_argument("--output", default="")
 
-    p = sub.add_parser("review", help="生成 copilot-native-review/v1 复核信封")
+    p = sub.add_parser("review", help="生成 copilot-native-review/v2 复核信封")
     p.add_argument("--state", required=True)
     p.add_argument("--dispatch", required=True)
     p.add_argument("--execution", required=True,
-                   help="已入账的 copilot-native-result/v1 执行信封")
+                   help="已入账的 copilot-native-result/v2 执行信封")
     p.add_argument("--work-item", required=True)
     p.add_argument("--metadata", required=True,
                    help="Reviewer 原生 Agent 的 metadata.json（或 agent 目录）")
@@ -769,7 +923,7 @@ def main(argv: list[str] | None = None) -> int:
         else:
             payload = build_review(args)
         return _emit(payload, args.output)
-    except (AgentRecordError, D.DispatchError, OSError) as exc:
+    except (AgentRecordError, G.GovernanceError, OSError) as exc:
         print(f"native-agent: {exc}", file=sys.stderr)
         return EXIT_USAGE
 

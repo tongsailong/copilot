@@ -12,7 +12,7 @@
 
 图片证据（--image，或 --file 命中受支持图片魔数时自动识别）：
   证据包里只落**元数据 + 机器可读引用**（类型 / 大小 / 尺寸 / sha256 / 来源路径 / 版本说明），
-  不含 base64、不含十六进制摘要；真实像素由 call_gpt.py 读取同一份文件后作为 `input_image` 内联。
+  不含 base64、不含十六进制摘要；真实像素由上层调用方读取同一份文件后作为 `input_image` 内联。
   格式按魔数判定（不信任扩展名），支持 png/jpeg/webp/gif（CPA 实测）；其他格式明确失败。
 
 退出码：0 成功 / 2 用法或采集错误
@@ -44,7 +44,7 @@ from lib_common import (  # noqa: E402
 EXIT_OK, EXIT_USAGE = 0, 2
 BINARY_SNIFF = 8192
 IMAGE_HEAD = 64
-IMAGE_MARKER = "copilot-image"  # call_gpt.py 依此注释行识别图片证据引用
+IMAGE_MARKER = "copilot-image"  # 上层调用方依此注释行识别图片证据引用
 RANGE_RE = re.compile(r"^(\d+)(?:/(\d+)?)?$")
 # 证据包格式版本：v2 起包裹围栏长度按正文自适应（见 _fence_for），正文不会再被
 # 自己的围栏提前闭合。旧采集器固定用三反引号，包本身存在结构歧义（正文里的
@@ -106,7 +106,7 @@ def _fence_for(text: str) -> str:
     正文里的一行围栏就会提前结束包裹，后面的内容按「围栏外」解析——其中的 `### E<n> —`
     会被当成新证据条目，图片注释还会触发本地读图。
 
-    识别口径必须与解析端完全一致（`review_ledger.iter_fence_flags`：先 strip 再匹配，
+    识别口径必须与解析端完全一致（先 strip 再匹配，
     反引号与 `~` 都算，长度不限），否则生成端以为「正文没有围栏」而选了 3 个反引号，
     解析端却按缩进围栏错位——那正是这条修复最初引入的逃逸路径。
     """
@@ -277,7 +277,7 @@ def grep_file(text: str, pattern: str, context: int, path: str, total_lines: int
 def collect_image(args, spec: str, default_note: str = "") -> Item:
     """图片证据：按魔数校验格式，只落元数据 + 机器可读引用（不含像素数据）。
 
-    像素不在证据包里（也不在 stdout / manifest / 审计里）——由 call_gpt.py 在调用时
+    像素不在证据包里（也不在 stdout / manifest / 审计里）——由上层调用方在需要时
     读取同一份文件，校验 sha256 后作为 `input_image` 内联。这样证据包可安全落盘与审计，
     而 GPT 拿到的是真实像素，不是路径、描述或 base64 文本。
     """
@@ -318,7 +318,7 @@ def collect_image(args, spec: str, default_note: str = "") -> Item:
         die(f"图片无法纳入证据：{path} — {err}")
 
     it = Item("image", path,
-              "真实图片：像素由 call_gpt.py 作为 input_image 内联（非路径、非文字描述、非 base64 文本）")
+              "真实图片：像素由上层调用方作为 input_image 内联（非路径、非文字描述、非 base64 文本）")
     it.bytes = size
     it.digest = digest
     it.image = {
@@ -749,7 +749,7 @@ def main() -> int:
                     help="文件；可加 ::A/B 取行区间，或 ::/正则/ 只取命中行及上下文；"
                          "命中 png/jpeg/webp/gif 魔数时自动按图片证据处理")
     ap.add_argument("--image", action="append", default=[], metavar="PATH[::版本或上下文说明]",
-                    help="图片证据（真实像素，由 call_gpt.py 作为 input_image 内联）；"
+                    help="图片证据（真实像素，由上层调用方作为 input_image 内联）；"
                          "格式按魔数校验，支持 png/jpeg/webp/gif")
     ap.add_argument("--cmd", action="append", default=[], metavar="[LABEL::]SHELL",
                     help="真实执行命令并采集原始输出（含退出码）")

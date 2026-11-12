@@ -1,5 +1,9 @@
-# SOL 指令补充：REVIEW
+# SOL 指令补充：REVIEW（历史文档，已退役）
 
+> **历史文档（v5 SOL 时代，已退役）**：v6.0.0 起 `call_gpt.py` 与 SOL REVIEW 裁决不再存在。
+> 当前正式 REVIEW 仅在用户明确授权时进行，并作为治理记录而非门禁；G4 由原生只读复核承担
+> （见 `references/review.md`）。原文保留仅为追溯。
+>
 > 本文件由 `call_gpt.py` 在 `--mode REVIEW` 时追加在 `references/role.md` 之后，
 > 只提供该模式的裁决契约、重判范围与输出要求；核心职责、安全、证据和授权规则仍以
 > `role.md` 为准。

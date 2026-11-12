@@ -93,6 +93,8 @@ try:
 except ImportError:  # 非 POSIX 平台：退化为不加锁，其余写入路径不变
     fcntl = None
 
+sys.path.insert(0, os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts"))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from lib_common import (  # noqa: E402
     AUDIT_TEST_MODE_ENV,
@@ -101,11 +103,11 @@ from lib_common import (  # noqa: E402
     human_bytes,
     now_iso,
     redact,
-    resolve_api_key,
     sha256_file,
     sha256_text,
     sniff_image_mime,
 )
+from lib_common_legacy import resolve_api_key  # noqa: E402  v5 凭据链（已退役）
 import copilot_dispatch  # noqa: E402
 from review_ledger import (  # noqa: E402
     PACK_FORMAT_VERSION,

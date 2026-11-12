@@ -9,8 +9,10 @@ import sys
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-SCRIPTS = os.path.join(os.path.dirname(HERE), "scripts")
+LEGACY = os.path.dirname(HERE)
+SCRIPTS = os.path.join(os.path.dirname(LEGACY), "scripts")
 sys.path.insert(0, SCRIPTS)
+sys.path.insert(0, LEGACY)
 
 import copilot_dispatch  # noqa: E402
 import reply_protocol  # noqa: E402

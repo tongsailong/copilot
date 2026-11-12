@@ -6,42 +6,43 @@
 
 ## 1. 项目定位
 
-Copilot 是运行于 ZCode 内的**协作治理 Skill**（任务承接与协作治理层）：按需经 SOL 获取高级工程
-决策；用户侧 ChatGPT 负责需求与产品层目标、交接与验收；ZCode 原生 Agent 是工程执行主体，负责
-工程调查、规划、执行与调度。原生子代理承担执行与独立复核，Copilot 状态层负责合同、轮次、证据与
-门禁（G1–G4）。
+Copilot 是运行于 ZCode 内的**轻量协作治理 Skill**：负责任务承接、合同与完成条件、状态机、
+证据桥接、审计、PARTIAL 持续推进与 G1–G4 收口。ZCode 原生 Agent 是唯一的工程执行与技术
+决策主体；用户侧 ChatGPT 负责需求与产品层目标、交接与验收；原生 Reviewer 承担独立复核与
+高风险 G4。
 
+- **v6.0.0 起 SOL 决策通道退役**：活动路径不得调用任何远程模型，不得把其他远程大模型设为
+  强制决策节点，也不得设置等待远程返回的状态门禁。历史实现归档在 `legacy/`，历史审计、
+  裁决、台账与证据只读保留。
 - 本仓库是**唯一源码**。`~/.zcode/skills/copilot` 与 `~/.zcode/agents/reviewer.md`
   是构建产物，只能由 `scripts-sync/sync_runtime.py` 单向下发，不得直接编辑。
 - 运行时临时修复必须先回迁本仓库，再同步下发；不使用符号链接替代副本。
-- 源码与运行时的分工见 `docs/DECISIONS.md`（第 1–8 条）。
+- 源码与运行时的分工见 `docs/DECISIONS.md`。
 
 ## 2. 角色职责
 
-顶层协作角色按 `docs/PROJECT-CHARTER.md` 的六角色定义：用户、ChatGPT（用户侧）、Copilot、SOL、
-ZCode 原生 Agent、DesignWise。下表只列本仓库直接约束的执行侧与通道侧分工；Executor / Reviewer 是
-ZCode 工程执行体系内的子角色，不是与六角色并列的顶层角色。
+顶层协作角色按 `docs/PROJECT-CHARTER.md`：用户、ChatGPT（用户侧）、Copilot、ZCode 原生
+Agent、原生 Reviewer、DesignWise。Executor / Reviewer 是 ZCode 工程执行体系内的子角色，
+不是与顶层角色并列的职责。
 
 | 角色 | 职责 | 关键限制 |
 |---|---|---|
-| SOL（GPT-6.1-SOL High） | 高级工程判断、技术方案取舍、风险分析；依据提交证据给出工程工作安排及工程结果判断 | 零工具；只经 `scripts/call_gpt.py` 走 CPA；不读文件、不跑命令、不取证；意见不是授权、执行结果或独立复核 |
-| ZCode 主代理 | 现场调查、工程规划、实现、调试、测试、交付；派发子代理；执行自检与必要的独立复核 | 不擅自改变产品目标、业务规则或授权范围 |
+| ZCode 主代理 | 现场调查、工程规划、技术选型、实现、调试、测试、交付；派发子代理；组织必要的独立复核 | 不擅自改变产品目标、业务规则或授权范围 |
 | Executor 子代理 | 按工作项执行具体实现与取证，回报事实 | 有工具但无最终判断权；不得替代 Reviewer |
 | Reviewer 子代理 | 在独立上下文基于真实文件、diff、测试日志与原始证据给出复核结论 | 只读工具集（`Read,Grep,Glob,Bash`，禁止 `Write,Edit`）；这是提示词与工具配置层面的要求，不是操作系统沙箱；不得修改代码或代替执行方 |
-| Copilot 状态层 | 合同、轮次、证据登记、四门、收口、审计 | 是脚本与状态，不是模型；门禁不得绕过 |
+| Copilot 状态层 | 合同、条件、状态、证据登记、四门、PARTIAL 派生、收口、审计 | 是本地脚本与状态，不是模型；不调用模型、不实施工程、不替代技术决策、门禁不得绕过 |
+| 正式 REVIEW | 用户明确要求时的治理记录 | 不是普通开发前置门禁；不能替代 G4；无授权不得伪造 |
+| G4 复核 | 高风险任务收口所需的技术复核 | 原生独立只读复核 + 宿主记录重核 + 目标摘要绑定；fail-closed |
 
 **模型独立 ≠ Agent 独立。** 共享同一 Provider/模型不等于共享上下文、会话或判断。
 Reviewer 与 Executor 必须是不同的 Agent ID / Child Session / 上下文；Reviewer 的
-独立性由独立上下文、只读工具、独立取证与独立报告保证，不由模型名保证。不得因为
-Reviewer 跟随主代理模型就认为它与主代理或执行方“同一个 Agent”。
+独立性由独立上下文、只读工具、独立取证与独立报告保证，不由模型名保证。
 
 ## 3. 模型路由规则
 
-- **SOL 固定**：`gpt-6.1-sol` + `reasoning.effort=high`，经 CPA 零工具通道调用；
-  请求体不得包含 `tools`，不得自动降档。标准 SOL／自动协作通道不得用 `--model` 覆盖模型与路由；
-  不带 `--dispatch-state` 的手动一次性调用仍可用 `--model`（见 `SKILL.md` 模型段落），
-  按手动模式留痕（`model_source=override`），不属于自动协作通道，也不改变本条默认路由。
-  SOL 的模型与路由未经用户明确授权不得修改。
+- **活动路径无远程决策模型**：`governance.py`、`copilot_dispatch.py`、`copilot_auto.py`、
+  `native_bridge.py`、`native_agent.py` 不得导入网络客户端或已退役的 SOL 模块
+  （`call_gpt` / `review_ledger` / `reply_protocol`）。
 - **Executor / Reviewer 继承主代理**：Profile 中省略 `model` 或写 `model: inherit`，
   Provider/模型/推理级别跟随主代理当前会话。不得写死官方 DeepSeek 直连模型或任何
   固定 Provider；`thoughtLevel` 只在钉死具体模型时生效，`inherit` 下忽略。
@@ -51,15 +52,22 @@ Reviewer 跟随主代理模型就认为它与主代理或执行方“同一个 A
   rollout 的 `model.providerId` / `x-cpa-trace-id` 与 CPA `usage_events` 三方互证为准；
   Agent 自报模型名不算证据。
 - **主代理换模型后必须复查**：确认 Executor/Reviewer 仍为 `inherit` 且实际路由一致。
-  Agent Profile 在进程/会话启动时缓存，配置修改后须新会话或新进程验证，不能据当前
-  会话的旧行为判定配置无效。
+  Agent Profile 在进程/会话启动时缓存，配置修改后须新会话或新进程验证。
+- 不修改 Provider、模型路由与 CPA 配置；相关变更须用户单独授权。
 
 ## 4. 工程执行规则
 
 1. 修改前核实项目身份、分支、`git status`、相关入口与既有改动；保留他人及任务外改动。
 2. 只改与本任务相关的文件；不顺手重构、格式化或修复无关内容。
-3. 运行测试：`python3 -B -m unittest discover -s tests -p 'test_*.py'`。新增行为应有
-   对应测试；不得为通过而放宽断言或删除测试。
+3. 运行测试：
+
+   ```bash
+   python3 -B -m unittest discover -s tests -p 'test_*.py'
+   python3 -B -m unittest discover -s legacy/tests -p 'test_*.py'   # 历史回归
+   ```
+
+   新增行为应有对应测试；不得为通过而放宽断言或删除测试。`legacy/tests` 只验证 v5
+   历史行为，历史文档契约类允许 skip，但实现回归失败必须查明。
 4. 检查实际 diff，清除调试残留、秘密和任务外内容。
 5. 源码改动后必须同步并复查：
 
@@ -69,18 +77,25 @@ Reviewer 跟随主代理模型就认为它与主代理或执行方“同一个 A
    ```
 
    同步同时覆盖 Skill 与 Reviewer；`--prune` 仅在明确要求清理运行时多余文件时使用。
-6. 真实 GPT/SOL 调用、push、发布、部署均需单独授权；本地 commit 仅在任务明确授权时执行。
+6. 真实模型调用、push、发布、部署均需单独授权；本地 commit 仅在任务明确授权时执行。
 
 ## 5. Copilot 闭环规则
 
+- 状态机收敛为 `RUNNING` / `PARTIAL` / `PASS` / `BLOCKED` / `CLOSED`；不得恢复
+  `pending_call`、`quota`、`round_seq`、`budget`、`pass_pending` 等远程判定字段。
+- **PARTIAL 不是终点**：必须本地派生工作项（`AUTO-C<n>` / `AUTO-R-<id>` / `AUTO-G4` /
+  `AUTO-REPLAN` / `AUTO-NEXT`）并继续推进，直到 PASS 或真实 BLOCKED。禁止因轮次、Token、
+  内部费用、等待模型、重复评审、子 Agent PARTIAL、首次方案失败或普通测试失败停止。
 - `execution_backend` 默认 `legacy`，native 为显式 opt-in；既有协议决定不得擅改。
 - G1–G4 保持 fail-closed：证据不足、绑定不符、门禁未过时必须失败关闭，不得用
-  “看起来合理”替代验证；普通 Reviewer PASS **不等于** G4，`g4_eligible=false`。
-- 执行/复核必须绑定 task / round / dispatch / work_item /
+  “看起来合理”替代验证；普通 Reviewer PASS **不等于** G4，`g4_eligible` 由宿主记录计算。
+- 执行/复核必须绑定 task / contract / plan / dispatch / work_item /
   `execution_result_sha256`；证据须先登记且属于本任务，文件型证据会重读校验摘要。
 - Reviewer 只读、独立取证、独立报告；不得继承执行方判断，不得因执行方自述而放弃核查。
-- 不跳过 REVIEW_PENDING、REJUDGE、CLOSURE_CHECK 等流程；未过门不得标记 CLOSED 或
-  PASS。真实调用只在授权与配额内进行，测试默认使用 Fake Upstream。
+- 正式 REVIEW 仅在用户明确授权时登记；授权在同一任务合同内持续有效，不得成为普通开发
+  门禁，也不得用自检冒充。G4 不依赖正式 REVIEW。
+- 不跳过四门、收口与证据校验；未过门不得标记 CLOSED 或 PASS。测试默认使用本地夹具，
+  不发起真实外部调用。
 - 不重做状态机、四门、自动驱动或证据协议；需要变更时先说明影响并取得授权。
 
 ## 6. 修改与交付纪律
@@ -105,4 +120,7 @@ Reviewer 跟随主代理模型就认为它与主代理或执行方“同一个 A
 - 已确认 / 建议 / 待决：`docs/DECISIONS.md`
 - 当前证据与未验证项：`docs/STATUS.md`
 - Skill 入口与运行契约：`SKILL.md`
-- 协议细节：`references/agent-bridge.md`、`references/role.md`
+- 操作命令：`references/workflow.md`
+- 阶段机与持续推进：`references/runtime.md`
+- 复核与 G4：`references/review.md`
+- 原生信封：`references/agent-bridge.md`

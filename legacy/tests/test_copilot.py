@@ -26,12 +26,15 @@ import urllib.error
 import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-SCRIPTS = os.path.join(os.path.dirname(HERE), "scripts")
+LEGACY = os.path.dirname(HERE)
+SCRIPTS = os.path.join(os.path.dirname(LEGACY), "scripts")
 sys.path.insert(0, SCRIPTS)
+sys.path.insert(0, LEGACY)
 
 import bridge_evidence  # noqa: E402
 import call_gpt  # noqa: E402
 import lib_common  # noqa: E402
+import lib_common_legacy  # noqa: E402  v5 凭据链已移入 legacy/
 import copilot_dispatch  # noqa: E402
 import review_ledger  # noqa: E402
 from lib_common import (  # noqa: E402
@@ -54,7 +57,7 @@ CHATGPT_V40 = os.path.join(REFERENCES, "chatgpt-custom-instructions-v4.0.md")
 CHATGPT_V34 = os.path.join(REFERENCES, "chatgpt-custom-instructions-v3.4.md")
 # ZCode 宿主的 provider 配置（Astra 不得被宿主声明为可派发模型的能力级检查用）。
 ZCODE_PROVIDER_CONFIG = os.path.expanduser("~/.zcode/v2/provider_config.json")
-SKILL_MD = os.path.join(os.path.dirname(HERE), "SKILL.md")
+SKILL_MD = os.path.join(os.path.dirname(LEGACY), "SKILL.md")
 
 
 def write_pack(directory: str, name: str, entries: list[tuple[str, str]],
@@ -297,7 +300,7 @@ class ZCodeAdaptationTests(unittest.TestCase):
         # 导入的必须是本 checkout 的 call_gpt（源码仓库或已安装副本），
         # 不能是 sys.path 上另一个同名模块。
         self.assertTrue(os.path.samefile(
-            call_gpt.__file__, os.path.join(SCRIPTS, "call_gpt.py")),
+            call_gpt.__file__, os.path.join(LEGACY, "call_gpt.py")),
             call_gpt.__file__)
 
     def test_resolve_api_key_falls_back_to_zcode_provider_config(self):
@@ -314,26 +317,32 @@ class ZCodeAdaptationTests(unittest.TestCase):
                     fh)
             empty_env = os.path.join(tmp, "empty.env")
             open(empty_env, "w").close()
-            old_env_file, old_provider = lib_common.ENV_FILE, lib_common.ZCODE_PROVIDER_FILE
+            old_env_file = lib_common_legacy.ENV_FILE
+            old_provider = lib_common_legacy.ZCODE_PROVIDER_FILE
             old_value = os.environ.get("CUSTOM_127_API_KEY")
             try:
                 os.environ.pop("CUSTOM_127_API_KEY", None)
-                lib_common.ENV_FILE = empty_env
-                lib_common.ZCODE_PROVIDER_FILE = fixture
-                self.assertEqual(lib_common.resolve_api_key("CUSTOM_127_API_KEY"),
-                                 "test-key-zcode-fallback")
+                lib_common_legacy.ENV_FILE = empty_env
+                lib_common_legacy.ZCODE_PROVIDER_FILE = fixture
+                self.assertEqual(
+                    lib_common_legacy.resolve_api_key("CUSTOM_127_API_KEY"),
+                    "test-key-zcode-fallback")
                 # 不匹配 CPA 的规则不提供钥匙
                 with open(fixture, "w", encoding="utf-8") as fh:
                     json.dump({"config": {"providerConfigRules": {"providerRules": [
                         {"providerName": "other", "config": {
                             "api": {"baseUrl": "https://api.example.com/v1"},
                             "access": {"apiKey": "test-key-other"}}}]}}}, fh)
-                self.assertIsNone(lib_common.resolve_api_key("CUSTOM_127_API_KEY"))
+                self.assertIsNone(
+                    lib_common_legacy.resolve_api_key("CUSTOM_127_API_KEY"))
                 # 损坏/缺失文件安全返回 None
-                lib_common.ZCODE_PROVIDER_FILE = os.path.join(tmp, "missing.json")
-                self.assertIsNone(lib_common.resolve_api_key("CUSTOM_127_API_KEY"))
+                lib_common_legacy.ZCODE_PROVIDER_FILE = os.path.join(
+                    tmp, "missing.json")
+                self.assertIsNone(
+                    lib_common_legacy.resolve_api_key("CUSTOM_127_API_KEY"))
             finally:
-                lib_common.ENV_FILE, lib_common.ZCODE_PROVIDER_FILE = old_env_file, old_provider
+                lib_common_legacy.ENV_FILE = old_env_file
+                lib_common_legacy.ZCODE_PROVIDER_FILE = old_provider
                 if old_value is not None:
                     os.environ["CUSTOM_127_API_KEY"] = old_value
 
@@ -359,6 +368,8 @@ class ZCodeAdaptationTests(unittest.TestCase):
         self.assertIsNotNone(dm)
         self.assertLessEqual(len(dm.group(1)), 1024, "description 超出 1024 字符上限")
 
+    @unittest.skip("历史文档契约（v5 及以前）：v6.0.0 已重写 SKILL.md 并退役 call_gpt.py，"
+                   "本断言仅作历史追溯。")
     def test_skill_md_points_to_zcode_paths(self):
         with open(SKILL_MD, "r", encoding="utf-8") as fh:
             text = fh.read()
@@ -367,6 +378,8 @@ class ZCodeAdaptationTests(unittest.TestCase):
         self.assertNotIn("--audit-log ~/.reasonix", text)
         self.assertIn("~/.zcode/skills/copilot/scripts/call_gpt.py", text)
 
+    @unittest.skip("历史文档契约（v5 及以前）：v6.0.0 的复核引用改为 references/review.md "
+                   "与 agents/reviewer.md，标题断言仅作历史追溯。")
     def test_skill_md_uses_stable_independent_review_reference(self):
         """AGENTS.md 的章节编号会随重组变化，引用应使用稳定标题。"""
         with open(SKILL_MD, "r", encoding="utf-8") as fh:
@@ -3672,6 +3685,7 @@ class ReviewAccountingTests(unittest.TestCase):
         self.assertEqual(len(self.rounds()), 1)
 
 
+@unittest.skip("历史文档契约（v5 及以前）：v6.0.0 已重写 SKILL.md 与 references，本类断言仅作历史追溯，不代表当前文档要求。")
 class RoleCompositionTests(unittest.TestCase):
     """SOL 指令按模式确定性组装：共享核心 + 本模式补充，不丢规则、不跨模式夹带。"""
 
@@ -3755,6 +3769,7 @@ class RoleCompositionTests(unittest.TestCase):
             self.assertEqual(files, [custom])
 
 
+@unittest.skip("历史文档契约（v5 及以前）：v6.0.0 已重写 SKILL.md 与 references，本类断言仅作历史追溯，不代表当前文档要求。")
 class DocumentRoutingTests(unittest.TestCase):
     """Skill 文档与代码路由必须一致，防止只改文档或只改代码。"""
 
@@ -3801,6 +3816,7 @@ class DocumentRoutingTests(unittest.TestCase):
         self.assertIn("os.fsync(fd)", source)
 
 
+@unittest.skip("历史文档契约（v5 及以前）：v6.0.0 已重写 SKILL.md 与 references，本类断言仅作历史追溯，不代表当前文档要求。")
 class SingleEntryPointTests(unittest.TestCase):
     """唯一入口与「GPT 不做调查 / 不做复核子代理」的契约必须可断言。"""
 
@@ -4238,6 +4254,7 @@ class SingleEntryPointTests(unittest.TestCase):
         self.assertIn("tools", skill)
 
 
+@unittest.skip("历史文档契约（v5 及以前）：v6.0.0 已重写 SKILL.md 与 references，本类断言仅作历史追溯，不代表当前文档要求。")
 class HostLanguageTests(unittest.TestCase):
     """现行 Skill / role / dispatch 文案不得把 Reasonix 当作当前宿主或主代理。
 
@@ -4248,7 +4265,7 @@ class HostLanguageTests(unittest.TestCase):
     FILES = (
         ("SKILL.md", os.path.join(os.path.dirname(HERE), "SKILL.md")),
         ("role.md", os.path.join(os.path.dirname(HERE), "references", "role.md")),
-        ("copilot_dispatch.py", os.path.join(SCRIPTS, "copilot_dispatch.py")),
+        ("copilot_dispatch.py", os.path.join(LEGACY, "copilot_dispatch.py")),
     )
     ALLOWED_MARKERS = ("历史", "兼容", "归档", "迁移", "退役", "旧路径", "未迁移", "遗留")
 
@@ -4274,7 +4291,7 @@ class HostLanguageTests(unittest.TestCase):
             role = fh.read()
         self.assertNotIn("Reasonix 主代理", role)
         self.assertNotIn("task / fleet", role)
-        with open(os.path.join(SCRIPTS, "copilot_dispatch.py"), encoding="utf-8") as fh:
+        with open(os.path.join(LEGACY, "copilot_dispatch.py"), encoding="utf-8") as fh:
             dispatch = fh.read()
         self.assertNotIn("Reasonix 主代理", dispatch)
         self.assertIn("宿主主代理维护", dispatch)
@@ -4286,6 +4303,7 @@ class HostLanguageTests(unittest.TestCase):
         self.assertIn("宿主主代理已执行", skill)
 
 
+@unittest.skip("历史文档契约（v5 及以前）：v6.0.0 已重写 SKILL.md 与 references，本类断言仅作历史追溯，不代表当前文档要求。")
 class WorkflowTierTests(unittest.TestCase):
     """评审档位、缺陷分级与独立复核预算必须可判定。
 
@@ -4359,7 +4377,7 @@ class WorkflowTierTests(unittest.TestCase):
         self.assertIn("档位不是新模式", self.docs)
         self.assertEqual(set(call_gpt.MODE_ROUTES), {"CONSULT", "PLAN", "REVIEW"})
         # 档位不应带来新的 CLI 参数
-        with open(os.path.join(SCRIPTS, "call_gpt.py"), encoding="utf-8") as fh:
+        with open(os.path.join(LEGACY, "call_gpt.py"), encoding="utf-8") as fh:
             source = fh.read()
         self.assertNotIn('"--tier"', source)
         self.assertNotIn('"--review-tier"', source)
@@ -5222,6 +5240,7 @@ class SelfReviewRegressionTests(unittest.TestCase):
             holder = (
                 "import sys, time\n"
                 f"sys.path.insert(0, {SCRIPTS!r})\n"
+                f"sys.path.insert(0, {LEGACY!r})\n"
                 "import review_ledger as RL\n"
                 f"RL.acquire_ledger_lock({ledger!r})\n"
                 "print('held', flush=True)\n"

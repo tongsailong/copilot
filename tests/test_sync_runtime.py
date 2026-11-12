@@ -281,5 +281,21 @@ class CliTests(unittest.TestCase):
         self.assertIn("不像 Copilot skill", err)
 
 
+class RealDistributionTests(unittest.TestCase):
+    """真实仓库的分发范围：v6 模块进入运行时，历史/测试目录不进入。"""
+
+    def test_v6_modules_are_distributed_and_legacy_is_not(self):
+        manifest = S.source_manifest(ROOT)
+        for rel in ("SKILL.md", "scripts/governance.py",
+                    "scripts/copilot_dispatch.py", "scripts/copilot_auto.py",
+                    "scripts/native_bridge.py", "scripts/native_agent.py"):
+            self.assertIn(rel, manifest)
+        self.assertFalse([k for k in manifest if k.startswith("legacy/")])
+        self.assertFalse([k for k in manifest if k.startswith("tests/")])
+        for retired in ("scripts/call_gpt.py", "scripts/review_ledger.py",
+                        "scripts/reply_protocol.py"):
+            self.assertNotIn(retired, manifest)
+
+
 if __name__ == "__main__":
     unittest.main()

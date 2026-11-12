@@ -1,5 +1,9 @@
-# SOL 指令补充：CONSULT
+# SOL 指令补充：CONSULT（历史文档，已退役）
 
+> **历史文档（v5 SOL 时代，已退役）**：v6.0.0 起 `call_gpt.py` 不再存在，本文件不再被注入。
+> 当前 CONSULT 是 ZCode 的本地分析模式，不调用模型、不阻塞任务（见 `SKILL.md`「模式」）。
+> 原文保留仅为追溯。
+>
 > 本文件由 `call_gpt.py` 在 `--mode CONSULT` 时追加在 `references/role.md` 之后，
 > 只提供该模式的专业判断与输出要求；核心职责、安全、证据和授权规则仍以 `role.md` 为准。
 

@@ -1,365 +1,202 @@
-# Agent Bridge：SOL 安排 → ZCode 原生执行/复核 → Copilot 回填
+# agent-bridge：原生执行与复核信封（v2）
 
-本文件是阶段 0–3.6 的 Agent Bridge 协议说明。它只覆盖**协议、校验、状态字段和人工排程入口**，
-不包含阶段 4 的 Reviewer 自动派发或 SOL 自动闭环。
+本文件说明 v6 的 Native Bridge：**ZCode 原生 Agent 执行 / Reviewer 复核 → Copilot 校验回填**。
+v1 信封（SOL 通道时代）已退役，出现即 `schema_retired`。
 
-## 1. 边界与角色
+## 1. 角色与边界
 
-- **SOL（`gpt-6.1-sol`, reasoning high）**：唯一工程决策大脑。工作项必须来自已验证的 SOL
-  回复；`task_id` / `round_id` / `contract_sha256` / `plan_call_id` / `plan_reply_sha256`
-  都从该轮凭证取得。
-- **ZCode 主代理**：读取 dispatch，使用宿主原生工具或原生 `Agent` 派发实际执行；回填执行结果；
-  需要时再派发独立 Reviewer。主代理不得改写 SOL 的目标、约束、预期证据、执行方或依赖。
-- **执行方**：正式 native 执行必须使用原生子代理（`kind=subagent`，通常复用
-  `general-purpose`），以便绑定 `agent_id` / `child_session_id` / 实际模型。主代理仍可
-  读 dispatch、派发子代理和回填结果，但不能用自己的身份冒充正式执行方。不得使用
-  `reviewer` Profile 执行工作项。
-- **原生 Reviewer**：独立子会话，Profile 固定为 `reviewer`，只读工具
-  `Read` / `Grep` / `Glob` + 受限只读 `Bash`；不写文件、不提交、不发布。
-- **Copilot 状态层**：保存任务合同、轮次、工作项、证据、报告、四门与 PASS/CLOSED 锁。
-  Bridge 只回填状态；它不调度模型、不发起真实调用、不改变 G1–G4。
+| 角色 | 职责 | 约束 |
+|---|---|---|
+| Executor | 执行单个工作项，产出结果与原始证据 | 可以是主代理（`kind=main`）或原生子代理（`kind=subagent`）；不得使用 `reviewer` Profile |
+| Reviewer | 独立只读复核，给出 verdict/findings | 必须是 `kind=subagent`、`profile_id=reviewer`、工具仅 `Read/Grep/Glob/Bash`；不得修改文件、不得与执行方共用 Agent/Child Session |
 
-**可信边界**：Bridge 的 SHA-256 是本地完整性和绑定校验，不是密码学签名，也不是宿主可信身份
-证明。`model_reported`、`Agent ID`、`Child Session ID` 不能作为模型身份的独立凭证；即使
-Agent 自报模型名，也不能证明上游实际模型。任何普通原生 Reviewer 的 PASS 都不等于 G4。
+Copilot 不派发 Agent、不调用模型、不写别人的会话。它只校验宿主已产生的记录并回填状态。
+`native_agent.py` 从真实 `metadata.json`、rollout 与证据文件生成信封，避免主代理手抄身份。
 
-## 2. 启用方式
+## 2. 信封 v2
 
-原生后端是**显式 opt-in**；旧任务和旧状态默认仍是 `legacy`：
+### 2.1 dispatch（`copilot-native-dispatch/v2`）
 
-```bash
-python3 ~/.zcode/skills/copilot/scripts/copilot_dispatch.py start \
-  --state /tmp/copilot/dispatch.json --goal-file /tmp/copilot/goal.md \
-  --contract-file /tmp/copilot/contract.md --task-id <task> --mode PLAN \
-  --execution-backend native
-```
-
-- `start` 默认 `--execution-backend legacy`，不需要原生流程时行为不变。
-- 旧状态缺少 `execution_backend` 时升级为 `legacy`；缺少的
-  `native_dispatch` / `review_channel` / `review_round` / `review_consumed` /
-  `native_results` / `native_reviews` 按空值补齐。重复加载/保存是幂等的。
-- native 状态拒绝 `ingest --result-file`；legacy 状态拒绝 `ingest --native-result`
-  （`drive --native-result` 已停用，只保留迁移提示）。两个渠道不能混用，避免把人工
-  manifest 和原生报告当成同一份执行结果。
-- 预算默认不设限：`budget.max_requests` / `budget.max_total_tokens` 默认为 `null`，
-  `budget.projection` 默认关闭；用量只从审计重建并写入 `budget.usage` 供观察。
-  只有调用方显式 `--max-requests / --max-total-tokens / --budget-projection` 时才生效，
-  并在 `budget_limits.explicit=true` 中标记为显式运营上限。
-
-## 3. 状态字段
-
-| 字段 | 含义 |
-|---|---|
-| `execution_backend` | `legacy`（默认）或 `native` |
-| `native_dispatch` | 当前已验证轮次的 dispatch 状态，含 `items`、批次 `dispatch_id` 和计划绑定 |
-| `native_results` | 已入账执行结果索引（含 `result_sha256`、证据 id、执行方元数据、报告摘要） |
-| `native_reviews` | 已入账复核索引（绑定 `execution_result_sha256`，含 verdict/findings/元数据、原始报告证据 id 与 SHA-256） |
-| `review_channel` | `null` / `native` / `gpt_review`；同一轮不得让两个渠道同时拥有复核权威 |
-| `review_round` | 原生复核所属轮次 |
-| `review_consumed` | 已被原生复核消费的执行结果 SHA 列表；每个执行结果只允许一份原生复核 |
-| `budget.max_requests` / `budget.max_total_tokens` / `budget.projection` | 可选显式运营上限（默认空＝不限）与保守预估开关；用量只记录，不作为停止门 |
-| `budget.usage` | 从审计重建的用量快照（输入/输出/总量/请求数/未知 usage 调用数）；权威来源仍是审计 |
-
-执行报告和复核报告分别写入 `reports`，通过 `kind=execution` / `kind=review` 区分；
-复核报告还带 `review_of`、`review_of_kind`、`review_source`、`evidence_id`、
-`raw_report_sha256`、`verdict`、`g4_eligible=false`。执行方自评不会被合并进复核报告。
-
-原始复核报告单独登记为 `evidence`（`origin=review-report`），保存文件、SHA-256、任务归属、
-轮次与复核对象绑定；`review_source=native` 只来自通过 native 信封校验的 Reviewer，
-`legacy` 报告永不写入 `native_reviews`。自动证据包会纳入最近复核轮次及完成条件显式引用的
-复核原文；原文缺失、摘要不符、被截断或因预算未纳入时失败关闭，不退化为摘要。
-
-## 4. 信封
-
-所有信封是 JSON 对象；`result_sha256` 是对**排除自身**的规范化 JSON（键排序、紧凑分隔符）做
-SHA-256。校验时重新计算，任何字段变化都会导致 `result_sha_mismatch`。
-
-### 4.1 Dispatch：`copilot-native-dispatch/v1`
+由 `copilot_auto.py drive` 自动生成（`--backend native` 且工作项属于已登记计划）：
 
 ```json
 {
-  "schema": "copilot-native-dispatch/v1",
-  "dispatch_id": "b-...",
-  "task_id": "task-1",
-  "round_id": "task-1-r1",
+  "schema": "copilot-native-dispatch/v2",
+  "dispatch_id": "b-<24 hex>",
+  "task_id": "task-...",
   "contract_sha256": "<64 hex>",
-  "plan_call_id": "call-...",
-  "plan_reply_sha256": "<64 hex>",
-  "created_at": "2026-11-02T10:00:00+08:00",
-  "actions": [
-    {
-      "work_item_id": "T1",
-      "dispatch_id": "d-...",
-      "idempotency_key": "ik-...",
-      "title": "SOL 原始标题",
-      "assignee": "zcode",
-      "goal": "SOL 原始目标",
-      "constraints": "SOL 原始约束",
-      "expected_evidence": "SOL 原始预期证据",
-      "depends_on": []
-    }
-  ]
+  "plan_id": "p-<16 hex>",
+  "plan_sha256": "<64 hex>",
+  "iteration_id": "I3",
+  "created_at": "ISO8601",
+  "actions": [{
+    "work_item_id": "A1",
+    "dispatch_id": "d-<24 hex>",
+    "idempotency_key": "ik-<24 hex>",
+    "title": "...", "assignee": "zcode", "goal": "...",
+    "constraints": "...", "expected_evidence": "...", "depends_on": []
+  }]
 }
 ```
 
-- `actions` 必须来自 `ready_actions(state)`，且每项带 `source_round_id`；
-  该轮必须在已验证轮次中。
-- `assignee` 只允许 `zcode` / `deepseek`；`reasonix` 不能进入原生后端。
-- `dispatch_id` / `idempotency_key` 由 `task_id + round_id + contract_sha256 +
-  plan_call_id + work_item_id` 稳定派生；同一轮重复生成复用同一 ID，不会产生第二份派发。
-- 校验会逐字段比对状态中 SOL 工作项的 `title` / `assignee` / `goal` / `constraints` /
-  `expected_evidence` / `depends_on`；任何改写都返回 `dispatch_action_mismatch`。
-- dispatch 信封本身不能用 `--native-result` 回填。
+- `dispatch_id` 与 `idempotency_key` 由 `task_id + plan_id + plan_sha256 + work_item_id`
+  确定性派生：同一计划同一工作项重复派发得到相同 id（幂等），计划变化则 id 变化。
+- 只有 `execution_backend=native` 才能生成；`legacy` 后端直接 `backend_not_native`。
+- 不做空派发（`dispatch_empty`）；同批不得重复工作项/id。
+- 既有 dispatch 的 id 与当前绑定不一致时拒绝覆盖（`dispatch_id_drift`）。
 
-### 4.2 Execution：`copilot-native-result/v1`
+### 2.2 execution（`copilot-native-result/v2`）
 
 ```json
 {
-  "schema": "copilot-native-result/v1",
-  "task_id": "task-1",
-  "round_id": "task-1-r1",
-  "contract_sha256": "<64 hex>",
-  "plan_call_id": "call-...",
-  "plan_reply_sha256": "<64 hex>",
-  "dispatch_id": "d-...",
-  "idempotency_key": "ik-...",
-  "work_item_id": "T1",
-  "status": "done | failed | blocked | dropped",
+  "schema": "copilot-native-result/v2",
+  "task_id": "...", "contract_sha256": "...",
+  "plan_id": "...", "plan_sha256": "...", "iteration_id": "I3",
+  "dispatch_id": "d-...", "idempotency_key": "ik-...",
+  "work_item_id": "A1",
+  "status": "done|failed|blocked|dropped",
   "summary": "一句话结果",
-  "result": "实际输出/交付说明",
-  "evidence": [
-    {
-      "id": "E1",
-      "file": "/absolute/path/raw.log",
-      "sha256": "<64 hex>",
-      "kind": "test-output",
-      "note": "原始命令输出"
-    }
-  ],
-  "executor": {
-    "kind": "subagent",
-    "agent_id": "agent-...",
-    "child_session_id": "sess_subagent_agent-...",
-    "profile_id": "general-purpose",
-    "model_reported": "provider/model"
-  },
-  "timing": {"started_at": "...", "finished_at": "...", "duration_ms": 1000},
-  "usage": {"total_tokens": 12, "tool_use_count": 1},
-  "result_sha256": "<64 hex>"
+  "result": "实际结果（文件/命令/diff 摘要）",
+  "evidence": [{"id": "E1", "file": "/abs/path", "sha256": "<64 hex>", "kind": "file"}],
+  "executor": {"kind": "subagent", "agent_id": "...", "child_session_id": "...",
+               "profile_id": "executor", "model_reported": "..."},
+  "timing": {"duration_ms": 1200},
+  "usage": {"total_tokens": 321},
+  "result_sha256": "<信封自身摘要>"
 }
 ```
 
-- 执行结果必须同时绑定 `plan_call_id` / `plan_reply_sha256` / `idempotency_key`，
-  并分别与当前 dispatch 和最近已验证 SOL 轮次一致；缺少任一项返回
-  `schema_invalid`，不一致返回 `plan_call_mismatch` / `plan_reply_mismatch` /
-  `idempotency_mismatch`。
-- `executor` 必须是 `kind=subagent`，并提供 `agent_id` / `child_session_id` /
-  `profile_id`；主代理没有可核对的 Agent/Child Session 身份，不能冒充正式执行方。
-  身份与模型由 `native_agent.py` 从宿主 `metadata.json` 与 rollout 读取，不接受
-  调用方手填。
-- 至少一条证据；文件必须是绝对路径、普通文件、实际存在，且 SHA-256 与声明一致。
-- 同一任务内证据 id 不得重复；已登记且摘要不同会拒绝静默替换。
-- `profile_id=reviewer` 会被拒绝。
-- 执行结果先校验、再登记证据、回填工作项、写执行报告、更新 dispatch item，最后原子保存；
-  任一校验失败不会产生半更新。
-- 同一 `result_sha256` 重复回填是幂等的（返回 `duplicate=true`，不重复写报告）。
-  已终态工作项不接受不同结果 SHA。
+校验要点：
 
-### 4.3 Review：`copilot-native-review/v1`
+- `task_id` / `contract_sha256` / `plan_id` / `plan_sha256` / `dispatch_id` /
+  `idempotency_key` / `iteration_id` 必须与当前 dispatch 一致。
+- `result_sha256` 必须等于 `envelope_sha256(信封去掉该字段)`；被改动即 `result_sha_mismatch`。
+- 证据至少一条；文件必须是绝对路径、存在、可读；SHA-256 必须与文件实际内容一致
+  （`evidence_sha_mismatch`），且证据属于本任务（`evidence_foreign`）。
+- 已终态（done/dropped）的工作项不能被不同结果覆盖（`work_item_terminal`）；相同
+  `result_sha256` 重复回填是幂等成功。
+- 执行方不得使用 `reviewer` Profile（`reviewer_as_executor`）。
+
+### 2.3 review（`copilot-native-review/v2`）
 
 ```json
 {
-  "schema": "copilot-native-review/v1",
-  "task_id": "task-1",
-  "round_id": "task-1-r1",
-  "contract_sha256": "<64 hex>",
-  "dispatch_id": "d-...",
-  "work_item_id": "T1",
-  "execution_result_sha256": "<被复核执行结果的 result_sha256>",
-  "reviewer": {
-    "kind": "subagent",
-    "agent_id": "agent-...",
-    "child_session_id": "child-...",
-    "profile_id": "reviewer",
-    "model_reported": "provider/model"
-  },
-  "verdict": "pass | partial | blocked",
-  "findings": [
-    {
-      "severity": "blocking | major | minor | info",
-      "summary": "具体缺陷/观察",
-      "file": "/absolute/path",
-      "line": 1,
-      "evidence": "具体 diff/log/hash 证据"
-    }
-  ],
-  "files_inspected": ["/absolute/path"],
-  "commands_run": ["git diff -- path"],
+  "schema": "copilot-native-review/v2",
+  "task_id": "...", "contract_sha256": "...",
+  "plan_id": "...", "plan_sha256": "...",
+  "dispatch_id": "d-...", "work_item_id": "A1",
+  "execution_result_sha256": "<被执行结果的摘要>",
+  "target_sha256": "<当前 final_evidence_digest>",
+  "reviewer": {"kind": "subagent", "agent_id": "agent-review",
+               "child_session_id": "child-review", "profile_id": "reviewer",
+               "model_reported": "..."},
+  "host": {"metadata_path": "/abs/metadata.json",
+           "output_file": "/abs/review-output.json",
+           "rollout_path": "/abs/model-io-<child>.jsonl",
+           "tool_calls": [{"name": "Read", "count": 2}, {"name": "Bash", "count": 1}],
+           "agent_id": "agent-review", "child_session_id": "child-review"},
+  "verdict": "pass|partial|blocked",
+  "findings": [{"severity": "blocking|major|minor|info", "file": "...",
+                "summary": "...", "evidence": "..."}],
+  "files_inspected": ["/abs/path"],
+  "commands_run": ["git status --short"],
   "changed_files": [],
   "unverified": [],
   "residual_risks": [],
-  "g4_eligible": false,
-  "result_sha256": "<64 hex>"
+  "g4_eligible": true,
+  "result_sha256": "<信封自身摘要>"
 }
 ```
 
-- 复核必须先有已入账的执行结果；`execution_result_sha256` 必须等于该执行结果的信封摘要。
-- Reviewer 必须是 `kind=subagent`、`profile_id=reviewer`，且 Agent ID / Child Session ID
-  不能与执行方任一相同；`model_reported` 必须来自实际 rollout 记录，不能由主代理
-  手填或猜测（`native_agent.py` 负责提取）。
-- `changed_files` 必须为空；非空直接判为工作区污染。该字段是 Reviewer 自报，
-  宿主记录只覆盖工具调用、不覆盖文件写入。
-- 至少检查一个实际存在的普通文件；`/dev`、`/proc`、`/sys` 路径拒绝。
-- `files_inspected` 的每一项都必须能在实际工具调用参数里找到对应访问，且按路径组件边界
-  匹配，并保留绝对/相对属性：读取是绝对路径时，声明也是绝对路径则要求组件完全相同
-  （`/repo-a/docs/x` 不能由 `/foreign/repo-a/docs/x` 或 `/docs/x` 满足）；声明是相对路径时
-  允许读取以它结尾。读取是相对路径时，允许以声明结尾，或是声明组件更少的直接相对形式
-  （直接父目录同名）。`./x` 与 `x` 等价；`..` 无法在无工作目录时核实，一律不算命中；
-  目录插层（`docs/archive/report.md`）、不同绝对根、`docs/report.md.bak`、另一目录下的同名
-  文件，以及「父目录名与文件名分处两个参数」都不算命中（只读命令白名单本身也拒绝 `&&`；
-  `;` 分段后不跨段拼接）。这是启发式校验，不是内容级证明。
-- 宿主输出原则上必须是纯 JSON；仅兼容「整段输出被包在**单个** ```json（或 ```）围栏里」
-  的形式（允许围栏前后空白），围栏内的唯一对象按严格 JSON 解析。多围栏、围栏外带叙述
-  文字、对象前后有额外内容一律 `review_output_unparsable` 失败关闭。
-- `commands_run` 只允许只读前缀：`git diff/status/log/show/grep/rev-parse/ls-files`
-  （也允许 `git -C <dir> <只读子命令>` 只切换目录；小写 `-c` 可注入 external pager，
-  不剥离并继续拒绝）、
-  `rg`、`grep`、`cat`、`head`、`tail`、`wc`、`ls`、`find`
-  （拒绝 `-delete` / `-exec` / `-fprint` / `-fprintf` / `-fls`；`find` 的 `--`
-  只是选项终止符，不是表达式终止符，其后的谓词仍检查）、`stat`、
-  `sha256sum`、`diff`、`cmp`、`sort`（拒绝 `-o` / `--output` /
-  `--compress-program` / `-T`）、`cd`、`uniq`、`cut`、`tr`、`nl`、
-  `basename`、`dirname`、`realpath`、`readlink`、`md5sum`、`sha1sum`。
-  `git grep -O`、`git grep --open-files-in-pager` 与 `git grep --textconv`
-  拒绝（会执行外部程序或 textconv 驱动）。
-  `rg` 也拒绝 `--pre`/`--pre-glob`、`--hostname-bin`、`-z`/`--search-zip`
-  （都会启动外部程序）。
-  `uniq` 只允许一个输入操作数；`uniq INPUT OUTPUT` 会写文件，拒绝（`uniq INPUT -`
-  输出到 stdout，仍允许）。
-  花括号在引号外一律拒绝：bash 的 brace expansion 会把 `{-,-}delete` 展开成
-  `-delete`，校验时看不到危险谓词。未引用的 `*`/`?`/`[` 也拒绝：文件名展开会改变
-  实际参数（`uniq a-*` 可能展开成输入+输出文件），使校验参数与实际执行参数不一致；
-  需要通配时由 Reviewer 显式加引号。纯文本正则会被引号骗过，因此每一段还会用
-  `shlex` 还原 argv 再查一次：引号包裹、
-  `--output=...` 等写参数在展开后一律拒绝。长选项唯一前缀缩写与短选项聚簇同样检查：
-  `git grep --ope`/`--op`/`--textc`（等价 `--open-files-in-pager`/`--textconv`）、
-  `sort --o=`/`--co=`/`--t=`（等价 `--output`/`--compress-program`/
-  `--temporary-directory`）、`sort -no`/`-ro` 均拒绝；`git diff --text`、
-  `git grep --only-matching`、`sort --check` 等精确匹配的合法选项不受影响。分离形式
-  （`git grep -e '-O'`、`sort -t -o`）与 `--` 之后的操作数按参数值处理，不当作选项；
-  但 `find` 例外：`find ... -- -delete`/`-exec`/`-fprint` 仍会执行，继续拒绝。
-- **实际调用也校验**：`native_agent.py review` 从同一 rollout 读取 Reviewer 的
-  真实工具调用，要求工具名只能是 `Read/Grep/Glob/Bash`、每条实际 Bash 命令通过
-  上述只读校验、调用条目数等于 `metadata.totalToolUseCount`；自报 `commands_run`
-  的每条必须与实际命令原文完全一致。任何一项不满足都拒绝生成复核信封。这是
-  **事后记录校验**，不是执行前拦截或操作系统沙箱。
-- 顶层 `;` / `|` 允许用于组合只读命令，但会按引号感知拆分后**逐段**套用同一
-  白名单与破坏性参数校验；`&&`、`||`、指向 `/dev/null` 之外的重定向、反引号、
-  `$()`、换行和未闭合引号一律失败关闭。`2>/dev/null` / `>/dev/null` 只丢弃输出，
-  不写工作区，按允许处理。拆分不改变 Reviewer 原始命令文本，`result_sha256` 仍绑定
-  原始输出。这是第二道失败关闭，不是操作系统沙箱。
-- `blocking` / `major` finding 必须给 `file` 和 `evidence`。
-- `pass` 不能带 blocking finding 或任何 `unverified` 项；不能猜 PASS。
-- `g4_eligible` 必须显式为 `false`；普通原生复核不改变 G4。
-- 同一执行结果只接受一份复核；第二份不同复核（即使来自另一个 Reviewer）会拒绝，
-  不能覆盖第一份结论。完全相同的复核信封重复回填是幂等的。
+校验要点：
 
-## 5. 校验失败码
+- 必须绑定一条**已回填**的执行结果（`execution_result_sha256`）；先 ingest 执行信封。
+- `work_item_id` / `dispatch_id` / 执行摘要必须与执行结果一致（`review_binding_mismatch`）。
+- Reviewer 必须是独立子代理（`reviewer_invalid`），Profile 必须是 `reviewer`
+  （`reviewer_profile_invalid`），且与执行方不同 Agent / Child Session
+  （`executor_reviewer_same`、`review_contaminated`）。
+- `files_inspected` 必须覆盖本工作项的原始证据文件（`review_inspection_missing` /
+  `review_inspection_invalid`）。
+- `commands_run` 只允许只读命令；任何写操作、输出重定向、`-delete`、`-exec`、
+  `--output`、`sort -o`、`git grep -O` 等一律 `review_command_not_readonly`。
+- `g4_eligible=true` 时必须：`verdict=pass`、无 blocking、`unverified` 为空、
+  `changed_files` 为空，并附完整宿主记录（`g4_requires_pass`、`g4_with_unverified`、
+  `g4_with_blocking`、`g4_host_record_missing`）。
+- 非 G4 复核若 `verdict=pass` 但有 blocking/unverified，同样拒绝
+  （`pass_with_blocking_finding` / `pass_with_unverified`）。
 
-常见稳定错误码：
+## 3. 宿主记录与 G4 资格
 
-- 绑定：`task_mismatch`、`round_mismatch`、`contract_mismatch`、`plan_call_mismatch`、
-  `plan_reply_mismatch`、`idempotency_mismatch`、`dispatch_mismatch`、
-  `work_item_unknown`、`review_binding_mismatch`。
-- 工作项：`dispatch_empty`、`dispatch_duplicate`、`dispatch_action_mismatch`、
-  `work_item_unverified`、`work_item_terminal`、`assignee_unsupported`。
-- 执行：`evidence_missing`、`evidence_invalid`、`evidence_duplicate`、
-  `evidence_sha_mismatch`、`evidence_conflict`、`evidence_foreign`、
-  `executor_identity_missing`、`reviewer_as_executor`。
-- 复核：`review_before_execution`、`executor_reviewer_same`、`review_contaminated`、
-  `review_inspection_missing`、`review_inspection_invalid`、`reviewer_invalid`、
-  `reviewer_profile_invalid`、`review_command_not_readonly`、`review_finding_invalid`、
-  `review_tool_not_allowed`、`review_toolcalls_incomplete`、
-  `review_rollout_duplicate_call`、`review_command_not_executed`、
-  `pass_with_blocking_finding`、`pass_with_unverified`、`g4_eligible_forbidden`。
-- 完整性：`schema_invalid`、`hash_invalid`、`result_sha_mismatch`。
+`g4_eligible` 由**脚本按宿主记录计算**，Reviewer 不能自述。`native_agent.py review`
+读取：
 
-CLI 会把 `BridgeError.code` 包进 `AutoError` 并返回退出码 2；失败时不写状态。
+- `metadata.json`：`agentId`、`childSessionId`、`profileId`、`profileSnapshot`
+  （`tools` 必须是 `Read/Grep/Glob/Bash`，`disallowedTools` 必须含 `Write`/`Edit`）、
+  `status=completed`、`totalToolUseCount`、`outputFile`。
+- rollout（`~/.zcode/cli/rollout/model-io-<childSessionId>.jsonl`）：实际工具调用序列、
+  模型 provider/model。
+- `outputFile`：Reviewer 原始结论（verdict/findings/…），只能提供判断内容，不能提供身份。
 
-## 6. 操作顺序
+回填 G4 复核时，`copilot_auto.py ingest` 会再次调用 `verify_review_host_record` 重新读取
+metadata/rollout，确认：
 
-1. 用 `copilot_dispatch.py start --execution-backend native` 建立 native 任务，完成合同与
-   SOL 轮次入账。
-2. `copilot_auto.py drive` 到 `EXECUTE` 时返回 `native_dispatch`。主代理按 `actions` 执行，
-   保留 SOL 原始字段，不自行改写。执行必须由原生子代理完成；把宿主返回的 Agent
-   `metadata.json` 原样保存在任务目录。
-3. 用 `native_agent.py execution` 从实际运行记录生成 `copilot-native-result/v1`
-   信封；证据 SHA-256、执行方身份、实际模型、计划/幂等绑定和 `result_sha256`
-   都由脚本计算，不接受手填：
-   ```bash
-   python3 ~/.zcode/skills/copilot/scripts/native_agent.py execution \
-     --state /tmp/copilot/dispatch.json --dispatch /tmp/copilot/native-dispatch.json \
-     --work-item T1 --metadata /path/to/agent-.../metadata.json \
-     --status done --summary "一句话结果" --result-file /tmp/copilot/T1.result.md \
-     --evidence E1=/tmp/copilot/raw.log --output /tmp/copilot/T1.execution.json
+| 检查 | 失败码 |
+|---|---|
+| Profile 仍是 `reviewer` | `host_profile_changed` |
+| Agent / Child Session 与信封一致 | `host_agent_mismatch` / `host_session_mismatch` |
+| `output_file` 与 metadata 的 `outputFile` 一致 | `host_output_mismatch` |
+| rollout 工具调用计数与 `host.tool_calls` 完全一致 | `host_tool_calls_changed` |
+| rollout 中没有非只读工具或写命令 | `host_*` / `review_command_not_readonly` |
+| metadata 声称的调用数与 rollout 实际一致 | `host_tool_calls_changed` |
 
-   python3 ~/.zcode/skills/copilot/scripts/copilot_auto.py ingest \
-     --state /tmp/copilot/dispatch.json --native-result /tmp/copilot/T1.execution.json
-   ```
-   执行回填是纯本地操作：0 请求、不递增轮次、不创建 pending；阶段进入
-   `REVIEW_PENDING`。此后必须显式运行 `drive` 才会请求 SOL。
-4. 需要复核时，派发 `reviewer` 子代理并保存它的 `metadata.json`。Reviewer 只返回
-   verdict/findings/files_inspected/commands_run 等判断内容；用 helper 填入 Reviewer
-   身份、实际模型、执行结果绑定和复核摘要：
-   ```bash
-   python3 ~/.zcode/skills/copilot/scripts/native_agent.py review \
-     --state /tmp/copilot/dispatch.json --dispatch /tmp/copilot/native-dispatch.json \
-     --execution /tmp/copilot/T1.execution.json --work-item T1 \
-     --metadata /path/to/reviewer-agent-.../metadata.json \
-     --input /tmp/copilot/T1.reviewer.raw.json --output /tmp/copilot/T1.review.json
+任何问题都拒绝回填，结论不得作为 G4 依据。
 
-   python3 ~/.zcode/skills/copilot/scripts/copilot_auto.py ingest \
-     --state /tmp/copilot/dispatch.json --native-result /tmp/copilot/T1.review.json
-   ```
-   复核 ingest 同样 0 请求。只有执行与复核都回填、且绑定校验通过后，显式 `drive`
-   才能让 SOL 做最终判断；复核有 blocking finding 时进入 REJUDGE，CLOSED 前
-   `closure --close` 会再次检查复核完成度。
-5. `ingest --dry-run --native-result ...` 只做只读校验，不登记证据、不写报告、不调用 GPT。
-6. 执行失败/阻塞照实回填 `status=failed|blocked`，报告为执行报告；不会自动切换到 GPT
-   REVIEW 或另一个复核渠道。复核 `partial|blocked` 同样只作为复核报告留痕，不自动重试。
-7. 下一轮由 SOL 根据真实回填与新证据重新安排；不要用同一个执行结果重复复核，也不要把
-   Reviewer 的 PASS 当成任务 PASS 或 G4。
-8. 请求/Token 预算：默认**不设上限**，用量按审计 `call_requested` 与 `usage` 重建，
-   进程重启不归零，只用于观察与成本审计。只有显式运营上限被触及时才拒绝：显式请求数上限
-   在出站前判定（`drive` 返回 `budget_exhausted`，`call_gpt.py` 退出码 12）；显式 Token
-   阈值按 `usage` 核算，响应后才知道，不是严格上界。
+**局限**：这些检查保证“不靠主代理记忆或手抄身份”，不是宿主签名；能写本机文件的人仍可伪造。
+G4 是本地可得的最强原生复核，不等于密码学证明。
 
-## 7. Reviewer Profile
+## 4. `native_agent.py` 用法
 
-- 用户级路径：`~/.zcode/agents/reviewer.md`。
-- `model: inherit`：Reviewer 的 Provider/模型/推理级别继承自主代理当前会话，不做固定
-  模型钉死，因此主代理更换模型后 Reviewer 自动跟随；这不是运行时身份凭证，
-  `model_reported` 仍以实际 rollout 记录为准。
-- `tools: [Read, Grep, Glob, Bash]`，`disallowedTools: [Write, Edit]`；
-  Bash 仅用于只读检查，真实写保护仍依赖宿主权限与 bridge 白名单。
-- `injectAgentsMd: true`，`maxTurns: 30`，`permissionMode: default`。
-- Profile 正文要求 Reviewer 独立检查真实代码/diff/日志/原始证据，重要 finding 给
-  文件位置与具体证据，无法核实的写 `unverified`，不得猜 PASS，不得声称 G4。
-- 测试只做静态解析与文件位置断言；不发起真实 Agent 调用，因此不证明模型实际可用性、
-  真实身份或复核质量。
+```bash
+# 执行信封：身份/证据/摘要全部由脚本从真实记录提取
+python3 -B scripts/native_agent.py execution --state T/state.json \
+  --dispatch T/state.dispatch.json --work-item A1 \
+  --metadata <agent-exec>/metadata.json --status done --summary "完成" \
+  --result-file result.md --evidence E1=/abs/raw.log --output A1.execution.json
 
-## 8. G4 与阶段 4 边界
+# 复核信封：Reviewer 原始结论 + 宿主记录
+python3 -B scripts/native_agent.py review --state T/state.json \
+  --dispatch T/state.dispatch.json --execution A1.execution.json \
+  --work-item A1 --metadata <agent-review>/metadata.json \
+  --input reviewer.raw.json --output A1.review.json
+```
 
-**G4 没有因为本 Bridge 而放宽。** 当前 `closure-check` 的 G4 仍只接受宿主可信绑定的原生
-独立复核记录；Bridge 产出的普通 Reviewer 记录、`g4_eligible=false`、GPT REVIEW 台账、
-Agent 自报身份都不满足 G4。高风险任务仍返回 `native_review_missing` 并停在 BLOCKED。
+- 两个子命令在写文件前调用 `native_bridge` 的正式校验；失败不产生输出文件。
+- 证据 SHA-256 由脚本读取文件计算，不接受调用方传入。
+- `--evidence` 形如 `E1=/abs/path`，可重复。
 
-本阶段**未实现**：
+## 5. 回填与 idempotency
 
-- Reviewer 自动派发、自动读取 dispatch 并生成复核信封；
-- SOL 自动闭环、自动重判、自动收口；
-- 把 Bridge 记录升级为 G4 可信记录；
-- 任何 MCP / daemon / Workflow / LangGraph / 第二套 Agent 调度框架。
+```bash
+python3 -B scripts/copilot_auto.py ingest --state T/state.json --result-file A1.execution.json
+python3 -B scripts/copilot_auto.py ingest --state T/state.json --review-file A1.review.json
+```
 
-因此阶段 0–3.6 的交付是：协议、Profile、emit/ingest、从实际运行记录生成信封、
-状态兼容和测试；阶段 4 仍需单独授权与实现。
+- 执行回填：校验通过后把工作项置为信封 `status`、写 `result` 与 `evidence_ids`，并把规范化
+  信封加入 `native_results`。
+- 复核回填：加入 `native_reviews`，G4 资格重新核对后写入。
+- 同一 `result_sha256` 重复回填幂等跳过；不同结果覆盖已终态工作项被拒绝。
+- 被拒绝时退出码 12，stderr 含错误码，状态不被部分写入。
+
+## 6. 错误码速查
+
+| 类别 | 错误码 |
+|---|---|
+| schema | `schema_invalid`、`schema_retired`、`hash_invalid` |
+| 任务/合同 | `task_mismatch`、`contract_mismatch`、`credential_missing` |
+| 计划/派发 | `plan_missing`、`plan_unknown`、`plan_mismatch`、`plan_drift`、`dispatch_missing`、`dispatch_empty`、`dispatch_duplicate`、`dispatch_mismatch`、`dispatch_id_drift`、`idempotency_mismatch`、`iteration_mismatch`、`work_item_unknown`、`work_item_terminal` |
+| 执行 | `backend_not_native`、`assignee_unsupported`、`invalid_status`、`executor_identity_missing`、`reviewer_as_executor` |
+| 证据 | `evidence_missing`、`evidence_invalid`、`evidence_duplicate`、`evidence_unreadable`、`evidence_sha_mismatch`、`evidence_foreign`、`evidence_conflict` |
+| 复核 | `reviewer_invalid`、`reviewer_profile_invalid`、`review_binding_mismatch`、`executor_reviewer_same`、`review_contaminated`、`invalid_verdict`、`review_finding_invalid`、`review_inspection_missing`、`review_command_not_readonly` |
+| G4 | `g4_host_record_missing`、`g4_host_record_invalid`、`g4_tool_calls_missing`、`g4_tool_not_readonly`、`g4_not_eligible`、`g4_requires_pass`、`g4_with_unverified`、`g4_with_blocking`、`pass_with_blocking_finding`、`pass_with_unverified`、`host_profile_changed` 等 |
+
+错误码只用于定位与修复，不提供绕过开关；修正记录后重新生成信封。

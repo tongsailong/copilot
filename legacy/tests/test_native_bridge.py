@@ -18,8 +18,10 @@ import unittest
 import yaml
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-SCRIPTS = os.path.join(os.path.dirname(HERE), "scripts")
+LEGACY = os.path.dirname(HERE)
+SCRIPTS = os.path.join(os.path.dirname(LEGACY), "scripts")
 sys.path.insert(0, SCRIPTS)
+sys.path.insert(0, LEGACY)
 sys.path.insert(0, HERE)
 
 from test_e2e_fake_upstream import Upstream, plan, success  # noqa: E402
@@ -28,8 +30,8 @@ import copilot_auto as A  # noqa: E402
 import copilot_dispatch as D  # noqa: E402
 import native_bridge as NB  # noqa: E402
 
-AUTO = os.path.join(SCRIPTS, "copilot_auto.py")
-DISPATCH = os.path.join(SCRIPTS, "copilot_dispatch.py")
+AUTO = os.path.join(LEGACY, "copilot_auto.py")
+DISPATCH = os.path.join(LEGACY, "copilot_dispatch.py")
 
 
 class NativeBridgeBase(unittest.TestCase):

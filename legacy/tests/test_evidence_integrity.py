@@ -19,9 +19,11 @@ import tempfile
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-ROOT = os.path.dirname(HERE)
+LEGACY = os.path.dirname(HERE)
+ROOT = os.path.dirname(LEGACY)
 SCRIPTS = os.path.join(ROOT, "scripts")
 sys.path.insert(0, SCRIPTS)
+sys.path.insert(0, LEGACY)
 
 import bridge_evidence  # noqa: E402
 import call_gpt  # noqa: E402

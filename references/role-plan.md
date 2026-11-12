@@ -1,5 +1,8 @@
-# SOL 指令补充：PLAN
+# SOL 指令补充：PLAN（历史文档，已退役）
 
+> **历史文档（v5 SOL 时代，已退役）**：v6.0.0 起 `call_gpt.py` 不再存在，本文件不再被注入。
+> 当前 PLAN 由 ZCode 自主决定，Copilot 只登记与校验（见 `SKILL.md`「模式」）。原文保留仅为追溯。
+>
 > 本文件由 `call_gpt.py` 在 `--mode PLAN` 时追加在 `references/role.md` 之后，
 > 只提供该模式的方案规划与输出要求；核心职责、安全、证据、授权与合同确认规则仍以
 > `role.md` 为准。

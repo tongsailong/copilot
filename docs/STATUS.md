@@ -1,8 +1,73 @@
 # STATUS
 
-更新：2026-11-11 CST。本文件只记录现场可核实的事实；规划与未完成事项单独标注。
+更新：2026-11-12 CST。本文件只记录现场可核实的事实；规划与未完成事项单独标注。
 
-## 当前阶段
+## v6.0.0（2026-11-12，当前）：SOL 退役与自主化架构升级
+
+本批次在用户任务授权下完成。提交前现场为**未提交、未推送、未发布**；2026-11-12 用户随后明确授权提交与普通快进推送，实际提交 SHA 以 git 历史为准（本节其余「未提交」表述均为提交前的现场记录）。
+
+- **SOL 退役**：`scripts/` 活动路径不再有 `gpt-6.1-sol`、CPA 调用、轮次/预算状态机、
+  等待远程模型返回的门禁。`call_gpt.py`、`review_ledger.py`、`reply_protocol.py` 与 13 个
+  历史测试移入 `legacy/`；`native_bridge.py` 拒绝 v1 信封。
+- **本地治理引擎**：新增 `scripts/governance.py`（schema `copilot-governance/v1`），阶段收敛为
+  RUNNING / PARTIAL / PASS / BLOCKED / CLOSED；原子写入 + `fcntl.flock` + `save_seq` CAS。
+- **PARTIAL 持续推进**：`copilot_auto.py drive` 在同一调用内派生
+  `AUTO-C<n>` / `AUTO-R-<id>` / `AUTO-G4` / `AUTO-G4-INGEST` / `AUTO-REPLAN` / `AUTO-NEXT`
+  并继续；`MAX_DRIVE_STEPS=32` 只是防死循环保护（超限退出 12），不构成任务终止条件。
+- **CONSULT / PLAN / REVIEW 重定位**：CONSULT 本地分析不阻塞；PLAN 由 ZCode 决定、Copilot
+  只登记；正式 REVIEW 只在用户明确授权（`authorize-review --authorized-by user`）时登记，
+  不参与 G1–G4。
+- **Native Bridge v2**：dispatch/result/review 三信封绑定 task/contract/plan/iteration；
+  `g4_eligible` 由 `native_agent.py` 按宿主 metadata/rollout 计算，`ingest` 回填前重新核对；
+  G4 仍 fail-closed。
+- **测试**：当前套件 `124 tests OK`（`tests/`）；历史套件 `853 tests OK (skipped=31)`
+  （`legacy/tests/`：29 个类级历史文档契约 + 2 个方法级跳过，共 31 项；另有 1 项
+  `skipIf` 只在无 git 环境跳过）。
+- **文档**：`SKILL.md` 重写为 v6（轻量治理 / PARTIAL / 正式 REVIEW opt-in / G4），
+  `references/workflow.md`、`runtime.md`、`review.md`、`agent-bridge.md`、`history.md`
+  同步；v5 SOL 角色/台账文档加历史横幅；`agents/reviewer.md` 改到 v2 绑定。
+- **运行时同步**：`sync_runtime.py --apply` 首批写入 17 个受管理文件，复核修复后增量写入
+  10 个（`SKILL.md`、`governance.py`、`copilot_dispatch.py`、`copilot_auto.py`、
+  `native_bridge.py`、`native_agent.py`、`lib_common.py`、`references/*`），Reviewer 已写入；
+  末次 `--check` 缺失 0、不同 0、Reviewer 一致。运行时目录仍有 8 个 v5 遗留未受管理文件
+  （`call_gpt.py`、`reply_protocol.py`、`review_ledger.py` 及 5 个旧测试），当前无任何
+  脚本引用它们，默认保留；如需清理需显式 `--prune` 授权。
+- **运行时加载验证（静态 + 实际执行）**：运行时 `SKILL.md` 12,136 B（<100,000）、
+  frontmatter 完整、description 125 字符、末尾未截断；`references/` 五个 v6 文档存在；
+  运行时 `copilot_dispatch.py --version` 输出 `6.0.0`；在临时任务上实测
+  `PARTIAL → 派生 AUTO-C1 → RUNNING 工作单`，退出码 10，无任何远程调用。
+- **独立只读复核后修复（2026-11-12，同一批次内完成，未提交）**：两轮独立只读审计
+  （不同子代理上下文，不是 G4 记录，`g4_eligible=false`，不作为收口依据）确认主线成立，
+  并指出以下真实缺陷，均已修复并补测试：
+  1. `--risk high` 配默认 `legacy` 后端会永远无法产生可回填的复核（G4 死锁）→ `start`
+     改为 fail-fast 要求 `--backend native`；`review.md`「AUTO-G4 不走原生 dispatch」
+     的错误说法已改。
+  2. 正式 REVIEW 授权 `--authorized-by` 曾有默认值 `user` → 取消默认、改为必填，并绑定
+     当前合同指纹；`reopen` 同样要求显式 `--authorized-by user`。文档说明该字段是调用方
+     声明而非可验证凭证。
+  3. G4 收口只信任状态里的 `g4_eligible` → ingest 时固化宿主记录摘要 `host_sha256`，
+     收口重新核对摘要、Reviewer 身份与工具调用记录，新增
+     `native_review_host_missing/changed/identity_mismatch/no_tool_calls`。
+  4. 文档/CLI 漂移：补 `status` 子命令别名；统一 CLOSED=0；`evidence_sha_mismatch` →
+     `evidence_sha_changed`；删除不存在的 `stale_state`；更正同 id 证据幂等语义；
+     更正 AUTO-REPLAN 触发范围（`AUTO-G4*` 也计入）。
+  5. 活动脚本残留 SOL 死代码：`lib_common.py` 的凭据读取函数与模型 ID 注释 → 迁入
+     `legacy/lib_common_legacy.py`，活动脚本不再读取 Provider 配置；架构测试改为覆盖
+     `lib_common.py` 并新增凭据读取检查。
+  6. `manifests/source-baseline.sha256` 已过期（含已退役脚本）→ 用
+     `sync_runtime.py --baseline` 重建为 20 个文件，`sha256sum -c` 全部通过。
+  7. 新增 `tests/test_native_agent_v6.py`（`build_review` 的 G4 资格计算、非 pass 复核、
+     PARTIAL→工作单、AUTO-REPLAN 升级）与 G4 门禁拒绝分支、授权绑定、`status` 别名、
+     高风险后端绑定等测试。
+- **未验证**：没有启动新的 ZCode GUI 会话做“会话内实际加载”观察（当前 CLI 无 headless
+  入口，启动 GUI 会干扰用户桌面）；已用运行时产物静态校验 + 运行时 CLI 实测替代，二者
+  不等于真实会话加载。真实原生 Executor/Reviewer 端到端也未在本批次重新运行。
+
+## 历史阶段（v5 及以前，仅追溯）
+
+以下内容记录 v6 之前的现场状态，涉及 SOL 的表述均为历史；不再作为当前执行依据。
+
+### 当前阶段
 
 - **Phase 3.6**：离线协议、校验、信封生成、异常/幂等测试与兼容性已完成；**完整 Native Bridge
   端到端（C4）仍未执行、未验证**。2026-11-08 在用户授权下完成过 **4 次真实 SOL HTTP 调用**，

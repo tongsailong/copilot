@@ -21,12 +21,14 @@ import tempfile
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-SCRIPTS = os.path.join(os.path.dirname(HERE), "scripts")
-AUTO = os.path.join(SCRIPTS, "copilot_auto.py")
-DISPATCH = os.path.join(SCRIPTS, "copilot_dispatch.py")
+LEGACY = os.path.dirname(HERE)
+SCRIPTS = os.path.join(os.path.dirname(LEGACY), "scripts")
+AUTO = os.path.join(LEGACY, "copilot_auto.py")
+DISPATCH = os.path.join(LEGACY, "copilot_dispatch.py")
 
-sys.path.insert(0, HERE)
 sys.path.insert(0, SCRIPTS)
+sys.path.insert(0, LEGACY)
+sys.path.insert(0, HERE)
 from test_e2e_fake_upstream import Reply, Upstream, plan, success  # noqa: E402
 import copilot_auto  # noqa: E402
 import copilot_dispatch  # noqa: E402
@@ -864,6 +866,7 @@ class AutoLoopBase(unittest.TestCase):
         self.assertEqual(len(self.upstream.requests), 1)
 
 
+@unittest.skip("历史文档契约（v5 及以前）：v6.0.0 已重写 SKILL.md，本类断言仅作历史追溯。")
 class AutoDocsTest(unittest.TestCase):
     """运行文档必须把自动驱动的边界说清楚，不能只靠实现存在。
 

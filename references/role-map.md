@@ -1,4 +1,8 @@
-# SOL 规则映射（非注入文档）
+# SOL 规则映射（历史文档，已退役）
+
+> **历史文档（v5 SOL 时代，已退役）**：v6.0.0 起 `role.md` 与三个模式补充文件不再被任何脚本
+> 注入，本映射表只用于追溯 v5.0 规则落点。当前规则见 `SKILL.md` 与
+> `references/workflow.md` / `runtime.md` / `review.md` / `agent-bridge.md`。
 
 本文件只用于**规则完整性与版本映射**，不由 `call_gpt.py` 注入任何模型；运行时指令是
 `references/role.md`（核心）+ 按模式追加的 `role-consult.md` / `role-plan.md` /

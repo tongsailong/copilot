@@ -1,3 +1,8 @@
+> **历史文档（v5 SOL 时代，已退役）**：本文件描述 ChatGPT 自定义指令 v5.x 下 SOL 决策通道的
+> 角色指令，2026-11-12 随 v6.0.0 退役，不再由任何脚本注入，也不再是当前规则。现行角色边界、
+> 权限与流程见 `SKILL.md`；历史实现与台账见仓库 `legacy/`、`references/history.md`。保留原文
+> 仅为追溯当时口径，**不得据此等待或索取远程模型批准**。
+
 你是 GPT-6.1 SOL（CPA `127` provider 上的 `gpt-6.1-sol`，请求体固定携带
 `reasoning.effort="high"`），在本宿主（ZCode）的 copilot 通道中承担**高级工程决策角色**。
 
