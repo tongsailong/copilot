@@ -73,7 +73,10 @@ _READONLY_COMMAND_PREFIXES = (
 # `date -s` 改系统时间；`tree -o` 写输出文件；`unzip` 默认解包；`aapt2 link`
 # 生成文件；`apksigner sign` 改写 APK。只读用法继续放行，写用法失败关闭。
 _TREE_WRITE_OPTIONS = frozenset({"-o", "--output"})
-_UNZIP_LIST_OPTIONS = ("-l", "-v", "-t", "-Z")
+# 只输出到 stdout 的 unzip 模式：列目录（-l/-v/-t/-Z）与解压到标准输出
+# （-p/-c）。G4 复核 APK 内的 dex/资源时常用 `unzip -p a.apk classes.dex |
+# strings`；它不落盘，落盘写仍被重定向规则与 -d 拒绝。
+_UNZIP_STDOUT_OPTIONS = ("-l", "-v", "-t", "-Z", "-p", "-c")
 _AAPT_READONLY_SUBCOMMANDS = frozenset({"dump", "list", "badging", "version"})
 _AAPT2_READONLY_SUBCOMMANDS = frozenset({"dump", "version"})
 _APKSIGNER_READONLY_SUBCOMMANDS = frozenset({"verify"})
@@ -105,10 +108,29 @@ _SED_SUB_WRITE_FLAGS = frozenset("wWe")
 # **引号感知**拆分后逐段校验，只把顶层 `;` / `|` 当作分隔符；`&&`、重定向、
 # 命令替换、反引号、换行一律拒绝。花括号也拒绝：bash 的 brace expansion 会把
 # `{-,-}delete` 展开成 `-delete`，校验时看不到危险谓词。未引用的 `*`/`?`/`[`
-# 同样拒绝：文件名展开会改变实际参数（`uniq a-*` 可能展开成输入+输出文件），
-# 校验参数/参数个数就不再等于实际执行参数。拆分不改变只读边界：每一段仍走
-# 同一白名单。
-_COMMAND_SHELL_META = "&><`$\n\r{}*?["
+# 见 _GLOB_META：只有无输出位置参数的只读族放行。拆分不改变只读边界：每一段
+# 仍走同一白名单。
+_COMMAND_SHELL_META = "&><`$\n\r{}"
+_GLOB_META = "*?["
+# 未加引号的通配符会由 shell 展开成多个参数，校验时看到的 argv 就不等于实际
+# 执行的 argv。对**没有输出位置参数、也没有写/执行选项**的只读族，展开最多把
+# 文件名当参数（`sha256sum evidence/*.png`、`ls */release/*.apk`）。仍有三类风险
+# 所以边界保守：① `sort -o`、`uniq`、`xxd` 的输出位置参数；② `file -C`、
+# `git grep -O/--textconv`、`rg --pre` 这类写/执行选项——目录里以 `-` 开头的
+# 文件名会被展开成选项；③ `sed`/`awk`/`find` 的写操作。因此这些族仍要求加引号。
+_GLOB_SAFE_FAMILIES = frozenset({
+    "ls", "cat", "head", "tail", "wc", "stat", "strings",
+    "sha256sum", "md5sum", "sha1sum", "grep", "diff", "cmp",
+    "basename", "dirname", "realpath", "readlink", "du", "jq",
+    "zipinfo", "aapt", "aapt2",
+})
+# 允许以绝对路径调用的工具族：Android SDK / JDK 的检查工具通常不在 PATH，
+# 复核需要 `/path/to/build-tools/36.0.0/aapt2 dump ...`。只对这类专用工具做
+# 路径归一化；通用命令（cat/grep/git/sha256sum 等）必须走 PATH，否则任意目录下
+# 的同名二进制都能冒充白名单命令。
+_PATH_EXEC_FAMILIES = frozenset({
+    "aapt", "aapt2", "apksigner", "dexdump", "javap",
+})
 # Shell 的 token 分隔空白**只有**空格与制表符（换行已被拒绝）。Python 的
 # `str.isspace()` 还认 U+00A0、U+000B 等 Unicode 空白，但 bash 会把它们当作普通
 # 词内字符：`input<NBSP>2>/dev/null` 的 `2` 属于参数，按 isspace 判定会再次删掉
@@ -641,8 +663,115 @@ def _strip_git_dir(argv: list[str]) -> list[str]:
     return [argv[0]] + argv[idx:]
 
 
-def _is_readonly_prefix(segment: str) -> bool:
-    segment = _normalize_git_dir(segment)
+def _path_within(path: str, root: str) -> bool:
+    """`path` 是否在 `root` 之内；root 为 `/` 时也正确。"""
+    try:
+        return os.path.commonpath([path, root]) == root
+    except ValueError:
+        return False
+
+
+def _workspace_root() -> str:
+    """当前复核工作区的根目录：cwd 向上第一个含 `.git` 的目录，否则 cwd。
+
+    Reviewer 经常在仓库子目录里取证（`cd app; ...`）。只比较 cwd 会把
+    `<repo>/tools/aapt2` 当成“工作区外”，而它其实由被复核内容控制。`.git`
+    可能是目录（普通仓库）或文件（worktree/submodule），存在即可。
+    """
+    current = os.path.realpath(os.getcwd())
+    probe = current
+    while True:
+        if os.path.exists(os.path.join(probe, ".git")):
+            return probe
+        parent = os.path.dirname(probe)
+        if parent == probe:
+            return current
+        probe = parent
+
+
+def _normalize_executable_path(segment: str, name: str) -> str:
+    """把 `.../aapt2 dump ...` 的第一个 token 归一化成 `aapt2 dump ...`。
+
+    复核经常用绝对路径调用 SDK 工具（`/media/.../build-tools/36.0.0/aapt2 dump
+    badging x.apk`），前缀白名单按字符串比较会把它误拒，而 argv 层检查本来就按
+    basename 判族。只有同时满足以下条件才归一化：
+
+    - 以 `/` 开头的绝对路径（相对路径不归一化：工作区相对的可执行文件可能由
+      被复核内容写入，不能按 basename 冒充只读工具）；
+    - basename 属于 `_PATH_EXEC_FAMILIES`（专用检查工具；通用命令走 PATH）；
+    - realpath 不在复核工作区内（工作区根取 cwd 最近的 `.git` 祖先，防止用
+      仓库内的同名二进制绕过只读边界）。
+
+    命令本身仍必须命中白名单，参数级写检查照旧执行；Bash 不是沙箱，这一层只判断
+    argv 语义，不证明二进制来源可信。
+    """
+    token_end = len(segment)
+    for idx, ch in enumerate(segment):
+        if ch in _SHELL_SPACE:
+            token_end = idx
+            break
+    token, rest = segment[:token_end], segment[token_end:]
+    if "/" not in token or not token.startswith("/"):
+        return segment
+    if token.endswith("/") or any(ch in token for ch in _GLOB_META):
+        return segment
+    base = os.path.basename(token)
+    if base not in _PATH_EXEC_FAMILIES:
+        return segment
+    resolved = os.path.realpath(token)
+    literal = os.path.abspath(token)
+    workspace = _workspace_root()
+    # 同时检查 realpath 与未解析符号链接的字面路径：工作区内的链接指向工作区外时，
+    # 只按 realpath 判断会把“被复核内容控制的链接”当成工作区外。
+    if (_path_within(resolved, workspace) or _path_within(literal, workspace)):
+        _fail("review_command_not_readonly",
+              f"{name} 拒绝执行工作区内的可执行文件（可能由被复核内容写入，"
+              f"不能按 basename 当作只读工具）：{token}")
+    return base + rest
+
+
+def _segment_tokens(segment: str) -> list[str]:
+    """把已读到的命令片段按 shell 空白切成近似 argv，并剥掉成对引号。
+
+    只用于通配符放行时的族名判定：片段可能因为引号未闭合而不完整，但命令名与
+    子命令在通配符出现前总已完整读入。反斜杠转义按字面保留，族名判定不受影响。
+    """
+    tokens: list[str] = []
+    buf: list[str] = []
+    quote: str | None = None
+    for ch in segment:
+        if quote is None:
+            if ch in _SHELL_SPACE:
+                if buf:
+                    tokens.append("".join(buf))
+                    buf = []
+                continue
+            if ch in ("'", '"'):
+                quote = ch
+                continue
+        elif ch == quote:
+            quote = None
+            continue
+        buf.append(ch)
+    if buf:
+        tokens.append("".join(buf))
+    return tokens
+
+
+def _segment_family(segment: str) -> str:
+    """推断片段所属的只读命令族，判定口径与 `_argv_readonly_checks` 一致。"""
+    tokens = _segment_tokens(segment)
+    if not tokens:
+        return ""
+    argv = _strip_git_dir(tokens)
+    head = os.path.basename(argv[0])
+    if head == "git" and len(argv) > 1:
+        return f"git {argv[1]}"
+    return head
+
+
+def _is_readonly_prefix(segment: str, name: str) -> bool:
+    segment = _normalize_git_dir(_normalize_executable_path(segment, name))
     for prefix in _READONLY_COMMAND_PREFIXES:
         if prefix.endswith(" "):
             if segment == prefix.rstrip() or segment.startswith(prefix):
@@ -741,6 +870,17 @@ def _split_readonly_segments(cmd: str, name: str) -> list[str]:
                           f"{name} 含空命令片段（多余分隔符）：{cmd}")
                 segments.append(segment)
                 buf = []
+                idx += 1
+                continue
+            if ch in _GLOB_META:
+                # 未加引号的通配符只对没有输出位置参数的只读族放行：展开后只
+                # 增加输入文件，校验看到的参数个数变化不影响只读语义。
+                family = _segment_family("".join(buf))
+                if family not in _GLOB_SAFE_FAMILIES:
+                    _fail("review_command_not_readonly",
+                          f"{name} 的 {family or '未知'} 命令不支持未加引号的通配符 "
+                          f"{ch!r}（请加引号，例如 \"*.apk\"）：{cmd}")
+                buf.append(ch)
                 idx += 1
                 continue
             if ch in _COMMAND_SHELL_META:
@@ -1206,17 +1346,43 @@ def _family_readonly_checks(argv: list[str], family: str, *, name: str,
                       f"{name} 的 file 编译 magic 文件会写入磁盘"
                       f"（-C/--compile）：{segment}")
     elif family == "unzip":
+        # -P <password> / -I <charset> / -O <charset> 是取值选项：不同实现/版本下
+        # 可能吞掉后续 token，使按 token 前缀扫描看到的模式与实际执行不一致
+        # （只读检查不需要它们，统一拒绝，跨平台 fail-closed）。-x 的排除列表在
+        # 下个选项处结束，不吞选项，所以仍允许（`unzip -l a.zip -x 'META-INF/*'`）。
+        zipinfo_mode = any(
+            t.startswith("-") and not t.startswith("--") and "Z" in t[1:]
+            for t in tokens)
+        for token in tokens:
+            if token == "--":
+                break
+            if token.startswith("--"):
+                if token.split("=", 1)[0] == "--password":
+                    _fail("review_command_not_readonly",
+                          f"{name} 的 unzip 使用会吞掉后续参数的选项：{segment}")
+                continue
+            if token.startswith("-") and token != "-" and any(
+                    ch in token[1:] for ch in ("P", "I", "O")):
+                _fail("review_command_not_readonly",
+                      f"{name} 的 unzip 使用 -P/-I/-O 会吞掉后续参数，"
+                      f"模式校验不可靠：{segment}")
         shorts = [t for t in tokens
                   if t.startswith("-") and not t.startswith("--") and t != "-"]
-        if not any(t.startswith(_UNZIP_LIST_OPTIONS) for t in shorts):
+        if not any(t.startswith(_UNZIP_STDOUT_OPTIONS) for t in shorts):
             _fail("review_command_not_readonly",
-                  f"{name} 的 unzip 不是列目录模式（需要 -l/-v/-t/-Z）：{segment}")
+                  f"{name} 的 unzip 不是只读模式"
+                  f"（需要 -l/-v/-t/-Z/-p/-c 之一）：{segment}")
         for token in tokens:
             if token == "-d" or token.startswith("--directory") or (
                     token.startswith("-") and not token.startswith("--")
                     and "d" in token[1:]):
                 _fail("review_command_not_readonly",
                       f"{name} 的 unzip 指定解包目录（-d/--directory）：{segment}")
+            if token.startswith("-") and not token.startswith("--") and \
+                    "T" in token[1:] and not zipinfo_mode:
+                # zipinfo 模式（-Z）下 -T 只改变日期输出格式，不写归档。
+                _fail("review_command_not_readonly",
+                      f"{name} 的 unzip -T 会改写归档时间戳（写操作）：{segment}")
     elif family == "aapt":
         _subcommand_check(argv, _AAPT_READONLY_SUBCOMMANDS, family=family,
                           name=name, segment=segment)
@@ -1322,7 +1488,7 @@ def _argv_readonly_checks(segment: str, name: str) -> None:
 
 def _validate_readonly_command(cmd: str, name: str) -> None:
     for segment in _split_readonly_segments(cmd, name):
-        if not _is_readonly_prefix(segment):
+        if not _is_readonly_prefix(segment, name):
             _fail("review_command_not_readonly",
                   f"{name} 的片段不在只读命令白名单：{segment}（原命令：{cmd}）")
         _argv_readonly_checks(segment, name)

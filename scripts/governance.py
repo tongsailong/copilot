@@ -1135,6 +1135,11 @@ def _current_iteration_id(state: dict) -> str:
 
 
 def begin_iteration(state: dict, *, note: str = "") -> dict:
+    # 上一轮迭代在开新一轮时结束：审计里不应同时存在多条 phase=RUNNING 的迭代。
+    for previous in state.get("iterations") or []:
+        if isinstance(previous, dict) and not previous.get("ended"):
+            previous["ended"] = now_iso()
+            previous["phase"] = "ENDED"
     seq = int(state.get("iteration_seq") or 0) + 1
     state["iteration_seq"] = seq
     entry = {
@@ -1393,6 +1398,55 @@ def _eligible_review(review: dict, state: dict, *,
     return True, ""
 
 
+def _coverage_drift_detail(review: dict, state: dict) -> str:
+    """比较复核记录里的覆盖快照与当前状态，列出目标摘要失效的具体来源。
+
+    只看诊断信息：真正判定仍由摘要相等决定（fail-closed）。没有快照的旧记录
+    无法判断变化项，如实说明。
+    """
+    coverage = review.get("coverage")
+    if not isinstance(coverage, dict) or not coverage:
+        return "复核记录没有覆盖快照（旧记录），无法列出变化项；请做一次完整复核"
+    import native_bridge as NB  # 延迟导入：与 review_coverage 保持同一口径
+
+    current = NB.review_coverage(state)
+    parts: list[str] = []
+    for key, label in (("criteria", "条件"), ("actions", "工作项"),
+                       ("evidence", "证据")):
+        before = coverage.get(key)
+        if not isinstance(before, dict):
+            continue
+        now = current.get(key) or {}
+        added = sorted(i for i in now if i not in before)
+        removed = sorted(i for i in before if i not in now)
+        changed = sorted(i for i in now if i in before and before[i] != now[i])
+        bits = []
+        if added:
+            bits.append("新增 " + ", ".join(added))
+        if removed:
+            bits.append("移除 " + ", ".join(removed))
+        if changed:
+            bits.append("变更 " + ", ".join(changed))
+        if bits:
+            parts.append(f"{label}：" + "；".join(bits))
+    if not parts:
+        return "覆盖快照与当前状态一致；差异来自收口动作或记录改写，请重新复核"
+    return "；".join(parts)[:400]
+
+
+def _review_reason_detail(review: dict, state: dict, code: str) -> str:
+    """G4 拒绝原因的可操作说明：说清是哪一条复核、为什么不可用、下一步做什么。"""
+    label = f"复核 {review.get('work_item_id') or '-'}"
+    if code == "native_review_stale":
+        return (f"{label} 不可用（目标摘要已过期）："
+                f"{_coverage_drift_detail(review, state)}。"
+                "需要基于当前证据做完整复核，或用可用的 G4 基线做增量复核。")
+    if code == "native_review_contract_mismatch":
+        return (f"{label} 不可用（合同指纹不一致）：复核后合同目标/正文/完成条件"
+                "发生过改动，旧结论不再覆盖当前合同；请对新合同做完整复核。")
+    return f"{label} 不可用（{code}）"
+
+
 def _gate_review(state: dict) -> dict:
     risk = str(state.get("risk") or "").strip().lower()
     if risk == "normal":
@@ -1416,14 +1470,65 @@ def _gate_review(state: dict) -> dict:
             best = review
             break
         reasons.append({"code": code,
-                        "detail": f"复核 {review.get('work_item_id') or '-'} 不可用",
+                        "detail": _review_reason_detail(review, state, code),
                         "required_target": target})
     if best is not None:
         return {"passed": True, "reasons": [], "review": best}
     return {"passed": False, "reasons": reasons}
 
 
-def closure_check(state: dict) -> dict:
+_TEMP_EVIDENCE_PREFIXES = ("/tmp/", "/var/tmp/", "/dev/shm/")
+
+
+def evidence_warnings(state: dict, *, task_dir: str = "") -> list[str]:
+    """证据卫生提醒：重复登记、临时目录与未登记文件。
+
+    非阻断：同一文件登记两次、不同时点快照内容相同都可能是刻意保留，四门不应
+    因此失败。但这些情况会让收口后的证据包难以解释，所以在收口检查里提示一次，
+    由 ZCode 决定是否补 note、归档或保留。
+    """
+    warnings: list[str] = []
+    live = [e for e in state.get("evidence") or []
+            if isinstance(e, dict) and not e.get("dropped")]
+    by_path: dict[str, list[str]] = {}
+    by_sha: dict[str, list[str]] = {}
+    for entry in live:
+        eid = str(entry.get("id") or "")
+        hint = str(entry.get("path_hint") or "")
+        if hint and hint != "<inline>":
+            by_path.setdefault(hint, []).append(eid)
+            if hint.startswith(_TEMP_EVIDENCE_PREFIXES):
+                warnings.append(f"{eid} 的证据文件位于临时目录，可能被系统清理：{hint}")
+        sha = str(entry.get("sha256") or "")
+        if sha:
+            by_sha.setdefault(sha, []).append(eid)
+    for hint, ids in sorted(by_path.items()):
+        if len(ids) > 1:
+            warnings.append(f"{'/'.join(ids)} 指向同一证据文件：{hint}（重复登记）")
+    for _sha, ids in sorted(by_sha.items()):
+        if len(ids) > 1:
+            warnings.append(f"{'/'.join(ids)} 内容完全相同（sha256 相同）："
+                            "若为不同时点的快照，请在 note 里说明差异")
+    if task_dir:
+        evidence_dir = os.path.join(task_dir, "evidence")
+        try:
+            names = sorted(os.listdir(evidence_dir)) if os.path.isdir(evidence_dir) else []
+        except OSError:
+            names = []
+            warnings.append(f"无法读取证据目录，未检查未登记文件：{evidence_dir}")
+        # 归档（dropped）证据的文件仍留在磁盘上，属于已登记材料，不应报“未登记”。
+        registered = {str(e.get("path_hint") or "")
+                      for e in state.get("evidence") or [] if isinstance(e, dict)}
+        for name in names:
+            full = os.path.join(evidence_dir, name)
+            if os.path.isdir(full) or full in registered:
+                continue
+            warnings.append(f"evidence/ 下有未登记文件：{name}"
+                            "（确认是否需要登记或归档）")
+    return warnings
+
+
+def closure_check(state: dict, *, task_dir: str = "") -> dict:
     risks = {
         "G1": _gate_actions(state),
         "G2": _gate_criteria(state),
@@ -1436,7 +1541,8 @@ def closure_check(state: dict) -> dict:
             reasons.append({"gate": name, **reason})
     return {"passed": not reasons, "iteration_id": _current_iteration_id(state),
             "gates": risks, "reasons": reasons,
-            "warnings": contract_source_warnings(state)}
+            "warnings": contract_source_warnings(state)
+            + evidence_warnings(state, task_dir=task_dir)}
 
 
 def close_task(path: str, *, by: str = "zcode-native") -> dict:
@@ -1445,7 +1551,7 @@ def close_task(path: str, *, by: str = "zcode-native") -> dict:
         return state["closure"]
     if any(not b.get("resolved_at") for b in state.get("blocks") or []):
         raise GovernanceError("存在未解除的阻塞：先 unblock 再收口。")
-    check = closure_check(state)
+    check = closure_check(state, task_dir=os.path.dirname(os.path.abspath(path)))
     if not check["passed"]:
         summary = "; ".join(f"{r.get('gate')}:{r.get('code')}" for r in check["reasons"])
         raise GovernanceError(f"四门未通过，不能收口：{summary}")
@@ -1459,6 +1565,12 @@ def close_task(path: str, *, by: str = "zcode-native") -> dict:
                  "reasons": []},
     })
     _history(state, "task_closed", {"verdict": "pass", "by": by})
+    # 收口时结束当前迭代：否则状态里会留下 phase=RUNNING、ended=null 的迭代，
+    # 与已 CLOSED 的任务自相矛盾。历史记录只增不改，这里只补 ended/phase。
+    for iteration in state.get("iterations") or []:
+        if isinstance(iteration, dict) and not iteration.get("ended"):
+            iteration["ended"] = state["closure"]["closed_at"]
+            iteration["phase"] = "CLOSED"
     save_state(path, state)
     return state["closure"]
 
@@ -1489,6 +1601,9 @@ def reopen_task(path: str, reason: str, *, authorized_by: str = "") -> dict:
         "reason": reason, "at": now_iso(), "authorized_by": authorized_by,
         "previous": old,
     })
+    # 重开后任务重新进入活动状态：上一轮已随收口标为 CLOSED，不能改回 RUNNING
+    # （会出现“同一轮既已收口又在进行”）。开一条新迭代承接后续工作。
+    begin_iteration(state, note=f"重开：{reason[:80]}")
     _history(state, "task_reopened", {"reason": reason[:200],
                                       "authorized_by": authorized_by})
     save_state(path, state)

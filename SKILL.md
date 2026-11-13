@@ -8,7 +8,7 @@ when_to_use: >
   原生完成，不进入本 Skill。
 ---
 
-# copilot：轻量协作治理（v6.1.0）
+# copilot：轻量协作治理（v6.2.0）
 
 Copilot 是运行在 ZCode 内的**协作治理层**，不是决策模型，也不是执行体。它负责把任务变成可
 追踪的合同、状态、证据与收口条件，并在任务没有真正完成时继续推进。
@@ -116,6 +116,11 @@ v6 状态内不再有 `pending_call`、`quota`、`round_seq`、`budget`、`pass_
   closure 快照）。
 - **历史只读**：旧审计 JSONL、旧 REVIEW 台账、旧任务状态通过 `legacy-status` 展示，不重放、
   不续跑、不改写。
+- **证据卫生提醒**：`closure-check` 对重复登记同一文件、内容完全相同、临时目录证据以及
+  `evidence/` 下未登记文件给出**非阻断**提醒；不改变四门，由 ZCode 判断补 note、归档或保留。
+- **收口交付清单（只读）**：`handoff --state ... [--json]` 汇总任务阶段、证据统计与工作区
+  未提交/未跟踪文件的分类（治理记录、任务证据、验收产物、未分类）。它只读 git 状态，
+  **不提交、不删除、不改写 `.gitignore`**；已提交内容与忽略项不在清单里，也不会被自动处理。
 
 ## 四门与收口
 
@@ -194,7 +199,7 @@ v6 状态内不再有 `pending_call`、`quota`、`round_seq`、`budget`、`pass_
 
 | 场景 | 必读文件 |
 |---|---|
-| 命令矩阵、证据登记、收口操作、历史只读 | `references/workflow.md` |
+| 命令矩阵、证据登记、收口操作、只读交付清单、历史只读 | `references/workflow.md` |
 | 阶段机、`drive`/`ingest`、PARTIAL 派生、退出码 | `references/runtime.md` |
 | 正式 REVIEW、缺陷分级、G4 收口细则 | `references/review.md` |
 | 原生 Bridge v2 信封、宿主记录、错误码 | `references/agent-bridge.md` |
@@ -204,10 +209,14 @@ v6 状态内不再有 `pending_call`、`quota`、`round_seq`、`budget`、`pass_
 
 ## 版本
 
-当前版本 **v6.1.0（ZCode Autonomous Development Edition）**。v6.1 在 v6.0.0 的本地治理引擎上
-做了三件事：放宽只读复核命令策略并按宿主记录派生命令/文件（消除 Reviewer 自己作废自己的
-常见原因）、支持增量复核与修复后 `rerun`（减少重复整轮复核）、合同源文件漂移改为非阻断
-提醒（不因文件改动阻塞执行）。G1–G4、证据完整性、宿主记录与 fail-closed 语义未放宽。
+当前版本 **v6.2.0（ZCode Autonomous Development Edition）**。v6.2 在 v6.0.0/v6.1 的本地
+治理引擎上按最近 5 个真实任务（v6.1 自升级、步数宝 GroMore、Honor ECPM、腾讯插屏、
+journey 激励）的复盘
+收敛：补齐只读复核策略的真实盲区（SDK/JDK 专用工具的绝对路径、`unzip -p` 读 APK
+内容、只读族的未加引号通配符），G4 拒绝原因给出可操作诊断（目标摘要过期时列出变化的
+条件/工作项/证据），
+迭代在开新轮与收口时正确结束，证据卫生与收口工作区交付清单改为非阻断提醒/只读清单。
+G1–G4、证据完整性、宿主记录与 fail-closed 语义未放宽；新增能力不扩大任何授权。
 v5.x 及以前的 SOL 决策通道、轮次/预算状态机与远程 REVIEW 裁决已退役；历史文档保留但明确
 标注为历史，不再作为当前规则。协作语义基线为用户级 `AGENTS.md` 与 ChatGPT 自定义指令
 v5.4.0；本 Skill 不与基线冲突。

@@ -68,8 +68,9 @@
 4. PASS → `close_task`，退出 0；
 5. RUNNING → 取前 `--max-actions` 个 ready 项打印工作单；`backend=native` 且工作项属于
    已登记计划时，经 `native_bridge.build_dispatch` 写出 `dispatch.json`，退出 10；
-6. PARTIAL → `derive_work`；若派生成功则 `begin_iteration`（记录本轮工作项与证据快照）
-   并保存，比较 `progress_digest`；若派生结果为空，退出 12；
+6. PARTIAL → `derive_work`；若派生成功则 `begin_iteration`（记录本轮工作项与证据快照，
+   并把上一轮未结束的迭代标记为 `ENDED`）并保存，比较 `progress_digest`；若派生结果为空，
+   退出 12；
 7. 循环最多 32 步，超限退出 12 并保留状态。
 
 **进展摘要 `progress_digest`**：由工作项状态/结果摘要/证据引用、条件状态/证据引用、
@@ -81,10 +82,11 @@
 
 - `closure_check` 依次检查 G1–G4，全部通过才 `passed=true`。
 - `closure --close` 需要四门通过，写入 `closure`（时间、`by`、`iteration_id`、门禁快照）
-  并把阶段固定为 CLOSED；之后的修改一律拒绝。
+  并把阶段固定为 CLOSED；未结束的迭代同时标记为 `CLOSED` 并补 `ended`，之后的修改一律拒绝。
 - `reopen --reason ... --authorized-by user` 需要显式用户授权声明；它保存旧 closure 快照到
-  `reopen_history`（含授权声明），清理收口状态，任务回到 RUNNING/PARTIAL。旧快照在写入前
-  做深拷贝，避免自引用。
+  `reopen_history`（含授权声明），清理收口状态，任务回到 RUNNING/PARTIAL，并开一条新迭代
+  承接后续工作（已收口的旧迭代保持 `CLOSED`，不改写历史）。旧快照在写入前做深拷贝，避免
+  自引用。
 - `final_evidence_digest` 是 G4 的复核目标：它绑定合同指纹、条件与证据、工作项结果与证据，
   **排除 `origin=g4-review` 的工作项**——否则复核完成后自身状态变化会让合法结论永久“过期”；
   其他任何变化仍会使旧复核失效（fail-closed）。

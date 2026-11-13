@@ -35,6 +35,7 @@ python3 -B scripts/copilot_dispatch.py <子命令> --state <state.json> [参数]
 | `closure-check` | 只读检查 G1–G4 | `--json` |
 | `closure` | 收口（必须四门通过） | `--close`、`--by` |
 | `reopen` | 用户授权后重开 | `--reason`、`--authorized-by user`（必填） |
+| `handoff` | 只读列出生效交付清单：分支/HEAD/上游、已暂存、未暂存、未跟踪分类 | `--state`（可选）、`--cwd`、`--limit`、`--json`；不提交、不删除、不改 `.gitignore` |
 | `contract` | 查看/修订合同与条件 | `--show`、`--amend --contract-file/--criteria-file`；BLOCKED 时也可修订；登记源文件摘要，文件被改动时 `status` 给出非阻断提醒 |
 | `authorize-review` | 记录用户对正式 REVIEW 的授权 | `--authorized-by user`（必填，调用方声明）、`--reason`、`--scope` |
 | `formal-review` | 登记已授权的正式 REVIEW 结论 | `--verdict pass\|partial\|blocked`、`--summary`、`--review-ref`、`--reviewer` |
@@ -65,11 +66,32 @@ python3 -B scripts/copilot_dispatch.py <子命令> --state <state.json> [参数]
 - `--text`：登记内联文本（小片段说明），同样计算摘要。
 - `--capture-cmd "<shell 命令>"`：经 `bridge_evidence.py` 采集，输出写入
   `<state 目录>/evidence/<Eid>.md`，复用脱敏、截断标记与清单；`kind=capture`。
-  与 `--file`/`--text` 互斥。
-- 证据不可替换：同 id 且摘要相同是幂等（返回已有记录）；同 id 摘要不同直接拒绝；
-  撤回用 `--drop --id --reason`，历史记录保留。
+  与 `--file`/`--text` 互斥。该 id 已登记或已归档时拒绝：采集会先覆盖 `<Eid>.md`
+  再校验摘要，重采会改写已登记/归档证据；归档不删除文件，所以只能用新的 id 采集。
+- 证据不可替换：同 id 且摘要相同是幂等（返回已有记录，CLI 明确提示“已存在且摘要一致、
+  未新增”）；同 id 摘要不同直接拒绝；撤回用 `--drop --id --reason`，历史记录保留。
 - 文件型证据在 G2 收口前会被重新读取并与登记摘要比对：
   `evidence_tampered`（内容变化）、`evidence_file_missing`（文件丢失）都失败关闭。
+- **证据卫生提醒（非阻断）**：`closure-check` 会提示重复登记同一文件、不同 id 内容完全相同、
+  证据文件位于 `/tmp`/`/var/tmp`/`/dev/shm`、以及 `<任务>/evidence/` 下有未登记文件。
+  这些提醒不进入四门原因，由 ZCode 决定补 note、归档或保留。
+
+### 只读交付清单（`handoff`）
+
+`handoff` 汇总“当前任务 + 当前工作区”能核实的状态，供收口交接使用：
+
+```bash
+python3 -B scripts/copilot_dispatch.py handoff --state .copilot-tasks/<task>/state.json
+python3 -B scripts/copilot_dispatch.py handoff --state ... --json
+```
+
+- 仓库信息：分支、HEAD、上游、落后/领先提交数。
+- 变更分类：已暂存（下次提交会包含）、已修改未暂存、未跟踪文件按类别分组——
+  治理记录（`.copilot-tasks/...`）、任务证据（已登记路径）、验收产物
+  （`.apk`/`.png`/`.log` 等）、未分类（需 ZCode/用户判断）。
+- 任务信息：阶段、风险、收口人、证据统计、缺失的证据文件与证据提醒。
+- **只读边界**：命令只运行 `git --no-optional-locks` 查询，不 `add`、不 `commit`、
+  不删除、不改写 `.gitignore`，也不处理忽略项。清单不构成提交授权。
 
 ## 3. `copilot_auto.py`：驱动与回填
 

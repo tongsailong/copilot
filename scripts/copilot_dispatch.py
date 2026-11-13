@@ -33,7 +33,7 @@ if HERE not in sys.path:
 
 import governance as G  # noqa: E402
 
-__version__ = "6.1.0"
+__version__ = "6.2.0"
 
 
 class CLIError(Exception):
@@ -240,6 +240,14 @@ def cmd_evidence(args) -> int:
     if not args.add:
         raise CLIError("请指定 --add / --drop / --list / --next-id。")
     eid = (args.id or "").strip() or G.next_evidence_id(state)
+    existed = any(str(e.get("id") or "") == eid for e in state.get("evidence") or [])
+    if args.capture_cmd and existed:
+        # 采集会先写 <evidence>/<id>.md 再校验摘要；同 id 重采会覆盖已登记文件，
+        # 即使随后报“摘要不同”，磁盘上的证据也已经被改写（G2 会判篡改）。
+        # 已归档（--drop）的证据文件仍作为历史材料保留，同样不能被覆盖，所以
+        # 这里的处置只能是换新 id。
+        raise CLIError(f"证据 {eid} 已登记或已归档；--capture-cmd 会覆盖证据文件。"
+                       "请使用新的 id 采集（归档证据的文件不会删除）。")
     if args.capture_cmd:
         if args.file or args.text is not None:
             raise CLIError("--capture-cmd 不能与 --file/--text 同时使用。")
@@ -264,14 +272,25 @@ def cmd_evidence(args) -> int:
     else:
         raise CLIError("--add 需要 --file、--text 或 --capture-cmd 之一。")
     G.save_state(path, state)
-    print(f"{entry['id']} 已登记：{entry['kind']} size={entry['size']} "
-          f"sha256={entry['sha256'][:16]}…")
+    if existed:
+        # 幂等登记不新增记录：明确说清楚，避免误以为又登记了一份证据。
+        peers = [str(e.get("id")) for e in state.get("evidence") or []
+                 if str(e.get("id") or "") != entry["id"]
+                 and not e.get("dropped")
+                 and str(e.get("sha256") or "") == entry["sha256"]]
+        extra = f"；与 {'/'.join(peers)} 内容相同" if peers else ""
+        print(f"{entry['id']} 已存在且摘要一致（未新增，sha256={entry['sha256'][:16]}…{extra}）")
+    else:
+        print(f"{entry['id']} 已登记：{entry['kind']} size={entry['size']} "
+              f"sha256={entry['sha256'][:16]}…")
     return 0
 
 
 def cmd_closure_check(args) -> int:
-    state = G.load_state(_state_path(args))
-    check = G.closure_check(state)
+    path = _state_path(args)
+    state = G.load_state(path)
+    check = G.closure_check(
+        state, task_dir=os.path.dirname(os.path.abspath(path)))
     if args.json:
         _print({"task_id": state.get("task_id"), **check})
         return 0
@@ -282,6 +301,8 @@ def cmd_closure_check(args) -> int:
         print(f"- {name}: {'PASS' if gate.get('passed') else 'FAIL'}")
         for reason in gate.get("reasons") or []:
             print(f"    {reason.get('code')}: {reason.get('detail')}")
+    for warning in check.get("warnings") or []:
+        print(f"- 提醒（不阻断）：{warning}")
     return 0
 
 
@@ -301,6 +322,247 @@ def cmd_reopen(args) -> int:
     print("任务已重开；历史收口记录保留在 closure.reopen_history。")
     return 0
 
+
+# ── 交付清单（只读） ──────────────────────────────────────────────────────
+_HANDOFF_ARTIFACT_EXTS = frozenset({
+    ".apk", ".aab", ".png", ".jpg", ".jpeg", ".webp", ".gif",
+    ".log", ".txt", ".mp4", ".webm", ".har", ".trace", ".hprof",
+})
+
+
+def _git_read(cwd: str, *args: str) -> str | None:
+    """只读执行 git 查询；禁用可选锁，失败返回 None（不抛异常、不写工作区）。
+
+    `errors="replace"`：`git status -z` 原样输出路径字节，非 UTF-8 文件名在严格
+    解码下会抛 UnicodeDecodeError 并让整个清单崩溃；替换字符只影响展示。
+    """
+    env = dict(os.environ, GIT_OPTIONAL_LOCKS="0")
+    try:
+        proc = subprocess.run(["git", "--no-optional-locks", *args], cwd=cwd,
+                              capture_output=True, text=True,
+                              encoding="utf-8", errors="replace", env=env)
+    except OSError:
+        return None
+    return proc.stdout if proc.returncode == 0 else None
+
+
+def _parse_git_status(raw: str) -> list[dict]:
+    """解析 `git status --porcelain=v1 -z`；重命名/复制记录的第二段是原路径。"""
+    entries: list[dict] = []
+    tokens = (raw or "").split("\0")
+    idx = 0
+    while idx < len(tokens):
+        token = tokens[idx]
+        idx += 1
+        if len(token) < 4:
+            continue
+        code, path = token[:2], token[3:]
+        entry = {"code": code, "path": path}
+        if code[0] in "RC" or code[1] in "RC":
+            if idx < len(tokens) and tokens[idx]:
+                entry["from"] = tokens[idx]
+                idx += 1
+        entries.append(entry)
+    return entries
+
+
+def _handoff_bucket(path: str, *, evidence: set[str], task_root: str) -> str:
+    """把未跟踪文件归入可解释的类别；Copilot 只分类，不删除、不 ignore。"""
+    if task_root and (path == task_root or path.startswith(task_root + "/")):
+        return "治理记录（任务状态/证据；通常由忽略规则保留）"
+    if path in evidence:
+        return "任务证据（已登记；按证据链保留）"
+    ext = os.path.splitext(path)[1].lower()
+    if ext in _HANDOFF_ARTIFACT_EXTS:
+        return "验收产物（截图/日志/安装包；确认是否交付或保留）"
+    return "未分类（需 ZCode / 用户判断）"
+
+
+def _resolve_handoff_cwd(state_dir: str) -> str:
+    """优先使用任务所在仓库根目录；否则回落到当前目录。
+
+    从任务目录本身开始向上探测，并用 `git rev-parse --show-toplevel` 判断——
+    直接检查 `.git` 目录会漏掉 worktree/submodule（`.git` 是文件）以及状态文件
+    直接放在仓库根的情况。
+    """
+    if state_dir:
+        candidate = state_dir
+        for _ in range(3):
+            if not candidate:
+                break
+            top = (_git_read(candidate, "rev-parse", "--show-toplevel") or "").strip()
+            if top:
+                return top
+            parent = os.path.dirname(candidate)
+            if parent == candidate:
+                break
+            candidate = parent
+    return os.getcwd()
+
+
+def cmd_handoff(args) -> int:
+    state = None
+    state_path = os.path.abspath(args.state) if args.state else ""
+    if state_path:
+        state = G.load_state(state_path)
+    task_dir = os.path.dirname(state_path) if state_path else ""
+    cwd = os.path.abspath(args.cwd) if args.cwd else _resolve_handoff_cwd(task_dir)
+
+    top = (_git_read(cwd, "rev-parse", "--show-toplevel") or "").strip()
+    git_ok = bool(top)
+    branch = head = upstream = divergence = ""
+    entries: list[dict] = []
+    if git_ok:
+        branch = (_git_read(cwd, "rev-parse", "--abbrev-ref", "HEAD") or "").strip()
+        head = (_git_read(cwd, "log", "-1", "--format=%h %s") or "").strip()
+        upstream = (_git_read(
+            cwd, "rev-parse", "--abbrev-ref", "--symbolic-full-name",
+            "@{upstream}") or "").strip()
+        divergence = (_git_read(
+            cwd, "rev-list", "--left-right", "--count", "@{upstream}...HEAD")
+            or "").strip()
+        entries = _parse_git_status(
+            _git_read(cwd, "status", "--porcelain=v1", "-z",
+                      "--untracked-files=all") or "")
+
+    staged, unstaged, untracked = [], [], []
+    for entry in entries:
+        code, path = entry["code"], entry["path"]
+        if code == "??":
+            untracked.append(entry)
+            continue
+        if code[0] != " ":
+            staged.append(entry)
+        if code[1] != " ":
+            unstaged.append(entry)
+
+    task_root = ""
+    if task_dir and git_ok:
+        relative = os.path.relpath(task_dir, top)
+        if not relative.startswith(".."):
+            task_root = relative.replace(os.sep, "/")
+    evidence_paths: set[str] = set()
+    evidence_warnings: list[str] = []
+    missing_evidence: list[str] = []
+    task_summary: dict = {}
+    if isinstance(state, dict):
+        for item in state.get("evidence") or []:
+            hint = str(item.get("path_hint") or "")
+            if not hint or hint == "<inline>":
+                continue
+            if git_ok:
+                relative = os.path.relpath(hint, top)
+                if not relative.startswith(".."):
+                    evidence_paths.add(relative.replace(os.sep, "/"))
+            # 已归档证据的文件被清理是正常收尾，不再报“缺失（需处理）”。
+            if not item.get("dropped") and not os.path.exists(hint):
+                missing_evidence.append(f"{item.get('id')}：{hint}")
+        evidence_warnings = G.evidence_warnings(state)
+        closed = bool((state.get("closure") or {}).get("closed"))
+        task_summary = {
+            "task_id": state.get("task_id"),
+            "goal": str(state.get("goal") or "")[:200],
+            "phase": "CLOSED" if closed else G.evaluate(state).get("phase"),
+            "risk": state.get("risk"),
+            "closed_by": (state.get("closure") or {}).get("closed_by"),
+            "evidence_live": len([e for e in state.get("evidence") or []
+                                  if not e.get("dropped")]),
+            "evidence_dropped": len([e for e in state.get("evidence") or []
+                                     if e.get("dropped")]),
+        }
+
+    buckets: dict[str, list[str]] = {}
+    for entry in untracked:
+        bucket = _handoff_bucket(entry["path"], evidence=evidence_paths,
+                                 task_root=task_root)
+        buckets.setdefault(bucket, []).append(entry["path"])
+
+    behind = ahead = None
+    if divergence:
+        parts = divergence.split()
+        if len(parts) == 2:
+            behind, ahead = parts[0], parts[1]
+
+    report = {
+        "cwd": cwd,
+        "repo": top.strip(),
+        "git_available": git_ok,
+        "branch": branch,
+        "head": head,
+        "upstream": upstream,
+        "behind": behind,
+        "ahead": ahead,
+        "staged": [{"code": e["code"], "path": e["path"],
+                    **({"from": e["from"]} if e.get("from") else {})}
+                   for e in staged],
+        "unstaged": [{"code": e["code"], "path": e["path"],
+                      **({"from": e["from"]} if e.get("from") else {})}
+                     for e in unstaged],
+        "untracked": [{"path": e["path"],
+                       "bucket": _handoff_bucket(e["path"], evidence=evidence_paths,
+                                                 task_root=task_root)}
+                      for e in untracked],
+        "untracked_buckets": {name: sorted(paths) for name, paths in buckets.items()},
+        "task": task_summary,
+        "evidence_warnings": evidence_warnings,
+        "missing_evidence_files": missing_evidence,
+        "note": ("只读清单：Copilot 不提交、不删除、不改写 .gitignore；"
+                 "已提交内容不在清单里，未列出的忽略项也不受影响。"),
+    }
+
+    if args.json:
+        _print(report)
+        return 0
+
+    if git_ok:
+        sync = ""
+        if behind is not None and ahead is not None:
+            sync = f"，落后上游 {behind} / 领先 {ahead}"
+        print(f"## 工作区交付清单（只读）\n")
+        print(f"- 仓库：{report['repo']}")
+        print(f"- 分支：{branch}（HEAD {head}）{sync}")
+        if upstream:
+            print(f"- 上游：{upstream}")
+        total = len(staged) + len(unstaged) + len(untracked)
+        print(f"- 变更：已暂存 {len(staged)} / 未暂存 {len(unstaged)} / "
+              f"未跟踪 {len(untracked)}（共 {total}）")
+        for title, items in (("已暂存（下次提交会包含）", staged),
+                             ("已修改未暂存", unstaged)):
+            print(f"\n### {title}")
+            if not items:
+                print("- （无）")
+            for entry in items:
+                origin = f" ← {entry['from']}" if entry.get("from") else ""
+                print(f"- `{entry['code']}` {entry['path']}{origin}")
+        print("\n### 未跟踪文件（按类别）")
+        if not buckets:
+            print("- （无）")
+        for name in sorted(buckets):
+            print(f"- {name}：{len(buckets[name])} 项")
+            for path in sorted(buckets[name])[:args.limit]:
+                print(f"    - {path}")
+            if len(buckets[name]) > args.limit:
+                print(f"    - …（其余 {len(buckets[name]) - args.limit} 项省略）")
+    else:
+        print(f"## 工作区交付清单（只读）\n\n- 目录 {cwd} 不是可用 git 仓库，"
+              "仅列出任务状态。")
+    if task_summary:
+        print(f"\n### 任务状态")
+        print(f"- {task_summary['task_id']}：{task_summary['phase']} "
+              f"（风险 {task_summary['risk']}，收口人 {task_summary['closed_by'] or '-'}）")
+        print(f"- 目标：{task_summary['goal']}")
+        print(f"- 证据：有效 {task_summary['evidence_live']} / "
+              f"已归档 {task_summary['evidence_dropped']}")
+    if missing_evidence:
+        print("\n### 证据文件缺失（需处理）")
+        for item in missing_evidence[:args.limit]:
+            print(f"- {item}")
+    if evidence_warnings:
+        print("\n### 证据提醒（不阻断）")
+        for item in evidence_warnings[:args.limit]:
+            print(f"- {item}")
+    print(f"\n{report['note']}")
+    return 0
 
 def cmd_contract(args) -> int:
     path = _state_path(args)
@@ -503,6 +765,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--authorized-by", required=True,
                    help="必须显式写 user：重开需要用户授权")
     p.set_defaults(func=cmd_reopen)
+
+    p = sub.add_parser("handoff", help="只读列出生效交付清单与未提交/未跟踪文件")
+    p.add_argument("--state", default="", help="任务状态文件（可选）")
+    p.add_argument("--cwd", default="", help="仓库目录（默认取任务所在仓库）")
+    p.add_argument("--limit", type=int, default=20, help="每类最多列出的条目数")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_handoff)
 
     p = sub.add_parser("contract", help="查看或修订合同与完成条件")
     p.add_argument("--state", required=True)

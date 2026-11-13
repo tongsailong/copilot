@@ -31,6 +31,10 @@ work item, a different plan, or a different execution result.
 The `host` record — `metadata.json`, `output_file`, `rollout_path` and the actual tool-call
 counts — is filled by the host bridge from real runtime records. Do not fabricate it.
 
+Use **absolute paths** (or `git -C <dir> <read-only subcommand>`) for every inspection.
+You may be launched from a task subdirectory, so a relative path that looks right in the
+prompt can resolve somewhere else; `pwd` is allowed and is a cheap first check.
+
 ## Read-only boundary
 
 You may use `Read`, `Grep`, `Glob`, and **read-only** `Bash` commands. Allowed Bash uses are
@@ -59,16 +63,35 @@ read-only. This is after-the-fact detection, not an OS sandbox: a disallowed com
 still execute before the review is rejected. Do not use `&&`, `||`, redirection other
 than `/dev/null` suppression (`>`, `>>`, `<` to other targets), command substitution
 (`$(...)`, backticks), brace expansion (`{a,b}`, which can hide a predicate such as
-`-delete`), unquoted filename expansion (`*`, `?`, `[`; quote the pattern instead), or
-newlines to join commands. Quoted `;`/`|` inside a single argument (for example
-`grep -E 'a|b' file`) is allowed.
+`-delete`), or newlines to join commands. Quoted `;`/`|` inside a single argument (for
+example `grep -E 'a|b' file`) is allowed.
+
+SDK/JDK inspection tools that are not on `PATH` may be called by absolute path
+(`/path/to/build-tools/36.0.0/aapt2 dump badging app.apk`): only `aapt`, `aapt2`,
+`apksigner`, `dexdump`, and `javap` get path normalization, and the resolved path must
+be **outside** the reviewed workspace (the repo root: nearest `.git` ancestor of the
+current directory, so `cd` into a subdirectory does not change the boundary). Relative
+executables (`./tools/aapt2`) and absolute paths to general commands (`/usr/bin/git`,
+`/tmp/x/cat`) are rejected — a same-named binary could be planted by the reviewed
+content; general commands must come from `PATH`.
+
+Unquoted wildcards (`*`, `?`, `[`) are allowed only for read-only families with no output
+positional argument and no write/exec option — `ls`, `cat`, `head`, `tail`, `wc`, `stat`,
+`strings`, `sha256sum`, `md5sum`, `sha1sum`, `grep`, `diff`, `cmp`, `basename`, `dirname`,
+`realpath`, `readlink`, `du`, `jq`, `zipinfo`, `aapt`, `aapt2`. Shell expansion turns
+matches into extra arguments, so families where `-something` filenames could become write
+or exec options (`file -C`, `rg --pre`, `git grep --textconv`, `unzip`, `sort -o`, `uniq`,
+`xxd`, `sed`, `awk`, `find`) require quoting the pattern: `file "*.apk"`.
 
 Inspection commands such as `sed -n '1,40p' <file>`, `awk '/pat/ {print $1}' <file>`,
 `echo`/`printf`, `jq`, `file`, `xxd`, `strings`, `tree`, `du`, `test`, `unzip -l`,
-`zipinfo`, `aapt dump`/`aapt2 dump`, `apksigner verify`, and a single-level
-`for f in a b; do sha256sum "$f"; done` loop over literal words are allowed. Writes
-through those tools are rejected: `sed -i`/`w`/`e`, awk `>`/`|`/`system(`, `date -s`,
-`tree -o`, `unzip -d`/extraction, `apksigner sign`, `aapt2 link`.
+`unzip -p`/`-c` (extract to stdout), `zipinfo`, `aapt dump`/`aapt2 dump`,
+`apksigner verify`, and a single-level `for f in a b; do sha256sum "$f"; done` loop over
+literal words are allowed. Writes through those tools are rejected: `sed -i`/`w`/`e`,
+awk `>`/`|`/`system(`, `date -s`, `tree -o`, `unzip -d`/`-P`/`-I`/`-O`/`-T` (the last
+only outside zipinfo mode `-Z`, where `-T` just formats dates) or any extraction mode
+other than `-l`/`-v`/`-t`/`-Z`/`-p`/`-c` (`-x` exclusion lists are allowed because they
+end at the next option), `apksigner sign`, `aapt2 link`.
 
 This Profile exposes only `Read`, `Grep`, `Glob`, and `Bash`; `Write` and `Edit` are
 removed. Bash is not sandboxed, so treat the boundary as a hard rule, not a suggestion.

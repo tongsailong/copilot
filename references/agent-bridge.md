@@ -128,8 +128,19 @@ Copilot 不派发 Agent、不调用模型、不写别人的会话。它只校验
 - 实际执行过的 Bash 命令必须全部只读；任何写操作、输出重定向、`-delete`、`-exec`、
   `--output`、`sort -o`、`git grep -O`、`sed -i`、awk 写文件/`system(` 等一律
   `review_command_not_readonly`。只读检查工具（`sed -n`、`awk` 只读程序、`echo`、
-  `jq`、`unzip -l`、`aapt dump`、`apksigner verify`、单输入 `xxd`、不带 `-C` 的
-  `file` 等）与单层字面量 `for` 循环允许。
+  `jq`、`unzip -l`/`-p`/`-c`、`aapt dump`、`apksigner verify`、单输入 `xxd`、不带
+  `-C` 的 `file` 等）与单层字面量 `for` 循环允许。
+- 不在 `PATH` 的 Android/JDK 检查工具可用绝对路径调用
+  （`/path/build-tools/36.0.0/aapt2 dump ...`）：只有 `aapt`/`aapt2`/`apksigner`/
+  `dexdump`/`javap` 做路径归一化，且 realpath 必须**不在被复核工作区内**（工作区根取
+  当前目录最近的 `.git` 祖先；在仓库子目录取证不改变边界）。相对路径可执行文件
+  （`./tools/aapt2`）与通用命令的绝对路径（`/usr/bin/git`、`/tmp/x/cat`）一律拒绝：
+  同名二进制可能由被复核内容写入，通用命令必须走 `PATH`。
+- 未加引号的通配符（`*`/`?`/`[`）只对**没有输出位置参数、也没有写/执行选项**的只读族
+  放行（`ls`、`cat`、`sha256sum`、`grep`、`diff`、`jq`、`zipinfo`、`aapt2` 等）；
+  shell 展开会把文件名变成额外参数，所以 `file -C`、`rg --pre`、`git grep --textconv`、
+  `unzip`、`sort -o`、`uniq`、`xxd`、`sed`、`awk`、`find` 等族仍要求加引号
+  （`file "*.apk"`）。
 - `files_inspected` 若填写，路径必须存在且是普通文件（`review_inspection_invalid`）。
 - `g4_eligible=true` 时必须：`verdict=pass`、无 blocking、`unverified` 为空、
   `changed_files` 为空，并附完整宿主记录（`g4_requires_pass`、`g4_with_unverified`、
