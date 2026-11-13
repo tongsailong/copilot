@@ -74,7 +74,10 @@ Copilot 不派发 Agent、不调用模型、不写别人的会话。它只校验
 - 证据至少一条；文件必须是绝对路径、存在、可读；SHA-256 必须与文件实际内容一致
   （`evidence_sha_mismatch`），且证据属于本任务（`evidence_foreign`）。
 - 已终态（done/dropped）的工作项不能被不同结果覆盖（`work_item_terminal`）；相同
-  `result_sha256` 重复回填是幂等成功。
+  `result_sha256` 重复回填是幂等成功。修复后需要重新验证同一工作项时，先用
+  `copilot_dispatch.py rerun --state ... --id <工作项> --reason <原因>` 把它重开为
+  `pending`（旧结果保留在 `rerun_history`），再回填新的执行结果；不要为了让新结果
+  通过而伪造新工作项或改写历史。
 - 执行方不得使用 `reviewer` Profile（`reviewer_as_executor`）。
 
 ### 2.3 review（`copilot-native-review/v2`）
@@ -87,6 +90,9 @@ Copilot 不派发 Agent、不调用模型、不写别人的会话。它只校验
   "dispatch_id": "d-...", "work_item_id": "A1",
   "execution_result_sha256": "<被执行结果的摘要>",
   "target_sha256": "<当前 final_evidence_digest>",
+  "review_scope": "full|incremental",
+  "based_on_review_sha256": "<增量复核的基线；full 时为空>",
+  "evidence_manifest": ["E7", "E8"],
   "reviewer": {"kind": "subagent", "agent_id": "agent-review",
                "child_session_id": "child-review", "profile_id": "reviewer",
                "model_reported": "..."},
@@ -115,15 +121,25 @@ Copilot 不派发 Agent、不调用模型、不写别人的会话。它只校验
 - Reviewer 必须是独立子代理（`reviewer_invalid`），Profile 必须是 `reviewer`
   （`reviewer_profile_invalid`），且与执行方不同 Agent / Child Session
   （`executor_reviewer_same`、`review_contaminated`）。
-- `files_inspected` 必须覆盖本工作项的原始证据文件（`review_inspection_missing` /
-  `review_inspection_invalid`）。
-- `commands_run` 只允许只读命令；任何写操作、输出重定向、`-delete`、`-exec`、
-  `--output`、`sort -o`、`git grep -O` 等一律 `review_command_not_readonly`。
+- `files_inspected` / `commands_run` 由 `native_agent.py` 从宿主 rollout **派生**：
+  `commands_run` 取实际 Bash 调用，`files_inspected` 合并自报与实际的读取路径；
+  两者可以为空，不再要求 Reviewer 手工复述，也不因自述与记录不完全一致而作废
+  整轮复核。`declared_files_unverified` 非空时会写入复核记录，供审计。
+- 实际执行过的 Bash 命令必须全部只读；任何写操作、输出重定向、`-delete`、`-exec`、
+  `--output`、`sort -o`、`git grep -O`、`sed -i`、awk 写文件/`system(` 等一律
+  `review_command_not_readonly`。只读检查工具（`sed -n`、`awk` 只读程序、`echo`、
+  `jq`、`unzip -l`、`aapt dump`、`apksigner verify`、单输入 `xxd`、不带 `-C` 的
+  `file` 等）与单层字面量 `for` 循环允许。
+- `files_inspected` 若填写，路径必须存在且是普通文件（`review_inspection_invalid`）。
 - `g4_eligible=true` 时必须：`verdict=pass`、无 blocking、`unverified` 为空、
   `changed_files` 为空，并附完整宿主记录（`g4_requires_pass`、`g4_with_unverified`、
   `g4_with_blocking`、`g4_host_record_missing`）。
 - 非 G4 复核若 `verdict=pass` 但有 blocking/unverified，同样拒绝
   （`pass_with_blocking_finding` / `pass_with_unverified`）。
+- 增量复核（`review_scope=incremental`）必须带 `based_on_review_sha256`
+  （本任务已回填的 PASS、`g4_eligible=true`、含覆盖快照的复核）与
+  `evidence_manifest`；基线之后新增/变更的证据必须全部列入清单，条件状态与
+  其他工作项不得变化，否则拒绝并要求完整复核（`incremental_*` 原因码）。
 
 ## 3. 宿主记录与 G4 资格
 
@@ -148,6 +164,7 @@ metadata/rollout，确认：
 | rollout 工具调用计数与 `host.tool_calls` 完全一致 | `host_tool_calls_changed` |
 | rollout 中没有非只读工具或写命令 | `host_*` / `review_command_not_readonly` |
 | metadata 声称的调用数与 rollout 实际一致 | `host_tool_calls_changed` |
+| 信封 verdict / findings / unverified / changed_files 与宿主 outputFile 原文一致 | `host_verdict_changed` / `host_findings_changed` / `host_unverified_changed` / `host_changed_files_changed` |
 
 任何问题都拒绝回填，结论不得作为 G4 依据。
 
@@ -196,7 +213,7 @@ python3 -B scripts/copilot_auto.py ingest --state T/state.json --review-file A1.
 | 计划/派发 | `plan_missing`、`plan_unknown`、`plan_mismatch`、`plan_drift`、`dispatch_missing`、`dispatch_empty`、`dispatch_duplicate`、`dispatch_mismatch`、`dispatch_id_drift`、`idempotency_mismatch`、`iteration_mismatch`、`work_item_unknown`、`work_item_terminal` |
 | 执行 | `backend_not_native`、`assignee_unsupported`、`invalid_status`、`executor_identity_missing`、`reviewer_as_executor` |
 | 证据 | `evidence_missing`、`evidence_invalid`、`evidence_duplicate`、`evidence_unreadable`、`evidence_sha_mismatch`、`evidence_foreign`、`evidence_conflict` |
-| 复核 | `reviewer_invalid`、`reviewer_profile_invalid`、`review_binding_mismatch`、`executor_reviewer_same`、`review_contaminated`、`invalid_verdict`、`review_finding_invalid`、`review_inspection_missing`、`review_command_not_readonly` |
+| 复核 | `reviewer_invalid`、`reviewer_profile_invalid`、`review_binding_mismatch`、`executor_reviewer_same`、`review_contaminated`、`invalid_verdict`、`review_finding_invalid`、`review_inspection_invalid`、`review_command_not_readonly`、`review_scope_invalid`、`incremental_base_missing`、`incremental_base_ineligible`、`incremental_manifest_missing`、`incremental_evidence_uncovered`、`incremental_criteria_changed`、`incremental_scope_too_narrow` |
 | G4 | `g4_host_record_missing`、`g4_host_record_invalid`、`g4_tool_calls_missing`、`g4_tool_not_readonly`、`g4_not_eligible`、`g4_requires_pass`、`g4_with_unverified`、`g4_with_blocking`、`pass_with_blocking_finding`、`pass_with_unverified`、`host_profile_changed` 等 |
 
 错误码只用于定位与修复，不提供绕过开关；修正记录后重新生成信封。

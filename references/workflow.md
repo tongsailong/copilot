@@ -25,6 +25,7 @@ python3 -B scripts/copilot_dispatch.py <子命令> --state <state.json> [参数]
 | `plan` | 登记 ZCode 本地计划 | `--plan <plan.json>`（或 stdin）、`--source` |
 | `status` / `next` | 查看阶段、工作项、四门、下一步 | `--json` |
 | `record` | 回填工作项结果 | `--id`、`--status`、`--result`、`--evidence E1`（可重复） |
+| `rerun` | 把已终结工作项重开为 pending（修复后重新验证） | `--id`、`--reason`；旧结果保留在 `rerun_history` |
 | `criterion` | 核销完成条件 | `--id C1`、`--status pending\|met\|not_met`、`--evidence`（`met` 必填） |
 | `judgment` | 记录自我判断（仅审计） | `--status pass\|partial\|blocked`、`--summary`、`--evidence` |
 | `evidence` | 登记 / 归档 / 列出证据 | `--add`、`--file`、`--text`、`--capture-cmd`、`--drop --id`、`--list`、`--next-id` |
@@ -34,7 +35,7 @@ python3 -B scripts/copilot_dispatch.py <子命令> --state <state.json> [参数]
 | `closure-check` | 只读检查 G1–G4 | `--json` |
 | `closure` | 收口（必须四门通过） | `--close`、`--by` |
 | `reopen` | 用户授权后重开 | `--reason`、`--authorized-by user`（必填） |
-| `contract` | 查看/修订合同与条件 | `--show`、`--amend --contract-file/--criteria-file` |
+| `contract` | 查看/修订合同与条件 | `--show`、`--amend --contract-file/--criteria-file`；BLOCKED 时也可修订；登记源文件摘要，文件被改动时 `status` 给出非阻断提醒 |
 | `authorize-review` | 记录用户对正式 REVIEW 的授权 | `--authorized-by user`（必填，调用方声明）、`--reason`、`--scope` |
 | `formal-review` | 登记已授权的正式 REVIEW 结论 | `--verdict pass\|partial\|blocked`、`--summary`、`--review-ref`、`--reviewer` |
 | `legacy-status` | 只读查看 v1/v2 SOL 历史状态与台账 | `--state`、`--audit-log`、`--ledger`、`--json` |

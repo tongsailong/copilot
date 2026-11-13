@@ -51,6 +51,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -292,18 +293,87 @@ def _review_tool_calls(meta: dict, override: str = "") -> list[tuple[str, str, d
     return calls
 
 
-def _assert_reported_commands_executed(reported: object,
-                                       calls: list[tuple[str, str, dict]]) -> None:
-    """自报 `commands_run` 必须有实际调用支持；不反向要求完整复述。"""
-    if not isinstance(reported, list):
-        return
-    executed = {cmd for _, cmd, _ in calls if cmd}
-    for raw in reported:
-        cmd = str(raw or "").strip()
-        if cmd and cmd not in executed:
-            raise AgentRecordError(
-                f"[review_command_not_executed] Reviewer 自报执行了 rollout 中不存在的命令：{cmd}；"
-                "禁止只报安全命令而实际执行其他命令。")
+def _actual_commands(calls: list[tuple[str, str, dict]]) -> list[str]:
+    """实际执行过的 Bash 命令（保持首次出现顺序，去重）。
+
+    v6.1 起复核信封的 `commands_run` 由宿主 rollout 派生，不再采信 Reviewer
+    自述：自述命令既可能漏报也可能多报，宿主记录才是可用证据。
+    """
+    out: list[str] = []
+    for _tool, command, _payload in calls:
+        if command and command not in out:
+            out.append(command)
+    return out
+
+
+_PAYLOAD_PATH_KEYS = ("file_path", "path", "pattern")
+
+
+def _absolute_file(value: str) -> str:
+    if not value or "\n" in value:
+        return ""
+    path = os.path.abspath(os.path.expanduser(value))
+    return path if os.path.isfile(path) else ""
+
+
+def _command_paths(command: str) -> list[str]:
+    """从 Bash 命令里提取真实存在的绝对文件路径（仅用于补充 inspected 清单）。"""
+    out: list[str] = []
+    try:
+        argv = shlex.split(command, posix=True)
+    except ValueError:
+        return out
+    for token in argv:
+        path = _absolute_file(token)
+        if path and path not in out:
+            out.append(path)
+    return out
+
+
+def _merge_inspected_files(declared: object,
+                           calls: list[tuple[str, str, dict]]) -> list[str]:
+    """合并自报与宿主实际的读取清单。
+
+    自报文件只在真实存在时保留；宿主读取（Read/Grep/Glob 的路径参数、Bash
+    命令里的绝对文件）一律并入。G4 的证据覆盖仍单独按实际调用计算，这份清单
+    只作说明，不构成放行依据。
+    """
+    out: list[str] = []
+    if isinstance(declared, list):
+        for item in declared:
+            path = _absolute_file(str(item or "").strip())
+            if path and path not in out:
+                out.append(path)
+    for _tool, command, payload in calls:
+        candidates: list[str] = []
+        if command:
+            candidates.extend(_command_paths(command))
+        for key in _PAYLOAD_PATH_KEYS:
+            value = payload.get(key)
+            if isinstance(value, str):
+                path = _absolute_file(value)
+                if path:
+                    candidates.append(path)
+        for path in candidates:
+            if path not in out:
+                out.append(path)
+    return out
+
+
+def _declared_files_unverified(declared: object,
+                               calls: list[tuple[str, str, dict]]) -> list[str]:
+    """自报读过、但实际调用里找不到对应访问的文件（记录用，不阻断复核）。"""
+    if not isinstance(declared, list):
+        return []
+    blobs = _call_blobs(calls)
+    missing: list[str] = []
+    for item in declared:
+        path = str(item or "").strip()
+        if not path:
+            continue
+        if not any(_mentions_path(path, blob) for blob in blobs):
+            missing.append(path)
+    return missing
 
 
 def _usage(meta: dict) -> dict:
@@ -462,6 +532,44 @@ def _review_fields(data: dict) -> dict:
     return out
 
 
+_FENCED_JSON_RE = re.compile(r"```(?:json)?[ \t]*\n(?P<body>.*?)\n[ \t]*```", re.S)
+
+
+def _extract_review_json(text: str, path: str) -> dict:
+    """从宿主输出里取出唯一的 JSON 对象。
+
+    v6.1 起不再要求“纯 JSON 且无任何叙述”：模型偶尔会把对象包在围栏里或前后
+    加一句说明，这不应让整轮复核作废。但也不做模糊解析：只接受
+    (1) 整段就是 JSON，或 (2) 恰好一个围栏且围栏内是单个 JSON 对象。多个围栏、
+    多个可解析对象或无法解析时失败关闭，避免从叙述里猜结论；围栏外的说明文字
+    不参与解析（结论只取那唯一一个对象）。
+    """
+    try:
+        data = json.loads(text)
+    except ValueError:
+        data = None
+    if isinstance(data, dict):
+        return data
+    blocks = [match.group("body") for match in _FENCED_JSON_RE.finditer(text)]
+    parsed = []
+    for block in blocks:
+        try:
+            candidate = json.loads(block)
+        except ValueError:
+            continue
+        if isinstance(candidate, dict):
+            parsed.append(candidate)
+    if len(parsed) == 1:
+        return parsed[0]
+    if len(parsed) > 1:
+        raise AgentRecordError(
+            f"[review_output_ambiguous] 宿主输出含 {len(parsed)} 个 JSON 对象；"
+            "无法确定正式结论，拒绝复核信封。")
+    raise AgentRecordError(
+        f"[review_output_unparsable] 无法把宿主输出解析为 JSON 对象：{path}；"
+        "请让 Reviewer 以单个 JSON 对象输出结论。")
+
+
 def _review_host_output(meta: dict) -> dict:
     """读取宿主为 Reviewer 落盘的**实际输出**（metadata.outputFile）。
 
@@ -479,21 +587,7 @@ def _review_host_output(meta: dict) -> dict:
         raise AgentRecordError(
             f"[review_output_misplaced] outputFile 不在 metadata 同目录：{path}；"
             "拒绝使用外部（可能被替换的）文件作为复核结论。")
-    text = _read_text(path).strip()
-    try:
-        data = json.loads(text)
-    except ValueError:
-        # Profile 要求纯 JSON；兼容宿主把整段输出包在单个 ```json 围栏里的情况，
-        # 仍只接受围栏内的唯一对象，允许前后空白，不解析任何叙述文字。
-        fenced = re.fullmatch(r"```(?:json)?\s*\n(?P<body>.*)\n```", text, re.S)
-        if not fenced:
-            raise AgentRecordError(
-                f"[review_output_unparsable] 无法把宿主输出解析为 JSON：{path}") from None
-        try:
-            data = json.loads(fenced.group("body"))
-        except ValueError:
-            raise AgentRecordError(
-                f"[review_output_unparsable] 宿主输出的 JSON 围栏无法解析：{path}") from None
+    data = _extract_review_json(_read_text(path).strip(), path)
     if not isinstance(data, dict):
         raise AgentRecordError("Reviewer 实际输出顶层必须是对象。")
     return data
@@ -589,42 +683,6 @@ def _mentions_path(path: str, blob: str) -> bool:
     return False
 
 
-def _assert_files_inspected(files: object, calls: list[tuple[str, str, dict]]) -> None:
-    """`files_inspected` 必须能在实际工具调用里找到对应访问。
-
-    只校验路径存在（native_bridge 层）不足以证明 Reviewer 真的看过内容：把别人的
-    复核结论配上几个真实路径也能通过。这里要求每个自报文件至少被一次实际调用的
-    参数（Read/Grep 的路径、Bash 命令里的路径或其文件名）引用；不要求必须出现
-    `Read`——Bash 读取与 git diff 同样是有效访问。Glob/列目录不算读过内容，
-    但仍要求该文件出现在调用参数里。
-
-    仅凭文件名相同不算：自报 `docs/report.md` 时，读取路径必须以它结尾（组件边界），
-    或是它的直接相对形式（组件更少且直接父目录同名）。目录插层
-    （`docs/archive/report.md`）、不同绝对根（`/repo-b/docs/report.md`）与
-    `docs/report.md.bak` 都不算命中；父目录名与文件名分处两个参数也不算一次读取。
-    这避免借别处的同名文件冒领，也避免 `ls docs; cat other/report.md` 这类复合命令
-    拼凑过关（Bash 按 `;`/`|`/换行拆分后逐段比较）。
-    """
-    if not isinstance(files, list):
-        return
-    blobs: list[str] = []
-    for _tool, command, payload in calls:
-        if command:
-            # Bash 只按命令段比对：整条命令拼在一起会让 `ls docs; cat other/report.md`
-            # 同时出现目录名与文件名，等于把两段互不相干的访问拼成一次读取。
-            blobs.extend(part for part in re.split(r"[;|\n]", command) if part.strip())
-        else:
-            blobs.append(json.dumps(payload, ensure_ascii=False))
-    for raw in files:
-        path = str(raw or "").strip().rstrip("/")
-        if not path:
-            continue
-        if not any(_mentions_path(path, blob) for blob in blobs):
-            raise AgentRecordError(
-                f"[review_file_not_inspected] 自报检查过 {path}，但实际工具调用中"
-                "没有任何访问该路径的记录；不能把未打开的文件算作已复核。")
-
-
 def _review_profile_problems(meta: dict) -> list[str]:
     """按宿主快照核对 Reviewer Profile 的工具边界。"""
     snapshot = meta["profile_snapshot"]
@@ -658,12 +716,21 @@ def _call_blobs(calls: list[tuple[str, str, dict]]) -> list[str]:
 
 
 def _evidence_not_inspected(state: dict,
-                            calls: list[tuple[str, str, dict]]) -> list[str]:
-    """G4 复核必须实际访问当前任务的每一条文件证据。"""
+                            calls: list[tuple[str, str, dict]],
+                            only_ids: set[str] | None = None) -> list[str]:
+    """G4 复核必须实际访问当前任务的文件证据。
+
+    `only_ids` 非空时只要求这些证据（增量复核只对基线之后新增/变更的证据
+    负责）；完整复核要求全部未归档证据。无论哪种模式都按宿主实际调用判定，
+    不看自述清单。
+    """
     blobs = _call_blobs(calls)
     missing: list[str] = []
     for entry in state.get("evidence") or []:
         if not isinstance(entry, dict) or entry.get("dropped"):
+            continue
+        eid = str(entry.get("id") or "")
+        if only_ids is not None and eid not in only_ids:
             continue
         hint = str(entry.get("path_hint") or "")
         if not hint or hint == "<inline>":
@@ -674,7 +741,8 @@ def _evidence_not_inspected(state: dict,
 
 
 def _g4_problems(meta: dict, calls: list[tuple[str, str, dict]], raw: dict,
-                 execution: dict, state: dict, target_sha: str) -> list[str]:
+                 execution: dict, state: dict, target_sha: str,
+                 evidence_ids: set[str] | None = None) -> list[str]:
     """按宿主记录计算 G4 资格；任何一项不满足都不得标记 g4_eligible。"""
     problems = _review_profile_problems(meta)
     if not calls:
@@ -703,9 +771,53 @@ def _g4_problems(meta: dict, calls: list[tuple[str, str, dict]], raw: dict,
         problems.append("risk_not_high")
     if target_sha != G.final_evidence_digest(state):
         problems.append("target_stale")
-    if _evidence_not_inspected(state, calls):
+    if _evidence_not_inspected(state, calls, evidence_ids):
         problems.append("evidence_not_inspected")
     return problems
+
+
+def _incremental_base(state: dict, path: str) -> dict:
+    """读取已回填的基线复核记录（按 result_sha256 匹配状态）。"""
+    data = _load_json(path)
+    if not isinstance(data, dict):
+        raise AgentRecordError(
+            "--based-on 必须是已回填的复核信封 JSON 文件（完整对象）。")
+    sha = str(data.get("result_sha256") or "").strip().lower()
+    if not sha:
+        raise AgentRecordError(
+            "[incremental_base_missing] --based-on 文件缺少 result_sha256。")
+    for record in state.get("native_reviews") or []:
+        if isinstance(record, dict) and str(record.get("result_sha256") or "") == sha:
+            if str(record.get("verdict") or "").strip().lower() != "pass" or \
+                    record.get("g4_eligible") is not True:
+                # 与 native_bridge 的增量校验同一前提：增量只用于高风险 G4
+                # 链路，基线必须是可用的 G4 PASS；否则先做完整复核，避免
+                # 生成一条注定在 ingest 被拒的信封。
+                raise AgentRecordError(
+                    "[incremental_base_ineligible] 基线复核不是可用的 G4 PASS"
+                    " 结论，不能作为增量基础；请先做一次完整复核。")
+            return record
+    raise AgentRecordError(
+        f"[incremental_base_missing] --based-on 指向的复核 {sha[:16]}… 尚未回填到本任务；"
+        "先 ingest 基线复核，或改用完整复核。")
+
+
+def _incremental_evidence(state: dict, base: dict) -> list[str]:
+    """基线之后新增或内容变化的证据 id；没有覆盖快照时失败关闭。"""
+    coverage = base.get("coverage")
+    if not isinstance(coverage, dict) or not coverage:
+        raise AgentRecordError(
+            "[incremental_base_coverage_missing] 基线复核没有覆盖快照（旧版本记录）；"
+            "请先做一次完整复核，之后的复核才能增量复用。")
+    base_evidence = coverage.get("evidence") or {}
+    current = NB.review_coverage(state)
+    changed = sorted(eid for eid, sha in current["evidence"].items()
+                     if base_evidence.get(eid) != sha)
+    if not changed:
+        raise AgentRecordError(
+            "[incremental_without_change] 相对基线没有新增/变更证据；"
+            "直接复用基线复核结论即可，不需要重复复核。")
+    return changed
 
 
 def build_review(args) -> dict:
@@ -753,10 +865,24 @@ def build_review(args) -> dict:
     if getattr(args, "input", ""):
         _assert_input_matches_host(_review_input(args.input), raw)
     calls = _review_tool_calls(meta, args.model_rollout)
-    _assert_reported_commands_executed(raw.get("commands_run"), calls)
-    _assert_files_inspected(raw.get("files_inspected"), calls)
+    # 复核范围：默认完整；--based-on 指定一条已回填的 PASS 复核做增量复核。
+    scope = "full"
+    based_on = ""
+    manifest: list[str] = []
+    delta_ids: set[str] | None = None
+    based_on_path = str(getattr(args, "based_on", "") or "").strip()
+    if based_on_path:
+        base = _incremental_base(state, based_on_path)
+        manifest = _incremental_evidence(state, base)
+        scope = "incremental"
+        based_on = str(base.get("result_sha256") or "")
+        delta_ids = set(manifest)
+    files = _merge_inspected_files(raw.get("files_inspected"), calls)
+    commands = _actual_commands(calls)
+    undeclared = _declared_files_unverified(raw.get("files_inspected"), calls)
     target_sha = G.final_evidence_digest(state)
-    problems = _g4_problems(meta, calls, raw, execution, state, target_sha)
+    problems = _g4_problems(meta, calls, raw, execution, state, target_sha,
+                            delta_ids)
     counts: dict[str, int] = {}
     for name, _command, _payload in calls:
         counts[name] = counts.get(name, 0) + 1
@@ -780,6 +906,9 @@ def build_review(args) -> dict:
         "work_item_id": execution["work_item_id"],
         "execution_result_sha256": exec_sha,
         "target_sha256": target_sha,
+        "review_scope": scope,
+        "based_on_review_sha256": based_on,
+        "evidence_manifest": manifest,
         "reviewer": {
             "kind": "subagent",
             "agent_id": meta["agent_id"],
@@ -790,8 +919,10 @@ def build_review(args) -> dict:
         "host": host,
         "verdict": raw.get("verdict"),
         "findings": raw.get("findings") or [],
-        "files_inspected": raw.get("files_inspected") or [],
-        "commands_run": raw.get("commands_run") or [],
+        # commands_run/files_inspected 由宿主 rollout 派生；Reviewer 的自述只作补充。
+        "files_inspected": files,
+        "commands_run": commands,
+        "declared_files_unverified": undeclared,
         "changed_files": raw.get("changed_files") or [],
         "unverified": raw.get("unverified") or [],
         "residual_risks": raw.get("residual_risks") or [],
@@ -849,6 +980,26 @@ def verify_review_host_record(envelope: dict) -> list[str]:
         problems.append("host_tool_calls_changed")
     if _review_profile_problems(meta):
         problems.extend(_review_profile_problems(meta))
+    # 信封的结论必须与宿主落盘的原文一致：只核对宿主文件存在与调用计数，
+    # 手工伪造一份“pass”信封仍可能被当成 G4。宿主 outputFile 是结论来源，
+    # ingest 时重新解析并对照 verdict/findings/unverified/changed_files。
+    try:
+        raw = _review_host_output(meta)
+    except AgentRecordError as exc:
+        problems.append(f"host_output_unreadable:{exc}")
+    else:
+        if str(raw.get("verdict") or "").strip().lower() != str(
+                envelope.get("verdict") or "").strip().lower():
+            problems.append("host_verdict_changed")
+        if NB.canonical_json(raw.get("findings") or []) != NB.canonical_json(
+                envelope.get("findings") or []):
+            problems.append("host_findings_changed")
+        if NB.canonical_json(raw.get("unverified") or []) != NB.canonical_json(
+                envelope.get("unverified") or []):
+            problems.append("host_unverified_changed")
+        if NB.canonical_json(raw.get("changed_files") or []) != NB.canonical_json(
+                envelope.get("changed_files") or []):
+            problems.append("host_changed_files_changed")
     return problems
 
 
@@ -911,8 +1062,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--work-item", required=True)
     p.add_argument("--metadata", required=True,
                    help="Reviewer 原生 Agent 的 metadata.json（或 agent 目录）")
-    p.add_argument("--input", required=True,
-                   help="Reviewer 原始结论 JSON（verdict/findings/...）")
+    p.add_argument("--input", default="",
+                   help="可选：调用方保存的 Reviewer 结论副本，仅用于与宿主实际输出"
+                        "交叉核对；结论只以宿主 outputFile 为准")
+    p.add_argument("--based-on", default="",
+                   help="增量复核：已回填的基线复核信封 JSON；只复核基线之后"
+                        "新增/变更的证据，要求基线含覆盖快照")
     p.add_argument("--model-rollout", default="")
     p.add_argument("--output", default="")
 

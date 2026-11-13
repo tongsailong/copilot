@@ -1,8 +1,50 @@
 # STATUS
 
-更新：2026-11-12 CST。本文件只记录现场可核实的事实；规划与未完成事项单独标注。
+更新：2026-11-13 CST。本文件只记录现场可核实的事实；规划与未完成事项单独标注。
 
-## v6.0.0（2026-11-12，当前）：SOL 退役与自主化架构升级
+## v6.1.0（2026-11-13，当前）：复核收敛与自主推进优化
+
+本批次在用户任务授权下完成，**未提交、未推送、未发布**（用户明确本任务不授权 Git 提交/推送/发布）。
+
+- **动机（真实任务复盘）**：最近两个真实任务（tencent 6 轮复核、honor 7 次 G4 尝试）中，
+  主要浪费来自复核机制本身而非 Reviewer 判断质量：只读白名单过窄使 Reviewer 自己作废自己
+  （`sed -n`、`for` 循环被判越界）、要求自报命令并与记录逐字比对、每轮重读全部证据、
+  BLOCKED 下无法修订合同、已终结工作项修复后无法重验。
+- **只读策略**：按实际写风险放宽（`sed -n`/只读 awk/`echo`/`printf`/`jq`/单输入 `xxd`/
+  不带 `-C` 的 `file`/`unzip -l`/`aapt dump`/`apksigner verify`/单层字面量 `for` 等）；
+  写变体失败关闭：`sed -i/-ni/--in-pl/--fil=`、`sed` 脚本 `w/W/e`、awk 写重定向/管道/
+  `system(` 与 `-f/-i/-l/-p/-o/-d`/长选项缩写、`xxd` 第二位置参数、`file -C`、
+  `date -sX`/位置参数、`tree -o`、`unzip -d`、`aapt2 link`、`apksigner sign`。
+- **命令与文件由宿主派生**：`commands_run`/`files_inspected` 从 rollout 的实际调用得到，
+  Reviewer 不再自报；自报但无实际访问痕迹的文件写入 `declared_files_unverified`。
+- **增量复核**：`review_scope=incremental` + `--based-on` 只覆盖基线之后新增/变更/归档的证据；
+  条件、合同或其他工作项变化拒绝增量。基线必须是可用的 G4 PASS，因此只适用于高风险链路；
+  收口时 `governance` 重算覆盖，空增量也拒绝。
+- **修复后重验**：`rerun` 把已终结工作项重开为 `pending`，旧结果保留在 `rerun_history`。
+- **合同源漂移**：`evaluate`/`status` 返回非阻断 `warnings`；BLOCKED 下允许 `contract --amend`。
+- **宿主输出交叉核对**：ingest 重新解析宿主 `outputFile`，与信封 verdict/findings/
+  unverified/changed_files 不一致即拒绝（`host_*_changed`）。
+- **测试**：活动套件 `143 tests OK`（`tests/`）；历史套件 `853 tests OK (skipped=31)`。
+  新增 `tests/test_v61_convergence.py`（17 项）与 `test_native_agent_v6` 的 2 个宿主输出篡改用例。
+- **独立只读复核**：三轮原生只读子代理（均非 G4、非正式 REVIEW，未提供 Copilot 信封绑定）。
+  第一轮指出 3 个 substantive（`xxd`/`file` 写路径、`sed` 选项缩写与聚簇、awk `system`
+  空白/写选项）；第二轮针对性复核又指出 `file --co`、awk 比较表达式误拒/漏拒、
+  `unverified`/`changed_files` 仅布尔比对等 7 项；第三轮聚焦前轮修复，发现 3 个真实问题：
+  `date -I`/`--iso-8601` 把下一个 token 当作自身取值而跳过位置参数（`date -I 010100002020`
+  被放行）、gawk 的 `|& getline` 未匹配、print 参数里的合法 `||`/`>=` 被误拒。三项均已修复
+  并补测试（`date` 只有必需取值选项消费下一 token；`|&` 纳入管道检测；`||`/`>=` 不再判写）。
+  第三轮同时确认 `sed 'y/a/w/'`、`sed 'a\welcome'` 放行是正确的（不写文件），此前任务清单
+  中“必须拒绝”的措辞有误。复核记录不构成 G4 证据。
+- **运行时同步（2026-11-13）**：`sync_runtime.py --apply` 先写入 9 个受管理文件（`SKILL.md`、
+  4 个 `references/*.md`、`scripts/{copilot_dispatch,governance,native_agent,native_bridge}.py`）
+  与 Reviewer；第三轮修复后再次 `--apply` 写入 `scripts/native_bridge.py`，`--check` 均为
+  **缺失 0、不同 0、Reviewer 一致**。运行时 `SKILL.md` 14,537 B（<100,000 上限），frontmatter
+  可解析，引用的 7 个路径全部存在，运行时脚本 `py_compile` 通过。运行时仍保留 8 个未受管理
+  的历史文件（默认保留）。
+- **未验证**：没有启动新的 ZCode GUI 会话观察会话内加载；未在真实高风险任务上跑完整
+  G4 增量复核链路（只有本地夹具与单元/集成测试）。真实模型调用、提交、推送、发布均未执行。
+
+## v6.0.0（2026-11-12）：SOL 退役与自主化架构升级
 
 本批次在用户任务授权下完成。提交前现场为**未提交、未推送、未发布**；2026-11-12 用户随后明确授权提交与普通快进推送，实际提交 SHA 以 git 历史为准（本节其余「未提交」表述均为提交前的现场记录）。
 

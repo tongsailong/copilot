@@ -8,7 +8,7 @@ when_to_use: >
   原生完成，不进入本 Skill。
 ---
 
-# copilot：轻量协作治理（v6.0.0）
+# copilot：轻量协作治理（v6.1.0）
 
 Copilot 是运行在 ZCode 内的**协作治理层**，不是决策模型，也不是执行体。它负责把任务变成可
 追踪的合同、状态、证据与收口条件，并在任务没有真正完成时继续推进。
@@ -144,9 +144,29 @@ v6 状态内不再有 `pending_call`、`quota`、`round_seq`、`budget`、`pass_
 - 执行方用 `native_agent.py execution` 生成 `copilot-native-result/v2`，绑定计划与执行方身份。
 - 复核方用 `native_agent.py review` 生成 `copilot-native-review/v2`；G4 资格由宿主记录计算，
   不由 Reviewer 自报：Profile 只读、实际工具调用计数与 metadata 一致、独立 Agent/Child
-  Session、访问过全部文件证据、目标摘要未过期。
+  Session、访问过全部文件证据、目标摘要未过期。`commands_run` / `files_inspected` 由宿主
+  rollout 派生，Reviewer 不需要手工复述命令或文件。
+- 首次完整复核 PASS 后又有新证据时，可用 `--based-on <基线复核.json>` 做增量复核：只覆盖
+  基线之后新增/变更（含归档）的证据；条件、合同或其他工作项变化则拒绝增量、要求完整复核。
+  基线必须是可用的 G4 PASS，所以增量用于高风险复核链路的修复后复验；普通风险任务按需做
+  一次完整复核即可。
 - `copilot_auto.py ingest` 校验信封后回填；G4 复核回填前会重新读取 metadata/rollout 核对宿主
   记录。字段与错误码见 `references/agent-bridge.md`。
+
+## 复核策略与收敛
+
+复核按需使用，不是流程门禁：
+
+- **普通任务**：ZCode 自检（diff、针对性测试、完成条件核对），不派 Reviewer。
+- **复杂非高风险任务**：自检 + 必要时一个只读子代理，聚焦目标符合性、关键改动、测试结果与
+  真实风险；不要求完整 G4 信封。
+- **高风险任务**：G1–G4 不变，独立上下文、只读约束、宿主记录与最终证据绑定，fail-closed。
+- **正式 REVIEW**：仅用户明确要求时登记（见 `references/review.md`）。
+
+收敛顺序：**充分自检 → 首次全面复核（一次列出全部重要问题与 severity）→ 集中修复 →
+针对性复核（只验证修复、新问题、受影响区域与完成条件）→ 收口**。目标 1–2 轮收敛，这是
+性能目标不是硬上限；超过两轮先诊断非收敛原因（首次遗漏 / 修复不彻底 / 新增缺陷 / 复核
+机制开销），不要用重复整轮复核掩盖。不得为减少轮次而漏报或降低标准。
 
 ## 授权与安全（不可放宽）
 
@@ -184,6 +204,10 @@ v6 状态内不再有 `pending_call`、`quota`、`round_seq`、`budget`、`pass_
 
 ## 版本
 
-当前版本 **v6.0.0（ZCode Autonomous Development Edition）**。v5.x 及以前的 SOL 决策通道、
-轮次/预算状态机与远程 REVIEW 裁决已退役；历史文档保留但明确标注为历史，不再作为当前规则。
-协作语义基线为用户级 `AGENTS.md` 与 ChatGPT 自定义指令 v5.4.0；本 Skill 不与基线冲突。
+当前版本 **v6.1.0（ZCode Autonomous Development Edition）**。v6.1 在 v6.0.0 的本地治理引擎上
+做了三件事：放宽只读复核命令策略并按宿主记录派生命令/文件（消除 Reviewer 自己作废自己的
+常见原因）、支持增量复核与修复后 `rerun`（减少重复整轮复核）、合同源文件漂移改为非阻断
+提醒（不因文件改动阻塞执行）。G1–G4、证据完整性、宿主记录与 fail-closed 语义未放宽。
+v5.x 及以前的 SOL 决策通道、轮次/预算状态机与远程 REVIEW 裁决已退役；历史文档保留但明确
+标注为历史，不再作为当前规则。协作语义基线为用户级 `AGENTS.md` 与 ChatGPT 自定义指令
+v5.4.0；本 Skill 不与基线冲突。

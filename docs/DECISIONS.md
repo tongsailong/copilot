@@ -608,6 +608,42 @@
     `README.md`、`AGENTS.md` 不进入运行时。退役脚本不进入分发清单。依据：第 2 条分发边界
     在 v6 的延续。
 
+35. **v6.1 复核收敛与自主推进优化（2026-11-13）。** 基于最近两个真实任务（tencent 6 轮、
+    honor 7 次 G4 尝试）的复盘，确认主要浪费不是 Reviewer 判断质量，而是复核机制本身：
+    只读白名单过窄导致 Reviewer 自己作废自己（`sed -n`/`for` 循环被判越界）、要求自报命令与
+    文件并逐字比对、每条复核都重新读全部证据、合同修订在 BLOCKED 下被拒导致阻塞往返、
+    已终结工作项无法在修复后重新验证。v6.1 的处理：
+
+    - **只读策略按“实际写风险”放宽**：新增 `sed -n`、只读 awk、`echo/printf/jq/file/xxd/
+      strings/tree/du/test/date`、`unzip -l`、`zipinfo`、`aapt/aapt2 dump`、`apksigner verify`、
+      `javap` 与单层字面量 `for` 循环；`sed -i`/`w`/`e`、awk `>`/`|`/`system(`、`date -s`、
+      `tree -o`、`unzip -d`、`aapt2 link`、`apksigner sign` 仍然失败关闭。
+    - **命令与文件由宿主记录派生**：`native_agent.py` 从 rollout 取实际 Bash 命令与读取路径，
+      Reviewer 不再需要手工复述；自报与实际不一致只记录 `declared_files_unverified`，不再
+      让整轮复核作废。实际命令仍逐条只读校验，G4 仍要求实际访问证据文件。
+    - **增量复核**：首次完整复核 PASS 且记录带覆盖快照后，`--based-on` 只复核基线之后
+      新增/变更的证据；条件、合同或其他工作项变化一律拒绝增量，要求完整复核。收口时
+      `governance` 重算覆盖，fail-closed。
+    - **修复后重验**：新增 `rerun` 把已终结工作项重开为 `pending`，旧结果保留在
+      `rerun_history`；不再需要新建语义重复的工作项绕过 `work_item_terminal`。
+    - **合同源漂移改为非阻断提醒**：`start`/`contract --amend` 记录源文件路径与摘要，
+      文件被改动时只在 `status`/`evaluate.warnings` 提示，不改变阶段与门禁；BLOCKED 下
+      允许修订合同（阻塞不因此解除）。
+    - **复核输出容错**：宿主输出允许单个 ```json 围栏（多对象/多围栏仍拒绝）；`--input`
+      改为可选交叉核对，结论只以宿主 `outputFile` 为准。
+    - **独立复核后的加固**：只读检查补齐 GNU 选项缩写与附值绕过（`sed -ni`/`--in-pl`/
+      `--fil=`、awk `--fil=`/`-p`/`-o`/`-d`/`system<TAB>(`、`date -sX`/位置参数、
+      `xxd` 第二位置参数、`file -C`）；`date -I[FMT]`/`--iso-8601[=FMT]` 的可选参数只能
+      紧贴，绝不消费下一个 token（否则 `date -I 010100002020` 会跳过位置参数）；awk 管道
+      检测覆盖 gawk 的 `|& getline`，print 参数里的 `||` 与 `>=` 按逻辑/比较运算放行；
+      覆盖快照纳入证据归档状态，避免“归档证据 + 工作项变化”以空清单通过增量复核；ingest
+      重新解析宿主 `outputFile`，信封与原文的 verdict/findings/unverified/changed_files
+      不一致即拒绝（`host_*_changed`）。
+
+    依据：用户要求 Copilot 成为“保证大目标不偏航”的轻量机制，而不是反复评审、反复修复、
+    频繁打断的流程管理器；同时明确不得降低安全门禁、不得为减少轮次掩盖缺陷。上述改动只
+    减少重复劳动与无效作废，未放宽 G1–G4、证据完整性、宿主记录或 fail-closed 语义。
+
 ## 建议（未采纳）
 
 > 以下为 v5 时期记录，保留原文；其中涉及 `call_gpt.py`、SOL 预算或远程 REVIEW 的建议

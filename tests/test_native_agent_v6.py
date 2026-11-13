@@ -127,6 +127,24 @@ class BuildReviewTests(unittest.TestCase):
         self.assertFalse(env["g4_eligible"])
         self.assertIn("review_verdict_not_pass", env["g4_reasons"])
 
+    def test_host_output_change_after_envelope_is_detected(self):
+        env = NA.build_review(self._args())
+        self.assertTrue(env["g4_eligible"], env["g4_reasons"])
+        output = json.loads(open(self.host["output_file"], encoding="utf-8").read())
+        output["verdict"] = "partial"
+        write_json(self.host["output_file"], output)
+        problems = NA.verify_review_host_record(env)
+        self.assertIn("host_verdict_changed", problems)
+
+    def test_host_unverified_truncation_is_detected(self):
+        env = NA.build_review(self._args())
+        self.assertTrue(env["g4_eligible"], env["g4_reasons"])
+        output = json.loads(open(self.host["output_file"], encoding="utf-8").read())
+        output["unverified"] = ["未验证项 A", "未验证项 B"]
+        write_json(self.host["output_file"], output)
+        problems = NA.verify_review_host_record(env)
+        self.assertIn("host_unverified_changed", problems)
+
 
 class DriveGuardTests(unittest.TestCase):
     def test_partial_returns_executable_work_order_instead_of_stopping(self):

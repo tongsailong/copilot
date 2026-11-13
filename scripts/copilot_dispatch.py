@@ -33,7 +33,7 @@ if HERE not in sys.path:
 
 import governance as G  # noqa: E402
 
-__version__ = "6.0.0"
+__version__ = "6.1.0"
 
 
 class CLIError(Exception):
@@ -118,7 +118,8 @@ def cmd_start(args) -> int:
     state = G.start_state(
         _state_path(args), args.goal, contract=contract, criteria=criteria,
         risk=args.risk, execution_backend=args.backend,
-        task_id=args.task_id or "", mode=args.mode or "", note=args.note or "")
+        task_id=args.task_id or "", mode=args.mode or "", note=args.note or "",
+        contract_source=args.contract_file or "")
     print(f"任务已创建：{state['task_id']}")
     print(f"状态文件：{os.path.abspath(_state_path(args))}")
     print(f"完成条件：{len(state['contract']['criteria'])} 条 "
@@ -157,6 +158,13 @@ def cmd_record(args) -> int:
     print(f"{action['id']} → {action['status']}"
           + (f"；证据 {', '.join(action['evidence_ids'])}"
              if action["evidence_ids"] else ""))
+    return 0
+
+
+def cmd_rerun(args) -> int:
+    action = G.rerun_action(_state_path(args), args.id, reason=args.reason or "")
+    print(f"{action['id']} → pending（第 {action['rerun_count']} 次重开）；"
+          "旧结果已保存在 rerun_history。")
     return 0
 
 
@@ -316,7 +324,8 @@ def cmd_contract(args) -> int:
     contract_text = (_read_text(args.contract_file)
                      if args.contract_file else "")
     criteria = _load_criteria(args.criteria_file) if args.criteria_file else None
-    result = G.amend_contract(path, contract=contract_text, criteria=criteria)
+    result = G.amend_contract(path, contract=contract_text, criteria=criteria,
+                              contract_source=args.contract_file or "")
     print(f"合同已修订：criteria_sha256={result['criteria_sha256'][:16]}…")
     for criterion in result["criteria"]:
         print(f"- {criterion['criterion_id']} [{criterion['status']}] "
@@ -415,6 +424,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--result", default="")
     p.add_argument("--evidence", action="append", default=[])
     p.set_defaults(func=cmd_record)
+
+    p = sub.add_parser("rerun", help="把已终结工作项重开为 pending（修复后重新验证）")
+    p.add_argument("--state", required=True)
+    p.add_argument("--id", required=True)
+    p.add_argument("--reason", default="")
+    p.set_defaults(func=cmd_rerun)
 
     p = sub.add_parser("criterion", help="核销完成条件")
     p.add_argument("--state", required=True)
