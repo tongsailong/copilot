@@ -116,6 +116,19 @@
 以下**不得**作为 BLOCKED 理由：轮次/预算/费用阈值、等待远程模型、重复评审、内部状态流转、
 子 Agent 返回 PARTIAL、首次方案失败、普通测试失败、可自行补齐的证据不足。
 
+### BLOCKED 下的受控写入
+
+BLOCKED 阻止的是收口和受阻动作，不是事实记录。允许 `record`、`rerun`、`evidence --add`、
+`criterion`、`report`、`judgment`、额外的 `block`、以及已授权的 `authorize-review` /
+`formal-review`（含 amendment）。这些写入不会解除阻塞、不会改变合同/授权、也不会让
+`close_task` 提前通过；G1–G4 仍按当前状态重算。
+
+继续拒绝：`plan`（改变计划范围）、`decide`（可能改变优先级/范围）、`evidence --drop`
+（破坏性归档）。多个真实阻塞可以并存；存在多条未解除阻塞时，`unblock` 必须用
+`--block-id` 逐条解除，不能用一条理由把不同阻塞一起清除。合同修订使用单独的
+`contract --amend`：BLOCKED 下允许，但会更新合同指纹并使旧正式 REVIEW 授权/G4 绑定失效，
+不属于上述受控写入白名单。
+
 ## 8. 恢复清单
 
 中断或回到旧任务时按顺序核对：

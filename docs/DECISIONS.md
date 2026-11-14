@@ -726,6 +726,91 @@
     `$`（`$?`/`$VAR`）与解释器单行命令会被拒。未验证：GUI 新会话运行时加载（本会话
     `profileSnapshot` 仍是启动期缓存版本）、生产高风险任务重跑。
 
+38. **v6.4 质量保障精简（2026-11-14）。** 基于《测试体系与独立复核机制过度设计专项审计
+    报告》的真实任务证据，只处理三项已证实的 P1 问题，不增加质量保障层、不删除历史测试、
+    不降低 G1–G4：
+
+    - **BLOCKED 受控写入**：BLOCKED 只阻止收口和改变范围/授权的动作。允许 `record`、
+      `rerun`、`evidence --add`、`criterion`、`report`、`judgment`、额外 `block`，以及
+      已授权的 `authorize-review` / `formal-review`（含 amendment）；这些写入不解除阻塞、
+      不改变合同/授权，`close` 仍拒绝未解除的阻塞。`plan`、`decide`、`evidence --drop`
+      继续拒绝；`contract --amend` 保持独立语义。依据：perf-ads 4 次、Honor 4 次
+      `unblock → 登记 → block` 循环，均非安全需要。
+    - **复核顺序与 PASS 收口**：最终 G4 复核必须在完成条件核销、证据登记完整、目标摘要
+      稳定之后进行；`AUTO-G4` 工作单要求先读 `review-context` 的 warnings/scope_reason。
+      PASS 后 minor/info 记录为 findings/residual_risks，不修改已通过证据重开完整复核；
+      后续实质变化仍必须重新判断原 PASS 是否覆盖新快照，G4 继续绑定 `final_evidence_digest`。
+      依据：ad-strategy 在 PASS 后为 minor/info 修改证据并再次完整复核（13 条重复命令）；
+      v6.3 e2e 第 1 轮因条件未核销而 stale。
+    - **正式 REVIEW amendment**：正式 REVIEW 结论只登记一次；非实质修订用
+      `--amend <review_id> --reason` 追加，目标摘要变化时拒绝，必须用
+      `--supersedes <review_id>` 登记新结论；原记录、授权快照与 verdict 不被覆盖。
+      `review-metrics` 分别统计 `formal_reviews_total`、`formal_review_amendments_total`、
+      `superseded_formal_reviews_total`、`active_formal_reviews_total`。依据：review-perf
+      4 次 pass，v2/v3 只改证据引用/口径，结论未变。
+
+    不变：G1–G4 fail-closed、Reviewer 独立性/只读、宿主记录重核、证据 SHA 与目标摘要绑定、
+    正式 REVIEW 用户授权、无远程决策节点、无人工轮次/Token/费用停止条件。活动测试新增
+    `tests/test_v64_convergence.py`；历史测试仅在共享库/发布需要时运行，不删除。
+
+39. **G4 复核快照绑定完整性（2026-11-14，v6.4 补强）。** 原实现的 `target_sha256` 由
+    `native_agent.py review` 在生成信封时按当前状态计算，`_gate_review` 只比较复核记录的
+    target 与当前摘要；宿主记录虽然校验了 Agent/Child Session、工具调用与输出原文，却没有
+    把 Reviewer 会话开始时间、prompt 与派发时的内容快照绑定。因此在状态变化后，旧 Reviewer
+    输出理论上可以被重新封装成新 target 的“有效”结论。处理：
+
+    - **派发前 attempt**：`review-context --create-attempt` 在条件全部核销、执行证据无漂移
+      时创建不可变 `review_attempt`，冻结 task/contract/plan/dispatch/work item/execution、
+      `final_evidence_digest`、条件摘要与文件证据内容摘要；返回 `review_attempt_id` 供写入
+      Reviewer prompt。未核销/漂移/无需重审时拒绝创建。
+    - **信封绑定**：`review --attempt <id>` 要求 attempt 属于本任务、未消费、绑定与当前执行
+      一致、目标仍是当前摘要；宿主 `metadata.createdAt` 不早于 attempt 且 `prompt` 包含
+      attempt id。旧会话不能冒充新 attempt，旧 attempt 不能套到新派发。
+    - **ingest 一次性消费**：`copilot_auto.py ingest` 重新核对 metadata/rollout 与 attempt，
+      在同一份状态写入中把 attempt 消费给该 `result_sha256` 并记录 Reviewer 会话；被拒的
+      attempt 不消费，修正后可重试，已消费的 attempt 不能重放另一份结果。
+    - **G4 收口**：要求 attempt 存在、已消费、会话一致、`target = attempt 快照 = 当前
+      final_evidence_digest`，并重新核对 attempt 冻结的文件证据内容；任何不一致 fail-closed。
+    - **不改边界**：不增加新的质量层、不降低 G1–G4、不放宽 Reviewer 只读/独立性；不改变
+      正式 REVIEW 的 opt-in 语义。活动测试新增 `tests/test_snapshot_binding.py` 覆盖 S0
+      PASS、S0→S1 代码/证据/合同变化、会话不匹配、attempt 重放、旧输出重封装、复核期间
+      文件漂移、新快照新建 attempt、失败重试与幂等回填。
+
+    残余边界：宿主 metadata/rollout 与状态文件不是密码学签名；能改写本机文件的人仍可伪造。
+    attempt 冻结登记证据文件，不覆盖未登记为证据的任意工作区代码；后者仍需 G2 重读与流程
+    约束发现。
+
+40. **G2 完整代码范围与真实宿主 Session 绑定（2026-11-14，v6.4 最终安全验收）。**
+    审计确认 v6.4 的 attempt 只冻结已登记证据，`final_evidence_digest` 不包含未登记源码；
+    真实宿主 metadata 已提供 `createdAt`/`prompt`/`workspaceRoot`，但此前未把
+    `workspaceRoot` 与 attempt 代码根绑定。处理：
+
+    - 新增 `scripts/code_scope.py`：由宿主用 `git status --porcelain=v1 -z` 生成代码范围
+      快照，覆盖 tracked 修改、untracked、删除、重命名，逐文件记录路径/状态/SHA-256；
+      `.gitignore` 排除构建输出，治理临时目录/缓存额外排除，已登记证据由证据快照单独绑定。
+    - `review-context --create-attempt --workspace <repo>` 把代码快照写入不可变 attempt；
+      高风险任务在非 git 工作区拒绝创建；workspace 还必须与任务证据所属 git 仓库一致。
+      `--base <任务开始 commit>` 可把已提交的任务代码纳入范围；默认比较工作区与 HEAD。
+      `review --attempt` 与 ingest/G4 都重算代码快照，任何未登记源码、未跟踪文件、删除/
+      重命名变化按 `native_review_code_scope_drift` 失败关闭；G2 使用与 G4 相同的合格
+      复核/attempt，并检查其代码快照。attempt 不能绑定 rerun 前的旧 execution：execution
+      必须是该工作项最近一次结果，且 summary/result 与当前 action.result 一致。
+    - 宿主 metadata 的 `workspaceRoot` 必须等于 attempt 代码根；`prompt` 必须包含
+      attempt id；`createdAt` 必须晚于 attempt。真实 ZCode Reviewer 探针已验证这些字段
+      存在，并走通 attempt→Reviewer→review 信封→ingest→G4/closure。
+    - 增量复核只在代码范围未变化时可用；源码变化必须完整复核，避免“只复核新证据”掩盖
+      未审查的代码变更。
+    - 判别测试覆盖：已登记源码、未登记源码、新增、删除、重命名、build 输出、Reviewer
+      期间源码变化、新快照重新派发、旧会话/工作区不匹配、attempt 重放与旧输出重封装。
+
+    边界：这是宿主生成的快照一致性证明，不是对 Reviewer 每个字节读取行为的密码学证明；
+    Reviewer 的实际读取仍由 rollout 的 Read/Bash 记录与 `files_inspected` 体现。宿主记录
+    与状态文件仍可被有本机写权限的人伪造；`code_scope` 排除已登记证据，未登记的业务
+    配置/构建产物是否属于源码由 `.gitignore` 与任务范围决定。符号链接只哈希链接目标文本，
+    不跟随哈希仓库外目标内容；非 UTF-8 路径按 Python 解码结果处理；任务若把改动提交到
+    多个 commit，调用方需用 `--base` 指定任务开始 commit，否则只能覆盖工作区相对 HEAD 的
+    变更。
+
 ## 建议（未采纳）
 
 > 以下为 v5 时期记录，保留原文；其中涉及 `call_gpt.py`、SOL 预算或远程 REVIEW 的建议

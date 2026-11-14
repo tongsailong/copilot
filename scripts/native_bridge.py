@@ -53,6 +53,7 @@ REVIEWER_TOOLS = ("Read", "Grep", "Glob", "Bash")
 
 EVIDENCE_ID_RE = re.compile(r"^E[1-9][0-9]{0,3}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_REVIEW_ATTEMPT_RE = re.compile(r"^RA[0-9a-f]{24}$")
 # Reviewer 可以用 Bash 读取现场，但只允许这些只读前缀。真正的写保护仍由
 # Reviewer Profile 的 instructions + 宿主工具权限负责；这里是第二道失败关闭。
 # v6.1 起不再要求「命令形式完美」：白名单覆盖复核实际需要的只读工具，写操作由
@@ -1862,6 +1863,13 @@ def _validate_host_record(raw: object, *, required: bool) -> dict:
     out["tool_calls"] = normalized
     out["agent_id"] = str(obj.get("agent_id") or "").strip()
     out["child_session_id"] = str(obj.get("child_session_id") or "").strip()
+    # G4 快照绑定的宿主侧证据：会话创建时间与 prompt 摘要。只接受字符串，
+    # 具体时间顺序与值是否与 metadata 一致由 native_agent 重新核对。
+    for key in ("session_created_at", "session_completed_at", "prompt_sha256",
+                "workspace_root"):
+        value = obj.get(key)
+        if value is not None:
+            out[key] = str(value).strip()
     return out
 
 
@@ -1971,6 +1979,29 @@ def _validate_review_scope(env: dict, state: dict, *, contract: str,
     if any(isinstance(f, dict) and str(f.get("severity") or "") == "blocking"
            for f in base.get("findings") or []):
         _fail("incremental_base_ineligible", "基线复核仍有 blocking finding。")
+    # 基线的最终信任由治理层统一判定：旧版无 attempt 的 PASS、宿主记录被
+    # 改写、attempt 未消费或证据文件漂移都不能作为增量基础。这里只做同一
+    # 口径的早期拒绝，避免 ingest 接受一条收口必败的增量复核。
+    try:
+        import governance as G  # 延迟导入：避免状态引擎与信封层在导入期耦合
+    except ImportError:
+        G = None
+    if G is not None:
+        trust = G._review_trust_problems(base, state, check_target=False)
+        if trust:
+            _fail("incremental_base_ineligible",
+                  "基线复核未通过当前 G4 信任检查：" + ", ".join(trust)
+                  + "；请对当前快照做一次完整复核。")
+        base_attempt = G.find_review_attempt(
+            state, str(base.get("review_attempt_id") or ""))
+        code_problems = G.code_scope_problems(
+            base_attempt, state, check_current=True) if base_attempt else \
+            ["native_review_code_scope_missing"]
+        if code_problems:
+            _fail("incremental_code_changed",
+                  "基线复核之后工作区代码范围已变化（"
+                  + ", ".join(code_problems)
+                  + "）；增量复核只覆盖证据，不能覆盖源码变更，请做完整复核。")
     base_coverage = base.get("coverage")
     if not isinstance(base_coverage, dict) or not base_coverage:
         _fail("incremental_base_coverage_missing",
@@ -2097,6 +2128,18 @@ def validate_review_result(envelope: object, dispatch: dict | None, execution: d
     g4_eligible = env.get("g4_eligible")
     if not isinstance(g4_eligible, bool):
         _fail("schema_invalid", "review.g4_eligible 必须是布尔值。")
+    attempt_id = str(env.get("review_attempt_id") or "").strip()
+    attempt_created = str(env.get("review_attempt_created_at") or "").strip()
+    if attempt_id and not _REVIEW_ATTEMPT_RE.match(attempt_id):
+        _fail("review_attempt_invalid",
+              "review.review_attempt_id 必须是 RA + 24 位小写十六进制。")
+    if g4_eligible and not attempt_id:
+        _fail("review_attempt_missing",
+              "G4 复核必须绑定派发前创建的 review_attempt_id；"
+              "不能用信封生成时的 target 代替实际评审快照。")
+    if g4_eligible and not attempt_created:
+        _fail("review_attempt_invalid",
+              "G4 复核必须携带 review_attempt_created_at。")
     target_sha = ""
     if g4_eligible:
         target_sha = _sha(env.get("target_sha256"), "review.target_sha256")
@@ -2130,6 +2173,8 @@ def validate_review_result(envelope: object, dispatch: dict | None, execution: d
         "work_item_id": wid,
         "execution_result_sha256": exec_sha,
         "target_sha256": target_sha,
+        "review_attempt_id": attempt_id,
+        "review_attempt_created_at": attempt_created,
         "reviewer": reviewer,
         "host": host,
         "verdict": verdict,

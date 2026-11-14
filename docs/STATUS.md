@@ -2,7 +2,84 @@
 
 更新：2026-11-14 CST。本文件只记录现场可核实的事实；规划与未完成事项单独标注。
 
-## v6.3.0（2026-11-14，当前）：Reviewer 多轮评审根因收敛
+## v6.4.0（2026-11-14，当前）：质量保障精简
+
+本批次在用户任务授权下完成，**未提交、未推送、未发布**（用户明确本任务不授权 Git 提交/推送/发布）。
+
+- **动机（专项审计）**：基于《测试体系与独立复核机制过度设计专项审计报告》的真实任务证据，
+  只处理三项 P1：BLOCKED 受控写入、复核顺序与 PASS 收口、正式 REVIEW amendment。
+- **BLOCKED 受控写入**：`record`、`rerun`、`evidence --add`、`criterion`、`report`、
+  `judgment`、额外 `block`、已授权的 `authorize-review` / `formal-review`（含 amendment）
+  在 BLOCKED 下允许登记；不解除阻塞、不改变合同/授权、`close` 仍拒绝。`plan`、`decide`、
+  `evidence --drop` 继续拒绝。依据：perf-ads 4 次、Honor 4 次 `unblock → 登记 → block`。
+- **复核顺序**：`AUTO-G4` 工作单要求先核销条件、稳定证据与摘要，再读取 `review-context`
+  的 warnings/scope_reason 做最终复核；PASS 后 minor/info 记录为 findings/residual_risks，
+  不修改已通过证据重开完整复核；后续实质变化仍必须重新判断原 PASS 是否覆盖新快照。
+- **正式 REVIEW amendment**：新增 `formal-review --amend <review_id> --reason` 与
+  `--supersedes <review_id> --reason`。非实质修订不生成新 PASS，目标摘要变化时拒绝；
+  supersede 保留旧记录并由 `review-metrics` 统计。原始授权快照、verdict 与 `target_sha256`
+  不被覆盖；BLOCKED 下仍要求有效用户授权。
+- **指标**：`review-metrics` 新增 `formal_review_amendments_total`、
+  `superseded_formal_reviews_total`、`active_formal_reviews_total`；不复用旧口径把
+  amendment 计为新的正式 REVIEW。
+- **测试**：活动套件 `243 tests OK`（新增 `tests/test_v64_convergence.py`、
+  `tests/test_snapshot_binding.py` 及 governance/CLI/docs 回归）；相关 legacy native
+  回归 `118 tests OK`；历史套件未全量运行（本次未修改 `lib_common` / `bridge_evidence`，
+  按任务要求不做形式全量）。
+- **运行时同步**：`sync_runtime.py --apply` 写入受管理文件；最终 `--check` 缺失 0、不同 0、
+  Reviewer same；关键文件源码/运行时 SHA-256 逐项一致；`--baseline` 已刷新为 21 个文件
+  （新增 `scripts/code_scope.py`）。
+- **独立只读复核（非 G4、非正式 REVIEW）**：一次针对性原生 Reviewer 复核（只读、独立上下文），
+  报 7 条 minor/info、无 blocking/major；已修 review-metrics 空 review_id 误计 superseded、
+  AUTO-G4 “warnings 为空”与增量复核冲突、多阻塞一次全量解除、SKILL 标题版本、
+  minor/residual_risks 分类口径与文档精度；并补对应测试。
+- **G4 快照绑定完整性修复（v6.4 补强）**：原实现只在信封生成时重算 `target_sha256`，
+  宿主记录未绑定 Reviewer 会话开始时间与内容快照，理论上旧 Reviewer 原文可被重新封装成
+  新 target 的结论。现改为派发前 `review-context --create-attempt` 冻结 task / contract /
+  plan / dispatch / work item / execution / `final_evidence_digest` / 条件摘要 / 文件证据
+  内容摘要；`review --attempt` 要求 attempt 未消费、目标未过期、宿主 `createdAt` 晚于
+  attempt 且 prompt 携带 attempt id；ingest 重新核对宿主记录后在同一次状态写入中消费
+  attempt；G4 收口核对 attempt 存在、已消费、会话一致、目标 = attempt 快照 = 当前摘要，
+  并重新核对文件证据内容。被拒 attempt 不消费，可修正后重试；已消费 attempt 不能重放。
+  `tests/test_snapshot_binding.py` 覆盖 S0 PASS、代码/证据/合同变化过期、会话不匹配、
+  attempt 重放、旧输出重封装、复核期间文件漂移、新快照重新 attempt、失败重试与幂等回填。
+- **G2 完整代码范围（最终验收补强）**：新增 `scripts/code_scope.py`，由宿主从
+  `git status --porcelain=v1 -z` 生成任务工作区代码快照，覆盖 tracked 修改、untracked、
+  新增、删除、重命名，逐文件记录状态与 SHA-256；`.gitignore` 排除构建输出，治理临时
+  目录/缓存额外排除，已登记证据由证据快照单独绑定。`review-context --create-attempt
+  --workspace <repo>` 把代码快照写入不可变 attempt；`review --attempt`、ingest 与 G4 都
+  重算代码快照，任何未登记源码/未跟踪文件/删除/重命名变化按
+  `native_review_code_scope_drift` 失败关闭；G2 使用与 G4 相同的合格复核/attempt，并检查
+  其代码快照。高风险任务在非 git 工作区拒绝创建 attempt；attempt 的 workspace 还必须与
+  任务证据所属仓库一致。默认快照覆盖工作区相对 HEAD 的变更，任务代码已提交时用
+  `--base <任务开始 commit>` 纳入已提交范围。增量复核只在代码范围未变化时可用。
+- **真实 ZCode 宿主 Session 探针**：在隔离临时任务（`/tmp/copilot-g4-probe2-sP3th0`）用
+  真实 Reviewer 子代理（`agent_42c6012a-...`，child `sess_subagent_agent_42c...`）走通：
+  attempt `RAee6358e...` → Reviewer 实际读取证据并运行只读 `git status`/`git diff --stat`
+  → 生成信封（g4_eligible=true）→ ingest 消费 attempt（`consumed_by_result_sha256` +
+  Reviewer session）→ `closure_check` 全部通过。宿主 metadata 实测提供
+  `createdAt`/`completedAt`/`prompt`/`workspaceRoot`/`cwd`/`outputFile`/rollout；prompt
+  包含 attempt id、`workspaceRoot` 等于 attempt 代码根。用同一旧 session 绑定新 attempt
+  被拒绝（`review_attempt_session_precedes_attempt` + `review_attempt_prompt_unbound`）。
+  探针完成后本仓库继续修改；用最终源码复查该临时状态会按预期报
+  `native_review_code_scope_drift`，这是 fail-closed 的正确结果。探针只证明当时真实
+  宿主的字段/会话绑定，不作为当前仓库的 G4 结论。
+- **Headless 新会话加载**：用独立 `node zcode.cjs -p ... --json --surface terminal
+  --cwd /media/vdb/projects/copilot --mode plan` 启动新会话
+  `sess_86c0a3dc-4976-4eac-afc8-6b1a5aa69632`；rollout 记录实际调用
+  `Skill(skill="copilot")`、`Read(.../skills/copilot/SKILL.md)`、
+  `Read(.../agents/reviewer.md)`；返回 `skill_loaded=true`、标题
+  `# copilot：轻量协作治理（v6.4.0）`，review_attempt/create_attempt/code_scope 与
+  Reviewer attempt/code_snapshot 均识别为 true。
+- **未验证**：未启动正式 REVIEW；未执行真实生产 G4（隔离探针不计生产 G4）；未在真实
+  GUI 新会话观察加载（headless 新会话已验证）。
+- **残余风险（诚实边界）**：attempt/宿主 metadata/rollout 与状态文件不是密码学签名；
+  能改写本机文件的人仍可伪造宿主记录。代码快照证明“派发范围 = ingest 接受范围 = G4
+  范围”，但不等于证明 Reviewer 逐字节读取了每个文件；实际读取仍由 rollout 的
+  Read/Bash 记录与 `files_inspected` 体现。`code_scope` 排除已登记证据与 `.gitignore`
+  构建输出，未登记的业务配置/产物是否属于源码由任务范围决定。
+
+## v6.3.0（2026-11-14，历史）：Reviewer 多轮评审根因收敛
 
 本批次在用户任务授权下完成，**未提交、未推送、未发布**（用户明确本任务不授权 Git 提交/推送/发布）。
 

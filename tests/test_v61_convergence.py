@@ -221,11 +221,14 @@ class IncrementalReviewTests(F.BridgeBase):
         self.first = self.execution()
         auto._ingest_execution(self.state_path, self.first)
         state = G.load_state(self.state_path)
+        self.base_attempt = self.create_attempt(self.first)
         base_env = self.review(
-            self.first, target_sha256=G.final_evidence_digest(state))
+            self.first, attempt=self.base_attempt,
+            target_sha256=G.final_evidence_digest(state))
         base = NB.validate_review_result(base_env, self.dispatch, self.first, state)
         base["host_sha256"] = G._sha256_text(G.canonical_json(base["host"]))
-        state["native_reviews"].append(base)
+        state = G.load_state(self.state_path)
+        F.attach_review(state, base, self.base_attempt)
         G.save_state(self.state_path, state)
         self.base = base
 
@@ -244,10 +247,18 @@ class IncrementalReviewTests(F.BridgeBase):
 
     def _incremental(self, second: dict, **overrides) -> dict:
         state = G.load_state(self.state_path)
-        env = self.review(second, target_sha256=G.final_evidence_digest(state),
-                          review_scope="incremental",
-                          based_on_review_sha256=self.base["result_sha256"],
-                          evidence_manifest=["E2"])
+        based_on = overrides.get("based_on_review_sha256",
+                                 self.base["result_sha256"])
+        manifest = overrides.get("evidence_manifest", ["E2"])
+        self.incremental_attempt = self.create_attempt(
+            second, scope="incremental",
+            based_on=based_on, manifest=manifest)
+        env = self.review(
+            second, attempt=self.incremental_attempt,
+            target_sha256=G.final_evidence_digest(state),
+            review_scope="incremental",
+            based_on_review_sha256=self.base["result_sha256"],
+            evidence_manifest=["E2"])
         env.update(overrides)
         env["result_sha256"] = NB.envelope_sha256(env)
         return env
@@ -264,7 +275,8 @@ class IncrementalReviewTests(F.BridgeBase):
         self.assertTrue(result["g4_eligible"], result.get("g4_reasons"))
         record = {**result,
                   "host_sha256": G._sha256_text(G.canonical_json(result["host"]))}
-        state["native_reviews"].append(record)
+        state = G.load_state(self.state_path)
+        F.attach_review(state, record, self.incremental_attempt)
         ok, code = G._eligible_review(record, state)
         self.assertTrue(ok, code)
 
@@ -316,10 +328,12 @@ class IncrementalReviewTests(F.BridgeBase):
                            "rollout_path": "/r",
                            "tool_calls": [{"name": "Read", "count": 1}],
                            "agent_id": "agent-review",
-                           "child_session_id": "child-review"},
+                           "child_session_id": "child-review",
+                           "workspace_root": self.dir},
                   "evidence_manifest": []}
         record["host_sha256"] = G._sha256_text(G.canonical_json(record["host"]))
-        state["native_reviews"].append(record)
+        state = G.load_state(self.state_path)
+        F.attach_review(state, record, self.incremental_attempt)
         ok, code = G._eligible_review(record, state)
         self.assertFalse(ok)
         self.assertEqual(code, "native_review_incremental_evidence_uncovered")

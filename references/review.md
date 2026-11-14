@@ -41,6 +41,33 @@ copilot_dispatch.py formal-review --state <state> --verdict pass \
   `target_sha256`，写入 `history`，只作审计与追溯。
 - 正式 REVIEW 结论**不参与** G1–G4 判定；它不能替代 G4，也不能让普通任务跳过证据要求。
 
+### 修订与 supersede
+
+正式 REVIEW 的“结论”和“报告引用”分开管理：
+
+```bash
+# 非实质修订：证据编号、引用链接、文字口径；目标摘要必须未变
+copilot_dispatch.py formal-review --state <state> --amend FR<id> \
+  --review-ref <新引用> --reason "仅更正证据编号，结论未变"
+
+# 实质变化：证据/目标摘要变化后重新验证；旧记录原样保留
+copilot_dispatch.py formal-review --state <state> --verdict pass \
+  --summary "新证据下复核通过" --supersedes FR<id> --reason "证据实质变化"
+```
+
+- `--amend` 不生成新的 PASS，不改变原 verdict；原记录、授权快照与 `target_sha256` 不变，
+  只在原记录下追加 `amendments[]`。
+- 目标摘要变化时 `--amend` 直接拒绝：amendment 不能继承旧 PASS；必须用 `--supersedes`
+  登记新结论，旧记录由 `review-metrics` 标为 superseded。
+- 即使修订看起来只是“证据编号”，只要它新增/更正/归档了证据条目并改变了
+  `final_evidence_digest`，就按实质变化处理，走 supersede；amendment 只用于目标摘要
+  未变的引用、链接与文字口径修订。这样同一结论不会再被重复登记为新的 PASS，但可能
+  表现为“1 条原始 PASS + 若干 supersede”，而不是所有修订都塞进 amendment。
+- `--supersedes` 仍走原有授权与合同绑定校验；不能用 amendment/supersede 修改原始授权快照。
+- `review-metrics` 分别输出 `formal_reviews_total`、`formal_review_amendments_total`、
+  `superseded_formal_reviews_total` 与 `active_formal_reviews_total`，不把 amendment 计为
+  新的 PASS。
+
 ### 独立性
 
 正式 REVIEW 若使用原生 Reviewer，必须满足 `agent-bridge.md` 的独立性约束：不同 Agent、
@@ -65,13 +92,16 @@ copilot_dispatch.py formal-review --state <state> --verdict pass \
 
 1. **ZCode 充分自检**：先自己完成针对性测试、diff 检查与目标核对，把能本地发现
    的问题修完；不要把未消化的半成品交给复核。
-2. **首次全面复核**：一次覆盖当前工作项/任务的全部重要方面，findings 带
+2. **稳定最终快照**：核销完成条件、登记完整证据、确认 `final_evidence_digest` 不再变化；
+   最终 G4 复核必须晚于这些动作。派发前读取 `review-context` 的 `warnings` /
+   `scope_reason`，有未闭合条件或证据漂移时先解决，不要让 Reviewer 基于即将过期的摘要工作。
+3. **首次全面复核**：一次覆盖当前工作项/任务的全部重要方面，findings 带
    severity、文件位置、具体证据与影响；同时报告 blocking / major / minor / info。
-3. **集中修复**：按首次复核的全部 blocking/major 与共同根因一起修，不要只修第一条
+4. **集中修复**：按首次复核的全部 blocking/major 与共同根因一起修，不要只修第一条
    再重跑一轮。
-4. **针对性复核**：只验证修复项、新引入的问题、受影响区域与完成条件；能复用且仍
+5. **针对性复核**：只验证修复项、新引入的问题、受影响区域与完成条件；能复用且仍
    有效的证据直接复用，不重复同一检查。
-5. **收口**：完成条件与门禁满足即结束，不追加“再确认一轮”的形式复核。
+6. **收口**：完成条件与门禁满足即结束，不追加“再确认一轮”的形式复核。
 
 目标是一次全面复核 + 一次针对性复核收敛（这是性能目标，不是硬上限）。超过两轮
 仍未收敛时，先判断是**首次复核不全面**、**修复不彻底**、**新增缺陷**还是**复核
@@ -104,7 +134,10 @@ finding 必须有可达的缺陷机制、实际影响与可核实证据（文件
 - **只在输入变化时重跑**：文件内容、证据、合同或测试命令变了才重新执行；仍有效的
   结果直接复用并说明复用了哪些证据。
 - **PASS 即停止**：合同与完成条件满足、无 blocking、`unverified` 为空即返回 `pass`；
-  不为 `minor`/`info` 或可选改进重开。范围实质扩展是新阶段或新任务，不是又一轮。
+  不为 `minor`/`info` 或可选改进重开。把 `minor` 记录为 findings、把已核实非缺陷风险记录
+  为 `residual_risks`，不要为了让 finding 归零而修改已通过的证据再重开完整复核。
+- **PASS 绑定快照**：如果 PASS 之后出现实质代码、证据、合同或风险变化，原 PASS 不再覆盖
+  新快照；按新范围重新完整或增量复核。不得用“及时停止”作为旧结论覆盖新代码的理由。
 - **每轮新会话**：不要续跑同一 Reviewer 会话；宿主按新 rollout 统计工具调用，续跑会
   重置 `totalToolUseCount` 并使信封因 `review_toolcalls_incomplete` 被拒。
 
@@ -173,7 +206,12 @@ finding 必须有可达的缺陷机制、实际影响与可核实证据（文件
 | `unverified` 为空 | 没有未验证项 |
 | `changed_files` 为空 | 复核方未改动任何文件 |
 | `g4_eligible=true` | 宿主记录判定其具备 G4 资格 |
-| `target_sha256` == 当前 `final_evidence_digest` | 复核针对当前最终证据，不是过期结论 |
+| `review_attempt_id` 有效且未被重放 | 复核绑定派发前创建、只消费一次的 attempt |
+| 代码范围快照等于当前 git 工作区 | 未登记为证据的源码、未跟踪/删除/重命名文件也在范围内 |
+| Reviewer `workspaceRoot` == attempt 代码根 | Reviewer 确实在任务工作区运行 |
+| `target_sha256` == attempt 快照 == 当前 `final_evidence_digest` | 复核针对当前最终证据，不是过期结论 |
+| Reviewer 会话晚于 attempt，prompt 携带 attempt id | 旧会话不能冒充新 attempt 的复核方 |
+| 证据文件内容仍等于 attempt 快照 | 复核期间文件被改动时旧结论失效 |
 | `reviewer.profile_id == "reviewer"` | 复核方是 Reviewer Profile |
 | `host` 存在且 `host_sha256` 与内容一致 | ingest 固化的宿主记录未被改写 |
 | `host.agent_id` / `child_session_id` 与 `reviewer` 一致 | 宿主记录的复核方身份与自报一致 |
@@ -184,7 +222,14 @@ finding 必须有可达的缺陷机制、实际影响与可核实证据（文件
 `native_review_not_g4_eligible` / `native_review_stale` / `native_review_profile_invalid` /
 `native_review_foreign` / `native_review_contract_mismatch` / `native_review_host_missing` /
 `native_review_host_changed` / `native_review_host_identity_mismatch` /
-`native_review_host_no_tool_calls`），G4 失败，任务不能 CLOSED。
+`native_review_host_no_tool_calls` / `native_review_attempt_missing` /
+`native_review_attempt_foreign` / `native_review_attempt_binding_mismatch` /
+`native_review_attempt_target_mismatch` / `native_review_attempt_consumed` /
+`native_review_attempt_session_mismatch` / `native_review_attempt_workspace_missing` /
+`native_review_attempt_workspace_mismatch` / `native_review_attempt_workspace_drift` /
+`native_review_attempt_not_consumed` / `native_review_code_scope_missing` /
+`native_review_code_scope_unavailable` / `native_review_code_scope_drift`），G4 失败，
+任务不能 CLOSED。
 
 增量复核（`review_scope=incremental`）同样要满足上表全部条件，另外收口时会重算
 覆盖：基线必须可信、条件与其他工作项在基线之后未变化、新增/变更证据全部列入
@@ -194,6 +239,44 @@ finding 必须有可达的缺陷机制、实际影响与可核实证据（文件
 修复后重新验证同一工作项时，用 `copilot_dispatch.py rerun` 把已终结工作项重开为
 `pending`（旧结果保留在 `rerun_history`），再生成新的执行/复核信封；不要新建一个
 语义重复的工作项来绕过 `work_item_terminal`。
+
+### review attempt：派发快照绑定
+
+G4 不能只依赖“生成信封时重新算一次 `final_evidence_digest`”。否则旧 Reviewer 输出可以在
+代码变化后重新封装成新摘要的有效结论。高风险复核必须走 attempt：
+
+```bash
+# 1. 派发前：固化当前快照（完成条件已核销、证据无漂移时才允许）
+python3 -B scripts/native_agent.py review-context ... --work-item A1 \
+  --create-attempt --output context.json
+# context.json 里有 review_attempt_id / review_attempt_created_at
+
+# 2. 把 attempt id 写入 Reviewer prompt，再派发只读子代理
+
+# 3. 生成信封时必须绑定同一 attempt
+python3 -B scripts/native_agent.py review ... --work-item A1 --attempt RA...
+```
+
+- attempt 在派发前由宿主创建，冻结 task / contract / plan / dispatch / work item /
+  execution result、`target_sha256`、条件摘要、文件证据内容摘要，以及 git 工作区的
+  代码范围（tracked/untracked/新增/删除/重命名，逐文件 SHA-256）；创建后不可修改。
+  已登记证据由证据快照单独绑定，代码快照不重复纳入。
+- `review --attempt` 要求：attempt 属于本任务、未被消费、所有绑定与当前执行一致、
+  attempt 的目标仍是当前 `final_evidence_digest`；宿主 metadata 的 `createdAt` 不早于
+  attempt 创建时间，且宿主 prompt 确实包含该 attempt id。
+- ingest 是 attempt 的唯一消费点：先复核宿主记录与 attempt，再在同一份状态写入中标记
+  `consumed` 并记录 Reviewer 会话。被拒的 attempt 不消费，修正后可重试；已消费的 attempt
+  不能用于另一份结果。
+- G4 收口再次核对：attempt 存在、已消费给本条复核、Reviewer 会话一致、目标摘要等于
+  attempt 快照与当前状态；任何不一致都失败关闭（`native_review_attempt_*` /
+  `native_review_stale`）。
+- 文件证据在派发后、ingest 前或收口前被改写，即使 `final_evidence_digest` 未变，也按
+  `native_review_attempt_workspace_drift` 拒绝；必须新建 attempt 重做复核。
+- 工作区源码/未跟踪文件在派发后、ingest 前或收口前变化（即使没有登记为 evidence），按
+  `native_review_code_scope_drift` 拒绝；G2 也检查最近一次已消费 attempt 的代码快照。
+  增量复核只在代码范围未变化时可用；代码变化必须完整复核。
+- 旧输出重新封装、跨任务复用 attempt、同一 attempt 重放、旧会话冒充新 attempt 都不会
+  因为宿主能重算当前 SHA 而变成有效 G4。
 
 ### 复核目标与“过期”
 

@@ -33,7 +33,7 @@ if HERE not in sys.path:
 
 import governance as G  # noqa: E402
 
-__version__ = "6.3.0"
+__version__ = "6.4.0"
 
 
 class CLIError(Exception):
@@ -208,8 +208,11 @@ def cmd_block(args) -> int:
 
 
 def cmd_unblock(args) -> int:
-    result = G.resolve_block(_state_path(args), args.reason)
+    result = G.resolve_block(_state_path(args), args.reason,
+                             block_id=args.block_id or "")
     print(f"已解除 {result['resolved']} 条阻塞：{result['reason']}")
+    if result.get("block_ids"):
+        print("block_id：" + ", ".join(result["block_ids"]))
     return 0
 
 
@@ -615,9 +618,20 @@ def cmd_authorize_review(args) -> int:
 
 def cmd_formal_review(args) -> int:
     entry = G.record_formal_review(
-        _state_path(args), verdict=args.verdict, summary=args.summary,
-        review_ref=args.review_ref or "", reviewer=args.reviewer)
-    print(f"正式 REVIEW 已登记：{entry['review_id']} → {entry['verdict']}")
+        _state_path(args), verdict=args.verdict or "", summary=args.summary or "",
+        review_ref=args.review_ref or "", reviewer=args.reviewer,
+        amend=args.amend or "", supersedes=args.supersedes or "",
+        reason=args.reason or "")
+    if "amendment" in entry:
+        amendment = entry["amendment"]
+        print(f"正式 REVIEW amendment 已登记：{entry['review_id']} → "
+              f"{amendment['amendment_id']}；原 {entry['verdict']} 结论未覆盖。")
+        print(f"原因：{amendment['reason'][:160]}")
+    elif entry.get("supersedes"):
+        print(f"正式 REVIEW 新结论已登记：{entry['review_id']} → {entry['verdict']}")
+        print(f"已关联 supersedes={entry['supersedes']}；旧记录原样保留。")
+    else:
+        print(f"正式 REVIEW 已登记：{entry['review_id']} → {entry['verdict']}")
     return 0
 
 
@@ -754,6 +768,8 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("unblock", help="解除阻塞")
     p.add_argument("--state", required=True)
     p.add_argument("--reason", required=True)
+    p.add_argument("--block-id", default="",
+                   help="存在多条未解除阻塞时必填，只解除指定 block")
     p.set_defaults(func=cmd_unblock)
 
     p = sub.add_parser("closure-check", help="检查 G1–G4")
@@ -803,12 +819,21 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--scope", default="")
     p.set_defaults(func=cmd_authorize_review)
 
-    p = sub.add_parser("formal-review", help="登记已获授权的正式 REVIEW 结论")
+    p = sub.add_parser("formal-review",
+                       help="登记正式 REVIEW 结论，或对既有结论追加 amendment")
     p.add_argument("--state", required=True)
-    p.add_argument("--verdict", required=True, choices=G.VERDICTS)
-    p.add_argument("--summary", required=True)
+    p.add_argument("--verdict", choices=G.VERDICTS,
+                   help="新结论必填；--amend 时继承原结论，不要传")
+    p.add_argument("--summary", default="",
+                   help="新结论必填；amendment 可只改引用或写修订说明")
     p.add_argument("--review-ref", default="")
     p.add_argument("--reviewer", default="native")
+    p.add_argument("--amend", default="",
+                   help="对既有 review_id 追加非实质修订（目标摘要必须未变）")
+    p.add_argument("--supersedes", default="",
+                   help="实质变化后登记新结论，并关联旧 review_id")
+    p.add_argument("--reason", default="",
+                   help="amendment / supersede 必填，说明修订或失效原因")
     p.set_defaults(func=cmd_formal_review)
 
     p = sub.add_parser("legacy-status", help="只读查看 v1/v2 SOL 历史状态与台账")

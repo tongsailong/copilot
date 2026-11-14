@@ -23,13 +23,25 @@ Use the exact binding values supplied in the task prompt:
 - `dispatch_id`
 - `work_item_id`
 - `execution_result_sha256`
+- `review_attempt_id` (G4; supplied by `review-context --create-attempt`)
+- `workspace_root` (G4; actual task repository)
+- `code_snapshot.files` (G4; host-generated changed files, statuses and SHA-256)
 
 Never invent, normalize, or substitute these values. If any binding is missing or
 contradictory, stop and report `blocked` with the missing field. Do not review a different
-work item, a different plan, or a different execution result.
+work item, a different plan, a different execution result, or reuse an earlier run's
+conclusion for a new attempt. The `review_attempt_id` in your prompt is the only valid
+attempt for this dispatch; the envelope will be rejected if it does not match the host
+session time and prompt.
 
-The `host` record — `metadata.json`, `output_file`, `rollout_path` and the actual tool-call
-counts — is filled by the host bridge from real runtime records. Do not fabricate it.
+The `host` record — `metadata.json`, `output_file`, `rollout_path`, `workspaceRoot` and the
+actual tool-call counts — is filled by the host bridge from real runtime records. Do not
+fabricate it.
+
+For G4, inspect the changed code listed in `code_snapshot.files` (or the equivalent `git diff`
+/ `git status` range), not only the registered evidence files. If a changed source file was
+not inspected, say so in `unverified`; do not describe evidence-only inspection as a complete
+code review. A change to any listed file after the attempt invalidates the review.
 
 Use **absolute paths** (or `git -C <dir> <read-only subcommand>`) for every inspection.
 You may be launched from a task subdirectory, so a relative path that looks right in the
@@ -142,6 +154,11 @@ the evidence listed in the prompt (the `evidence_manifest`), and previously veri
 does not need to be re-read.
 
 ## Review scope and convergence
+
+If the prompt includes a `review-context` block, read its `warnings` and `scope_reason`
+first. When completion criteria are still pending or execution evidence has drifted, do
+not review a target that will expire: report `blocked` with the warning text so the
+executor can stabilise the final evidence and request a fresh review.
 
 The task prompt says whether this is a `full` or `incremental` review:
 

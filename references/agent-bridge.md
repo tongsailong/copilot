@@ -89,7 +89,9 @@ Copilot 不派发 Agent、不调用模型、不写别人的会话。它只校验
   "plan_id": "...", "plan_sha256": "...",
   "dispatch_id": "d-...", "work_item_id": "A1",
   "execution_result_sha256": "<被执行结果的摘要>",
-  "target_sha256": "<当前 final_evidence_digest>",
+  "target_sha256": "<attempt 冻结的 final_evidence_digest>",
+  "review_attempt_id": "RA<24 hex>",
+  "review_attempt_created_at": "<attempt 创建时间>",
   "review_scope": "full|incremental",
   "based_on_review_sha256": "<增量复核的基线；full 时为空>",
   "evidence_manifest": ["E7", "E8"],
@@ -100,7 +102,11 @@ Copilot 不派发 Agent、不调用模型、不写别人的会话。它只校验
            "output_file": "/abs/review-output.json",
            "rollout_path": "/abs/model-io-<child>.jsonl",
            "tool_calls": [{"name": "Read", "count": 2}, {"name": "Bash", "count": 1}],
-           "agent_id": "agent-review", "child_session_id": "child-review"},
+           "agent_id": "agent-review", "child_session_id": "child-review",
+           "session_created_at": "<metadata.createdAt>",
+           "session_completed_at": "<metadata.completedAt>",
+           "prompt_sha256": "<metadata.prompt 的摘要>",
+           "workspace_root": "<metadata.workspaceRoot>"},
   "verdict": "pass|partial|blocked",
   "findings": [{"id": "F1", "severity": "blocking|major|minor|info", "file": "...",
                 "line": 1, "summary": "...", "evidence": "...",
@@ -119,6 +125,11 @@ Copilot 不派发 Agent、不调用模型、不写别人的会话。它只校验
 校验要点：
 
 - 必须绑定一条**已回填**的执行结果（`execution_result_sha256`）；先 ingest 执行信封。
+- G4（`g4_eligible=true`）必须带 `review_attempt_id` / `review_attempt_created_at`，且
+  attempt 必须是 `review-context --create-attempt` 在本任务派发前创建的
+  （`review_attempt_missing`、`review_attempt_invalid`）。attempt 由宿主冻结目标摘要、
+  文件证据内容与 git 工作区代码范围；`review --attempt` 拒绝旧 attempt、已消费 attempt、
+  目标过期或代码范围已漂移的 attempt。
 - `work_item_id` / `dispatch_id` / 执行摘要必须与执行结果一致（`review_binding_mismatch`）。
 - Reviewer 必须是独立子代理（`reviewer_invalid`），Profile 必须是 `reviewer`
   （`reviewer_profile_invalid`），且与执行方不同 Agent / Child Session
@@ -179,7 +190,8 @@ Copilot 不派发 Agent、不调用模型、不写别人的会话。它只校验
 
 - `metadata.json`：`agentId`、`childSessionId`、`profileId`、`profileSnapshot`
   （`tools` 必须是 `Read/Grep/Glob/Bash`，`disallowedTools` 必须含 `Write`/`Edit`）、
-  `status=completed`、`totalToolUseCount`、`outputFile`。
+  `status=completed`、`totalToolUseCount`、`outputFile`、`createdAt`、`completedAt` 与
+  `prompt`（G4 attempt 的会话时间/prompt 绑定）。
 - rollout（`~/.zcode/cli/rollout/model-io-<childSessionId>.jsonl`）：实际工具调用序列、
   模型 provider/model。
 - `outputFile`：Reviewer 原始结论（verdict/findings/…），只能提供判断内容，不能提供身份。
@@ -192,10 +204,17 @@ metadata/rollout，确认：
 | Profile 仍是 `reviewer` | `host_profile_changed` |
 | Agent / Child Session 与信封一致 | `host_agent_mismatch` / `host_session_mismatch` |
 | `output_file` 与 metadata 的 `outputFile` 一致 | `host_output_mismatch` |
+| `session_created_at` / `prompt_sha256` 与 metadata 一致 | `host_session_time_changed` / `host_prompt_changed` |
+| 会话创建时间不早于 attempt 创建 | `review_attempt_session_precedes_attempt` |
+| 宿主 prompt 包含 attempt id | `review_attempt_prompt_unbound` |
 | rollout 工具调用计数与 `host.tool_calls` 完全一致 | `host_tool_calls_changed` |
 | rollout 中没有非只读工具或写命令 | `host_*` / `review_command_not_readonly` |
 | metadata 声称的调用数与 rollout 实际一致 | `host_tool_calls_changed` |
 | 信封 verdict / findings / unverified / changed_files 与宿主 outputFile 原文一致 | `host_verdict_changed` / `host_findings_changed` / `host_unverified_changed` / `host_changed_files_changed` |
+| attempt 存在、绑定本任务、未消费给其他结果、目标仍是当前摘要、会话一致 | `native_review_attempt_*` / `native_review_stale` |
+| attempt 冻结的文件证据内容未变化 | `native_review_attempt_workspace_drift` |
+| attempt 冻结的 git 代码范围未变化 | `native_review_code_scope_drift` |
+| 宿主 `workspaceRoot` 等于 attempt 代码根 | `native_review_attempt_workspace_missing` / `native_review_attempt_workspace_mismatch` |
 
 任何问题都拒绝回填，结论不得作为 G4 依据。
 
@@ -211,25 +230,32 @@ python3 -B scripts/native_agent.py execution --state T/state.json \
   --metadata <agent-exec>/metadata.json --status done --summary "完成" \
   --result-file result.md --evidence E1=/abs/raw.log --output A1.execution.json
 
-# 复核信封：Reviewer 原始结论 + 宿主记录
+# 派发前创建 attempt：冻结任务/计划/执行/目标摘要/证据/代码范围
+python3 -B scripts/native_agent.py review-context --state T/state.json \
+  --dispatch T/state.dispatch.json --execution A1.execution.json \
+  --work-item A1 --create-attempt --workspace "$(git rev-parse --show-toplevel)" \
+  [--base <任务开始 commit>] --output A1.context.json
+
+# 复核信封：必须绑定同一 attempt；高风险缺 attempt 直接拒绝
 python3 -B scripts/native_agent.py review --state T/state.json \
   --dispatch T/state.dispatch.json --execution A1.execution.json \
-  --work-item A1 --metadata <agent-review>/metadata.json \
+  --work-item A1 --attempt RA... --metadata <agent-review>/metadata.json \
   --input reviewer.raw.json --output A1.review.json
 
 # 派发前预检 Reviewer 只读命令清单（不执行；失败 exit=2）
 python3 -B scripts/native_agent.py preflight-commands --file cmds.txt
-
-# 派发上下文：绑定值、证据、漂移、上轮 findings、建议 scope
-python3 -B scripts/native_agent.py review-context --state T/state.json \
-  --dispatch T/state.dispatch.json --execution A1.execution.json \
-  --work-item A1 --previous-review A1.review.json --output A1.context.json
 ```
 
 - 子命令在写文件前调用 `native_bridge` 的正式校验；失败不产生输出文件。
+- `review-context --create-attempt` 只允许高风险 G4；存在未核销完成条件、执行证据漂移或
+  工作区不是 git 仓库时拒绝创建，避免把即将过期/不可证明的快照交给 Reviewer。它把
+  attempt id 与代码范围写入输出；派发时必须把该 id 放进 Reviewer prompt。
+- `review --attempt` 会核对 attempt 属于本任务、未消费、绑定与当前执行一致、目标摘要与
+  代码范围仍等于当前状态，并核对宿主 `createdAt`、`prompt` 与 `workspaceRoot`；旧会话/
+  旧工作区无法冒充新 attempt。
 - `preflight-commands` 只做静态只读校验（`--file` 每行一条或 JSON 字符串数组）；它不
   执行命令，也不能证明 Reviewer 的输出格式合规。
-- `review-context` 只读，输出 `execution_evidence_unbound`（执行证据摘要与 live 证据
+- `review-context` 输出 `execution_evidence_unbound`（执行证据摘要与 live 证据
   不一致/已归档/未登记）、`evidence_manifest` 与建议 scope；ingest 会重新校验。
 - 证据 SHA-256 由脚本读取文件计算，不接受调用方传入。
 - `--evidence` 形如 `E1=/abs/path`，可重复。
@@ -243,7 +269,9 @@ python3 -B scripts/copilot_auto.py ingest --state T/state.json --review-file A1.
 
 - 执行回填：校验通过后把工作项置为信封 `status`、写 `result` 与 `evidence_ids`，并把规范化
   信封加入 `native_results`。
-- 复核回填：加入 `native_reviews`，G4 资格重新核对后写入。
+- 复核回填：加入 `native_reviews`，G4 资格与 attempt 重新核对通过后写入；同一份写入把
+  `review_attempts` 中对应 attempt 标记为已消费（记录 `consumed_by_result_sha256` 与
+  Reviewer 会话），被拒时不消费。
 - 同一 `result_sha256` 重复回填幂等跳过；不同结果覆盖已终态工作项被拒绝。
 - 被拒绝时退出码 12，stderr 含错误码，状态不被部分写入。
 
@@ -256,7 +284,7 @@ python3 -B scripts/copilot_auto.py ingest --state T/state.json --review-file A1.
 | 计划/派发 | `plan_missing`、`plan_unknown`、`plan_mismatch`、`plan_drift`、`dispatch_missing`、`dispatch_empty`、`dispatch_duplicate`、`dispatch_mismatch`、`dispatch_id_drift`、`idempotency_mismatch`、`iteration_mismatch`、`work_item_unknown`、`work_item_terminal` |
 | 执行 | `backend_not_native`、`assignee_unsupported`、`invalid_status`、`executor_identity_missing`、`reviewer_as_executor` |
 | 证据 | `evidence_missing`、`evidence_invalid`、`evidence_duplicate`、`evidence_unreadable`、`evidence_sha_mismatch`、`evidence_foreign`、`evidence_conflict` |
-| 复核 | `reviewer_invalid`、`reviewer_profile_invalid`、`review_binding_mismatch`、`executor_reviewer_same`、`review_contaminated`、`invalid_verdict`、`review_finding_invalid`、`review_finding_duplicate`、`review_inspection_invalid`、`review_command_not_readonly`、`review_output_ambiguous`、`review_output_unparsable`、`review_scope_invalid`、`incremental_base_missing`、`incremental_base_ineligible`、`incremental_manifest_missing`、`incremental_evidence_uncovered`、`incremental_criteria_changed`、`incremental_scope_too_narrow` |
-| G4 | `g4_host_record_missing`、`g4_host_record_invalid`、`g4_tool_calls_missing`、`g4_tool_not_readonly`、`g4_not_eligible`、`g4_requires_pass`、`g4_with_unverified`、`g4_with_blocking`、`pass_with_blocking_finding`、`pass_with_unverified`、`host_profile_changed` 等 |
+| 复核 | `reviewer_invalid`、`reviewer_profile_invalid`、`review_binding_mismatch`、`executor_reviewer_same`、`review_contaminated`、`invalid_verdict`、`review_attempt_missing`、`review_attempt_invalid`、`review_finding_invalid`、`review_finding_duplicate`、`review_inspection_invalid`、`review_command_not_readonly`、`review_output_ambiguous`、`review_output_unparsable`、`review_scope_invalid`、`incremental_base_missing`、`incremental_base_ineligible`、`incremental_manifest_missing`、`incremental_evidence_uncovered`、`incremental_criteria_changed`、`incremental_scope_too_narrow` |
+| G4 | `g4_host_record_missing`、`g4_host_record_invalid`、`g4_tool_calls_missing`、`g4_tool_not_readonly`、`g4_not_eligible`、`g4_requires_pass`、`g4_with_unverified`、`g4_with_blocking`、`pass_with_blocking_finding`、`pass_with_unverified`、`host_profile_changed`、`host_session_time_changed`、`host_prompt_changed`、`review_attempt_prompt_unbound`、`review_attempt_session_precedes_attempt`、`native_review_attempt_*`、`native_review_attempt_workspace_drift`、`native_review_code_scope_*`、`incremental_code_changed` 等 |
 
 错误码只用于定位与修复，不提供绕过开关；修正记录后重新生成信封。

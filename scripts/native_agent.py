@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """从 ZCode 实际运行记录生成 Native Bridge 执行/复核信封。
 
-本脚本不派发 Agent、不调用模型、不写任务状态。它只做一件事：把**宿主已经
+本脚本不派发 Agent、不调用模型；除 `review-context --create-attempt` 会让治理层
+写入一条不可变 review attempt 外，不写任务状态。它只做一件事：把**宿主已经
 产生**的原生运行记录（Agent 的 `metadata.json`、rollout 模型记录、实际证据
 文件、Reviewer 的原始结论）转换成 `copilot-native-result/v2` /
 `copilot-native-review/v2` 信封，并由脚本自己计算所有身份绑定、证据摘要和
@@ -40,10 +41,14 @@ SHA-256 或计划绑定写错/编造。这里把这些字段从实际记录中�
 
     native_agent.py review --state STATE --dispatch DISPATCH.json \
       --execution T1.execution.json --metadata .../metadata.json \
-      --input reviewer.raw.json --output T1.review.json
+      --attempt RA... --input reviewer.raw.json --output T1.review.json
 
-两个子命令在写文件前都会调用 `native_bridge` 的正式校验；校验失败不会产生
-输出文件。
+    native_agent.py review-context --state STATE --dispatch DISPATCH.json \
+      --execution T1.execution.json --work-item T1 --create-attempt \
+      --output T1.context.json
+
+前两个信封子命令在写文件前都会调用 `native_bridge` 的正式校验；校验失败不会
+产生输出文件。`review-context --create-attempt` 会写入治理层生成的复核 attempt。
 """
 from __future__ import annotations
 
@@ -740,6 +745,48 @@ def _mentions_path(path: str, blob: str) -> bool:
     return False
 
 
+def _attempt_session_problems(meta: dict, attempt: dict,
+                              attempt_created: str) -> list[str]:
+    """Reviewer 会话必须晚于 attempt 创建，且 prompt 明确携带 attempt id。
+
+    仅靠 Reviewer 在结论里复述 attempt id/SHA 不能证明“这就是为本次快照启动的
+    会话”：旧会话也可以复述新值。这里用宿主 metadata 的会话创建时间与宿主实际
+    prompt 做绑定，两个条件同时满足才允许生成 G4 信封。
+    """
+    problems: list[str] = []
+    data = meta["data"]
+    created = str(data.get("createdAt") or "").strip()
+    expected_time = str(attempt.get("created_at") or attempt_created or "").strip()
+    started = G._parse_time(created)
+    bound = G._parse_time(expected_time)
+    if not created:
+        problems.append("review_attempt_session_time_missing")
+    elif started is None or bound is None or \
+            (started.tzinfo is None) != (bound.tzinfo is None):
+        problems.append("review_attempt_session_time_invalid")
+    elif started < bound:
+        problems.append("review_attempt_session_precedes_attempt")
+    attempt_id = str(attempt.get("review_attempt_id") or "").strip()
+    prompt = str(data.get("prompt") or "")
+    if not attempt_id or attempt_id not in prompt:
+        problems.append("review_attempt_prompt_unbound")
+    reviewer = attempt.get("reviewer") or {}
+    if isinstance(reviewer, dict):
+        for key in ("agent_id", "child_session_id"):
+            value = str(reviewer.get(key) or "").strip()
+            if value and value != str(meta.get(key) or ""):
+                problems.append("review_attempt_session_mismatch")
+    snapshot = attempt.get("code_snapshot") or {}
+    expected_root = str(snapshot.get("git_root") or snapshot.get("workspace") or "")
+    actual_root = str(data.get("workspaceRoot") or "").strip()
+    if expected_root:
+        if not actual_root:
+            problems.append("review_attempt_workspace_missing")
+        elif os.path.realpath(actual_root) != os.path.realpath(expected_root):
+            problems.append("review_attempt_workspace_mismatch")
+    return problems
+
+
 def _review_profile_problems(meta: dict) -> list[str]:
     """按宿主快照核对 Reviewer Profile 的工具边界。"""
     snapshot = meta["profile_snapshot"]
@@ -859,6 +906,24 @@ def _incremental_base(state: dict, path: str) -> dict:
                 raise AgentRecordError(
                     "[incremental_base_ineligible] 基线复核不是可用的 G4 PASS"
                     " 结论，不能作为增量基础；请先做一次完整复核。")
+            trust = G._review_trust_problems(record, state, check_target=False)
+            if trust:
+                # 旧版无 attempt 的 PASS、宿主记录被改写、attempt 未消费或
+                # 证据文件漂移都会让基线不再可信；增量不能建立在不可信基线上。
+                raise AgentRecordError(
+                    "[incremental_base_ineligible] 基线复核未通过当前 G4 信任检查："
+                    + ", ".join(trust)
+                    + "；请对当前快照做一次完整复核，不要复用旧 PASS。")
+            base_attempt = G.find_review_attempt(
+                state, str(record.get("review_attempt_id") or ""))
+            code_problems = G.code_scope_problems(
+                base_attempt, state, check_current=True) if base_attempt else \
+                ["native_review_code_scope_missing"]
+            if code_problems:
+                raise AgentRecordError(
+                    "[incremental_code_changed] 基线复核之后工作区代码范围已变化（"
+                    + ", ".join(code_problems)
+                    + "）；增量复核只覆盖证据，不能覆盖源码变更，请做完整复核。")
             return record
     raise AgentRecordError(
         f"[incremental_base_missing] --based-on 指向的复核 {sha[:16]}… 尚未回填到本任务；"
@@ -912,7 +977,57 @@ def build_review(args) -> dict:
         raise AgentRecordError(
             f"execution 工作项 {execution.get('work_item_id')!r} 与 "
             f"--work-item {args.work_item!r} 不一致。")
+    risk = str(state.get("risk") or "").strip().lower()
+    attempt_id = str(getattr(args, "attempt", "") or "").strip()
+    attempt: dict | None = None
+    if attempt_id:
+        attempt = G.find_review_attempt(state, attempt_id)
+        if attempt is None:
+            raise AgentRecordError(
+                f"[review_attempt_foreign] 状态中没有复核 attempt {attempt_id!r}；"
+                "不得把其他任务或其他尝试的信封贴到本任务。")
+        if attempt.get("consumed"):
+            raise AgentRecordError(
+                f"[review_attempt_consumed] attempt {attempt_id} 已被消费；"
+                "重试必须重新创建 attempt，不能复用旧 Reviewer 输出。")
+        expected = {
+            "task_id": str(state.get("task_id") or ""),
+            "contract_sha256": str(state.get("contract_sha256") or ""),
+            "plan_id": str(dispatch_env.get("plan_id") or ""),
+            "plan_sha256": str(dispatch_env.get("plan_sha256") or "").lower(),
+            "dispatch_id": str(execution.get("dispatch_id") or ""),
+            "work_item_id": str(execution.get("work_item_id") or ""),
+            "execution_result_sha256": exec_sha,
+        }
+        for key, want in expected.items():
+            if str(attempt.get(key) or "").lower() != want.lower():
+                raise AgentRecordError(
+                    f"[review_attempt_binding_mismatch] attempt {attempt_id} 的 "
+                    f"{key} 与本次复核对象不一致；不能把旧 attempt 套到新派发上。")
+        if str(attempt.get("target_sha256") or "") != G.final_evidence_digest(state):
+            raise AgentRecordError(
+                f"[review_attempt_stale] attempt {attempt_id} 固化的目标摘要已过期；"
+                "派发后代码/证据/条件发生变化，必须创建新的 attempt 并重新复核，"
+                "不能用旧 Reviewer 输出重新封装。")
+        code_problems = G.code_scope_problems(attempt, state, check_current=True)
+        if code_problems:
+            raise AgentRecordError(
+                f"[{code_problems[0]}] attempt {attempt_id} 的代码范围与当前工作区"
+                "不一致或不可读取；Reviewer 实际审查的代码无法与派发快照对应，"
+                "必须新建 attempt 重新复核。")
+    elif risk == "high":
+        raise AgentRecordError(
+            "[review_attempt_missing] 高风险 G4 复核必须先创建 review attempt；"
+            "用 review-context --create-attempt 固化派发快照后再生成信封。")
     meta = _load_metadata(args.metadata)
+    if attempt is not None:
+        session_problems = _attempt_session_problems(
+            meta, attempt, str(attempt.get("created_at") or ""))
+        if session_problems:
+            raise AgentRecordError(
+                "[review_attempt_session_invalid] " + ", ".join(session_problems)
+                + "：Reviewer 会话必须晚于 attempt 创建，且宿主 prompt 携带该 "
+                "attempt id；不能使用旧会话输出。")
     if meta["profile_id"] != "reviewer":
         raise AgentRecordError(
             f"Reviewer metadata.profileId={meta['profile_id']!r}，不是 reviewer；"
@@ -943,7 +1058,25 @@ def build_review(args) -> dict:
     files = _merge_inspected_files(raw.get("files_inspected"), calls)
     commands = _actual_commands(calls)
     undeclared = _declared_files_unverified(raw.get("files_inspected"), calls)
-    target_sha = G.final_evidence_digest(state)
+    if attempt is not None:
+        if scope != str(attempt.get("review_scope") or ""):
+            raise AgentRecordError(
+                f"[review_attempt_scope_mismatch] attempt {attempt_id} 固化的 scope="
+                f"{attempt.get('review_scope')!r}，本次信封计算为 {scope!r}；"
+                "请按 attempt 创建时的范围复核。")
+        if based_on != str(attempt.get("based_on_review_sha256") or ""):
+            raise AgentRecordError(
+                f"[review_attempt_scope_mismatch] attempt {attempt_id} 绑定的基线复核"
+                f" {attempt.get('based_on_review_sha256') or '-'} 与本次不一致。")
+        if sorted(manifest) != sorted(str(x) for x in
+                                      attempt.get("evidence_manifest") or []):
+            raise AgentRecordError(
+                f"[review_attempt_scope_mismatch] attempt {attempt_id} 固化的证据清单"
+                f"与当前计算不一致（{manifest} vs "
+                f"{attempt.get('evidence_manifest') or []}）；新建 attempt 重做。")
+        target_sha = str(attempt.get("target_sha256") or "")
+    else:
+        target_sha = G.final_evidence_digest(state)
     problems = _g4_problems(meta, calls, raw, execution, state, target_sha,
                             delta_ids)
     counts: dict[str, int] = {}
@@ -958,6 +1091,15 @@ def build_review(args) -> dict:
                        for name, count in sorted(counts.items())],
         "agent_id": meta["agent_id"],
         "child_session_id": meta["child_session_id"],
+        "workspace_root": str(meta["data"].get("workspaceRoot") or "").strip(),
+        # 会话时间与 prompt 摘要随宿主记录固化；ingest 会重新读取 metadata
+        # 对照，避免旧会话通过重建信封冒充新 attempt 的复核方。
+        "session_created_at": str(meta["data"].get("createdAt") or "").strip(),
+        "session_completed_at": str(
+            meta["data"].get("completedAt")
+            or meta["data"].get("updatedAt") or "").strip(),
+        "prompt_sha256": NB.sha256_text(
+            str(meta["data"].get("prompt") or "")),
     }
     env = {
         "schema": NB.REVIEW_SCHEMA,
@@ -969,6 +1111,9 @@ def build_review(args) -> dict:
         "work_item_id": execution["work_item_id"],
         "execution_result_sha256": exec_sha,
         "target_sha256": target_sha,
+        "review_attempt_id": attempt_id if attempt is not None else "",
+        "review_attempt_created_at": str(
+            attempt.get("created_at") or "") if attempt is not None else "",
         "review_scope": scope,
         "based_on_review_sha256": based_on,
         "evidence_manifest": manifest,
@@ -1020,6 +1165,30 @@ def verify_review_host_record(envelope: dict) -> list[str]:
     problems = []
     if meta["profile_id"] != "reviewer":
         problems.append("host_profile_changed")
+    attempt_id = str(envelope.get("review_attempt_id") or "").strip()
+    attempt_created = str(envelope.get("review_attempt_created_at") or "").strip()
+    if not attempt_id:
+        problems.append("review_attempt_missing")
+    else:
+        session_created = str(host.get("session_created_at") or "").strip()
+        actual_created = str(meta["data"].get("createdAt") or "").strip()
+        if not session_created or session_created != actual_created:
+            problems.append("host_session_time_changed")
+        prompt = str(meta["data"].get("prompt") or "")
+        if str(host.get("prompt_sha256") or "") != NB.sha256_text(prompt):
+            problems.append("host_prompt_changed")
+        if attempt_id not in prompt:
+            problems.append("review_attempt_prompt_unbound")
+        if str(host.get("workspace_root") or "").strip() != str(
+                meta["data"].get("workspaceRoot") or "").strip():
+            problems.append("host_workspace_changed")
+        started = G._parse_time(actual_created)
+        bound = G._parse_time(attempt_created)
+        if started is None or bound is None or \
+                (started.tzinfo is None) != (bound.tzinfo is None):
+            problems.append("review_attempt_session_time_invalid")
+        elif started < bound:
+            problems.append("review_attempt_session_precedes_attempt")
     if meta["agent_id"] != str((envelope.get("reviewer") or {}).get("agent_id") or ""):
         problems.append("host_agent_mismatch")
     if meta["child_session_id"] != str(
@@ -1119,11 +1288,12 @@ def _execution_evidence_drift(execution: dict, state: dict) -> list[dict]:
 
 
 def build_review_context(args) -> dict:
-    """生成派发 Reviewer 所需的上下文清单（只读，不写状态）。
+    """生成派发 Reviewer 所需的上下文清单。
 
-    输出绑定值、当前证据、执行证据漂移、上轮 findings 与建议的复核 scope，让
-    主代理一次把「要复核什么、绑定值是什么、哪些问题还没闭合」交给 Reviewer，
-    减少因上下文缺失造成的重复取证。
+    默认只读，不写状态；`--create-attempt` 会调用治理层创建并保存一条不可变
+    review attempt（高风险 G4 专用）。输出绑定值、当前证据、执行证据漂移、
+    上轮 findings 与建议的复核 scope，让主代理一次把「要复核什么、绑定值是什么、
+    哪些问题还没闭合」交给 Reviewer，减少因上下文缺失造成的重复取证。
     """
     state = G.load_state(os.path.abspath(args.state))
     dispatch_env, _native = _dispatch_for_state(state, args.dispatch)
@@ -1149,6 +1319,11 @@ def build_review_context(args) -> dict:
     if not recorded:
         raise AgentRecordError(
             "execution 尚未入账；请先用 auto ingest 回填 execution，再生成上下文。")
+    workspace = str(getattr(args, "workspace", "") or "").strip() or os.getcwd()
+    code_base = str(getattr(args, "base", "") or "").strip()
+    code_snapshot = G.capture_code_snapshot(
+        workspace, exclude_paths=G._evidence_paths(state)
+        + G.governance_paths(args.state), base=code_base)
 
     coverage = NB.review_coverage(state)
     evidence = []
@@ -1171,6 +1346,7 @@ def build_review_context(args) -> dict:
     ]
     scope, based_on, manifest, reason = "full", "", [], "没有提供基线复核"
     previous = None
+    previous_target = ""
     previous_path = str(getattr(args, "previous_review", "") or "").strip()
     if previous_path:
         prev = _load_json(previous_path)
@@ -1186,19 +1362,31 @@ def build_review_context(args) -> dict:
         if base is None:
             raise AgentRecordError(
                 f"--previous-review 指向的复核 {prev_sha[:16]}… 尚未回填到本任务。")
+        previous_target = str(base.get("target_sha256") or "")
+        base_trust = G._review_trust_problems(base, state, check_target=False)
+        base_attempt = G.find_review_attempt(
+            state, str(base.get("review_attempt_id") or ""))
+        base_code = str((base_attempt or {}).get("code_scope_sha256") or "")
         previous = {
             "result_sha256": prev_sha,
             "verdict": str(base.get("verdict") or ""),
             "g4_eligible": base.get("g4_eligible") is True,
+            "trust_problems": base_trust,
+            "target_sha256": previous_target,
+            "code_scope_sha256": base_code,
             "findings": [f for f in (base.get("findings") or [])
                          if isinstance(f, dict)],
             "unverified": list(base.get("unverified") or []),
         }
-        if str(base.get("verdict") or "").strip().lower() != "pass" or \
-                base.get("g4_eligible") is not True:
-            reason = "基线复核不是可用的 G4 PASS；本轮必须完整复核"
+        if base_trust:
+            reason = ("基线复核未通过当前 G4 信任检查（"
+                      + ", ".join(base_trust)
+                      + "）；旧 PASS 不能作为增量基础或复用依据，本轮必须完整复核")
         elif not isinstance(base.get("coverage"), dict) or not base.get("coverage"):
             reason = "基线复核没有覆盖快照；本轮必须完整复核"
+        elif not base_code or base_code != str(code_snapshot.get("digest") or ""):
+            reason = ("基线之后工作区代码范围已变化；增量复核只覆盖新增/变更证据，"
+                      "不覆盖源码，本轮必须完整复核")
         else:
             base_cov = base.get("coverage") or {}
             base_evidence = base_cov.get("evidence") or {}
@@ -1228,6 +1416,11 @@ def build_review_context(args) -> dict:
                 reason = "基线是 G4 PASS 且只有证据变化；本轮做增量复核"
     drift = _execution_evidence_drift(execution, state)
     warnings: list[str] = []
+    if not code_snapshot.get("available"):
+        warnings.append(
+            "当前 workspace 不是可读取的 git 工作区（"
+            f"{code_snapshot.get('reason') or 'unknown'}）：无法冻结未登记为证据的"
+            "源码范围；高风险 G4 将拒绝创建 attempt。")
     pending = [c["criterion_id"] for c in criteria if c["status"] != "met"]
     if pending:
         warnings.append(
@@ -1239,6 +1432,47 @@ def build_review_context(args) -> dict:
             "执行信封引用的证据已变化/归档："
             + ", ".join(f"{item['id']}({item['problem']})" for item in drift)
             + "；先修正证据或重新回填执行结果再复核。")
+    current_target = G.final_evidence_digest(state)
+    if previous and not previous.get("trust_problems") and \
+            previous.get("g4_eligible") and previous_target and \
+            previous_target != current_target:
+        warnings.append(
+            "上轮 PASS 绑定的是旧目标摘要（"
+            f"{previous_target[:12]}… → {current_target[:12]}…）：若变化只是 "
+            "minor/info 处置，记录为 findings/residual_risks 并停止，不要为清理它们"
+            "重开完整复核；若发生实质代码/证据/合同变化，按新范围重新完整或增量复核。")
+    attempt = None
+    if getattr(args, "create_attempt", False):
+        if str(state.get("risk") or "").strip().lower() != "high":
+            raise AgentRecordError(
+                "[review_attempt_not_applicable] 只有高风险 G4 任务需要 review "
+                "attempt；普通风险复核不需要该绑定。")
+        if pending:
+            raise AgentRecordError(
+                "[review_attempt_unstable] 完成条件尚未全部核销："
+                + ", ".join(pending) + "；核销会改变目标摘要，先核销并稳定证据，"
+                "再创建最终复核 attempt。")
+        if drift:
+            raise AgentRecordError(
+                "[review_attempt_unstable] 执行信封引用的证据已漂移："
+                + ", ".join(f"{item['id']}({item['problem']})" for item in drift)
+                + "；先修正证据或重新回填执行结果，再创建 attempt。")
+        if previous is not None and previous.get("g4_eligible") and \
+                not previous.get("trust_problems") and \
+                previous.get("code_scope_sha256") == code_snapshot.get("digest") and \
+                previous_target == current_target and scope == "full" and not manifest:
+            raise AgentRecordError(
+                "[review_attempt_not_needed] 当前快照与上轮 G4 PASS 相同且没有"
+                "新增/变更证据；直接复用上轮结论，不需要重新派发复核。")
+        attempt = G.create_review_attempt(
+            os.path.abspath(args.state),
+            work_item_id=str(args.work_item),
+            execution_result_sha256=exec_sha,
+            review_scope=scope,
+            based_on_review_sha256=based_on,
+            evidence_manifest=manifest,
+            workspace=workspace, base=code_base,
+        )
     return {
         "schema": "copilot-review-context/v1",
         "task_id": state["task_id"],
@@ -1248,7 +1482,12 @@ def build_review_context(args) -> dict:
         "dispatch_id": execution.get("dispatch_id") or "",
         "work_item_id": execution.get("work_item_id") or "",
         "execution_result_sha256": exec_sha,
-        "target_sha256": G.final_evidence_digest(state),
+        "target_sha256": (attempt or {}).get("target_sha256") or current_target,
+        "review_attempt_id": (attempt or {}).get("review_attempt_id") or "",
+        "review_attempt_created_at": (attempt or {}).get("created_at") or "",
+        "code_snapshot": (attempt or {}).get("code_snapshot") or code_snapshot,
+        "code_scope_sha256": (attempt or {}).get("code_scope_sha256")
+        or code_snapshot.get("digest") or "",
         "review_scope": scope,
         "based_on_review_sha256": based_on,
         "evidence_manifest": manifest,
@@ -1258,7 +1497,10 @@ def build_review_context(args) -> dict:
         "warnings": warnings,
         "execution_evidence_unbound": drift,
         "previous_review": previous,
-        "note": "ingest 会重新校验 scope、绑定与证据覆盖；本清单只用于准备派发。",
+        "note": ("attempt 已创建：派发 Reviewer 时把 review_attempt_id 写入 prompt；"
+                 "信封必须用 review --attempt 生成。"
+                 if attempt else
+                 "ingest 会重新校验 scope、绑定与证据覆盖；本清单只用于准备派发。"),
     }
 
 
@@ -1327,6 +1569,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--based-on", default="",
                    help="增量复核：已回填的基线复核信封 JSON；只复核基线之后"
                         "新增/变更的证据，要求基线含覆盖快照")
+    p.add_argument("--attempt", default="",
+                   help="派发前由 review-context --create-attempt 创建的 "
+                        "review_attempt_id；高风险 G4 必填")
     p.add_argument("--model-rollout", default="")
     p.add_argument("--output", default="")
 
@@ -1347,6 +1592,13 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--work-item", required=True)
     p.add_argument("--previous-review", default="",
                    help="可选：上一轮已回填的复核信封，用于建议增量复核范围")
+    p.add_argument("--create-attempt", action="store_true",
+                   help="派发前固化本次复核 attempt；高风险 G4 必须先创建")
+    p.add_argument("--workspace", default="",
+                   help="任务实际工作区（默认当前目录）；G4 代码快照的 git 根")
+    p.add_argument("--base", default="",
+                   help="可选：任务开始时的 git commit；用于把已提交的任务代码纳入"
+                        "代码快照（默认只比较工作区与 HEAD）")
     p.add_argument("--output", default="")
 
     args = ap.parse_args(argv)

@@ -159,6 +159,64 @@ class LegacyCliTests(unittest.TestCase):
                          "--reason", "自行决定")
         self.assertEqual(proc.returncode, 2)
 
+    def test_unblock_requires_block_id_when_multiple(self):
+        self.assertEqual(self.start().returncode, 0)
+        self.assertEqual(F.run_cli(
+            "copilot_dispatch.py", "block", "--state", self.state,
+            "--reason", "缺授权", "--needs", "用户授权").returncode, 0)
+        first = read_json(self.state)["blocks"][0]["block_id"]
+        self.assertEqual(F.run_cli(
+            "copilot_dispatch.py", "block", "--state", self.state,
+            "--reason", "缺资源", "--needs", "外部资源").returncode, 0)
+        second = read_json(self.state)["blocks"][1]["block_id"]
+
+        proc = F.run_cli("copilot_dispatch.py", "unblock",
+                         "--state", self.state, "--reason", "一条理由")
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("--block-id", proc.stderr)
+        self.assertEqual(F.run_cli(
+            "copilot_dispatch.py", "unblock", "--state", self.state,
+            "--reason", "授权已到", "--block-id", first).returncode, 0)
+        active = [b for b in read_json(self.state)["blocks"]
+                  if not b.get("resolved_at")]
+        self.assertEqual([b["block_id"] for b in active], [second])
+        self.assertEqual(F.run_cli(
+            "copilot_dispatch.py", "unblock", "--state", self.state,
+            "--reason", "资源已到", "--block-id", second).returncode, 0)
+
+    def test_formal_review_amendment_cli(self):
+        self.assertEqual(self.start().returncode, 0)
+        self.assertEqual(F.run_cli(
+            "copilot_dispatch.py", "authorize-review", "--state", self.state,
+            "--authorized-by", "user", "--reason", "用户要求正式复核").returncode, 0)
+        proc = F.run_cli("copilot_dispatch.py", "formal-review",
+                         "--state", self.state, "--verdict", "pass",
+                         "--summary", "复核通过")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        review_id = read_json(self.state)["formal_reviews"][0]["review_id"]
+
+        proc = F.run_cli("copilot_dispatch.py", "formal-review",
+                         "--state", self.state, "--amend", review_id,
+                         "--review-ref", "E9（编号更正）",
+                         "--reason", "仅更正引用，结论未变")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("amendment", proc.stdout)
+        state = read_json(self.state)
+        self.assertEqual(len(state["formal_reviews"]), 1)
+        self.assertEqual(len(state["formal_reviews"][0]["amendments"]), 1)
+
+        evidence = os.path.join(self.dir, "new.txt")
+        with open(evidence, "w", encoding="utf-8") as fh:
+            fh.write("new evidence\n")
+        self.assertEqual(F.run_cli(
+            "copilot_dispatch.py", "evidence", "--state", self.state,
+            "--add", "--id", "E1", "--file", evidence).returncode, 0)
+        proc = F.run_cli("copilot_dispatch.py", "formal-review",
+                         "--state", self.state, "--amend", review_id,
+                         "--review-ref", "E1", "--reason", "证据已变化")
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("目标摘要已变化", proc.stderr)
+
     def test_legacy_state_is_read_only_through_cli(self):
         legacy = os.path.join(self.dir, "legacy.json")
         write_json(legacy, {"version": 2, "task_id": "task-old", "goal": "旧目标",
@@ -180,6 +238,7 @@ class NativeCliTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.dir = self.tmp.name
+        F.init_git_workspace(self.dir)
         self.state = os.path.join(self.dir, "state.json")
         self.contract = os.path.join(self.dir, "contract.md")
         with open(self.contract, "w", encoding="utf-8") as fh:
@@ -225,9 +284,15 @@ class NativeCliTests(unittest.TestCase):
 
     def _review(self, dispatch: dict, execution: dict) -> dict:
         state = read_json(self.state)
+        attempt = G.create_review_attempt(
+            self.state, work_item_id=str(execution["work_item_id"]),
+            execution_result_sha256=str(execution["result_sha256"]),
+            workspace=self.dir)
         host = F.make_fake_review_host(self.dir, execution=execution,
                                        dispatch=dispatch, evidence=self.evidence,
-                                       task_id=state["task_id"])
+                                       task_id=state["task_id"],
+                                       attempt_id=attempt["review_attempt_id"],
+                                       session_created_at=attempt["created_at"])
         env = {
             "schema": NB.REVIEW_SCHEMA,
             "task_id": state["task_id"],
@@ -238,6 +303,8 @@ class NativeCliTests(unittest.TestCase):
             "work_item_id": execution["work_item_id"],
             "execution_result_sha256": execution["result_sha256"],
             "target_sha256": G.final_evidence_digest(G.load_state(self.state)),
+            "review_attempt_id": attempt["review_attempt_id"],
+            "review_attempt_created_at": attempt["created_at"],
             "reviewer": {"kind": "subagent", "agent_id": host["agent_id"],
                          "child_session_id": host["child_session_id"],
                          "profile_id": "reviewer", "model_reported": "m"},

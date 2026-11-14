@@ -43,6 +43,7 @@ class BuildReviewTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.dir = self.tmp.name
+        F.init_git_workspace(self.dir)
         self.state_path = os.path.join(self.dir, "state.json")
         G.start_state(self.state_path, goal="目标", contract=CONTRACT,
                       execution_backend="native", risk="high")
@@ -86,9 +87,15 @@ class BuildReviewTests(unittest.TestCase):
                          "--result-file", self.execution_path)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.state = G.load_state(self.state_path)
+        self.attempt = G.create_review_attempt(
+            self.state_path, work_item_id="A1",
+            execution_result_sha256=self.execution["result_sha256"],
+            workspace=self.dir)
         self.host = F.make_fake_review_host(
             self.dir, execution=self.execution, dispatch=self.dispatch,
-            evidence=self.evidence, task_id=self.state["task_id"])
+            evidence=self.evidence, task_id=self.state["task_id"],
+            attempt_id=self.attempt["review_attempt_id"],
+            session_created_at=self.attempt["created_at"])
 
     def _args(self, **overrides) -> SimpleNamespace:
         args = SimpleNamespace(
@@ -96,7 +103,8 @@ class BuildReviewTests(unittest.TestCase):
             execution=self.execution_path, work_item="A1",
             metadata=self.host["metadata_path"],
             model_rollout=self.host["rollout_path"],
-            input=self.host["output_file"], output="")
+            input=self.host["output_file"], output="",
+            attempt=self.attempt["review_attempt_id"])
         for key, value in overrides.items():
             setattr(args, key, value)
         return args

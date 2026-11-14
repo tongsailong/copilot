@@ -31,7 +31,7 @@ python3 -B scripts/copilot_dispatch.py <子命令> --state <state.json> [参数]
 | `evidence` | 登记 / 归档 / 列出证据 | `--add`、`--file`、`--text`、`--capture-cmd`、`--drop --id`、`--list`、`--next-id` |
 | `report` | 登记执行报告 | `--summary`、`--blocked`、`--reason` |
 | `decide` | 记录用户/任务决策 | `--text`、`--source` |
-| `block` / `unblock` | 记录/解除真实阻塞 | `block --reason ... --needs ...`；`unblock --reason ...` |
+| `block` / `unblock` | 记录/解除真实阻塞 | `block --reason ... --needs ...`；`unblock --reason ... [--block-id B...]`（多条未解除时必须指定） |
 | `closure-check` | 只读检查 G1–G4 | `--json` |
 | `review-metrics` | 统计真实复核效率：轮次、首轮 finding、重复 finding、无效信封、重复命令/文件、证据包字符数、首轮到 PASS 耗时 | `--state`；正式 REVIEW/G4/原生复核分别计数 |
 | `closure` | 收口（必须四门通过） | `--close`、`--by` |
@@ -39,7 +39,7 @@ python3 -B scripts/copilot_dispatch.py <子命令> --state <state.json> [参数]
 | `handoff` | 只读列出生效交付清单：分支/HEAD/上游、已暂存、未暂存、未跟踪分类 | `--state`（可选）、`--cwd`、`--limit`、`--json`；不提交、不删除、不改 `.gitignore` |
 | `contract` | 查看/修订合同与条件 | `--show`、`--amend --contract-file/--criteria-file`；BLOCKED 时也可修订；登记源文件摘要，文件被改动时 `status` 给出非阻断提醒 |
 | `authorize-review` | 记录用户对正式 REVIEW 的授权 | `--authorized-by user`（必填，调用方声明）、`--reason`、`--scope` |
-| `formal-review` | 登记已授权的正式 REVIEW 结论 | `--verdict pass\|partial\|blocked`、`--summary`、`--review-ref`、`--reviewer` |
+| `formal-review` | 登记正式 REVIEW 结论或修订 | 新结论：`--verdict`、`--summary`；非实质修订：`--amend <review_id> --reason`；实质变化：`--supersedes <review_id> --reason`；均支持 `--review-ref`/`--reviewer` |
 | `legacy-status` | 只读查看 v1/v2 SOL 历史状态与台账 | `--state`、`--audit-log`、`--ledger`、`--json` |
 
 ### 计划 JSON
@@ -119,7 +119,8 @@ python3 -B scripts/copilot_auto.py ingest --state <state.json> [--result-file f]
 - `--result-file`：`copilot-native-result/v2` 执行信封；校验绑定与证据后回填工作项状态，
   重复回填同一 `result_sha256` 是幂等成功。
 - `--review-file`：`copilot-native-review/v2` 复核信封；G4 复核会重新读取宿主记录
-  （metadata / rollout）核对后才登记。
+  （metadata / rollout）核对会话时间、prompt 与 attempt，并在同一次状态写入中消费
+  attempt 后才登记。被拒的 attempt 不消费，修正后可用同一 attempt 重试。
 - 被拒绝时退出码 12，错误码写在 stderr，状态不被部分写入。
 
 ## 4. 标准回合
@@ -161,13 +162,54 @@ python3 -B scripts/copilot_dispatch.py authorize-review --state T/state.json \
 # 复核完成后登记结论（治理记录，不是门禁）
 python3 -B scripts/copilot_dispatch.py formal-review --state T/state.json \
   --verdict pass --summary "结论摘要" --review-ref <复核产物> --reviewer native
+
+# 非实质修订：证据编号/引用/文字口径，目标摘要必须未变
+python3 -B scripts/copilot_dispatch.py formal-review --state T/state.json \
+  --amend FR<review_id> --review-ref <新引用> --reason "仅更正引用，结论未变"
+
+# 实质变化：证据/目标摘要变化后重新验证，旧记录保留并标为 superseded
+python3 -B scripts/copilot_dispatch.py formal-review --state T/state.json \
+  --verdict pass --summary "新证据下复核通过" \
+  --supersedes FR<review_id> --reason "证据实质变化"
 ```
 
 - 未记录授权时 `formal-review` 会被拒绝；合同修订后需要重新授权。`--authorized-by` 是
   调用方对用户要求的声明，不是可验证凭证。这不是普通开发的步骤。
+- `--amend` 不生成新 PASS；目标摘要变化时拒绝，必须用 `--supersedes` 登记新结论。
+  原始记录、授权快照和 verdict 不被覆盖；`review-metrics` 分开统计 amendment 与
+  superseded。
+- BLOCKED 下允许登记已授权的正式 REVIEW 及其 amendment；不会解除阻塞，也不能替代
+  `unblock` 或收口。`plan`、`decide`、`evidence --drop` 在 BLOCKED 下仍被拒绝。
 - 高风险 G4 不依赖 `formal-review`：它需要 `native` 后端下的原生复核信封（见
   `agent-bridge.md`）与四门检查，缺失即 fail-closed。因此 `--risk high` 只能用
   `--backend native` 启动；`legacy` 后端没有派发链路，无法产生可回填的复核。
+
+### 高风险 G4 的最小流程
+
+```bash
+# 条件核销、证据稳定后，先创建 attempt（未核销/漂移会被拒）
+python3 -B scripts/native_agent.py review-context --state T/state.json \
+  --dispatch T/state.dispatch.json --execution A1.execution.json \
+  --work-item A1 --create-attempt --workspace "$(git rev-parse --show-toplevel)" \
+  [--base <任务开始 commit>] --output A1.context.json
+
+# 把 A1.context.json 的 review_attempt_id 写入 Reviewer prompt，再派发只读子代理；
+# 生成信封时必须带同一个 attempt
+python3 -B scripts/native_agent.py review --state T/state.json \
+  --dispatch T/state.dispatch.json --execution A1.execution.json \
+  --work-item A1 --attempt RA... --metadata <reviewer>/metadata.json \
+  --output A1.review.json
+
+python3 -B scripts/copilot_auto.py ingest --state T/state.json \
+  --review-file A1.review.json
+```
+
+attempt 在派发前冻结目标摘要、文件证据内容与 git 工作区代码范围，ingest 成功时一次性
+消费；旧 Reviewer 输出即使重新计算当前 SHA，也会因为 attempt 目标过期、会话/工作区不匹配
+或已消费而被拒绝。失败后修正宿主记录可复用同一 attempt 重试；代码/证据/合同变化则必须
+新建 attempt 重新复核。`--workspace` 应指向任务实际仓库根，且必须与任务证据所属仓库
+一致；高风险任务在非 git 工作区会拒绝创建 attempt。默认快照覆盖工作区相对 HEAD 的变更，
+任务代码已提交时用 `--base <任务开始 commit>` 纳入已提交范围。
 
 ## 6. 历史只读
 

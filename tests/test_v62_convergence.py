@@ -142,6 +142,18 @@ class ReviewDiagnosticsTests(F.BridgeBase):
     def _state_with_review(self, **overrides) -> dict:
         state = G.load_state(self.state_path)
         review = self.review()
+        target = str(overrides.get("target_sha256") or review["target_sha256"])
+        attempt = F.fake_attempt(
+            state, target=target, work_item="A1", consumed=True,
+            reviewer=review["reviewer"], workspace=self.dir)
+        attempt.update({
+            "plan_id": review["plan_id"],
+            "plan_sha256": review["plan_sha256"],
+            "dispatch_id": review["dispatch_id"],
+            "execution_result_sha256": review["execution_result_sha256"],
+        })
+        review["review_attempt_id"] = attempt["review_attempt_id"]
+        review["review_attempt_created_at"] = attempt["created_at"]
         review["coverage"] = NB.review_coverage(state)
         review.update(overrides)
         state["native_reviews"] = [review]

@@ -8,7 +8,7 @@ when_to_use: >
   原生完成，不进入本 Skill。
 ---
 
-# copilot：轻量协作治理（v6.3.0）
+# copilot：轻量协作治理（v6.4.0）
 
 Copilot 是运行在 ZCode 内的**协作治理层**，不是决策模型，也不是执行体。它负责把任务变成可
 追踪的合同、状态、证据与收口条件，并在任务没有真正完成时继续推进。
@@ -70,6 +70,11 @@ CONSULT / PLAN / REVIEW 是**本地工作模式**，不是审批节点，也不�
 - **正式 REVIEW 不是门禁**：普通开发不需要正式 REVIEW，也不需要等待任何模型裁决。用户明确
   要求后，授权在同一任务合同内持续有效；范围或风险实质变化时重新确认。没有用户授权时不得
   伪造正式 REVIEW，也不得用自检冒充。
+- **正式 REVIEW 一次登记、后续修订**：结论只登记一次；证据编号/引用/文字口径的非实质
+  修订用 `formal-review --amend <review_id> --reason ...` 追加 amendment，不生成新的 PASS。
+  amendment 要求目标摘要未变；证据实质变化时拒绝 amendment，必须用
+  `--supersedes <review_id>` 登记新结论并说明旧结论为何失效。原始记录、授权快照与结论不被
+  覆盖。
 - **G4 与正式 REVIEW 不同**：G4 是高风险任务收口所需的技术复核，要求原生只读 Reviewer 在
   隔离证据与独立上下文下给出 `g4_eligible=true` 的结论；formal review 是用户要求的治理记录。
   两者互不替代，任何模型判断都不等于 G4 证据。
@@ -102,6 +107,22 @@ PARTIAL 表示**仍有工作要做**，不是任务终点，也不是停止理�
 
 v6 状态内不再有 `pending_call`、`quota`、`round_seq`、`budget`、`pass_pending` 等远程判定
 字段。旧 v1/v2 状态不会被 v6 驱动，只能用 `legacy-status` 只读查看。
+
+### BLOCKED 下的受控写入
+
+BLOCKED 表示**不能正常收口或继续受阻动作**，不表示无法记录真实进展。允许在阻塞期间登记：
+
+- 已完成的执行结果（`record`）、修复后重验（`rerun`）；
+- 已存在的真实证据（`evidence --add`）、完成条件核销（`criterion`）；
+- 报告、判断、额外阻塞（`report` / `judgment` / `block`）；
+- 用户已明确授权的正式 REVIEW 结论及后续 amendment（`authorize-review` / `formal-review`）。
+
+这些登记**不会解除阻塞**，也不改变合同、授权或验收条件；`closure --close` 仍拒绝未解除的
+阻塞，G1–G4 仍按原规则重算。可能扩大范围或具破坏性的操作继续拒绝：`plan`、`decide`、
+`evidence --drop`。允许多个真实阻塞并存；存在多条未解除阻塞时，`unblock` 必须用
+`--block-id` 逐条解除，不能用一条理由把不同阻塞一起清除。合同修订走单独的
+`contract --amend`：BLOCKED 下允许，但会更新合同指纹并使旧正式 REVIEW 授权/G4 绑定失效，
+不属于上述普通写入白名单。
 
 ## 证据与审计
 
@@ -136,9 +157,12 @@ v6 状态内不再有 `pending_call`、`quota`、`round_seq`、`budget`、`pass_
   都有本任务已登记证据，且文件摘要重新核对一致。
 - **G3 无停摆**：没有 `running` / `failed` / `blocked` 遗留，也没有依赖不可满足的待办。
 - **G4 高风险复核**：`risk=high` 时必须存在绑定的原生独立复核：`verdict=pass`、无 blocking
-  finding、`unverified` 为空、`changed_files` 为空、`g4_eligible=true`、目标摘要等于当前
-  `final_evidence_digest`、Reviewer Profile 为 `reviewer`，且 ingest 时固化下来的宿主记录
-  摘要与身份仍一致。缺失、过期或被篡改一律 fail-closed。
+  finding、`unverified` 为空、`changed_files` 为空、`g4_eligible=true`、绑定派发前创建的
+  `review_attempt_id`、目标摘要等于当前 `final_evidence_digest`、代码范围快照等于当前工作区、
+  Reviewer Profile 为 `reviewer`，且 ingest 时固化下来的宿主记录摘要、会话时间、工作区与身份
+  仍一致。缺失、过期、代码/证据漂移、会话或工作区不匹配、attempt 重放或被篡改一律 fail-closed。
+- **G2 的代码范围**：G2 除合同/条件/证据外，还检查最近一次已消费 attempt 的代码快照；未登记
+  为 evidence 的源码、未跟踪文件、删除/重命名文件同样纳入范围，不能因“没登记证据”绕过。
 
 普通 Reviewer PASS **不等于** G4；`g4_eligible=false` 的结论只能作为参考。
 
@@ -156,16 +180,29 @@ v6 状态内不再有 `pending_call`、`quota`、`round_seq`、`budget`、`pass_
   不由 Reviewer 自报：Profile 只读、实际工具调用计数与 metadata 一致、独立 Agent/Child
   Session、访问过全部文件证据、目标摘要未过期。`commands_run` / `files_inspected` 由宿主
   rollout 派生，Reviewer 不需要手工复述命令或文件。
+- **G4 必须先创建 review attempt**：`review-context --create-attempt --workspace <任务仓库>`
+  在派发前把 task / contract / plan / dispatch / work item / execution / 当前
+  `final_evidence_digest`、条件摘要、文件证据内容摘要，以及 **git 工作区代码范围**
+  （tracked/untracked/新增/删除/重命名，逐文件 SHA-256）固化为不可变 attempt；把返回的
+  `review_attempt_id` 与 `code_snapshot.files` 写入 Reviewer prompt。`review --attempt <id>`
+  要求宿主 metadata 的会话创建时间晚于 attempt、prompt 携带该 id、`workspaceRoot` 等于
+  attempt 冻结的代码根，信封绑定同一目标；旧会话、旧工作区或旧输出不能换一个新 target
+  重新封装。已登记证据由证据快照单独绑定，代码快照不重复纳入。
 - 派发前用 `native_agent.py preflight-commands --file cmds.txt`（或多次 `--command`）预检
   只读命令清单，`exit=2` 表示有命令会被拒；用 `native_agent.py review-context --state …
-  --dispatch … --execution … --work-item … [--previous-review prev.json]` 生成绑定值、证据
-  清单、`execution_evidence_unbound` 漂移、上轮 findings 与建议 scope，一次交给 Reviewer。
+  --dispatch … --execution … --work-item … [--previous-review prev.json]
+  [--create-attempt] [--workspace <任务仓库>] [--base <任务开始 commit>]` 生成绑定值、
+  证据清单、`execution_evidence_unbound` 漂移、代码范围快照、上轮 findings 与建议 scope，
+  一次交给 Reviewer。存在未核销条件、证据漂移或工作区不是 git 仓库时拒绝创建 attempt；
+  默认快照覆盖工作区相对 HEAD 的变更，任务代码已提交时用 `--base` 纳入已提交范围。
 - 首次完整复核 PASS 后又有新证据时，可用 `--based-on <基线复核.json>` 做增量复核：只覆盖
   基线之后新增/变更（含归档）的证据；条件、合同或其他工作项变化则拒绝增量、要求完整复核。
   基线必须是可用的 G4 PASS，所以增量用于高风险复核链路的修复后复验；普通风险任务按需做
   一次完整复核即可。
 - `copilot_auto.py ingest` 校验信封后回填；G4 复核回填前会重新读取 metadata/rollout 核对宿主
-  记录。字段与错误码见 `references/agent-bridge.md`。
+  记录与 attempt，并在同一份状态写入中消费 attempt。被拒的 attempt 不消费，修正后可用同一
+  attempt 重试；已消费的 attempt 不能重放另一份结果。字段与错误码见
+  `references/agent-bridge.md`。
 
 ## 复核策略与收敛
 
@@ -177,10 +214,12 @@ v6 状态内不再有 `pending_call`、`quota`、`round_seq`、`budget`、`pass_
 - **高风险任务**：G1–G4 不变，独立上下文、只读约束、宿主记录与最终证据绑定，fail-closed。
 - **正式 REVIEW**：仅用户明确要求时登记（见 `references/review.md`）。
 
-收敛顺序：**充分自检 → 首次全面复核（一次列出全部重要问题与 severity）→ 集中修复 →
-针对性复核（只验证修复、新问题、受影响区域与完成条件）→ 收口**。目标 1–2 轮收敛，这是
-性能目标不是硬上限；超过两轮先诊断非收敛原因（首次遗漏 / 修复不彻底 / 新增缺陷 / 复核
-机制开销），不要用重复整轮复核掩盖。不得为减少轮次而漏报或降低标准。
+收敛顺序：**充分自检 → 稳定最终执行结果与证据 → 首次全面复核（一次列出全部重要问题与
+severity）→ 集中修复 → 针对性复核（只验证修复、新问题、受影响区域与完成条件）→ 收口**。
+最终 G4 复核必须在完成条件已核销、证据已登记且摘要稳定之后进行；派发前读取
+`review-context` 的 `warnings` / `scope_reason`，存在条件未闭合或证据漂移时先解决原因。
+目标 1–2 轮收敛，这是性能目标不是硬上限；超过两轮先诊断非收敛原因（首次遗漏 / 修复不彻底
+/ 新增缺陷 / 复核机制开销），不要用重复整轮复核掩盖。不得为减少轮次而漏报或降低标准。
 
 首轮与后续轮次的边界：
 
@@ -190,7 +229,9 @@ v6 状态内不再有 `pending_call`、`quota`、`round_seq`、`budget`、`pass_
 - **后续只验证变化**：复用 finding ID（`open`/`resolved`/`regressed`）、只复核修复与受影响
   区域、不重复已有效检查；已关闭问题无新证据不得重报。
 - **PASS 即停止**：合同与条件满足、无 blocking、`unverified` 为空即停，不为 minor/info 建议
-  重开；范围实质扩展按新阶段或新任务处理。
+  重开；把 minor 记录为 findings、把已核实非缺陷风险记录为 `residual_risks`，不要为了让
+  finding 归零而修改已通过的证据再重开完整复核。若后续发生实质代码/证据/合同变化，原 PASS
+  不再覆盖新快照，必须按新范围重新完整或增量复核。
 - **每轮新会话**：不要续跑同一 Reviewer 会话（宿主会重置 `totalToolUseCount`，导致
   `review_toolcalls_incomplete`）；每次复核都派发新的只读子代理。
 - **效率指标**：`copilot_dispatch.py review-metrics --state …` 输出有效复核轮次、首轮 finding
@@ -233,16 +274,31 @@ v6 状态内不再有 `pending_call`、`quota`、`round_seq`、`budget`、`pass_
 
 ## 版本
 
-当前版本 **v6.3.0（ZCode Autonomous Development Edition）**。v6.3 基于 10 个真实任务的复核
-复盘（ad-strategy 7 轮复核、Honor 7 次 G4 尝试、review-perf 4 次正式 REVIEW、gromore /
-腾讯 / journey 等）收敛“无效评审多、重复取证”的机制问题：补齐真实只读命令白名单
-（`git rev-list` / `git cat-file` / `git ls-tree` / `paste` 等）与危险长选项缩写拒绝，
-`&&` 与 `;`/`|` 同等串联只读命令（`cd <dir> && …`），含 `/` 的通配符对 `sed`/`awk`/`find`
-放行；放宽
-围栏 JSON 解析的真实变体；识别 `cd` / `git -C` 后的相对路径，消除“已读却判未访问”的假阴性；
-finding 增加稳定 ID/根因/状态/去重；新增 `preflight-commands`、`review-context`、
-`review-metrics` 与无效信封审计；执行证据漂移进入收口提醒；Reviewer Profile 明确“首轮一次
-看全、后续只验证变化、PASS 即停、每轮新会话”。
+当前版本 **v6.4.0（ZCode Autonomous Development Edition）**。v6.4 基于《测试体系与独立
+复核机制过度设计专项审计报告》的真实任务证据，只做三项 P1 收敛：
+
+- **BLOCKED 受控写入**：允许在阻塞期间登记证据、工作项结果、条件核销、报告、判断、额外
+  阻塞与已授权正式 REVIEW；不自动解除阻塞，不改变合同/授权，`close` 仍拒绝；`plan`、
+  `decide`、`evidence --drop` 继续拒绝。
+- **复核顺序与 PASS 收口**：最终 G4 复核前先稳定条件、证据与摘要，派发前读取
+  `review-context` warnings；PASS 后 minor/info 记录为 findings/residual_risks，不修改已
+  通过证据重开完整复核；后续实质变化必须重新判断原 PASS 是否仍覆盖新快照。
+- **正式 REVIEW amendment**：原始结论只登记一次；非实质修订用 `--amend` 追加，目标摘要
+  变化时拒绝并必须用 `--supersedes` 登记新结论；原始记录、授权快照与结论不被覆盖，
+  `review-metrics` 分别统计有效/已 superseded/amendment。
+- **G2 完整代码范围与真实宿主绑定**：`review-context --create-attempt` 同时冻结 git 工作区
+  的代码范围（tracked/untracked/新增/删除/重命名）；G2、`review --attempt`、ingest 与 G4
+  都重算代码快照，未登记源码变化按 fail-closed 拒绝。真实宿主 metadata 的
+  `createdAt`/`prompt`/`workspaceRoot` 与 attempt 绑定，旧会话/旧工作区不能复用。
+
+v6.3 基于 10 个真实任务的复核复盘（ad-strategy 7 轮复核、Honor 7 次 G4 尝试、review-perf
+4 次正式 REVIEW、gromore / 腾讯 / journey 等）收敛“无效评审多、重复取证”的机制问题：补齐
+真实只读命令白名单（`git rev-list` / `git cat-file` / `git ls-tree` / `paste` 等）与危险
+长选项缩写拒绝，`&&` 与 `;`/`|` 同等串联只读命令（`cd <dir> && …`），含 `/` 的通配符对
+`sed`/`awk`/`find` 放行；放宽围栏 JSON 解析的真实变体；识别 `cd` / `git -C` 后的相对路径，
+消除“已读却判未访问”的假阴性；finding 增加稳定 ID/根因/状态/去重；新增
+`preflight-commands`、`review-context`、`review-metrics` 与无效信封审计；执行证据漂移进入
+收口提醒；Reviewer Profile 明确“首轮一次看全、后续只验证变化、PASS 即停、每轮新会话”。
 G1–G4、证据完整性、宿主记录与 fail-closed 语义未放宽；新增能力不扩大任何授权。
 v5.x 及以前的 SOL 决策通道、轮次/预算状态机与远程 REVIEW 裁决已退役；历史文档保留但明确
 标注为历史，不再作为当前规则。协作语义基线为用户级 `AGENTS.md` 与 ChatGPT 自定义指令

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -28,6 +29,23 @@ def evidence_file(directory: str, text: str = "ok\n") -> str:
     with open(path, "w", encoding="utf-8") as fh:
         fh.write(text)
     return path
+
+
+def init_git(directory: str) -> None:
+    subprocess.run(["git", "init", "-q", directory], check=True,
+                   capture_output=True, text=True)
+    subprocess.run(["git", "-C", directory, "config", "user.email", "t@e.invalid"],
+                   check=True, capture_output=True, text=True)
+    subprocess.run(["git", "-C", directory, "config", "user.name", "t"],
+                   check=True, capture_output=True, text=True)
+    with open(os.path.join(directory, ".gitignore"), "w", encoding="utf-8") as fh:
+        fh.write("state.json\n")
+    with open(os.path.join(directory, "README.md"), "w", encoding="utf-8") as fh:
+        fh.write("baseline\n")
+    subprocess.run(["git", "-C", directory, "add", "."], check=True,
+                   capture_output=True, text=True)
+    subprocess.run(["git", "-C", directory, "commit", "-qm", "baseline"], check=True,
+                   capture_output=True, text=True)
 
 
 class StartAndPlanTests(unittest.TestCase):
@@ -155,11 +173,12 @@ class GateTests(unittest.TestCase):
         codes = {r["code"] for r in check["reasons"]}
         self.assertIn("evidence_file_missing", codes)
 
-    def test_blocked_state_blocks_writes_and_can_be_resolved(self):
+    def test_blocked_state_allows_progress_but_not_closure(self):
         G.add_block(self.state, "需要用户授权", "授权 push")
         self.assertEqual(G.evaluate(G.load_state(self.state))["phase"], "BLOCKED")
-        with self.assertRaises(G.GovernanceError):
-            G.record_action(self.state, "A1", "done", result="完成")
+        # 真实进展可以登记；阻塞状态不自动解除，也不能提前收口。
+        G.record_action(self.state, "A1", "done", result="完成")
+        self.assertEqual(G.evaluate(G.load_state(self.state))["phase"], "BLOCKED")
         with self.assertRaises(G.GovernanceError):
             G.close_task(self.state)
         G.resolve_block(self.state, "用户已授权")
@@ -249,6 +268,7 @@ class HighRiskGateTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.dir = self.tmp.name
+        init_git(self.dir)
         self.state = os.path.join(self.dir, "state.json")
         G.start_state(self.state, goal="目标", contract=CONTRACT, risk="high",
                       execution_backend="native")
@@ -264,6 +284,39 @@ class HighRiskGateTests(unittest.TestCase):
 
     def _review(self, **overrides) -> dict:
         state = G.load_state(self.state)
+        target = str(overrides.get("target_sha256")
+                     or G.final_evidence_digest(state))
+        attempt_id = overrides.pop("review_attempt_id",
+                                   "RA" + os.urandom(12).hex())
+        code_snapshot = G.capture_code_snapshot(
+            self.dir, exclude_paths=G._evidence_paths(state))
+        attempt = {
+            "review_attempt_id": attempt_id,
+            "task_id": state["task_id"],
+            "contract_sha256": state["contract_sha256"],
+            "plan_id": "",
+            "plan_sha256": "",
+            "dispatch_id": "",
+            "work_item_id": "AUTO-G4",
+            "execution_result_sha256": "",
+            # 夹具模拟“派发时固化、之后目标变化”的旧 attempt：目标摘要与
+            # 复核记录一致，从而让门禁按 native_review_stale 拒绝。
+            "target_sha256": target,
+            "criteria_sha256": G._review_criteria_state_digest(state),
+            "code_snapshot": code_snapshot,
+            "code_scope_sha256": code_snapshot.get("digest") or "",
+            "evidence_snapshot": G._review_evidence_snapshot(state),
+            "review_scope": "full",
+            "based_on_review_sha256": "",
+            "evidence_manifest": [],
+            "created_at": G.now_iso(),
+            "created_by": "test",
+            "consumed": True,
+            "consumed_by_result_sha256": "r" * 64,
+            "consumed_at": G.now_iso(),
+            "reviewer": {"agent_id": "agent-1", "child_session_id": "child-1"},
+        }
+        state.setdefault("review_attempts", []).append(attempt)
         review = {
             "task_id": state["task_id"],
             "contract_sha256": state["contract_sha256"],
@@ -273,14 +326,18 @@ class HighRiskGateTests(unittest.TestCase):
             "unverified": [],
             "changed_files": [],
             "g4_eligible": True,
-            "target_sha256": G.final_evidence_digest(state),
+            "target_sha256": target,
+            "review_attempt_id": attempt_id,
+            "review_attempt_created_at": attempt["created_at"],
+            "result_sha256": "r" * 64,
             "reviewer": {"profile_id": "reviewer", "agent_id": "agent-1",
                          "child_session_id": "child-1"},
             "host": {"metadata_path": "/tmp/meta.json",
                      "output_file": "/tmp/out.txt",
                      "rollout_path": "/tmp/rollout.jsonl",
                      "tool_calls": [{"name": "Read", "count": 1}],
-                     "agent_id": "agent-1", "child_session_id": "child-1"},
+                     "agent_id": "agent-1", "child_session_id": "child-1",
+                     "workspace_root": self.dir},
         }
         review["host_sha256"] = G._sha256_text(G.canonical_json(review["host"]))
         review.update(overrides)
@@ -505,6 +562,62 @@ class FormalReviewTests(unittest.TestCase):
         self.assertNotIn("formal_review", str(check["gates"]))
         names = set(check["gates"])
         self.assertEqual(names, {"G1", "G2", "G3", "G4"})
+
+    def _authorized_pass(self) -> dict:
+        G.authorize_formal_review(self.state, authorized_by="user",
+                                  reason="用户要求正式复核")
+        return G.record_formal_review(self.state, verdict="pass",
+                                      summary="独立复核通过")
+
+    def test_formal_review_amendment_preserves_original(self):
+        record = self._authorized_pass()
+        original = json.loads(json.dumps(record))
+        result = G.record_formal_review(
+            self.state, amend=record["review_id"], review_ref="E9（编号更正）",
+            reason="仅更正证据引用编号，结论未变")
+        self.assertEqual(result["review_id"], record["review_id"])
+        self.assertEqual(result["verdict"], "pass")
+        state = G.load_state(self.state)
+        stored = state["formal_reviews"][0]
+        for key in ("review_id", "verdict", "summary", "review_ref", "reviewer",
+                    "authorization", "target_sha256", "created"):
+            self.assertEqual(stored[key], original[key])
+        self.assertEqual(len(stored["amendments"]), 1)
+        self.assertIn("引用编号", stored["amendments"][0]["reason"])
+        metrics = G.review_metrics(state)
+        self.assertEqual(metrics["formal_reviews_total"], 1)
+        self.assertEqual(metrics["formal_review_amendments_total"], 1)
+        self.assertEqual(metrics["active_formal_reviews_total"], 1)
+
+    def test_formal_review_amendment_rejects_changed_target(self):
+        record = self._authorized_pass()
+        state = G.load_state(self.state)
+        G.register_evidence(state, "E1", text="new evidence")
+        G.save_state(self.state, state)
+        with self.assertRaises(G.GovernanceError):
+            G.record_formal_review(
+                self.state, amend=record["review_id"], review_ref="E1",
+                reason="证据变化后仍想继承旧 PASS")
+        stored = G.load_state(self.state)["formal_reviews"][0]
+        self.assertNotIn("amendments", stored)
+
+    def test_formal_review_supersede_keeps_both_records(self):
+        record = self._authorized_pass()
+        state = G.load_state(self.state)
+        G.register_evidence(state, "E1", text="new evidence")
+        G.save_state(self.state, state)
+        new = G.record_formal_review(
+            self.state, verdict="pass", summary="新证据下重新复核通过",
+            supersedes=record["review_id"], reason="新增证据改变了目标摘要")
+        self.assertEqual(new["supersedes"], record["review_id"])
+        state = G.load_state(self.state)
+        self.assertEqual(len(state["formal_reviews"]), 2)
+        self.assertEqual(state["formal_reviews"][0]["review_id"],
+                         record["review_id"])
+        metrics = G.review_metrics(state)
+        self.assertEqual(metrics["formal_reviews_total"], 2)
+        self.assertEqual(metrics["superseded_formal_reviews_total"], 1)
+        self.assertEqual(metrics["active_formal_reviews_total"], 1)
 
 
 class JudgmentAndReportTests(unittest.TestCase):

@@ -66,6 +66,7 @@ class SkillEntryTests(unittest.TestCase):
 
     def test_version_and_retirement(self):
         self.assertIn(f"v{current_version()}", self.doc)
+        self.assertIn(f"# copilot：轻量协作治理（v{current_version()}）", self.doc)
         self.assertIn("SOL 已退役", self.doc)
         self.assertIn("legacy-status", self.doc)
         self.assertNotIn("唯一正式 GPT/SOL 入口", self.doc)
@@ -86,6 +87,13 @@ class SkillEntryTests(unittest.TestCase):
         self.assertIn("authorize-review", self.doc)
         self.assertIn("仅在用户明确授权", self.doc)
         self.assertIn("不是普通开发", self.doc)
+        self.assertIn("--amend", self.doc)
+        self.assertIn("--supersedes", self.doc)
+
+    def test_blocked_controlled_writes_are_documented(self):
+        self.assertIn("BLOCKED 下的受控写入", self.doc)
+        self.assertIn("不会解除阻塞", self.doc)
+        self.assertIn("evidence --drop", self.doc)
 
     def test_four_gates_and_native_reviewer(self):
         for gate in ("G1", "G2", "G3", "G4"):
@@ -93,6 +101,10 @@ class SkillEntryTests(unittest.TestCase):
         self.assertIn("fail-closed", self.doc)
         self.assertIn("g4_eligible", self.doc)
         self.assertIn("copilot-native-review/v2", self.doc)
+        self.assertIn("--create-attempt", self.doc)
+        self.assertIn("review_attempt_id", self.doc)
+        self.assertIn("代码范围快照", self.doc)
+        self.assertIn("--workspace", self.doc)
         # 高风险与 native 后端的绑定必须写进入口，否则会留下无法收口的任务。
         self.assertIn("--risk high", self.doc)
         self.assertIn("--backend native", self.doc)
@@ -116,6 +128,18 @@ class ReferenceTests(unittest.TestCase):
         self.assertIn("native_review_host_changed", o["review.md"])
         self.assertIn("--authorized-by user", o["workflow.md"])
         self.assertIn("退出码 0", o["workflow.md"])
+        self.assertIn("--amend", o["workflow.md"])
+        self.assertIn("--supersedes", o["workflow.md"])
+        self.assertIn("BLOCKED 下的受控写入", o["runtime.md"])
+        self.assertIn("amendment", o["review.md"])
+        self.assertIn("superseded", o["review.md"])
+        self.assertIn("--create-attempt", o["review.md"])
+        self.assertIn("native_review_attempt_workspace_drift", o["review.md"])
+        self.assertIn("native_review_code_scope_drift", o["review.md"])
+        self.assertIn("code_snapshot.files", o["agent-bridge.md"] + text(REVIEWER))
+        self.assertIn("review_attempt_id", o["agent-bridge.md"])
+        self.assertIn("review_attempt_created_at", o["agent-bridge.md"])
+        self.assertIn("--create-attempt", o["workflow.md"])
         for name, doc in o.items():
             self.assertNotIn("gpt-6.1-sol", doc, f"{name} 不应把 SOL 写成活动路径")
             self.assertNotIn("call_gpt.py --", doc, name)

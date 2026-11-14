@@ -275,7 +275,7 @@ class ReviewContextV63Tests(F.BridgeBase):
     def args(self, **overrides):
         base = {"state": self.state_path, "dispatch": self.dispatch_path,
                 "execution": self.execution_path, "work_item": "A1",
-                "previous_review": ""}
+                "previous_review": "", "workspace": self.dir}
         base.update(overrides)
         return argparse.Namespace(**base)
 
@@ -291,10 +291,13 @@ class ReviewContextV63Tests(F.BridgeBase):
 
     def test_previous_review_flags_changed_criteria(self):
         # 真实 e2e 复现：复核后核销条件 → 基线目标摘要过期，不能再建议“直接复用”。
+        attempt = self.create_attempt(self.execution_env)
         host = F.make_fake_review_host(
             self.dir, execution=self.execution_env, dispatch=self.dispatch,
-            evidence=self.evidence, task_id=self.state["task_id"])
-        env = self.review(self.execution_env, host=host)
+            evidence=self.evidence, task_id=self.state["task_id"],
+            attempt_id=attempt["review_attempt_id"],
+            session_created_at=attempt["created_at"])
+        env = self.review(self.execution_env, attempt=attempt, host=host)
         AC._ingest_review(self.state_path, env)
         G.record_criterion(self.state_path, "C1", "met", evidence_ids=["E1"])
         review_path = os.path.join(self.dir, "previous.json")
@@ -388,7 +391,7 @@ class IngestAuditV63Tests(F.BridgeBase):
         with open(path, "r", encoding="utf-8") as fh:
             entry = json.loads(fh.readline())
         self.assertEqual(entry["kind"], "review_build")
-        self.assertEqual(entry["code"], "review_output_unbound")
+        self.assertEqual(entry["code"], "review_attempt_missing")
         self.assertEqual(entry["work_item_id"], "A1")
         self.assertEqual(entry["execution_result_sha256"],
                          self.execution()["result_sha256"])

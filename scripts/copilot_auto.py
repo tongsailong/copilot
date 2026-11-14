@@ -297,7 +297,55 @@ def _ingest_review(path: str, envelope: dict) -> int:
             raise AutoError(
                 "G4 复核的宿主记录复核未通过：" + ", ".join(problems) +
                 "；不得把该结论当作 G4 依据。")
+        # attempt 是派发前固化的不可变快照；ingest 只接受仍与当前状态一致的
+        # attempt，并把它消费给这一份结果，防止旧输出换新 target 重放。
+        attempt_problems = G.review_attempt_problems(
+            normalized, state, check_current=True)
+        if attempt_problems:
+            _record_attempt(path, "review", envelope, "review_attempt_rejected",
+                            ", ".join(attempt_problems))
+            raise AutoError(
+                "G4 复核的 review attempt 校验未通过：" + ", ".join(attempt_problems)
+                + "；旧 Reviewer 输出不能绑定到新快照，请新建 attempt 重做复核。")
+        attempt = G.find_review_attempt(
+            state, str(normalized.get("review_attempt_id") or ""))
+        if attempt is None:
+            raise AutoError(
+                "G4 复核引用的 review attempt 不存在；请先创建 attempt 再回填。")
+        if attempt.get("consumed"):
+            _record_attempt(path, "review", envelope, "review_attempt_consumed",
+                            "attempt already consumed")
+            raise AutoError(
+                "G4 复核引用的 review attempt 已被消费；不能用同一 attempt "
+                "重放另一份结果，请新建 attempt。")
     state = G.load_state(path)
+    if normalized["g4_eligible"]:
+        # 校验后重新加载，确保消费与复核登记基于同一份状态；任何一边变化都
+        # 失败关闭，而不是把“校验通过”当成可写入。
+        attempt = G.find_review_attempt(
+            state, str(normalized.get("review_attempt_id") or ""))
+        late_problems = G.review_attempt_problems(
+            normalized, state, check_current=True)
+        if attempt is None or late_problems or attempt.get("consumed"):
+            codes = late_problems or (["review_attempt_consumed"]
+                                      if attempt and attempt.get("consumed")
+                                      else ["review_attempt_foreign"])
+            _record_attempt(path, "review", envelope, "review_attempt_rejected",
+                            ", ".join(codes))
+            raise AutoError(
+                "G4 复核的 review attempt 在回填前发生变化："
+                + ", ".join(codes) + "；请重新创建 attempt 并复核。")
+        attempt["consumed"] = True
+        attempt["consumed_by_result_sha256"] = sha
+        attempt["consumed_at"] = G.now_iso()
+        attempt["reviewer"] = {
+            "agent_id": str((normalized.get("reviewer") or {}).get("agent_id") or ""),
+            "child_session_id": str(
+                (normalized.get("reviewer") or {}).get("child_session_id") or ""),
+            "profile_id": str(
+                (normalized.get("reviewer") or {}).get("profile_id") or ""),
+            "bound_at": G.now_iso(),
+        }
     state.setdefault("native_reviews", []).append({
         **normalized,
         # 宿主记录摘要随记录固化：G4 收口时用它检测记录被改写，避免只信任
@@ -319,6 +367,7 @@ def _ingest_review(path: str, envelope: dict) -> int:
                               if str(f.get("severity") or "") == "blocking"),
         "execution_evidence_unbound": normalized.get(
             "execution_evidence_unbound") or [],
+        "review_attempt_id": normalized.get("review_attempt_id") or "",
     })
     G.save_state(path, state)
     print(f"复核结果已回填：{normalized['work_item_id']} → {normalized['verdict']}"
