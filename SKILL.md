@@ -8,7 +8,7 @@ when_to_use: >
   原生完成，不进入本 Skill。
 ---
 
-# copilot：轻量协作治理（v6.2.0）
+# copilot：轻量协作治理（v6.3.0）
 
 Copilot 是运行在 ZCode 内的**协作治理层**，不是决策模型，也不是执行体。它负责把任务变成可
 追踪的合同、状态、证据与收口条件，并在任务没有真正完成时继续推进。
@@ -116,11 +116,16 @@ v6 状态内不再有 `pending_call`、`quota`、`round_seq`、`budget`、`pass_
   closure 快照）。
 - **历史只读**：旧审计 JSONL、旧 REVIEW 台账、旧任务状态通过 `legacy-status` 展示，不重放、
   不续跑、不改写。
-- **证据卫生提醒**：`closure-check` 对重复登记同一文件、内容完全相同、临时目录证据以及
-  `evidence/` 下未登记文件给出**非阻断**提醒；不改变四门，由 ZCode 判断补 note、归档或保留。
+- **证据卫生提醒**：`closure-check` 对重复登记同一文件、内容完全相同、临时目录证据、
+  `evidence/` 下未登记文件，以及“执行信封引用的证据摘要已被更新或归档”给出**非阻断**提醒；
+  不改变四门，由 ZCode 判断补 note、归档、重新回填执行结果或保留。
 - **收口交付清单（只读）**：`handoff --state ... [--json]` 汇总任务阶段、证据统计与工作区
   未提交/未跟踪文件的分类（治理记录、任务证据、验收产物、未分类）。它只读 git 状态，
   **不提交、不删除、不改写 `.gitignore`**；已提交内容与忽略项不在清单里，也不会被自动处理。
+- **复核审计事件**：执行/复核信封回填写入 `native_result_ingested` / `native_review_ingested`
+  历史事件；被拒信封（含生成阶段：输出漏绑定字段、实际命令未通过只读校验）追加到任务目录
+  `review-attempts.jsonl`（只记错误码与绑定值，不记正文），供复盘统计“无效信封”而不必依赖
+  终端输出。
 
 ## 四门与收口
 
@@ -151,6 +156,10 @@ v6 状态内不再有 `pending_call`、`quota`、`round_seq`、`budget`、`pass_
   不由 Reviewer 自报：Profile 只读、实际工具调用计数与 metadata 一致、独立 Agent/Child
   Session、访问过全部文件证据、目标摘要未过期。`commands_run` / `files_inspected` 由宿主
   rollout 派生，Reviewer 不需要手工复述命令或文件。
+- 派发前用 `native_agent.py preflight-commands --file cmds.txt`（或多次 `--command`）预检
+  只读命令清单，`exit=2` 表示有命令会被拒；用 `native_agent.py review-context --state …
+  --dispatch … --execution … --work-item … [--previous-review prev.json]` 生成绑定值、证据
+  清单、`execution_evidence_unbound` 漂移、上轮 findings 与建议 scope，一次交给 Reviewer。
 - 首次完整复核 PASS 后又有新证据时，可用 `--based-on <基线复核.json>` 做增量复核：只覆盖
   基线之后新增/变更（含归档）的证据；条件、合同或其他工作项变化则拒绝增量、要求完整复核。
   基线必须是可用的 G4 PASS，所以增量用于高风险复核链路的修复后复验；普通风险任务按需做
@@ -172,6 +181,21 @@ v6 状态内不再有 `pending_call`、`quota`、`round_seq`、`budget`、`pass_
 针对性复核（只验证修复、新问题、受影响区域与完成条件）→ 收口**。目标 1–2 轮收敛，这是
 性能目标不是硬上限；超过两轮先诊断非收敛原因（首次遗漏 / 修复不彻底 / 新增缺陷 / 复核
 机制开销），不要用重复整轮复核掩盖。不得为减少轮次而漏报或降低标准。
+
+首轮与后续轮次的边界：
+
+- **首轮一次看全**：枚举变更面、读取受影响调用方与测试、按根因归组、检查同类缺陷的其他位置，
+  一次给出全部可独立确认的问题；finding 用稳定 ID（`F1..Fn`）与可选 `root_cause`/
+  `category`/`related`，不把一个根因拆成多轮。
+- **后续只验证变化**：复用 finding ID（`open`/`resolved`/`regressed`）、只复核修复与受影响
+  区域、不重复已有效检查；已关闭问题无新证据不得重报。
+- **PASS 即停止**：合同与条件满足、无 blocking、`unverified` 为空即停，不为 minor/info 建议
+  重开；范围实质扩展按新阶段或新任务处理。
+- **每轮新会话**：不要续跑同一 Reviewer 会话（宿主会重置 `totalToolUseCount`，导致
+  `review_toolcalls_incomplete`）；每次复核都派发新的只读子代理。
+- **效率指标**：`copilot_dispatch.py review-metrics --state …` 输出有效复核轮次、首轮 finding
+  数、重复 finding 比例、无效信封计数、重复命令/文件、每轮证据包字符数与首轮到 PASS 耗时；
+  正式 REVIEW、原生复核与 G4 分别计数。
 
 ## 授权与安全（不可放宽）
 
@@ -209,13 +233,16 @@ v6 状态内不再有 `pending_call`、`quota`、`round_seq`、`budget`、`pass_
 
 ## 版本
 
-当前版本 **v6.2.0（ZCode Autonomous Development Edition）**。v6.2 在 v6.0.0/v6.1 的本地
-治理引擎上按最近 5 个真实任务（v6.1 自升级、步数宝 GroMore、Honor ECPM、腾讯插屏、
-journey 激励）的复盘
-收敛：补齐只读复核策略的真实盲区（SDK/JDK 专用工具的绝对路径、`unzip -p` 读 APK
-内容、只读族的未加引号通配符），G4 拒绝原因给出可操作诊断（目标摘要过期时列出变化的
-条件/工作项/证据），
-迭代在开新轮与收口时正确结束，证据卫生与收口工作区交付清单改为非阻断提醒/只读清单。
+当前版本 **v6.3.0（ZCode Autonomous Development Edition）**。v6.3 基于 10 个真实任务的复核
+复盘（ad-strategy 7 轮复核、Honor 7 次 G4 尝试、review-perf 4 次正式 REVIEW、gromore /
+腾讯 / journey 等）收敛“无效评审多、重复取证”的机制问题：补齐真实只读命令白名单
+（`git rev-list` / `git cat-file` / `git ls-tree` / `paste` 等）与危险长选项缩写拒绝，
+`&&` 与 `;`/`|` 同等串联只读命令（`cd <dir> && …`），含 `/` 的通配符对 `sed`/`awk`/`find`
+放行；放宽
+围栏 JSON 解析的真实变体；识别 `cd` / `git -C` 后的相对路径，消除“已读却判未访问”的假阴性；
+finding 增加稳定 ID/根因/状态/去重；新增 `preflight-commands`、`review-context`、
+`review-metrics` 与无效信封审计；执行证据漂移进入收口提醒；Reviewer Profile 明确“首轮一次
+看全、后续只验证变化、PASS 即停、每轮新会话”。
 G1–G4、证据完整性、宿主记录与 fail-closed 语义未放宽；新增能力不扩大任何授权。
 v5.x 及以前的 SOL 决策通道、轮次/预算状态机与远程 REVIEW 裁决已退役；历史文档保留但明确
 标注为历史，不再作为当前规则。协作语义基线为用户级 `AGENTS.md` 与 ChatGPT 自定义指令

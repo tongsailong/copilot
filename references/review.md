@@ -78,16 +78,61 @@ copilot_dispatch.py formal-review --state <state> --verdict pass \
 机制本身**（命令/绑定/证据流程）的问题，再决定补证据、换路线或改机制；不要用
 “再来一轮”掩盖非收敛原因。
 
+### 首轮完整性协议
+
+首轮是这次工作项唯一一次全面检查的机会，应把预算花在覆盖上：
+
+1. 从 diff、工作项与任务证据清单**枚举变更面**（改动文件、产物、日志、完成条件）。
+2. 读**受影响的代码**：调用方、消费方、配置、编码该行为的测试，而不只看改动行。
+3. **按根因归组**：一个根因一条 finding；同一根因的多处表现用 `related` 引用，不拆成
+   多条、更不拆成多轮。
+4. **检查同类缺陷的其他位置**：一个 handler 缺保护，就在本轮检查兄弟 handler。
+5. finding 使用稳定 ID（`F1..Fn`）与可选 `root_cause` / `category` / `related` /
+   `reproduce`；后续轮次复用同一 ID，宿主与指标据此统计重复 finding。
+6. 把输出分成四类：真实 blocking/major 缺陷、证据缺口（`unverified`）、非阻塞建议
+   （`minor`/`info`）、已核实但非缺陷的风险（`residual_risks`）。
+
+finding 必须有可达的缺陷机制、实际影响与可核实证据（文件+行、diff hunk、日志片段或
+哈希）；没有代码路径或证据的推测不得升级为 blocking。已确认的第二个缺陷不得因为
+第一个已经导致不通过而留到下一轮。
+
+### 后续轮次与停止
+
+- **复用 ID 与状态**：`resolved` 仅表示当前快照已验证修复，`open` 表示仍复现，
+  `regressed` 仅在有新证据表明已修复问题再次出现时使用。
+- **不重报已关闭问题**：没有新证据的同一观察是噪声，不是 finding。
+- **只在输入变化时重跑**：文件内容、证据、合同或测试命令变了才重新执行；仍有效的
+  结果直接复用并说明复用了哪些证据。
+- **PASS 即停止**：合同与完成条件满足、无 blocking、`unverified` 为空即返回 `pass`；
+  不为 `minor`/`info` 或可选改进重开。范围实质扩展是新阶段或新任务，不是又一轮。
+- **每轮新会话**：不要续跑同一 Reviewer 会话；宿主按新 rollout 统计工具调用，续跑会
+  重置 `totalToolUseCount` 并使信封因 `review_toolcalls_incomplete` 被拒。
+
+### 派发前预检与上下文
+
+- `native_agent.py preflight-commands --file cmds.txt`（每行一条或 JSON 数组）或多次
+  `--command`：派发前校验只读命令清单，`exit=2` 表示存在会被拒绝的命令。它只做静态
+  校验，不执行命令，也不保证输出格式。
+- `native_agent.py review-context --state … --dispatch … --execution … --work-item …
+  [--previous-review prev.json]`：输出绑定值、当前证据（含 live/dropped）、完成条件、
+  执行证据漂移 `execution_evidence_unbound`、上轮 findings 与建议 scope。把这份清单和
+  工作项要求一起交给 Reviewer，减少“上下文没给全 → 重新取证”。
+- 漂移提示与 ingest 校验都不阻断合同本身：证据被更正后应重新回填执行结果，或在复核
+  结论中说明；不得用旧摘要继续声称已覆盖。
+
 ### 记录与边界
 
 - 由 `reviewer` Profile 的只读子代理执行（工具仅 `Read`/`Grep`/`Glob`/`Bash`）。
 - 检查真实文件、diff、测试日志与原始证据，给出 verdict 与 findings（含文件位置与证据）。
 - 复核命令与实际读取由 `native_agent.py` 从宿主 rollout 派生，不要求 Reviewer 手工
   复述命令；实际执行的 Bash 命令仍逐条做只读校验。
+- `cd <dir>; cat 相对路径` 与 `git -C <dir> …` 后的相对路径会被解析到实际目录，用于
+  判定证据是否真的被访问；但优先使用绝对路径，避免歧义。
 - 结论可用 `native_agent.py review` 生成信封并回填；`g4_eligible` 由宿主记录决定。
 - **普通复核 PASS 不等于 G4**；`g4_eligible=false` 的结论只能作参考。
 - 失败处理：复核信封被拒时先看原因码——绑定/过期/只读边界是流程问题，修流程后
-  重试；finding 是实质问题，修复后复核。不要因为复核失败就把任务标为 BLOCKED。
+  重试；finding 是实质问题，修复后复核。不要因为复核失败就把任务标为 BLOCKED；被拒
+  尝试会追加到任务目录 `review-attempts.jsonl` 供复盘统计。
 - **过期诊断**：`native_review_stale` 会在原因里列出失效来源（哪些条件状态、工作项、
   证据相对复核快照新增/变更/移除了），据此决定是补一次完整复核还是用可用基线做增量；
   没有覆盖快照的旧记录会明确提示无法列出变化项。

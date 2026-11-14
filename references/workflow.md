@@ -33,6 +33,7 @@ python3 -B scripts/copilot_dispatch.py <子命令> --state <state.json> [参数]
 | `decide` | 记录用户/任务决策 | `--text`、`--source` |
 | `block` / `unblock` | 记录/解除真实阻塞 | `block --reason ... --needs ...`；`unblock --reason ...` |
 | `closure-check` | 只读检查 G1–G4 | `--json` |
+| `review-metrics` | 统计真实复核效率：轮次、首轮 finding、重复 finding、无效信封、重复命令/文件、证据包字符数、首轮到 PASS 耗时 | `--state`；正式 REVIEW/G4/原生复核分别计数 |
 | `closure` | 收口（必须四门通过） | `--close`、`--by` |
 | `reopen` | 用户授权后重开 | `--reason`、`--authorized-by user`（必填） |
 | `handoff` | 只读列出生效交付清单：分支/HEAD/上游、已暂存、未暂存、未跟踪分类 | `--state`（可选）、`--cwd`、`--limit`、`--json`；不提交、不删除、不改 `.gitignore` |

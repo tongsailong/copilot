@@ -33,7 +33,7 @@ if HERE not in sys.path:
 
 import governance as G  # noqa: E402
 
-__version__ = "6.2.0"
+__version__ = "6.3.0"
 
 
 class CLIError(Exception):
@@ -303,6 +303,15 @@ def cmd_closure_check(args) -> int:
             print(f"    {reason.get('code')}: {reason.get('detail')}")
     for warning in check.get("warnings") or []:
         print(f"- 提醒（不阻断）：{warning}")
+    return 0
+
+
+def cmd_review_metrics(args) -> int:
+    path = _state_path(args)
+    state = G.load_state(path)
+    metrics = G.review_metrics(
+        state, task_dir=os.path.dirname(os.path.abspath(path)))
+    _print(metrics)
     return 0
 
 
@@ -751,6 +760,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--state", required=True)
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_closure_check)
+
+    p = sub.add_parser("review-metrics",
+                       help="统计真实复核轮次/重复 finding/无效信封等效率指标")
+    p.add_argument("--state", required=True)
+    p.set_defaults(func=cmd_review_metrics)
 
     p = sub.add_parser("closure", help="收口任务（必须四门通过）")
     p.add_argument("--state", required=True)

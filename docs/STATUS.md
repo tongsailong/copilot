@@ -1,8 +1,92 @@
 # STATUS
 
-更新：2026-11-13 CST。本文件只记录现场可核实的事实；规划与未完成事项单独标注。
+更新：2026-11-14 CST。本文件只记录现场可核实的事实；规划与未完成事项单独标注。
 
-## v6.2.0（2026-11-13，当前）：实战复盘收敛
+## v6.3.0（2026-11-14，当前）：Reviewer 多轮评审根因收敛
+
+本批次在用户任务授权下完成，**未提交、未推送、未发布**（用户明确本任务不授权 Git 提交/推送/发布）。
+
+- **动机（10 个真实任务复盘）**：ad-strategy（7 轮复核、0 份信封入库）、Honor ECPM
+  （7 次 G4 尝试、3 次机械有效、最终 1 份 partial）、review-perf（1 份有效复核 + 4 次
+  正式 REVIEW、证据编号频繁漂移）、gromore（A10/A13 各 8 条 finding）、腾讯插屏、
+  tencent / journey / usb-debug / perf-ads / splash。真正造成返工的是机制摩擦而非
+  Reviewer 判断质量：安全命令缺失导致整轮作废（`git rev-list`、`paste -sd+`）、危险
+  长选项缩写未覆盖（`git log --out=`、`git show --ext-d`、`git cat-file --filt`）、
+  围栏 JSON 变体被判不可解析、`cd` 后相对路径被判“未访问证据”、finding 无可复用 ID/
+  根因/状态导致跨轮重复、无效信封只打印到终端、执行证据漂移需人工发现、无预检与上下文
+  助手、Reviewer Profile 缺少“首轮看全/后续只验变化/PASS 即停/每轮新会话”的协议。
+- **只读策略**：白名单新增只读 git 子命令（`rev-list`/`cat-file`/`ls-tree`/`show-ref`/
+  `for-each-ref`/`describe`/`merge-base`/`name-rev`/`check-ignore`/`check-attr`/
+  `diff-tree`/`diff-index`/`diff-files`/`shortlog`/`blame`/`count-objects`）与文本流
+  工具（`paste`/`comm`/`join`/`tac`/`rev`/`fold`/`expand`/`unexpand`/`column`/`cksum`/
+  `seq`/`base64`）；`--filters` 加入 argv 拒绝；`git diff/log/show/diff-tree/diff-index/
+  diff-files/cat-file` 的 `--output`/`--output-file`/`--ext-diff`/`--textconv`/
+  `--open-files-in-pager`/`--filters` 唯一缩写一律拒绝（`--text` 精确放行）。
+  顶层 `&&` 与 `;`/`|` 同等处理（两侧各自过只读校验，单独的 `&`、`||` 仍拒绝）；
+  通配符含 `/` 时对 `sed`/`awk`/`find` 放行（展开结果仍带 `/`，写操作另有参数校验），
+  `uniq`/`sort -o`/`xxd` 仍要求引号。
+- **解析与覆盖**：围栏解析容忍语言标记大小写/空格、围栏后无换行、CRLF 与前后说明，
+  仍拒绝多个可解析对象；`cd <dir>;`、`cd <dir> &&` 与 `git -C <dir>` 后的相对路径按
+  目录解析，修复 `review_file_not_inspected` 假阴性（honor G4 第 6 次尝试的真实根因）。
+- **finding 元数据**：保留 `id`（F1–F9999，轮内唯一）、`status`（open/resolved/
+  regressed）、`root_cause`/`category`/`related`/`reproduce`；同轮重复 ID 或完全相同的
+  `(severity,file,line,summary)` 拒绝（`review_finding_duplicate`）。
+- **预检与上下文**：`native_agent.py preflight-commands`（`--file`/`--command`，失败
+  exit=2）；`native_agent.py review-context` 输出绑定值、证据、`execution_evidence_unbound`
+  漂移、上轮 findings 与建议 scope。
+- **审计与指标**：ingest 写 `native_result_ingested`/`native_review_ingested` 历史事件；
+  被拒信封追加到任务目录 `review-attempts.jsonl`（只记错误码与绑定值）；`closure-check`
+  新增“执行结果引用旧摘要/已归档/未登记证据”非阻断提醒；新增
+  `copilot_dispatch.py review-metrics`（有效轮次、首轮 finding、重复 finding、无效信封、
+  重复命令/文件、证据包字符数、首轮到 PASS 耗时；正式 REVIEW/G4/原生复核分别计数）。
+- **Reviewer Profile**：`agents/reviewer.md` 增加首轮完整性协议、根因归组、稳定 ID、
+  证据/严重度门槛、follow-up 复用与不重报、PASS 停止、每轮新会话（续跑会重置
+  `totalToolUseCount`）。
+- **回放事实**：11 份真实复核信封的 298 条唯一命令在 v6.2 与 v6.3 下均 0 拒绝；宿主仍保留
+  的 1 份真实 Reviewer rollout（120 条唯一 Bash 命令）在 v6.2 下 1 条被拒（`awk '…'
+  app/build/test-results/*/*.xml`），v6.3 下 0 拒绝。被拒的 `cd … && ls …`（review-perf A8）
+  原始命令文本未保留，按同一模式补了回归用例。
+- **真实端到端（2026-11-14 18:39–18:55 CST，`/tmp/v63-e2e`，risk=high）**：真实
+  dispatch → 真实执行子代理 → 4 轮真实 Reviewer → G4 信封 → ingest → `drive` 收口，
+  `closure-check` 四门 PASS、任务 CLOSED；`task_seconds=935`。过程事实：
+  ① 第 1 轮 `g4_eligible=true`，但复核后核销 C1 改变了 `final_evidence_digest`，收口时
+  `native_review_stale`（顺序问题，非机制缺陷），已由 `review-context` 的 `warnings` 与
+  `scope_reason` 提前提示“先核销条件再最终复核”；
+  ② 第 2 轮 Reviewer 输出漏 `execution_result_sha256`，`review_build` 拒绝（fail-closed 正确，
+  属派发提示漏写绑定字段）；
+  ③ 第 3 轮实际命令含 `echo '---exit:'$?` 与 `python3 -c`，被只读策略拒绝（`$` 未加引号、
+  解释器不在白名单），整轮信封未生成；
+  ④ 第 4 轮聚焦复核 18 次真实工具调用、全部通过只读复查，`g4_eligible=true`，目标摘要
+  `89423ca7…` 与当前 `final_evidence_digest` 一致。
+- **e2e 暴露并已修**：生成阶段被拒此前只打印到终端，现已追加到 `review-attempts.jsonl`
+  （`kind=review_build`，带 `work_item_id` 与 `execution_result_sha256` 归因）；
+  `agents/reviewer.md` 与 `references/agent-bridge.md` 明确未加引号的 `$`（`$?`/`$VAR`）
+  与解释器单行命令（`python3`/`perl`/`node`/`sh -c`）会被拒，取证改用
+  `sha256sum`/`grep`/`sed -n`/`head`/`wc`/`diff`/`stat`。
+- **指标实测（同任务）**：`native_reviews=2`、`g4_reviews=2`、`invalid_envelopes`
+  `{execution:0, review:0, review_build:1}`（`review_command_not_readonly`）、
+  `duplicate_findings=0`、`repeated_command_count=0`、`avg_package_chars=5104`。
+  已知口径限制：第 1 轮的 PASS 在收口时已过期，但 `review-metrics` 仍按 `pass_round=1`、
+  `time_to_pass_seconds=0` 统计，过期性只在 `closure-check`/G4 反映。
+- **测试**：活动套件 `192 tests OK`（新增 `tests/test_v63_convergence.py` 26 项）；
+  历史套件 `853 tests OK (skipped=31)`。
+- **新会话加载验证（2026-11-14）**：桌面 GUI 入口不可用于验证——`/opt/ZCode/zcode` 实际是
+  Electron 单实例应用，`--help` 会接管/复用现有桌面进程，会干扰用户当前会话，故未启动
+  GUI 新会话。改用同版本 CLI 的 headless 新进程
+  （`node /opt/ZCode/resources/glm/zcode.cjs -p … --cwd /media/vdb/projects/copilot`）实测：
+  `skills list` 发现 `copilot`；新进程内派生的 Reviewer
+  （`agent_9244436c…`，独立 `sess_8e575ffd…`）`profileSnapshot.systemPrompt` 为 16,073 字符，
+  含 v6.3 的 `git rev-list`、`paste`、`&&`、`$?`、`python3` 说明，只读工具集
+  `[Read, Grep, Glob, Bash]`、`disallowedTools=[Write, Edit]`，并在无绑定时正确返回
+  `blocked`；另一次 headless 会话经 Skill 工具加载正文，引用到
+  `当前版本 **v6.3.0（ZCode Autonomous Development Edition）**`，证明运行时 SKILL.md
+  未被截断。对照：本会话（启动早于同步）的真实 Reviewer `profileSnapshot` 仍是缓存的
+  上一版，说明 Profile 在会话/进程启动期缓存，符合"配置修改后需新会话验证"。
+- **未验证**：GUI 桌面新会话本身的加载观察（受上述单实例限制），以 headless 新进程替代；
+  未在真实生产高风险任务上跑本链路（e2e 只限 `/tmp` 临时目录）；真实模型调用仅限本任务
+  授权的 Reviewer/执行子代理与上述新进程加载探针，提交、推送、发布均未执行。
+
+## v6.2.0（2026-11-13）：实战复盘收敛
 
 本批次在用户任务授权下完成，**未提交、未推送、未发布**（用户明确本任务不授权 Git 提交/推送/发布）。
 

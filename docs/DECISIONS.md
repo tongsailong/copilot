@@ -686,6 +686,46 @@
     真实验证：7 份有效复核信封（152 条命令）+ 1 份被拒的无效尝试（32 条）重放 0 拒绝，
     活动 166 + 历史 853 测试通过；未在真实 GUI 会话中验证运行时加载，未重跑完整 G4 链路。
 
+37. **v6.3 Reviewer 多轮评审根因收敛（2026-11-14）。** 基于 10 个真实任务（ad-strategy 7 轮
+    复核 0 份入库、Honor 7 次 G4 尝试、review-perf 4 次正式 REVIEW、gromore/腾讯/journey/
+    usb-debug/perf-ads/splash）的台账与复核信封复盘。结论：返工主要来自机制，不是
+    Reviewer 判断质量；不降低标准、不设硬轮次上限、不放宽 G1–G4。处理：
+
+    - **只读策略补真实缺口**：加入真实复核用过但被误拒的只读命令（`git rev-list`、
+      `git cat-file`、`paste` 等）与一组只读 git/文本检查工具；同时补齐危险长选项缩写拒绝
+      （`--output`/`--ext-diff`/`--textconv`/`--open-files-in-pager`/`--filters`），
+      保证放宽放行面不引入写/执行路径。`--text` 精确放行、`--textc` 仍拒绝。
+      顶层 `&&` 与 `;`/`|` 同等处理（两侧各自过只读校验；裸 `&`、`||` 仍拒绝）；
+      通配符含 `/` 时对 `sed`/`awk`/`find` 放行（展开结果仍带 `/`，不会变成 `-` 开头的
+      选项，写操作另有 `sed -i`/`awk print >`/`find -delete` 参数校验），`uniq`/`sort -o`/
+      `xxd` 仍要求引号。
+    - **解析与证据覆盖**：围栏 JSON 容忍真实变体（大小写、无换行、CRLF、前后说明），
+      仍拒绝多对象；`cd <dir>;`、`cd <dir> &&` 与 `git -C <dir>` 后的相对路径解析到
+      实际目录，修复“读到了却判 `review_file_not_inspected`”的假阴性，而不是放宽
+      “必须访问证据”的要求。
+    - **finding 一次说清**：可选 `id`/`root_cause`/`category`/`related`/`reproduce`/`status`
+      进入复核记录；同轮重复 ID 或完全相同四元组拒绝，强制按根因合并。Reviewer Profile
+      明确首轮一次看全、后续只复用 ID 验证变化、已关闭问题无新证据不重报、PASS 即停、
+      每轮新会话。
+    - **减少无效轮次**：新增 `preflight-commands`（派发前静态校验命令清单，失败 exit=2）
+      与 `review-context`（绑定值/证据/漂移/上轮 findings/建议 scope）。它们只减少“本来
+      可以避免的作废”，不改变 ingest 的最终校验。
+    - **可观测性**：ingest 写 `native_result_ingested`/`native_review_ingested` 审计事件；
+      被拒信封（含生成阶段，如输出漏绑定字段或命令被拒）落 `review-attempts.jsonl`（只记
+      错误码与绑定值，带 `work_item_id`/`execution_result_sha256` 归因）；`closure-check`
+      提示执行证据漂移；新增 `review-metrics` 输出有效轮次、首轮 finding、重复 finding、
+      无效信封、重复命令/文件、证据包字符数与首轮到 PASS 耗时，正式 REVIEW/G4/原生复核
+      分别计数。
+
+    依据：用户要求“减少无效评审而不是减少必要评审；减少重复劳动而不是减少缺陷发现”。
+    真实回放：11 份复核信封的 298 条唯一命令在 v6.2/v6.3 均 0 拒绝；宿主保留的 1 份真实
+    Reviewer rollout（120 条唯一 Bash 命令）在 v6.2 下 1 条被拒，v6.3 下 0 拒绝。活动
+    192 + 历史 853 测试通过。真实 e2e（`/tmp/v63-e2e`，risk=high）走通 dispatch→execution→
+    4 轮真实复核→G4→ingest→CLOSED，第 4 轮 18 次真实工具调用全部通过只读复查；过程中
+    复现并修复了“生成阶段被拒未入 attempts”的观测缺口，并在 Reviewer Profile 明确未加引号的
+    `$`（`$?`/`$VAR`）与解释器单行命令会被拒。未验证：GUI 新会话运行时加载（本会话
+    `profileSnapshot` 仍是启动期缓存版本）、生产高风险任务重跑。
+
 ## 建议（未采纳）
 
 > 以下为 v5 时期记录，保留原文；其中涉及 `call_gpt.py`、SOL 预算或远程 REVIEW 的建议

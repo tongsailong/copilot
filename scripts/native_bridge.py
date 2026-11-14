@@ -44,6 +44,9 @@ REVIEW_VERDICTS = ("pass", "partial", "blocked")
 # full：完整复核；incremental：在一条既有合格复核之上只复核新增/变更证据。
 REVIEW_SCOPES = ("full", "incremental")
 FINDING_SEVERITIES = ("blocking", "major", "minor", "info")
+# v6.3：finding 生命周期与稳定 ID。Reviewer 首轮给出的 ID 在后续轮次复用，
+# closed 的问题只有新证据才能以 `regressed` 重开，宿主据此统计重复 finding。
+FINDING_STATUSES = ("open", "resolved", "regressed")
 NATIVE_ASSIGNEES = ("zcode", "deepseek")
 EXECUTOR_KINDS = ("main", "subagent")
 REVIEWER_TOOLS = ("Read", "Grep", "Glob", "Bash")
@@ -64,6 +67,17 @@ _READONLY_COMMAND_PREFIXES = (
     # 只写 stdout / 只读取的常用检查工具（v6.1）
     "echo ", "printf ", "pwd", "date ", "file ", "xxd ", "od ", "strings ",
     "jq ", "tree ", "du ", "test ",
+    # v6.3：真实复核里被用来确认提交区间、对象内容与重命名历史的只读 git
+    # 子命令。此前缺 `git rev-list` 直接导致整轮复核信封被拒（ad-strategy）。
+    # 危险长选项（--output/--ext-diff/--textconv/--filters 等）由 argv 检查拒绝。
+    "git rev-list", "git cat-file", "git ls-tree", "git show-ref",
+    "git for-each-ref", "git describe", "git merge-base", "git name-rev",
+    "git check-ignore", "git check-attr", "git diff-tree", "git diff-index",
+    "git diff-files", "git shortlog", "git blame", "git count-objects",
+    # v6.3：文本流检查工具，全部只写 stdout；真实复核用 `paste -sd+` 汇总
+    # 证据校验和时曾被白名单误拒。
+    "paste ", "comm ", "join ", "tac ", "rev ", "fold ", "expand ",
+    "unexpand ", "column ", "cksum ", "seq ", "base64 ",
     # 带参数级写检查的命令族（见 _family_readonly_checks）
     "sed ", "awk ", "unzip ", "zipinfo ",
     # Android/Java 只读检查（复核 APK/dex 的常规工具）
@@ -117,13 +131,22 @@ _GLOB_META = "*?["
 # 文件名当参数（`sha256sum evidence/*.png`、`ls */release/*.apk`）。仍有三类风险
 # 所以边界保守：① `sort -o`、`uniq`、`xxd` 的输出位置参数；② `file -C`、
 # `git grep -O/--textconv`、`rg --pre` 这类写/执行选项——目录里以 `-` 开头的
-# 文件名会被展开成选项；③ `sed`/`awk`/`find` 的写操作。因此这些族仍要求加引号。
+# 文件名会被展开成选项；③ `sed`/`awk`/`find` 的写操作。这些族默认要求加引号，
+# 但含路径分隔符的通配符（`/path/*.xml`、`dir/*.log`）对 `sed`/`awk`/`find`
+# 例外：展开结果仍带 `/`，不可能变成以 `-` 开头的选项，写操作另有
+# `sed -i` / `awk print >` / `find -delete` 校验。真实复核用
+# `awk '…' app/build/test-results/*/*.xml` 统计用例数，此前整轮信封因通配符被拒。
 _GLOB_SAFE_FAMILIES = frozenset({
     "ls", "cat", "head", "tail", "wc", "stat", "strings",
     "sha256sum", "md5sum", "sha1sum", "grep", "diff", "cmp",
     "basename", "dirname", "realpath", "readlink", "du", "jq",
     "zipinfo", "aapt", "aapt2",
 })
+# 有输出位置参数、但写操作已在参数级校验的族：`sed -i`、`awk print >`、
+# `find -delete/-fprint/-exec` 都会被拒，所以**带路径分隔符**的通配符可以展开
+# （展开结果仍含 `/`，不会变成 `-` 开头的选项）。`uniq`/`sort -o`/`xxd` 不在
+# 此列：第二个位置参数就是输出文件，展开后会写文件。
+_GLOB_PATH_SAFE_FAMILIES = frozenset({"awk", "sed", "find"})
 # 允许以绝对路径调用的工具族：Android SDK / JDK 的检查工具通常不在 PATH，
 # 复核需要 `/path/to/build-tools/36.0.0/aapt2 dump ...`。只对这类专用工具做
 # 路径归一化；通用命令（cat/grep/git/sha256sum 等）必须走 PATH，否则任意目录下
@@ -153,17 +176,40 @@ _NULL_REDIRECT_AT_RE = re.compile(r">[ \t]*/dev/null(?=[ \t]|[;|]|$)")
 _ARGV_DENY_RE = re.compile(
     r"^(?:--output(?:=|$)|--output-file(?:=|$)|--ext-diff$|--textconv$|"
     r"--open-files-in-pager(?:=|$)|--pre(?:=|$)|--pre-glob(?:=|$)|"
-    r"--hostname-bin(?:=|$)|--search-zip(?:=|$)|"
+    r"--hostname-bin(?:=|$)|--search-zip(?:=|$)|--filters(?:=|$)|"
     r"-delete$|-exec(?:dir)?$|-ok(?:dir)?$|-fprint(?:0|f)?$|-fprintf$|-fls$)")
 # GNU getopt 与 git parse-options 允许长选项唯一前缀缩写：`sort --o=/tmp/x`
 # 会写文件，`git grep --ope='...'` 会执行外部程序。只匹配完整名不够，按命令族
 # 列出危险完整名，token 是其前缀同样拒绝；精确匹配的合法选项先放行。
+# v6.3 起覆盖 git diff/log/show/cat-file 等族：`git log --out=/tmp/x` 写文件、
+# `git show --ext-d` 执行外部 diff、`git cat-file --filt` 执行 smudge filter。
 _ABBREV_FORBIDDEN = {
     "git grep": ("--open-files-in-pager", "--textconv"),
+    "git diff": ("--output", "--output-file", "--ext-diff", "--textconv",
+                 "--open-files-in-pager"),
+    "git log": ("--output", "--output-file", "--ext-diff", "--textconv",
+                "--open-files-in-pager"),
+    "git show": ("--output", "--output-file", "--ext-diff", "--textconv",
+                 "--open-files-in-pager"),
+    "git diff-tree": ("--output", "--output-file", "--ext-diff", "--textconv",
+                      "--open-files-in-pager"),
+    "git diff-index": ("--output", "--output-file", "--ext-diff", "--textconv",
+                       "--open-files-in-pager"),
+    "git diff-files": ("--output", "--output-file", "--ext-diff", "--textconv",
+                       "--open-files-in-pager"),
+    "git cat-file": ("--filters", "--textconv", "--output", "--output-file"),
     "sort": ("--output", "--compress-program", "--temporary-directory"),
 }
 _ABBREV_ALLOW_EXACT = {
     "git grep": ("--only-matching",),
+    # `--text` 是合法 diff 选项，且是 `--textconv` 的前缀；按全名精确放行，
+    # 缩写形式（`--textc`）仍被下面拒绝。
+    "git diff": ("--text",),
+    "git log": ("--text",),
+    "git show": ("--text",),
+    "git diff-tree": ("--text",),
+    "git diff-index": ("--text",),
+    "git diff-files": ("--text",),
     "sort": ("--check",),
 }
 # 短选项聚簇：o/T 写文件。t/k/S 自身带参，其后的字符是参数值，不是选项。
@@ -824,11 +870,11 @@ def _consume_null_redirect(cmd: str, idx: int, buf: list[str], name: str) -> int
 
 
 def _split_readonly_segments(cmd: str, name: str) -> list[str]:
-    """把顶层 `;` / `|` 拆成独立命令段；引号内的分隔符保持原样。
+    """把顶层 `;` / `|` / `&&` 拆成独立命令段；引号内的分隔符保持原样。
 
-    只做拆分与拒绝，不做 shell 展开：`&&`、指向 /dev/null 之外的重定向、
-    反引号、`$`、换行和未闭合引号都直接失败关闭。拆分后的每一段仍由
-    `_validate_commands` 逐段套用只读
+    只做拆分与拒绝，不做 shell 展开：单独的 `&`（后台执行）、`||`、指向
+    /dev/null 之外的重定向、反引号、`$`、换行和未闭合引号都直接失败关闭。
+    拆分后的每一段仍由 `_validate_commands` 逐段套用只读
     前缀与破坏性参数校验。
     """
     segments: list[str] = []
@@ -872,11 +918,29 @@ def _split_readonly_segments(cmd: str, name: str) -> list[str]:
                 buf = []
                 idx += 1
                 continue
+            if ch == "&":
+                # `&&` 与 `;` 等价：只是条件串联，两侧各自仍须通过只读校验
+                # （`ls && rm -rf` 的第二段会被拒）。单独的 `&` 是后台执行，
+                # 无法保证命令在工作区快照内结束，继续拒绝。
+                if idx + 1 < len(cmd) and cmd[idx + 1] == "&":
+                    segment = "".join(buf).strip(_SHELL_SPACE)
+                    if not segment:
+                        _fail("review_command_not_readonly",
+                              f"{name} 含空命令片段（多余分隔符）：{cmd}")
+                    segments.append(segment)
+                    buf = []
+                    idx += 2
+                    continue
+                _fail("review_command_not_readonly",
+                      f"{name} 含单独的 `&`（后台执行）：{cmd}")
             if ch in _GLOB_META:
                 # 未加引号的通配符只对没有输出位置参数的只读族放行：展开后只
                 # 增加输入文件，校验看到的参数个数变化不影响只读语义。
                 family = _segment_family("".join(buf))
-                if family not in _GLOB_SAFE_FAMILIES:
+                token = re.split(r"[ \t]", "".join(buf))[-1]
+                if (family not in _GLOB_SAFE_FAMILIES
+                        and not (family in _GLOB_PATH_SAFE_FAMILIES
+                                 and "/" in token)):
                     _fail("review_command_not_readonly",
                           f"{name} 的 {family or '未知'} 命令不支持未加引号的通配符 "
                           f"{ch!r}（请加引号，例如 \"*.apk\"）：{cmd}")
@@ -1572,16 +1636,31 @@ def validate_review_commands(raw: object) -> list[str]:
     return _validate_commands(raw)
 
 
+_FINDING_ID_RE = re.compile(r"^F[1-9][0-9]{0,3}$")
+
+
+def _optional_text(obj: dict, key: str, name: str) -> str:
+    value = obj.get(key)
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        _fail("schema_invalid", f"{name}.{key} 必须是字符串。")
+    return value.strip()
+
+
 def _validate_findings(raw: object, *, check_files: bool) -> list[dict]:
     items = _list(raw or [], "findings")
     out: list[dict] = []
+    seen_ids: dict[str, int] = {}
+    seen_bodies: dict[tuple, int] = {}
     for idx, value in enumerate(items, 1):
-        obj = _obj(value, f"findings[{idx}]")
-        severity = _text(obj.get("severity"), f"findings[{idx}].severity").lower()
+        name = f"findings[{idx}]"
+        obj = _obj(value, name)
+        severity = _text(obj.get("severity"), f"{name}.severity").lower()
         if severity not in FINDING_SEVERITIES:
             _fail("review_finding_invalid",
-                  f"findings[{idx}].severity 只能是 {', '.join(FINDING_SEVERITIES)}。")
-        summary = _text(obj.get("summary"), f"findings[{idx}].summary")
+                  f"{name}.severity 只能是 {', '.join(FINDING_SEVERITIES)}。")
+        summary = _text(obj.get("summary"), f"{name}.summary")
         file = str(obj.get("file") or "").strip()
         evidence = str(obj.get("evidence") or "").strip()
         if severity in ("blocking", "major"):
@@ -1590,12 +1669,53 @@ def _validate_findings(raw: object, *, check_files: bool) -> list[dict]:
                       f"{severity} finding 必须给出 file 与 evidence（具体证据）。")
         if file and check_files and os.path.isabs(file) and not os.path.exists(file):
             _fail("review_finding_invalid",
-                  f"findings[{idx}].file 不存在：{file}")
+                  f"{name}.file 不存在：{file}")
         line = obj.get("line")
         if line is not None:
-            line = _int(line, f"findings[{idx}].line", minimum=1)
+            line = _int(line, f"{name}.line", minimum=1)
+        # v6.3 可选元数据：稳定 ID 与生命周期用于跨轮去重和指标，root_cause 用于
+        # 把同一根因的多处表现聚成一条，category 只做归类。缺失时保持旧行为。
+        fid = _optional_text(obj, "id", name).upper()
+        if fid:
+            if not _FINDING_ID_RE.match(fid):
+                _fail("review_finding_invalid",
+                      f"{name}.id 必须是 F1–F9999 形式（实际 {fid!r}）。")
+            if fid in seen_ids:
+                _fail("review_finding_duplicate",
+                      f"{name}.id={fid} 与 findings[{seen_ids[fid]}] 重复；"
+                      f"同一 finding 只登记一次。")
+            seen_ids[fid] = idx
+        root_cause = _optional_text(obj, "root_cause", name)
+        category = _optional_text(obj, "category", name)
+        reproduce = _optional_text(obj, "reproduce", name)
+        status = _optional_text(obj, "status", name).lower() or "open"
+        if status not in FINDING_STATUSES:
+            _fail("review_finding_invalid",
+                  f"{name}.status 只能是 {', '.join(FINDING_STATUSES)}。")
+        related_raw = obj.get("related")
+        related: list[str] = []
+        for rel_idx, rel in enumerate(_list(related_raw or [], f"{name}.related"), 1):
+            rel_id = _text(rel, f"{name}.related[{rel_idx}]").upper()
+            if not _FINDING_ID_RE.match(rel_id):
+                _fail("review_finding_invalid",
+                      f"{name}.related[{rel_idx}] 必须是 F1–F9999 形式。")
+            if rel_id == fid:
+                _fail("review_finding_invalid",
+                      f"{name}.related 不能引用自身 {rel_id}。")
+            if rel_id not in related:
+                related.append(rel_id)
+        # 同一轮把同一问题写两遍只会放大 finding 数量，不增加信息量。
+        body = (severity, file, line, summary)
+        if body in seen_bodies:
+            _fail("review_finding_duplicate",
+                  f"{name} 与 findings[{seen_bodies[body]}] 是同一问题"
+                  f"（severity/file/line/summary 相同）；请合并并引用 ID。")
+        seen_bodies[body] = idx
         out.append({"severity": severity, "summary": summary,
-                    "file": file, "line": line, "evidence": evidence})
+                    "file": file, "line": line, "evidence": evidence,
+                    "id": fid, "root_cause": root_cause, "category": category,
+                    "status": status, "related": related,
+                    "reproduce": reproduce})
     return out
 
 
@@ -1784,6 +1904,37 @@ def review_coverage(state: dict) -> dict:
                             sorted([[r.get("id"), r.get("sha256")]
                                     for r in criterion.get("evidence_refs") or []])]))
     return {"evidence": evidence, "actions": actions, "criteria": criteria}
+
+
+def execution_evidence_drift(execution: dict, state: dict) -> list[dict]:
+    """执行信封 evidence[] 与当前 live 证据之间的漂移（非阻断提示）。
+
+    执行结果登记后，证据可能被更正、重新捕获或归档；执行正文仍引用旧快照时，
+    复核必须能看见这层不一致，而不是靠人读正文发现。返回空列表表示一致。
+    """
+    live = {str(entry.get("id") or ""): entry
+            for entry in state.get("evidence") or [] if isinstance(entry, dict)}
+    out: list[dict] = []
+    for entry in execution.get("evidence") or []:
+        if not isinstance(entry, dict):
+            continue
+        eid = str(entry.get("id") or "")
+        if not eid:
+            continue
+        current = live.get(eid)
+        execution_sha = str(entry.get("sha256") or "")
+        if current is None:
+            out.append({"id": eid, "problem": "not_registered",
+                        "execution_sha256": execution_sha, "live_sha256": ""})
+            continue
+        live_sha = str(current.get("sha256") or "")
+        if live_sha != execution_sha:
+            out.append({"id": eid, "problem": "sha_differs",
+                        "execution_sha256": execution_sha, "live_sha256": live_sha})
+        elif current.get("dropped"):
+            out.append({"id": eid, "problem": "dropped",
+                        "execution_sha256": execution_sha, "live_sha256": live_sha})
+    return out
 
 
 def _validate_review_scope(env: dict, state: dict, *, contract: str,
@@ -1994,6 +2145,8 @@ def validate_review_result(envelope: object, dispatch: dict | None, execution: d
         # 覆盖快照固化在复核记录上，供后续增量复核计算“哪些证据/工作项/条件
         # 在基线之后发生了变化”，而不是重新猜测历史状态。
         "coverage": review_coverage(state),
+        # 执行证据与 live 证据的漂移：非阻断，但收口与复核需要看见。
+        "execution_evidence_unbound": execution_evidence_drift(execution, state),
         "g4_eligible": g4_eligible,
         "result_sha256": declared_sha,
     }

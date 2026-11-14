@@ -102,8 +102,10 @@ Copilot 不派发 Agent、不调用模型、不写别人的会话。它只校验
            "tool_calls": [{"name": "Read", "count": 2}, {"name": "Bash", "count": 1}],
            "agent_id": "agent-review", "child_session_id": "child-review"},
   "verdict": "pass|partial|blocked",
-  "findings": [{"severity": "blocking|major|minor|info", "file": "...",
-                "summary": "...", "evidence": "..."}],
+  "findings": [{"id": "F1", "severity": "blocking|major|minor|info", "file": "...",
+                "line": 1, "summary": "...", "evidence": "...",
+                "root_cause": "...", "category": "...", "status": "open",
+                "related": ["F2"], "reproduce": "..."}],
   "files_inspected": ["/abs/path"],
   "commands_run": ["git status --short"],
   "changed_files": [],
@@ -125,6 +127,15 @@ Copilot 不派发 Agent、不调用模型、不写别人的会话。它只校验
   `commands_run` 取实际 Bash 调用，`files_inspected` 合并自报与实际的读取路径；
   两者可以为空，不再要求 Reviewer 手工复述，也不因自述与记录不完全一致而作废
   整轮复核。`declared_files_unverified` 非空时会写入复核记录，供审计。
+- 相对路径解析：`cd <dir>; cat report.md` 与 `git -C <dir> …` 之后的相对 token 会按
+  该目录解析成绝对路径再判定“是否访问过证据”，避免已读取却判 `review_file_not_inspected`
+  的假阴性；仍建议 Reviewer 使用绝对路径。
+- finding 元数据：`id`（`F1`–`F9999`，本轮唯一）与 `status`（`open|resolved|regressed`，
+  缺省 `open`）可选；`root_cause`/`category`/`related`/`reproduce` 可选。同一轮重复 ID
+  或完全相同的 `(severity,file,line,summary)` 会被拒绝（`review_finding_duplicate`），
+  用于强制按根因合并而不是重复计数。
+- 宿主输出解析：接受纯 JSON 或**唯一**一个 fenced 代码块（语言标记大小写/带空格、围栏
+  后无换行、CRLF、前后有说明文字均可）；出现两个可解析对象时 `review_output_ambiguous`。
 - 实际执行过的 Bash 命令必须全部只读；任何写操作、输出重定向、`-delete`、`-exec`、
   `--output`、`sort -o`、`git grep -O`、`sed -i`、awk 写文件/`system(` 等一律
   `review_command_not_readonly`。只读检查工具（`sed -n`、`awk` 只读程序、`echo`、
@@ -138,9 +149,18 @@ Copilot 不派发 Agent、不调用模型、不写别人的会话。它只校验
   同名二进制可能由被复核内容写入，通用命令必须走 `PATH`。
 - 未加引号的通配符（`*`/`?`/`[`）只对**没有输出位置参数、也没有写/执行选项**的只读族
   放行（`ls`、`cat`、`sha256sum`、`grep`、`diff`、`jq`、`zipinfo`、`aapt2` 等）；
-  shell 展开会把文件名变成额外参数，所以 `file -C`、`rg --pre`、`git grep --textconv`、
-  `unzip`、`sort -o`、`uniq`、`xxd`、`sed`、`awk`、`find` 等族仍要求加引号
-  （`file "*.apk"`）。
+  `sed`/`awk`/`find` 在通配符**含 `/`** 时也放行（展开结果仍带 `/`，不会变成 `-` 开头的
+  选项，写操作另有 `sed -i`、`awk print >`、`find -delete` 校验）：真实复核用
+  `awk '…' app/build/test-results/*/*.xml` 统计用例数。shell 展开会把文件名变成额外参数，
+  所以 `file -C`、`rg --pre`、`git grep --textconv`、`unzip`、`sort -o`、`uniq`、`xxd`
+  等族仍要求加引号（`file "*.apk"`）。
+- 顶层 `;`、`|`、`&&` 可以串联多条只读命令（`cd app/build/test-results && ls -la`）；
+  两侧各自仍须通过只读校验（`ls && rm -rf x` 的第二段会被拒）。单独的 `&`（后台执行）、
+  `||`、重定向（`/dev/null` 抑制除外）、命令替换（`$(...)`/反引号）、花括号展开一律拒绝；
+  未加引号的 `$` 也拒绝（`$?`、`$1`、`$VAR`，例如 `echo "exit:"$?` 会让整轮复核作废），
+  只有文档允许的单层 `for f in a b; do … "$f" …; done` 字面量循环例外。解释器单行命令
+  （`python3`/`python`/`perl`/`node`/`ruby`/`sh -c`）不在白名单，取证请用 `sha256sum`、
+  `grep`、`sed -n`、`head`、`wc`、`diff`、`stat`。
 - `files_inspected` 若填写，路径必须存在且是普通文件（`review_inspection_invalid`）。
 - `g4_eligible=true` 时必须：`verdict=pass`、无 blocking、`unverified` 为空、
   `changed_files` 为空，并附完整宿主记录（`g4_requires_pass`、`g4_with_unverified`、
@@ -196,9 +216,21 @@ python3 -B scripts/native_agent.py review --state T/state.json \
   --dispatch T/state.dispatch.json --execution A1.execution.json \
   --work-item A1 --metadata <agent-review>/metadata.json \
   --input reviewer.raw.json --output A1.review.json
+
+# 派发前预检 Reviewer 只读命令清单（不执行；失败 exit=2）
+python3 -B scripts/native_agent.py preflight-commands --file cmds.txt
+
+# 派发上下文：绑定值、证据、漂移、上轮 findings、建议 scope
+python3 -B scripts/native_agent.py review-context --state T/state.json \
+  --dispatch T/state.dispatch.json --execution A1.execution.json \
+  --work-item A1 --previous-review A1.review.json --output A1.context.json
 ```
 
-- 两个子命令在写文件前调用 `native_bridge` 的正式校验；失败不产生输出文件。
+- 子命令在写文件前调用 `native_bridge` 的正式校验；失败不产生输出文件。
+- `preflight-commands` 只做静态只读校验（`--file` 每行一条或 JSON 字符串数组）；它不
+  执行命令，也不能证明 Reviewer 的输出格式合规。
+- `review-context` 只读，输出 `execution_evidence_unbound`（执行证据摘要与 live 证据
+  不一致/已归档/未登记）、`evidence_manifest` 与建议 scope；ingest 会重新校验。
 - 证据 SHA-256 由脚本读取文件计算，不接受调用方传入。
 - `--evidence` 形如 `E1=/abs/path`，可重复。
 
@@ -224,7 +256,7 @@ python3 -B scripts/copilot_auto.py ingest --state T/state.json --review-file A1.
 | 计划/派发 | `plan_missing`、`plan_unknown`、`plan_mismatch`、`plan_drift`、`dispatch_missing`、`dispatch_empty`、`dispatch_duplicate`、`dispatch_mismatch`、`dispatch_id_drift`、`idempotency_mismatch`、`iteration_mismatch`、`work_item_unknown`、`work_item_terminal` |
 | 执行 | `backend_not_native`、`assignee_unsupported`、`invalid_status`、`executor_identity_missing`、`reviewer_as_executor` |
 | 证据 | `evidence_missing`、`evidence_invalid`、`evidence_duplicate`、`evidence_unreadable`、`evidence_sha_mismatch`、`evidence_foreign`、`evidence_conflict` |
-| 复核 | `reviewer_invalid`、`reviewer_profile_invalid`、`review_binding_mismatch`、`executor_reviewer_same`、`review_contaminated`、`invalid_verdict`、`review_finding_invalid`、`review_inspection_invalid`、`review_command_not_readonly`、`review_scope_invalid`、`incremental_base_missing`、`incremental_base_ineligible`、`incremental_manifest_missing`、`incremental_evidence_uncovered`、`incremental_criteria_changed`、`incremental_scope_too_narrow` |
+| 复核 | `reviewer_invalid`、`reviewer_profile_invalid`、`review_binding_mismatch`、`executor_reviewer_same`、`review_contaminated`、`invalid_verdict`、`review_finding_invalid`、`review_finding_duplicate`、`review_inspection_invalid`、`review_command_not_readonly`、`review_output_ambiguous`、`review_output_unparsable`、`review_scope_invalid`、`incremental_base_missing`、`incremental_base_ineligible`、`incremental_manifest_missing`、`incremental_evidence_uncovered`、`incremental_criteria_changed`、`incremental_scope_too_narrow` |
 | G4 | `g4_host_record_missing`、`g4_host_record_invalid`、`g4_tool_calls_missing`、`g4_tool_not_readonly`、`g4_not_eligible`、`g4_requires_pass`、`g4_with_unverified`、`g4_with_blocking`、`pass_with_blocking_finding`、`pass_with_unverified`、`host_profile_changed` 等 |
 
 错误码只用于定位与修复，不提供绕过开关；修正记录后重新生成信封。

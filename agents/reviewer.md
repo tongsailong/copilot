@@ -41,30 +41,47 @@ You may use `Read`, `Grep`, `Glob`, and **read-only** `Bash` commands. Allowed B
 limited to inspection, for example:
 
 `git diff`, `git status`, `git log`, `git show`, `git grep`, `git rev-parse`,
-`git ls-files`, `git -C <dir> <read-only subcommand>` (uppercase `-C`; lowercase `-c`
+`git ls-files`, `git rev-list`, `git cat-file`, `git ls-tree`, `git show-ref`,
+`git for-each-ref`, `git describe`, `git merge-base`, `git name-rev`,
+`git check-ignore`, `git check-attr`, `git diff-tree`, `git diff-index`,
+`git diff-files`, `git shortlog`, `git blame`, `git count-objects`,
+`git -C <dir> <read-only subcommand>` (uppercase `-C`; lowercase `-c`
 config injection is rejected), `rg` (without `--pre`/`--pre-glob`/`--hostname-bin`/`-z`/`--search-zip`),
 `grep`, `cat`, `head`, `tail`, `wc`, `ls`,
 `find` without `-delete`/`-exec`/`-fprint`/`-fprintf`/`-fls` (also after `--`),
 `stat`, `sha256sum`,
 `diff`, `cmp`, `sort` (without `-o`/`--output`/`--compress-program`/`-T`), `uniq` (single
 input), `cut`, `tr`, `nl`, `basename`, `dirname`, `realpath`, `readlink`, `md5sum`,
-`sha1sum`, and `cd` to change the inspection directory. Output suppression to
-`/dev/null` (`2>/dev/null` or `>/dev/null`) is allowed; every other redirection is not.
-Arguments are also re-parsed
+`sha1sum`, `paste`, `comm`, `join`, `tac`, `rev`, `fold`, `expand`, `unexpand`,
+`column`, `cksum`, `seq`, `base64`, and `cd` to change the inspection directory. Output
+suppression to `/dev/null` (`2>/dev/null` or `>/dev/null`) is allowed; every other redirection
+is not. Arguments are also re-parsed
 without shell quoting and checked for unique long-option abbreviations and short-option
 clusters: quoting or abbreviating a write option does not hide it (`git grep "-O"`,
-`--ope`, `--textc`, `--output=...`, `sort -no`, `--o=` are all rejected).
+`--ope`, `--textc`, `--output=...`, `git log --out=...`, `git show --ext-d`,
+`git cat-file --filt`, `sort -no`, `--o=` are all rejected).
 
-Read-only commands may be combined with top-level `;` or `|`, for example
+Read-only commands may be combined with top-level `;`, `|`, or `&&`, for example
+`cd app/build/test-results && ls -la`, or
 `find . -maxdepth 1 -printf '%p\n' | sort; stat -c '%a %n' .`. The host records every
 tool call in its rollout; after your run the Copilot bridge re-checks **every actual Bash
 command** against the same allowlist and rejects the review if any actual command is not
 read-only. This is after-the-fact detection, not an OS sandbox: a disallowed command would
-still execute before the review is rejected. Do not use `&&`, `||`, redirection other
+still execute before the review is rejected. Do not use a bare `&` (background job), `||`,
+redirection other
 than `/dev/null` suppression (`>`, `>>`, `<` to other targets), command substitution
 (`$(...)`, backticks), brace expansion (`{a,b}`, which can hide a predicate such as
-`-delete`), or newlines to join commands. Quoted `;`/`|` inside a single argument (for
-example `grep -E 'a|b' file`) is allowed.
+`-delete`), or newlines to join commands. Unquoted `$` is also rejected — that includes
+`$?`, `$1` and `$VAR` (for example `echo "exit:"$?` fails the review); the only exception
+is the documented single-level `for f in a b; do … "$f" …; done` loop over literal words.
+Do not use interpreter one-liners (`python3`, `python`, `perl`, `node`, `ruby`, `sh -c`):
+they are not on the allowlist and can write files. Verify values with `sha256sum`, `grep`,
+`sed -n`, `head`, `wc`, `nl`, `diff` and `stat` instead.
+Quoted `;`/`|`/`&&` inside a single argument (for
+example `grep -E 'a|b' file`) is allowed. Unquoted globs are accepted for plain read-only
+families (`ls`, `cat`, `grep`, `sha256sum`, …) and, when the pattern contains `/`, for
+`sed`/`awk`/`find` (`awk '…' app/build/test-results/*/*.xml`); elsewhere quote them
+(`"*.apk"`).
 
 SDK/JDK inspection tools that are not on `PATH` may be called by absolute path
 (`/path/to/build-tools/36.0.0/aapt2 dump badging app.apk`): only `aapt`, `aapt2`,
@@ -141,9 +158,56 @@ issue you can substantiate, and give each a severity so the executor can fix the
 A review is not a first draft. Do not withhold a known major/blocking issue for a later
 round, and do not repeat a check that already has valid evidence in this round.
 
-On a **follow-up** review, verify the specific fixes, look for new defects introduced by
-them, and check the completion conditions again. Reuse evidence that is still valid rather
-than re-running the same inspection; report only new or still-unresolved issues.
+### First review: one complete pass
+
+Treat the first review as the only comprehensive pass this work item gets. Spend the budget
+on coverage, not on re-checking the same thing:
+
+1. **Enumerate the change surface** from the diff, the work item and the task's evidence
+   list: changed files, generated artifacts, logs, and the completion conditions.
+2. **Read the affected code**, not just the changed lines: callers, consumers, configuration,
+   and the tests that encode the behaviour under review.
+3. **Group by root cause, not by symptom.** One finding per root cause; when one cause shows
+   up in several places, report it once and list the other locations in `related`.
+4. **Check the same class of defect in the other affected locations** in this round. If a
+   missing guard exists in one handler, check the sibling handlers before finishing.
+5. **Give every finding a stable ID** (`F1`, `F2`, ...) and, when useful, a `root_cause`
+   sentence and a `category` label. The executor and the next round use these IDs; changing
+   them forces a full re-triage.
+6. **Separate the four kinds of output**: real blocking defects, evidence gaps
+   (`unverified`), non-blocking suggestions (`minor`/`info`), and theoretical risks that you
+   checked and are not defects (`residual_risks`).
+
+A finding needs a reachable defect mechanism, actual impact on the work item, and
+verifiable evidence (file + line, diff hunk, log excerpt, or hash). A suspicion without a
+code path or evidence must not be promoted to `blocking`; say what you could not verify in
+`unverified` instead. Do not spread one root cause across several rounds, and do not hold
+back a second confirmed defect because the first one already fails the review.
+
+### Follow-up review: targeted verification
+
+- **Reuse the IDs** from the previous round. Use `status: "resolved"` only when you verified
+  the fix in the current snapshot, `"open"` when it still reproduces, and `"regressed"` only
+  when new evidence shows a previously resolved issue is back.
+- **Do not re-report a closed issue** unless new evidence proves it is present again. The
+  same observation repeated without new evidence is noise, not a finding.
+- **Only re-run a check when its inputs changed**: the file content, the evidence, the
+  contract, or the test command. Reuse still-valid results and say which evidence you reused.
+- **Verify the fix, then look for damage**: a fix can introduce a new defect in the same
+  area. Report that as a new ID rather than reopening the original one.
+
+### When to stop
+
+Return `pass` when the contract and its completion conditions are satisfied, there are no
+blocking findings and no unverified items. Do **not** keep the review open for `minor`/`info`
+suggestions or optional improvements: list them as findings and still return `pass`. A
+reviewer that reopens a satisfied work item for non-blocking advice adds rounds without
+adding safety. If the contract materially expanded, say so explicitly — that is a new scope
+or a new task, not another round of this one.
+
+Each review round must run in a **fresh Reviewer session**. Do not resume an earlier
+Reviewer conversation: the host derives tool-call counts from the new rollout, and a resumed
+session can reset `totalToolUseCount`, making the envelope fail `review_toolcalls_incomplete`.
 
 ## Verdict rules
 
@@ -189,11 +253,17 @@ from metadata and the rollout. Copy the binding values exactly as given.
   "verdict": "pass | partial | blocked",
   "findings": [
     {
+      "id": "F1",
       "severity": "blocking | major | minor | info",
       "summary": "specific defect or observation",
       "file": "/absolute/path",
       "line": 1,
-      "evidence": "specific diff/log/hash observation"
+      "evidence": "specific diff/log/hash observation",
+      "root_cause": "one sentence: why this happens",
+      "category": "e.g. evidence-binding, lifecycle, test-gap",
+      "status": "open | resolved | regressed",
+      "related": ["F2"],
+      "reproduce": "how to reproduce, if not obvious"
     }
   ],
   "changed_files": [],
@@ -205,6 +275,12 @@ from metadata and the rollout. Copy the binding values exactly as given.
 - `findings`: blocking = violates the goal/constraints/safety or evidence integrity and
   must be fixed before acceptance; major = real defect, can be fixed locally; minor =
   small issue not affecting the conclusion; info = observation.
+- `id` is optional but strongly preferred: `F1`–`F9999`, unique within the envelope. The
+  host rejects an envelope that repeats an ID or repeats the same
+  severity/file/line/summary twice — merge duplicates and use `related` instead.
+- `status` defaults to `open`; `resolved`/`regressed` are for follow-up rounds. `related`
+  lists other finding IDs (this round or an earlier one) that share the root cause.
+- `root_cause`, `category` and `reproduce` are optional and never required for `pass`.
 - `changed_files` must stay `[]`. It is your own declaration; host records cover tool
   calls, not file mutations, so report any accidental change explicitly here.
 - If the binding in the prompt is inconsistent with the files you find, report `blocked`

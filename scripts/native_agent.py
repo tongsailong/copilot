@@ -316,17 +316,73 @@ def _absolute_file(value: str) -> str:
     return path if os.path.isfile(path) else ""
 
 
+def _absolute_dir(value: str) -> str:
+    if not value or "\n" in value:
+        return ""
+    path = os.path.abspath(os.path.expanduser(value))
+    return path if os.path.isdir(path) else ""
+
+
+def _join_dir(directory: str, token: str) -> str:
+    """把相对文件 token 解析到已知目录；未知目录或选项 token 返回空。"""
+    if not directory or not token or token.startswith("-"):
+        return ""
+    candidate = token if os.path.isabs(token) else os.path.join(directory, token)
+    return _absolute_file(candidate)
+
+
+def _command_contexts(command: str) -> list[tuple[str, list[str], str]]:
+    """按顶层 `;`/`|`/`&&` 切段，返回 (工作目录, argv, 原始片段)。
+
+    真实复核常用 `cd <dir>; cat report.md`、`cd <dir> && head x` 或
+    `git -C <dir> show ...` 在子目录取证。此前只解析绝对路径，导致
+    `report-final-v4.md` 这类相对读取被判成“未访问证据”（honor G4 第 6 次
+    尝试）。这里跟踪段内 `cd` 与 `git -C` 建立的目录，仅用于把相对 token
+    解析成绝对路径，不改变只读校验。
+    """
+    contexts: list[tuple[str, list[str], str]] = []
+    cwd = ""
+    for part in re.split(r"[;|\n]|&&", command):
+        text = part.strip()
+        if not text:
+            continue
+        try:
+            argv = shlex.split(text, posix=True)
+        except ValueError:
+            contexts.append((cwd, [], text))
+            continue
+        head = os.path.basename(argv[0]) if argv else ""
+        if head == "cd" and len(argv) >= 2:
+            target = argv[1]
+            resolved = _absolute_dir(
+                target if os.path.isabs(target)
+                else os.path.join(cwd or os.getcwd(), target))
+            if resolved:
+                cwd = resolved
+                contexts.append((cwd, argv, text))
+                continue
+        elif head == "git":
+            idx = 1
+            while idx + 1 < len(argv) and argv[idx] == "-C":
+                target = argv[idx + 1]
+                resolved = _absolute_dir(
+                    target if os.path.isabs(target)
+                    else os.path.join(cwd or os.getcwd(), target))
+                if resolved:
+                    cwd = resolved
+                idx += 2
+        contexts.append((cwd, argv, text))
+    return contexts
+
+
 def _command_paths(command: str) -> list[str]:
-    """从 Bash 命令里提取真实存在的绝对文件路径（仅用于补充 inspected 清单）。"""
+    """从 Bash 命令里提取真实存在的文件路径（仅用于补充 inspected 清单）。"""
     out: list[str] = []
-    try:
-        argv = shlex.split(command, posix=True)
-    except ValueError:
-        return out
-    for token in argv:
-        path = _absolute_file(token)
-        if path and path not in out:
-            out.append(path)
+    for cwd, argv, _text in _command_contexts(command):
+        for token in argv:
+            path = _absolute_file(token) or _join_dir(cwd, token)
+            if path and path not in out:
+                out.append(path)
     return out
 
 
@@ -532,17 +588,19 @@ def _review_fields(data: dict) -> dict:
     return out
 
 
-_FENCED_JSON_RE = re.compile(r"```(?:json)?[ \t]*\n(?P<body>.*?)\n[ \t]*```", re.S)
+_FENCED_JSON_RE = re.compile(
+    r"```[ \t]*(?P<tag>[A-Za-z0-9_+.-]*)[ \t]*\r?\n?(?P<body>.*?)```", re.S)
 
 
 def _extract_review_json(text: str, path: str) -> dict:
     """从宿主输出里取出唯一的 JSON 对象。
 
     v6.1 起不再要求“纯 JSON 且无任何叙述”：模型偶尔会把对象包在围栏里或前后
-    加一句说明，这不应让整轮复核作废。但也不做模糊解析：只接受
-    (1) 整段就是 JSON，或 (2) 恰好一个围栏且围栏内是单个 JSON 对象。多个围栏、
-    多个可解析对象或无法解析时失败关闭，避免从叙述里猜结论；围栏外的说明文字
-    不参与解析（结论只取那唯一一个对象）。
+    加一句说明，这不应让整轮复核作废。v6.3 进一步容忍真实输出里的围栏变体：
+    语言标记大小写/带空格、开头围栏后没有换行、CRLF 行尾、前后有说明文字。
+    但不做模糊解析：只接受 (1) 整段就是 JSON，或 (2) 恰好一个围栏且围栏内是
+    单个 JSON 对象。多个可解析对象或无法解析时失败关闭，避免从叙述里猜结论；
+    围栏外的说明文字不参与解析（结论只取那唯一一个可解析对象）。
     """
     try:
         data = json.loads(text)
@@ -550,11 +608,10 @@ def _extract_review_json(text: str, path: str) -> dict:
         data = None
     if isinstance(data, dict):
         return data
-    blocks = [match.group("body") for match in _FENCED_JSON_RE.finditer(text)]
     parsed = []
-    for block in blocks:
+    for match in _FENCED_JSON_RE.finditer(text):
         try:
-            candidate = json.loads(block)
+            candidate = json.loads(match.group("body").strip())
         except ValueError:
             continue
         if isinstance(candidate, dict):
@@ -709,7 +766,13 @@ def _call_blobs(calls: list[tuple[str, str, dict]]) -> list[str]:
     blobs: list[str] = []
     for _tool, command, payload in calls:
         if command:
-            blobs.extend(part for part in re.split(r"[;|\n]", command) if part.strip())
+            for cwd, argv, text in _command_contexts(command):
+                resolved = [p for p in (_join_dir(cwd, token) for token in argv) if p]
+                if resolved:
+                    # 追加解析后的绝对路径：相对读取（`cd <dir>; head x.md`）与
+                    # 绝对证据路径因此能在组件边界上命中，避免假阴性。
+                    text = f"{text} {' '.join(resolved)}"
+                blobs.append(text)
         else:
             blobs.append(json.dumps(payload, ensure_ascii=False))
     return blobs
@@ -1003,6 +1066,202 @@ def verify_review_host_record(envelope: dict) -> list[str]:
     return problems
 
 
+def build_preflight(args) -> dict:
+    """派发前校验一份 Reviewer 命令清单，避免整轮复核因一条命令作废。
+
+    只做静态只读校验，不执行命令；实际执行的命令仍由宿主 rollout 逐条复核。
+    真实记录里 ad-strategy 第 2/7 轮、honor G4 多次尝试都是“其余部分都对，只因
+    一条命令不在白名单或输出格式不合法而整轮作废”，预检把这类失败提前到派发前。
+    """
+    commands: list[str] = [str(c).strip() for c in (args.command or [])
+                           if str(c).strip()]
+    path = str(getattr(args, "file", "") or "").strip()
+    if path:
+        text = _read_text(path)
+        stripped = text.lstrip()
+        if stripped.startswith("["):
+            try:
+                data = json.loads(stripped)
+            except ValueError as exc:
+                raise AgentRecordError(
+                    f"--file 不是合法 JSON 数组：{exc}") from None
+            if not isinstance(data, list):
+                raise AgentRecordError("--file 的 JSON 顶层必须是字符串数组。")
+            commands.extend(str(item).strip() for item in data if str(item).strip())
+        else:
+            for line in text.splitlines():
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    commands.append(line)
+    if not commands:
+        raise AgentRecordError(
+            "preflight-commands 需要 --command 或 --file 提供至少一条命令。")
+    problems: list[dict] = []
+    for idx, command in enumerate(commands, 1):
+        try:
+            NB.validate_review_commands([command])
+        except NB.BridgeError as exc:
+            problems.append({"index": idx, "command": command,
+                             "code": exc.code, "message": str(exc)})
+    return {
+        "schema": "copilot-native-preflight/v1",
+        "ok": not problems,
+        "checked": len(commands),
+        "problems": problems,
+        "note": "预检只证明命令通过只读白名单；实际执行的命令仍由宿主 rollout "
+                "逐条复核，写操作与输出格式问题仍需 Reviewer 自己守住。",
+    }
+
+
+def _execution_evidence_drift(execution: dict, state: dict) -> list[dict]:
+    """执行信封 evidence[] 与当前 live 证据的漂移（与 native_bridge 同一实现）。"""
+    return NB.execution_evidence_drift(execution, state)
+
+
+def build_review_context(args) -> dict:
+    """生成派发 Reviewer 所需的上下文清单（只读，不写状态）。
+
+    输出绑定值、当前证据、执行证据漂移、上轮 findings 与建议的复核 scope，让
+    主代理一次把「要复核什么、绑定值是什么、哪些问题还没闭合」交给 Reviewer，
+    减少因上下文缺失造成的重复取证。
+    """
+    state = G.load_state(os.path.abspath(args.state))
+    dispatch_env, _native = _dispatch_for_state(state, args.dispatch)
+    execution = _load_json(args.execution)
+    if not isinstance(execution, dict):
+        raise AgentRecordError("execution 文件顶层必须是对象。")
+    if str(execution.get("schema") or "") != NB.RESULT_SCHEMA:
+        raise AgentRecordError(
+            f"--execution 必须是 {NB.RESULT_SCHEMA} 信封。")
+    exec_sha = str(execution.get("result_sha256") or "").strip().lower()
+    if not exec_sha or NB.envelope_sha256(execution) != exec_sha:
+        raise AgentRecordError(
+            "execution.result_sha256 与信封内容不一致；不能作为复核上下文。")
+    if str(execution.get("work_item_id") or "") != str(args.work_item):
+        raise AgentRecordError(
+            f"execution 工作项 {execution.get('work_item_id')!r} 与 "
+            f"--work-item {args.work_item!r} 不一致。")
+    recorded = [
+        rec for rec in (state.get("native_results") or [])
+        if isinstance(rec, dict)
+        and str(rec.get("result_sha256") or "") == exec_sha
+    ]
+    if not recorded:
+        raise AgentRecordError(
+            "execution 尚未入账；请先用 auto ingest 回填 execution，再生成上下文。")
+
+    coverage = NB.review_coverage(state)
+    evidence = []
+    for entry in state.get("evidence") or []:
+        if not isinstance(entry, dict):
+            continue
+        evidence.append({
+            "id": str(entry.get("id") or ""),
+            "live": not bool(entry.get("dropped")),
+            "sha256": str(entry.get("sha256") or ""),
+            "path_hint": str(entry.get("path_hint") or ""),
+            "note": str(entry.get("note") or ""),
+        })
+    criteria = [
+        {"criterion_id": str(c.get("criterion_id") or ""),
+         "description": str(c.get("description") or ""),
+         "status": str(c.get("status") or "")}
+        for c in (state.get("contract") or {}).get("criteria") or []
+        if isinstance(c, dict)
+    ]
+    scope, based_on, manifest, reason = "full", "", [], "没有提供基线复核"
+    previous = None
+    previous_path = str(getattr(args, "previous_review", "") or "").strip()
+    if previous_path:
+        prev = _load_json(previous_path)
+        if not isinstance(prev, dict):
+            raise AgentRecordError("--previous-review 顶层必须是对象。")
+        prev_sha = str(prev.get("result_sha256") or "").strip().lower()
+        base = None
+        for record in state.get("native_reviews") or []:
+            if isinstance(record, dict) and \
+                    str(record.get("result_sha256") or "") == prev_sha:
+                base = record
+                break
+        if base is None:
+            raise AgentRecordError(
+                f"--previous-review 指向的复核 {prev_sha[:16]}… 尚未回填到本任务。")
+        previous = {
+            "result_sha256": prev_sha,
+            "verdict": str(base.get("verdict") or ""),
+            "g4_eligible": base.get("g4_eligible") is True,
+            "findings": [f for f in (base.get("findings") or [])
+                         if isinstance(f, dict)],
+            "unverified": list(base.get("unverified") or []),
+        }
+        if str(base.get("verdict") or "").strip().lower() != "pass" or \
+                base.get("g4_eligible") is not True:
+            reason = "基线复核不是可用的 G4 PASS；本轮必须完整复核"
+        elif not isinstance(base.get("coverage"), dict) or not base.get("coverage"):
+            reason = "基线复核没有覆盖快照；本轮必须完整复核"
+        else:
+            base_cov = base.get("coverage") or {}
+            base_evidence = base_cov.get("evidence") or {}
+            base_actions = base_cov.get("actions") or {}
+            base_criteria = base_cov.get("criteria") or {}
+            changed = sorted(
+                eid for eid, sha in coverage["evidence"].items()
+                if base_evidence.get(eid) != sha)
+            changed_actions = sorted(
+                aid for aid, fp in coverage["actions"].items()
+                if base_actions.get(aid) != fp)
+            changed_criteria = sorted(
+                cid for cid, fp in coverage["criteria"].items()
+                if base_criteria.get(cid) != fp)
+            if changed_criteria:
+                # 条件核销会改变目标摘要，复用基线会在收口时判 native_review_stale。
+                reason = ("完成条件状态已变化（" + ", ".join(changed_criteria)
+                          + "）；基线的目标摘要过期，本轮必须完整复核")
+            elif [aid for aid in changed_actions if aid != args.work_item]:
+                reason = "其他工作项结论已变化；增量复核不覆盖，本轮必须完整复核"
+            elif not changed and not changed_actions:
+                reason = "相对基线没有新增/变更证据；可直接复用基线结论"
+            else:
+                scope = "incremental"
+                based_on = prev_sha
+                manifest = changed
+                reason = "基线是 G4 PASS 且只有证据变化；本轮做增量复核"
+    drift = _execution_evidence_drift(execution, state)
+    warnings: list[str] = []
+    pending = [c["criterion_id"] for c in criteria if c["status"] != "met"]
+    if pending:
+        warnings.append(
+            "完成条件 " + ", ".join(pending) + " 尚未核销：核销会改变目标摘要，"
+            "本轮复核在收口时会被判为过期（native_review_stale）；"
+            "先用 criterion --status met 核销，再做最终 G4 复核。")
+    if drift:
+        warnings.append(
+            "执行信封引用的证据已变化/归档："
+            + ", ".join(f"{item['id']}({item['problem']})" for item in drift)
+            + "；先修正证据或重新回填执行结果再复核。")
+    return {
+        "schema": "copilot-review-context/v1",
+        "task_id": state["task_id"],
+        "contract_sha256": state["contract_sha256"],
+        "plan_id": dispatch_env.get("plan_id") or "",
+        "plan_sha256": dispatch_env.get("plan_sha256") or "",
+        "dispatch_id": execution.get("dispatch_id") or "",
+        "work_item_id": execution.get("work_item_id") or "",
+        "execution_result_sha256": exec_sha,
+        "target_sha256": G.final_evidence_digest(state),
+        "review_scope": scope,
+        "based_on_review_sha256": based_on,
+        "evidence_manifest": manifest,
+        "scope_reason": reason,
+        "evidence": evidence,
+        "criteria": criteria,
+        "warnings": warnings,
+        "execution_evidence_unbound": drift,
+        "previous_review": previous,
+        "note": "ingest 会重新校验 scope、绑定与证据覆盖；本清单只用于准备派发。",
+    }
+
+
 def _write_json(path: str, payload: dict) -> None:
     path = os.path.abspath(path)
     parent = os.path.dirname(path) or "."
@@ -1071,14 +1330,59 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--model-rollout", default="")
     p.add_argument("--output", default="")
 
+    p = sub.add_parser("preflight-commands",
+                       help="派发前校验 Reviewer 只读命令清单（不执行命令）")
+    p.add_argument("--file", default="",
+                   help="命令文件：每行一条，或 JSON 字符串数组")
+    p.add_argument("--command", action="append", default=[],
+                   help="单条命令；可多次")
+    p.add_argument("--output", default="")
+
+    p = sub.add_parser("review-context",
+                       help="生成派发 Reviewer 的绑定/证据/上轮 findings 清单")
+    p.add_argument("--state", required=True)
+    p.add_argument("--dispatch", required=True)
+    p.add_argument("--execution", required=True,
+                   help="已入账的 copilot-native-result/v2 执行信封")
+    p.add_argument("--work-item", required=True)
+    p.add_argument("--previous-review", default="",
+                   help="可选：上一轮已回填的复核信封，用于建议增量复核范围")
+    p.add_argument("--output", default="")
+
     args = ap.parse_args(argv)
     try:
         if args.cmd == "execution":
             payload = build_execution(args)
-        else:
+            return _emit(payload, args.output)
+        if args.cmd == "review":
             payload = build_review(args)
+            return _emit(payload, args.output)
+        if args.cmd == "preflight-commands":
+            payload = build_preflight(args)
+            code = _emit(payload, args.output)
+            return code if payload["ok"] else EXIT_USAGE
+        payload = build_review_context(args)
         return _emit(payload, args.output)
     except (AgentRecordError, G.GovernanceError, OSError) as exc:
+        # 生成阶段被拒也是“无效信封”：落进同一份 review-attempts.jsonl，
+        # 否则 review-metrics 只统计 ingest 阶段，低估真实返工。
+        if args.cmd == "review" and getattr(args, "state", ""):
+            match = re.search(r"\[([a-z][a-z0-9_]*)\]", str(exc))
+            attempt = {"work_item_id": str(getattr(args, "work_item", "") or "")}
+            raw_exec = str(getattr(args, "execution", "") or "")
+            if raw_exec:
+                # 尽量带上执行摘要，让指标能按工作项/执行结果归因；
+                # 读取失败不影响记录错误本身。
+                try:
+                    data = _load_json(raw_exec)
+                except (AgentRecordError, G.GovernanceError, OSError, ValueError):
+                    data = None
+                if isinstance(data, dict):
+                    attempt["execution_result_sha256"] = str(
+                        data.get("result_sha256") or "")
+            G.log_attempt(args.state, "review_build",
+                          match.group(1) if match else "review_build_failed",
+                          str(exc), attempt)
         print(f"native-agent: {exc}", file=sys.stderr)
         return EXIT_USAGE
 

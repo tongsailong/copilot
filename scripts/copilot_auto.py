@@ -207,12 +207,23 @@ def _existing_review(state: dict, sha: str) -> dict | None:
     return None
 
 
+def _record_attempt(path: str, kind: str, envelope: dict, code: str,
+                    message: str) -> None:
+    """把被拒的信封尝试追加到任务目录的 review-attempts.jsonl（只记元数据）。
+
+    实现复用 `governance.log_attempt`，让 ingest 被拒与 `native_agent.py review`
+    生成被拒落在同一份尝试记录里，`review-metrics` 口径一致。
+    """
+    G.log_attempt(path, kind, code, message, envelope)
+
+
 def _ingest_execution(path: str, envelope: dict) -> int:
     state = G.load_state(path)
     dispatch = state.get("native_dispatch")
     try:
         normalized = NB.validate_execution_result(envelope, dispatch, state)
     except NB.BridgeError as exc:
+        _record_attempt(path, "execution", envelope, exc.code, exc.message)
         raise AutoError(f"执行信封被拒绝 [{exc.code}]：{exc}") from None
     sha = normalized["result_sha256"]
     if _existing_result(state, sha):
@@ -249,6 +260,13 @@ def _ingest_execution(path: str, envelope: dict) -> int:
         "usage": normalized["usage"],
         "received": G.now_iso(),
     })
+    G._history(state, "native_result_ingested", {
+        "work_item_id": normalized["work_item_id"],
+        "result_sha256": sha,
+        "dispatch_id": normalized["dispatch_id"],
+        "status": normalized["status"],
+        "evidence_ids": [item["id"] for item in normalized["evidence"]],
+    })
     G.save_state(path, state)
     print(f"执行结果已回填：{normalized['work_item_id']} → {normalized['status']} "
           f"sha256={sha[:16]}… 证据 {', '.join(i['id'] for i in normalized['evidence'])}")
@@ -265,6 +283,7 @@ def _ingest_review(path: str, envelope: dict) -> int:
     try:
         normalized = NB.validate_review_result(envelope, dispatch, execution, state)
     except NB.BridgeError as exc:
+        _record_attempt(path, "review", envelope, exc.code, exc.message)
         raise AutoError(f"复核信封被拒绝 [{exc.code}]：{exc}") from None
     sha = normalized["result_sha256"]
     if _existing_review(state, sha):
@@ -273,6 +292,8 @@ def _ingest_review(path: str, envelope: dict) -> int:
     if normalized["g4_eligible"]:
         problems = NA.verify_review_host_record(envelope)
         if problems:
+            _record_attempt(path, "review", envelope, "review_host_record_changed",
+                            ", ".join(problems))
             raise AutoError(
                 "G4 复核的宿主记录复核未通过：" + ", ".join(problems) +
                 "；不得把该结论当作 G4 依据。")
@@ -283,6 +304,21 @@ def _ingest_review(path: str, envelope: dict) -> int:
         # g4_eligible 布尔值（首次核对已在上面按 metadata/rollout 完成）。
         "host_sha256": G._sha256_text(G.canonical_json(normalized.get("host") or {})),
         "received": G.now_iso(),
+    })
+    findings = normalized.get("findings") or []
+    G._history(state, "native_review_ingested", {
+        "work_item_id": normalized["work_item_id"],
+        "result_sha256": sha,
+        "verdict": normalized["verdict"],
+        "g4_eligible": normalized["g4_eligible"],
+        "review_scope": normalized["review_scope"],
+        "based_on_review_sha256": normalized["based_on_review_sha256"],
+        "evidence_manifest": normalized["evidence_manifest"],
+        "finding_count": len(findings),
+        "blocking_count": sum(1 for f in findings
+                              if str(f.get("severity") or "") == "blocking"),
+        "execution_evidence_unbound": normalized.get(
+            "execution_evidence_unbound") or [],
     })
     G.save_state(path, state)
     print(f"复核结果已回填：{normalized['work_item_id']} → {normalized['verdict']}"

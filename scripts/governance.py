@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 import tempfile
 from datetime import datetime
 
@@ -320,6 +321,37 @@ def save_state(path: str, state: dict, expect: dict | None = None) -> None:
             state["updated"] = payload["updated"]
         finally:
             _unlock_file(lock_fh)
+
+
+def log_attempt(state_path: str, kind: str, code: str, message: str,
+                envelope: dict | None = None) -> str:
+    """把被拒/无法生成的信封尝试追加到任务目录 `review-attempts.jsonl`。
+
+    无效信封是复盘“为什么多轮”的关键证据，但过去只打印到终端。这里只记定位
+    字段（时间、类型、错误码、工作项、摘要），不写信封正文或证据内容；失败时
+    只打印警告，不影响原流程。生成阶段（`native_agent.py review`）被拒也走同一
+    通道，`review-metrics` 的无效信封计数才完整。
+    """
+    envelope = envelope if isinstance(envelope, dict) else {}
+    entry = {
+        "at": now_iso(),
+        "kind": kind,
+        "code": code,
+        "message": str(message)[:400],
+        "work_item_id": str(envelope.get("work_item_id") or ""),
+        "execution_result_sha256": str(
+            envelope.get("execution_result_sha256") or ""),
+        "result_sha256": str(envelope.get("result_sha256") or ""),
+    }
+    target = os.path.join(os.path.dirname(os.path.abspath(state_path)),
+                          "review-attempts.jsonl")
+    try:
+        fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        with os.fdopen(fd, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except OSError as exc:
+        print(f"警告：无法记录无效信封尝试到 {target}：{exc}", file=sys.stderr)
+    return target
 
 
 # ── 合同 / 完成条件 ────────────────────────────────────────────────────────
@@ -1525,7 +1557,229 @@ def evidence_warnings(state: dict, *, task_dir: str = "") -> list[str]:
                 continue
             warnings.append(f"evidence/ 下有未登记文件：{name}"
                             "（确认是否需要登记或归档）")
+    # 执行信封 evidence[] 与 live 证据的漂移：证据在回填后被更正或归档时，
+    # 执行正文可能仍引用旧快照（gromore A13 的实际 major）。非阻断提示。
+    live_state = {
+        str(e.get("id") or ""): (str(e.get("sha256") or ""), bool(e.get("dropped")))
+        for e in state.get("evidence") or [] if isinstance(e, dict)
+    }
+    for rec in state.get("native_results") or []:
+        if not isinstance(rec, dict):
+            continue
+        wid = str(rec.get("work_item_id") or "")
+        for item in rec.get("evidence") or []:
+            if not isinstance(item, dict):
+                continue
+            eid = str(item.get("id") or "")
+            if not eid:
+                continue
+            current = live_state.get(eid)
+            if current is None:
+                warnings.append(
+                    f"{wid} 的执行结果引用了未登记证据 {eid}；执行前请先登记")
+                continue
+            live_sha, dropped = current
+            if dropped:
+                warnings.append(
+                    f"{wid} 的执行结果引用已归档证据 {eid}；请确认执行正文是否仍成立")
+            elif live_sha != str(item.get("sha256") or ""):
+                warnings.append(
+                    f"{wid} 的执行结果引用 {eid} 的旧摘要（live 已更新）；"
+                    "证据更正后应重新回填执行结果，或在复核结论中说明")
     return warnings
+
+
+def _parse_time(value: object):
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        return None
+
+
+def _seconds_between(start: object, end: object) -> float | None:
+    first, second = _parse_time(start), _parse_time(end)
+    if first is None or second is None:
+        return None
+    return round((second - first).total_seconds(), 1)
+
+
+def _finding_keys(review: dict) -> list[tuple]:
+    keys = []
+    for finding in review.get("findings") or []:
+        if not isinstance(finding, dict):
+            continue
+        keys.append((str(review.get("work_item_id") or ""),
+                     str(finding.get("severity") or ""),
+                     str(finding.get("file") or ""),
+                     finding.get("line"),
+                     str(finding.get("summary") or "")))
+    return keys
+
+
+def review_metrics(state: dict, *, task_dir: str = "") -> dict:
+    """真实复核效率指标（只读，不改状态）。
+
+    口径说明：
+    * 有效复核 = 已回填到 `native_reviews` 的记录；被拒信封只能从任务目录的
+      `review-attempts.jsonl` 统计，二者分开计数，不把尝试当轮次。
+    * 重复 finding 按 (工作项, severity, file, line, summary) 完全相同计；同一
+      根因的多处表现应合并成一条 finding，否则会在这里显形。
+    * 重复命令/文件按同一工作项跨复核记录出现次数计；增量复核本应减少这类重复。
+    * 正式 REVIEW、原生独立复核、G4 资格分别统计，不混为一个数字。
+    """
+    reviews = [r for r in state.get("native_reviews") or [] if isinstance(r, dict)]
+    reviews.sort(key=lambda r: str(r.get("received") or ""))
+    by_item: dict[str, list[dict]] = {}
+    for review in reviews:
+        wid = str(review.get("work_item_id") or "")
+        by_item.setdefault(wid, []).append(review)
+
+    total_findings = 0
+    finding_counts: dict[tuple, int] = {}
+    blocking_total = 0
+    rounds_with_blocking = 0
+    scope_counts: dict[str, int] = {}
+    g4_reviews = 0
+    package_chars: list[int] = []
+    command_rounds: dict[str, int] = {}
+    file_rounds: dict[str, int] = {}
+    for review in reviews:
+        scope = str(review.get("review_scope") or "full")
+        scope_counts[scope] = scope_counts.get(scope, 0) + 1
+        if review.get("g4_eligible") is True:
+            g4_reviews += 1
+        findings = [f for f in review.get("findings") or [] if isinstance(f, dict)]
+        total_findings += len(findings)
+        blocking = sum(1 for f in findings
+                       if str(f.get("severity") or "") == "blocking")
+        blocking_total += blocking
+        if blocking:
+            rounds_with_blocking += 1
+        for key in _finding_keys(review):
+            finding_counts[key] = finding_counts.get(key, 0) + 1
+        package_chars.append(len(canonical_json({
+            k: review.get(k) for k in (
+                "findings", "files_inspected", "commands_run", "unverified",
+                "residual_risks", "evidence_manifest")})))
+        wid = str(review.get("work_item_id") or "")
+        for command in set(str(c) for c in review.get("commands_run") or [] if c):
+            command_rounds[f"{wid}\0{command}"] = \
+                command_rounds.get(f"{wid}\0{command}", 0) + 1
+        for path in set(str(p) for p in review.get("files_inspected") or [] if p):
+            file_rounds[f"{wid}\0{path}"] = file_rounds.get(f"{wid}\0{path}", 0) + 1
+
+    duplicate_findings = sum(count - 1 for count in finding_counts.values()
+                             if count > 1)
+    repeated_commands = sorted(key.split("\0", 1)[1]
+                               for key, count in command_rounds.items() if count > 1)
+    repeated_files = sorted(key.split("\0", 1)[1]
+                            for key, count in file_rounds.items() if count > 1)
+
+    items: list[dict] = []
+    rounds_to_pass: list[int] = []
+    first_round_findings: list[int] = []
+    for wid, records in sorted(by_item.items()):
+        rounds = len(records)
+        first_findings = len(records[0].get("findings") or []) if records else 0
+        first_round_findings.append(first_findings)
+        pass_round = None
+        for idx, record in enumerate(records, 1):
+            if str(record.get("verdict") or "").lower() == "pass":
+                pass_round = idx
+                break
+        if pass_round is not None:
+            rounds_to_pass.append(pass_round)
+        empty_rounds = sum(
+            1 for record in records[1:]
+            if not (record.get("findings") or [])
+            and str(record.get("verdict") or "").lower() != "pass")
+        items.append({
+            "work_item_id": wid,
+            "rounds": rounds,
+            "first_round_findings": first_findings,
+            "pass_round": pass_round,
+            "empty_rounds": empty_rounds,
+            "verdicts": [str(r.get("verdict") or "") for r in records],
+            "time_to_pass_seconds": (
+                _seconds_between(records[0].get("received"),
+                                 records[pass_round - 1].get("received"))
+                if pass_round else None),
+        })
+
+    invalid_attempts: dict[str, int] = {"execution": 0, "review": 0,
+                                        "review_build": 0}
+    attempt_codes: dict[str, int] = {}
+    if task_dir:
+        path = os.path.join(task_dir, "review-attempts.jsonl")
+        if os.path.isfile(path):
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    for line in fh:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            entry = json.loads(line)
+                        except ValueError:
+                            continue
+                        if not isinstance(entry, dict):
+                            continue
+                        kind = str(entry.get("kind") or "")
+                        if kind in invalid_attempts:
+                            invalid_attempts[kind] += 1
+                        code = str(entry.get("code") or "")
+                        if code:
+                            attempt_codes[code] = attempt_codes.get(code, 0) + 1
+            except OSError:
+                pass
+
+    closure = state.get("closure") or {}
+    return {
+        "schema": "copilot-review-metrics/v1",
+        "task_id": str(state.get("task_id") or ""),
+        "risk": str(state.get("risk") or ""),
+        "execution_backend": str(state.get("execution_backend") or ""),
+        "closed": bool(closure.get("closed")),
+        "native_reviews_total": len(reviews),
+        "g4_reviews": g4_reviews,
+        "formal_reviews_total": len([
+            r for r in state.get("formal_reviews") or [] if isinstance(r, dict)]),
+        "invalid_envelopes": invalid_attempts,
+        "invalid_envelope_codes": dict(sorted(attempt_codes.items())),
+        "review_scopes": dict(sorted(scope_counts.items())),
+        "work_items": items,
+        "work_items_with_reviews": len(items),
+        "avg_review_rounds": (round(sum(i["rounds"] for i in items) / len(items), 2)
+                              if items else 0),
+        "avg_first_round_findings": (
+            round(sum(first_round_findings) / len(first_round_findings), 2)
+            if first_round_findings else 0),
+        "avg_rounds_to_pass": (
+            round(sum(rounds_to_pass) / len(rounds_to_pass), 2)
+            if rounds_to_pass else None),
+        "findings_total": total_findings,
+        "blocking_findings_total": blocking_total,
+        "rounds_with_blocking": rounds_with_blocking,
+        "duplicate_findings": duplicate_findings,
+        "duplicate_finding_ratio": (
+            round(duplicate_findings / total_findings, 3)
+            if total_findings else 0),
+        "repeated_commands": repeated_commands[:50],
+        "repeated_command_count": len(repeated_commands),
+        "repeated_files": repeated_files[:50],
+        "repeated_file_count": len(repeated_files),
+        "avg_package_chars": (
+            round(sum(package_chars) / len(package_chars)) if package_chars else 0),
+        "max_package_chars": max(package_chars) if package_chars else 0,
+        "task_seconds": _seconds_between(
+            state.get("created"), closure.get("closed_at") or state.get("updated")),
+        "reopen_count": len(closure.get("reopen_history") or []),
+        "note": "有效复核按 native_reviews 统计；被拒信封按 review-attempts.jsonl "
+                "统计。正式 REVIEW、G4 与原生复核分别计数，不互相替代。",
+    }
 
 
 def closure_check(state: dict, *, task_dir: str = "") -> dict:

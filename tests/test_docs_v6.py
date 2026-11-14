@@ -20,11 +20,21 @@ REVIEWER = os.path.join(ROOT, "agents", "reviewer.md")
 ACTIVE_REFS = ("workflow.md", "runtime.md", "review.md", "agent-bridge.md")
 HISTORICAL_REFS = ("role.md", "role-consult.md", "role-plan.md", "role-review.md",
                    "role-map.md", "review-ledger.md")
+DISPATCH = os.path.join(ROOT, "scripts", "copilot_dispatch.py")
 
 
 def text(path: str) -> str:
     with open(path, "r", encoding="utf-8") as fh:
         return fh.read()
+
+
+def current_version() -> str:
+    """以代码里的版本号为准，避免文档测试钉死某个历史版本。"""
+    match = re.search(r'^__version__ = "([0-9]+\.[0-9]+\.[0-9]+)"',
+                      text(DISPATCH), re.M)
+    if not match:
+        raise AssertionError("copilot_dispatch.py 缺少 __version__")
+    return match.group(1)
 
 
 def raw(path: str) -> bytes:
@@ -55,7 +65,7 @@ class SkillEntryTests(unittest.TestCase):
                                  .group(1)), 1024)
 
     def test_version_and_retirement(self):
-        self.assertIn("v6.0.0", self.doc)
+        self.assertIn(f"v{current_version()}", self.doc)
         self.assertIn("SOL 已退役", self.doc)
         self.assertIn("legacy-status", self.doc)
         self.assertNotIn("唯一正式 GPT/SOL 入口", self.doc)
