@@ -2,6 +2,108 @@
 
 更新：2026-11-15 CST。本文件只记录现场可核实的事实；规划与未完成事项单独标注。
 
+## 通用只读 Profile 与旧 Reviewer 文件退役（2026-11-15，v6.6.1）
+
+用户确认接受最小化的通用只读 Profile。本轮只做文件通用化与引用清理，不改 G4 设计：
+
+- **迁移**：删除 `.zcode/agents/reviewer.md`，新建 `.zcode/agents/independent-readonly.md`；
+  frontmatter 权限不变（`tools: [Read, Grep, Glob]`、`disallowedTools` 含
+  `Write/Edit/Bash/WebFetch/WebSearch/Agent/Task/TodoWrite/NotebookEdit`、
+  `permissionMode: default`、`injectAgentsMd: false`）。正文改为通用只读约束，删除
+  Reviewer 身份、复核流程、`review-json/v2` 输出契约与生命周期；输出格式由主 Agent
+  在派发 prompt 中给出。
+- **代码**：G4 已按宿主有效策略判定（v6.6），本轮无脚本逻辑改动，只更新版本号与文档/
+  测试引用；`tests/test_profile_policy.py` 改为锁定“旧文件不存在 + 新文件唯一 + 通用正文”。
+- **场景 A（普通只读调查）**：headless 新进程在仓库内派发 `independent-readonly` 调查
+  `native_bridge`/`g4_attest` 的 Profile 策略实现。子会话 `agent_b59e25ab…`
+  （parent `sess_bc74a8e8…`）profile `independent-readonly`、`workspaceRoot` 为仓库、
+  tools `[Read,Grep,Glob]`、disallowed 含 Bash/Write/Edit；实际 2×Read、
+  `read_only=1`、`side_effect_scope=none`、0 次 Bash；回报的函数名/行号与实际源码一致。
+- **场景 B（正式 G4）**：`/tmp/copilot-e2e61-yzRiSL/task`，task `task-e2e-v661`；
+  Executor `agent_ab904028…`（general-purpose，Read+Edit+`bash run-tests.sh` exit 0）、
+  binding `EB24184a…`、execution `5e8e12d0…`；attempt `RA77095998…`；Reviewer
+  `agent_ec4fd642…`（profile `independent-readonly`，9×Read+1×Glob，0 Bash）；
+  raw 384 字节 SHA `15048f80…`；attestation `57980f16…`（69/69 checks，0 rejections，
+  `profile_snapshot.name=independent-readonly`、tools 精确只读）；TE 四层全 true；
+  候选 `eligible=true`；正式 `g4_eligible=True`/`g4_source=candidate`；attempt 一次性
+  消费；`drive` 直接 `CLOSED/pass`。信封与 context 写在任务工作区之外，代码快照只有
+  `src/calc.py`。
+- **独立只读复核**：全新 headless 进程用 `independent-readonly` 复核 31 个文件的 diff，
+  verdict `partial`，5 条 finding 全为 minor/info；已修复 F1（`review_output` 注释仍写
+  Profile 要求纯 JSON）、F2（执行方策略缺失/空值的判定口径注释与文档）、F3（
+  `manifests/source-baseline.sha256` 未更新）、F4（增加 `.zcode/agents` 仅允许单个通用
+  Profile 的测试并纳入 T4 场景）、F5（`agent-bridge` 补充派发 prompt 的原始 JSON 模板）。
+- **测试**：活动 `556 tests OK`；历史 `853 OK (skipped=31)`；T4 34/34 场景，
+  T0 0.6s / T1 19.7s / T2 41.2s / T3 92.4s。`manifests` 基线 25 文件已重建。
+- **运行时**：`--apply` 写入 6 个受管理文件，`--check` 缺失 0 / 不同 0；8 个未受管理
+  文件保留；全新 headless 会话加载 Skill `v6.6.1`，并在仓库工作区识别
+  `independent-readonly`（见场景 A）。
+- **未完成/限制**：宿主仍不支持派发期工具白名单，因此必须保留一个只读 Profile 文件；
+  该文件现在不承担任何 Reviewer 角色。metadata/SQLite 无签名；未做主动 Bash 渗透测试。
+
+## 复核方去专用化：有效权限取代 Profile 身份（2026-11-15，v6.6.0）
+
+目标是把“独立复核”与“Copilot 专用 Reviewer Profile”解耦。调查结论：ZCode
+**3.18.2 不支持按派发指定工具白名单**，宿主只能在 Agent Profile frontmatter 上强制
+`tools`/`disallowedTools`；内置 `general-purpose` 为 `tools:["*"]`、`Explore` 含
+`Bash`，官方插件 Agent 也含 `Bash`。因此“没有 Profile 文件也能证明只读”在当前版本
+不成立，专用只读 Profile 仍必须保留（见“未完成/限制”）。本轮完成的是 G4 判定口径与
+调用链的去标识化：
+
+- **P0 调查（静态证据）**：`/opt/ZCode/resources/glm/zcode.cjs` 中 Agent 工具入参只有
+  `description`/`prompt`/`subagent_type`/`run_in_background`；profile frontmatter 才支持
+  `tools`/`disallowedTools`；`tools: []` 等于继承父工具。
+- **P0 调查（真实宿主探针）**：`/tmp/copilot-probe-UPrxnK/ws` 用**非 `reviewer` 名称**的
+  工作区 Profile（`independent-readonly`）派发真实子代理：宿主快照 `tools=[Read,Grep,Glob]`、
+  `disallowedTools` 含 Bash/Write/Edit、`source=project`；子代理 `Bash` 不可用，实际
+  只有 1 次 `Read`（`read_only=1`、`side_effect_scope=none`）；child `workspaceRoot`
+  等于 `--cwd`，DB `session.task_type=subagent_child` 与 `tool_usage`/`part` 齐全。
+- **判定口径**：`native_bridge`/`native_agent`/`governance`/`test_execution`/`g4_attest`
+  改为校验**宿主 `profileSnapshot` 派生的有效权限策略**（`tools` 精确等于
+  `Read/Grep/Glob`、禁用 `Write/Edit/Bash`、无 skills/MCP、`permissionMode` 缺省/空或
+  default/plan）；Profile 名称、来源、路径只作记录事实。缺失/类型错误的策略失败关闭
+  （含信封层 `reviewer.profile`/`executor.profile` 必填）；执行方等价只读策略 →
+  `executor_profile_readonly`。
+- **移除**：`g4_attest` 的 `allowed_profile_sources`（含 `project` 强制）与
+  `require_workspace_profile`、`profile_path_outside_workspace`/`_user_dir`、
+  `profile_permission_mode_missing` 及 CLI `--allowed-profile-source`/
+  `--allow-user-profile`；`g4_shadow` 不再传递来源白名单；复核信封新增
+  `reviewer.profile`（native/agent/session 真实性不变）。
+- **保留**：Profile 文件存在且正文与 `profileSnapshot.systemPrompt` 一致、Session 独立性、
+  会话晚于 attempt、prompt 携带 attempt id、工作区绑定、工具调用白名单、原始输出 SHA、
+  attempt 一次性消费、TE 四层、fail-closed 全部不变。
+- **真实 E2E（最终运行时）**：`/tmp/copilot-e2e-DMIFkP/task`，task `task-e2e-v66`；
+  Executor `agent_97a16c06…`（`general-purpose`，Read+Edit+`bash run-tests.sh` exit 0）、
+  binding `EBb7d938…`、execution `23b76673…`；attempt `RA67c08d…`；
+  Reviewer `agent_9b32f76d…`（profile **`independent-readonly`**，9×Read+1×Glob，
+  无 Bash）；raw SHA `f6ca91a6…`；attestation `74b4c230…`（69/69 checks，0 rejections）；
+  TE `verified`（四层全 true）、候选 `eligible=true`、正式 `PASS`、
+  `drive` 自动 `CLOSED/pass`（`2026-11-15T19:27:09+08:00`）。`verify_stored` 正例 ok；
+  改写 raw verdict 后 `ok=false`。
+- **E2E 暴露的流程约束**：当任务状态目录就是代码工作区时，把执行信封写在
+  `--output A1.execution.json` 会让 attempt 快照多出该文件（执行信封自身被排除），
+  TE 报 `execution_code_scope_mismatch`；信封应写到工作区之外。本轮首次 attempt
+  `RAc63a3b…` 因此未获正式 G4（未消费），修正后重做 attempt 得到上述 PASS。
+- **独立只读复核（原生子代理 `agent_c122fd25…`）**：对 24 文件未提交改动做只读复核，
+  verdict `partial`，5 条 finding 全为 minor/info（F1 信封层把非列表 skills/MCP 归一化
+  成空、F2 文档 permissionMode 口径、F3 envelope 示例缺 `executor.profile`、F4 项目
+  `AGENTS.md` 仍写 Reviewer 含 Bash/固定工作区 Profile、F5 执行方只读判定依赖可选字段）。
+  已修复 F1（非空 skills/MCP 一律拒绝，含类型错误）、F5（`executor.profile` 必填，
+  `executor_profile_invalid`）、F2–F4（文档与 `AGENTS.md` 口径）。复核方自述的测试与
+  宿主记录未由它重跑，由本文件的真实命令输出与本机证据承担。
+- **测试**：活动 `552 tests OK`（41.9s）；历史 `853 OK (skipped=31)`；T4 34/34 场景、
+  T0 0.6s / T1 20.8s / T2 41.7s / T3 93.3s 全过；新增名称无关、Bash/Write/MCP 拒绝、
+  策略缺失/类型错误 fail-closed、只读 Profile 不得作为 Executor 等用例。
+- **最终代码复核 E2E 证据**：用最终源码重跑 `g4_attest` 核对同一宿主记录，65 项检查
+  中仅 `attempt_consumed` 失败（一次性消费的预期行为），Profile 策略、会话、输出 SHA、
+  工具调用均再次通过；最终 `native_bridge.validate_review_result` 接受同一复核信封。
+- **运行时**：`sync_runtime.py --apply` 写入 10 个受管理文件；`--check` 缺失 0 /
+  不同 0；8 个未受管理文件保留。Skill 版本 `v6.6.0`。
+- **当时的限制（v6.6.1 已解决）**：`.zcode/agents/reviewer.md` 未删除——原生接口无法在不
+  使用 Profile 的情况下施加可验证只读约束。用户随后确认接受通用只读 Profile，
+  v6.6.1 已把它改名为 `independent-readonly.md` 并删除旧文件。
+- 另：metadata/SQLite 无签名；未做主动 Bash 渗透测试；真实 GUI 会话未人工观察。
+
 ## 正式 G4 切换与旧 Reviewer 退役（2026-11-15，阶段九）
 
 在阶段八切换准入 PASS 的最终源码上执行正式切换：正式 G4 改由新链

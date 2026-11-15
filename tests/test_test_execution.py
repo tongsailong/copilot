@@ -251,12 +251,21 @@ class TestExecutionTests(unittest.TestCase):
         self.assertEqual(record["status"], "failed")
         self.assertIn("executor_workspace_mismatch", record["problems"])
 
-    def test_reviewer_profile_cannot_be_executor(self):
-        self._rewrite_metadata(profileId="reviewer",
-                               profileSnapshot={"name": "reviewer"})
-        record = TE.build(self.execution, self.attempt, db=self.db)
-        self.assertEqual(record["status"], "failed")
-        self.assertIn("executor_profile_reviewer", record["problems"])
+    def test_readonly_profile_cannot_be_executor(self):
+        # 判定按宿主有效工具策略，与 Profile 名称无关：任何名字的只读 Profile
+        # 都不能承担工程执行。
+        for name in ("reviewer", "readonly-any"):
+            with self.subTest(name=name):
+                self._rewrite_metadata(
+                    profileId=name,
+                    profileSnapshot={
+                        "name": name,
+                        "tools": ["Read", "Grep", "Glob"],
+                        "disallowedTools": ["Write", "Edit", "Bash"],
+                    })
+                record = TE.build(self.execution, self.attempt, db=self.db)
+                self.assertEqual(record["status"], "failed")
+                self.assertIn("executor_profile_readonly", record["problems"])
 
     def test_profile_snapshot_mismatch_is_failed(self):
         self._rewrite_metadata(profileSnapshot={"name": "other"})

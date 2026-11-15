@@ -153,7 +153,11 @@ finding 必须有可达的缺陷机制、实际影响与可核实证据（文件
 
 ### 记录与边界
 
-- 由工作区级 `reviewer` Profile 的只读子代理执行（工具仅 `Read`/`Grep`/`Glob`，无 Bash）。
+- 由 ZCode 原生只读子代理执行：工作区通用只读 Profile
+  `.zcode/agents/independent-readonly.md` 只提供宿主权限（`tools=[Read,Grep,Glob]`，
+  禁用 `Write/Edit/Bash`，无 skills/MCP）；G4 按 `reviewer.profile` 记录的有效策略判定，
+  Profile 名称、来源与路径不参与；没有宿主策略时失败关闭。`review-json/v2` 的输出格式
+  由主 Agent 在派发 prompt 中给出，Profile 本身不定义复核流程或输出契约。
 - 检查真实文件、diff、测试日志与原始证据，给出 verdict 与 findings（含文件位置与证据）。
 - 实际读取由 `native_agent.py` 从宿主 `tool_usage`/`part` 合并，不要求 Reviewer 手工
   复述；`commands_run` 恒为空。结论可用 `native_agent.py review` 生成信封并回填；
@@ -226,7 +230,7 @@ finding 必须有可达的缺陷机制、实际影响与可核实证据（文件
 | `target_sha256` == attempt 快照 == 当前 `final_evidence_digest` | 复核针对当前最终证据，不是过期结论 |
 | Reviewer 会话晚于 attempt，prompt 携带 attempt id | 旧会话不能冒充新 attempt 的复核方 |
 | 证据文件内容仍等于 attempt 快照 | 复核期间文件被改动时旧结论失效 |
-| `reviewer.profile_id == "reviewer"` | 复核方是 Reviewer Profile |
+| `reviewer.profile` 有效策略为只读 | Reviewer 的宿主权限等价于只读复核（名称无关） |
 | `host` 存在且 `host_sha256` 与内容一致 | ingest 固化的宿主记录未被改写 |
 | `g4_attest` 独立核验宿主 DB | Profile 精确只读、会话/prompt/工作区绑定、工具调用与原始输出一致 |
 | `test_execution` 四层通过 | 合同要求的命令/结果/产物完整性已验证（或合同显式 N/A） |
@@ -235,6 +239,7 @@ finding 必须有可达的缺陷机制、实际影响与可核实证据（文件
 `host_*`）只用于历史记录，新链改用 `g4_attest` 原因码（`native_review_missing` / `native_review_not_pass` /
 `native_review_blocking` / `native_review_unverified` / `native_review_changed_files` /
 `native_review_not_g4_eligible` / `native_review_stale` / `native_review_profile_invalid` /
+`native_review_profile_not_readonly` /
 `native_review_foreign` / `native_review_contract_mismatch` / `native_review_host_missing` /
 `native_review_host_changed` / `native_review_host_identity_mismatch` /
 `native_review_host_no_tool_calls` / `native_review_attempt_missing` /

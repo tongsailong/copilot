@@ -23,6 +23,24 @@ CONTRACT = """## 完成条件
 """
 
 
+def readonly_profile_policy(**overrides) -> dict:
+    """宿主只读复核 Profile 的有效权限策略（与 profileSnapshot 派生字段同构）。
+
+    G4 只认这份策略：名称/来源/路径可以任意变化，工具集与禁用项不能。
+    """
+    policy = {
+        "name": "reviewer",
+        "source": "project",
+        "path": "",
+        "tools": ["Read", "Grep", "Glob"],
+        "disallowedTools": ["Write", "Edit", "Bash", "WebFetch", "WebSearch",
+                            "Agent", "Task", "TodoWrite", "NotebookEdit"],
+        "permissionMode": "default",
+    }
+    policy.update(overrides)
+    return policy
+
+
 def run_cli(script: str, *args: str, cwd: str | None = None) -> subprocess.CompletedProcess:
     """以子进程运行 scripts/ 下的 CLI；返回完整 stdout/stderr 供断言。"""
     return subprocess.run(
@@ -182,6 +200,7 @@ class BridgeBase(unittest.TestCase):
             "executor": {
                 "kind": "subagent", "agent_id": "agent-exec",
                 "child_session_id": "child-exec", "profile_id": "executor",
+                "profile": {"tools": ["*"]},
                 "model_reported": "some-model",
             },
             "timing": {"duration_ms": 1200},
@@ -243,6 +262,7 @@ class BridgeBase(unittest.TestCase):
             "reviewer": {
                 "kind": "subagent", "agent_id": "agent-review",
                 "child_session_id": "child-review", "profile_id": "reviewer",
+                "profile": readonly_profile_policy(),
                 "model_reported": "some-model",
             },
             "host": {

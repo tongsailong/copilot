@@ -15,9 +15,10 @@ Copilot 是运行于 ZCode 内的**轻量协作治理 Skill**：负责任务承�
   强制决策节点，也不得设置等待远程返回的状态门禁。历史实现归档在 `legacy/`，历史审计、
   裁决、台账与证据只读保留。
 - 本仓库是**唯一源码**。`~/.zcode/skills/copilot` 是构建产物，只能由
-  `scripts-sync/sync_runtime.py` 单向下发，不得直接编辑。阶段九起旧 Reviewer 全局
-  Profile 已退役；Reviewer 使用工作区级 `.zcode/agents/reviewer.md`（只读
-  Read/Grep/Glob，无 Bash），不属于同步分发范围。
+  `scripts-sync/sync_runtime.py` 单向下发，不得直接编辑。旧 Reviewer 全局 Profile
+  已退役；工作区 `.zcode/agents/independent-readonly.md` 是唯一通用只读权限载体
+  （只声明宿主权限，不定义 Reviewer 角色或流程），G4 按 `profileSnapshot` 的有效策略
+  判定（名称/来源/路径不参与），该文件不属于同步分发范围。
 - 运行时临时修复必须先回迁本仓库，再同步下发；不使用符号链接替代副本。
 - 源码与运行时的分工见 `docs/DECISIONS.md`。
 
@@ -31,7 +32,7 @@ Agent、原生 Reviewer、DesignWise。Executor / Reviewer 是 ZCode 工程执�
 |---|---|---|
 | ZCode 主代理 | 现场调查、工程规划、技术选型、实现、调试、测试、交付；派发子代理；组织必要的独立复核 | 不擅自改变产品目标、业务规则或授权范围 |
 | Executor 子代理 | 按工作项执行具体实现与取证，回报事实 | 有工具但无最终判断权；不得替代 Reviewer |
-| Reviewer 子代理 | 在独立上下文基于真实文件、diff、测试日志与原始证据给出复核结论 | 只读工具集（`Read,Grep,Glob,Bash`，禁止 `Write,Edit`）；这是提示词与工具配置层面的要求，不是操作系统沙箱；不得修改代码或代替执行方 |
+| Reviewer 子代理 | 在独立上下文基于真实文件、diff、测试日志与原始证据给出复核结论 | 宿主有效工具策略必须是 `Read/Grep/Glob` 且禁用 `Write/Edit/Bash`、无 skills/MCP（`tools: []` 等于继承父工具，一律拒绝）；这是工具配置层面的约束，不是操作系统沙箱；不得修改代码或代替执行方 |
 | Copilot 状态层 | 合同、条件、状态、证据登记、四门、PARTIAL 派生、收口、审计 | 是本地脚本与状态，不是模型；不调用模型、不实施工程、不替代技术决策、门禁不得绕过 |
 | 正式 REVIEW | 用户明确要求时的治理记录 | 不是普通开发前置门禁；不能替代 G4；无授权不得伪造 |
 | G4 复核 | 高风险任务收口所需的技术复核 | 原生独立只读复核 + 宿主记录重核 + 目标摘要绑定；fail-closed |

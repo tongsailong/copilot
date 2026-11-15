@@ -16,7 +16,6 @@ import sqlite3
 import sys
 import tempfile
 import unittest
-from contextlib import contextmanager
 from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -44,22 +43,6 @@ def _sha(path: str) -> str:
 def _sha_text(text: str) -> str:
     import hashlib
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
-
-
-@contextmanager
-def temp_home(root: str):
-    """把 HOME 指向临时目录，避免测试触碰真实的 ~/.zcode/agents。"""
-    old = os.environ.get("HOME")
-    os.environ["HOME"] = root
-    try:
-        agents = os.path.join(root, ".zcode", "agents")
-        os.makedirs(agents, exist_ok=True)
-        yield agents
-    finally:
-        if old is None:
-            os.environ.pop("HOME", None)
-        else:
-            os.environ["HOME"] = old
 
 
 class Fixture:
@@ -520,37 +503,39 @@ class ProfileBoundaryTests(AttestTestCase):
         self.f.set_profile(mcpServers=["playwright"])
         self.assertCode(self.f.run(), "profile_mcp_servers")
 
-    def test_profile_source_user_rejected(self) -> None:
-        self.f.set_profile(source="user")
-        self.assertCode(self.f.run(), "profile_source_not_allowed")
-
-    def test_profile_source_user_requires_permission_mode(self) -> None:
-        with temp_home(self.f.tmp) as user_dir:
-            path = os.path.join(user_dir, "readonly.md")
-            with open(path, "w", encoding="utf-8") as fh:
-                fh.write("read only\n")
-            self.f.set_profile(source="user", path=path)
-            record = self.f.run(allowed_profile_sources=("project", "user"))
-            self.assertFalse(record["eligible"])
-            code = record["code"]
-            self.assertEqual(code, "profile_permission_mode_missing", record["checks"])
-
-    def test_profile_source_user_allowed_when_opted_in(self) -> None:
-        with temp_home(self.f.tmp) as user_dir:
-            path = os.path.join(user_dir, "readonly.md")
-            with open(path, "w", encoding="utf-8") as fh:
-                fh.write("read only\n")
-            self.f.set_profile(source="user", path=path,
-                               permissionMode="default")
-            record = self.f.run(allowed_profile_sources=("project", "user"))
-            self.assertTrue(record["eligible"], record["rejections"])
-
-    def test_profile_path_outside_workspace(self) -> None:
+    def test_profile_source_and_path_are_not_gating(self) -> None:
+        # 只读边界由有效工具策略决定：来源任意（project/user/…）、路径在工作区
+        # 外也照样合格；G4 不再要求固定来源或固定目录。
         outside = os.path.join(self.f.tmp, "outside-profile.md")
         with open(outside, "w", encoding="utf-8") as fh:
             fh.write("read only\n")
-        self.f.set_profile(path=outside)
-        self.assertCode(self.f.run(), "profile_path_outside_workspace")
+        for source in ("user", "built-in", "plugin"):
+            with self.subTest(source=source):
+                self.f.set_profile(source=source, path=outside,
+                                   permissionMode="default")
+                record = self.f.run()
+                self.assertTrue(record["eligible"], record["rejections"])
+
+    def test_profile_name_is_not_gating(self) -> None:
+        # Profile 名称改变（含完全无关的名字）不影响合法复核。
+        renamed = os.path.join(self.f.ws, ".zcode", "agents", "any-name.md")
+        with open(renamed, "w", encoding="utf-8") as fh:
+            fh.write("---\nname: any-name\n---\nread only\n")
+        self.f.meta["profileId"] = "any-name"
+        self.f.set_profile(name="any-name", path=renamed)
+        self.assertTrue(self.f.run()["eligible"])
+
+    def test_readonly_policy_requires_exact_tools(self) -> None:
+        for tools in (["Read", "Write"], ["Read", "Edit"], ["Read", "Bash"],
+                      ["Read", "Grep", "Glob", "mcp__demo__tool"]):
+            with self.subTest(tools=tools):
+                self.f.set_profile(tools=tools)
+                self.assertCode(self.f.run(), "profile_tools_not_exact")
+
+    def test_policy_missing_fails_closed(self) -> None:
+        # 没有有效权限策略（元数据缺失/空对象）时必须失败关闭。
+        self.f.set_profile(tools=None, disallowedTools=None)
+        self.assertCode(self.f.run(), "profile_tools_empty")
 
     def test_profile_content_mismatch(self) -> None:
         with open(self.f.profile, "w", encoding="utf-8") as fh:
@@ -1250,14 +1235,6 @@ class CliTests(AttestTestCase):
                                  "--task-id", TASK, "--workspace", self.f.ws,
                                  "--db", self.f.db]), 1)
 
-    def test_cli_allow_user_profile_flag(self) -> None:
-        with temp_home(self.f.tmp) as user_dir:
-            path = os.path.join(user_dir, "readonly.md")
-            with open(path, "w", encoding="utf-8") as fh:
-                fh.write("read only\n")
-            self.f.set_profile(source="user", path=path,
-                               permissionMode="default")
-            self.assertEqual(self._main("--allow-user-profile"), 0)
 
     def test_cli_output_conflicts_with_input(self) -> None:
         self.assertEqual(self._main("--output",

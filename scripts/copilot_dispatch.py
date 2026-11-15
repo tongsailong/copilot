@@ -33,7 +33,7 @@ if HERE not in sys.path:
 
 import governance as G  # noqa: E402
 
-__version__ = "6.5.0"
+__version__ = "6.6.1"
 
 
 class CLIError(Exception):

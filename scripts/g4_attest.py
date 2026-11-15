@@ -5,8 +5,11 @@
 
 - 只读 metadata.json、宿主 SQLite（`mode=ro`）、attempt JSON、证据文件与
   Reviewer 的 outputFile；不调用模型、不联网、不执行 Bash、不写宿主数据库。
-- 不依赖 Reviewer 专属 Profile 名称，也不依赖 rollout 长期留存。rollout 只在
-  存在时做第三路交叉核对；模型身份取 `session_entry` 的持久模型记录。
+- 不依赖 Reviewer 专属 Profile 名称、来源或路径，也不依赖 rollout 长期留存。
+  只读边界按宿主 `profileSnapshot` 的有效工具策略判定（工具精确等于
+  Read/Grep/Glob、禁用 Write/Edit/Bash、无 skills/MCP），并按 Profile 文件内容
+  交叉核对快照；rollout 只在存在时做第三路交叉核对；模型身份取
+  `session_entry` 的持久模型记录。
 - 输出确定性取证记录（`copilot-g4-attestation/v1`），可在 ingest 时保存，供
   rollout 与本地 DB 被清理后审计。
 
@@ -33,11 +36,13 @@ import review_output
 from lib_common import is_sensitive_path, sha256_file, sha256_text
 
 SCHEMA = "copilot-g4-attestation/v1"
+# 只读复核的宿主有效权限契约：工具精确等于只读集合、显式禁用写入/执行工具。
+# 判定依据是 metadata.profileSnapshot（宿主派发时固化），不依赖 Profile 名称、
+# 来源或所在路径；`tools=[]` 在宿主语义里等于继承父工具，必须拒绝。
 READONLY_TOOLS = frozenset({"Read", "Grep", "Glob"})
 REQUIRED_DISALLOWED = frozenset({"Write", "Edit", "Bash"})
 ALLOWED_PERMISSION_MODES = frozenset({"default", "plan"})
 REVIEW_SCHEMAS = frozenset({"copilot-native-review/v2"})
-DEFAULT_PROFILE_SOURCES = ("project",)
 METADATA_FIELDS = ("agentId", "childSessionId", "parentSessionId", "profileId",
                    "profileSnapshot", "prompt", "status", "createdAt",
                    "workspaceRoot", "outputFile", "totalToolUseCount")
@@ -214,8 +219,7 @@ def _db_fingerprint(path: str) -> dict:
 def attest(*, metadata: str, attempt: str, task_id: str, workspace: str,
            expected_target: str = "", evidence: list[str] | None = None,
            db: str = "", executor_agent: str = "", executor_session: str = "",
-           task_dir: str = "", allowed_profile_sources: tuple[str, ...] =
-           DEFAULT_PROFILE_SOURCES, require_workspace_profile: bool = True,
+           task_dir: str = "",
            require_model_selection: bool = True,
            require_target: bool = True,
            require_executor_identity: bool = True,
@@ -231,10 +235,6 @@ def attest(*, metadata: str, attempt: str, task_id: str, workspace: str,
     if outside_reads not in ("reject", "record"):
         raise AttestError("bad_argument", "outside_reads 只能是 reject / record")
     db = db or os.path.expanduser("~/.zcode/cli/db/db.sqlite")
-    unknown_sources = set(allowed_profile_sources) - {"project", "user"}
-    if unknown_sources:
-        raise AttestError("bad_argument",
-                          f"allowed_profile_sources 含未知来源：{sorted(unknown_sources)}")
     if not str(task_id or "").strip():
         raise AttestError("bad_argument", "task_id 不能为空")
     if not str(workspace or "").strip():
@@ -376,10 +376,10 @@ def attest(*, metadata: str, attempt: str, task_id: str, workspace: str,
           f"skills={snap.get('skills')}")
     check("profile_mcp_servers", not (snap.get("mcpServers") or []),
           f"mcpServers={snap.get('mcpServers')}")
+    # Profile 名称/来源/路径只作为记录事实：只读边界由上面的有效工具策略
+    # 决定，G4 不再要求任何固定名称、固定目录或固定来源。
     source = str(snap.get("source") or "")
-    check("profile_source_not_allowed",
-          source in allowed_profile_sources,
-          f"source={source!r} 允许={list(allowed_profile_sources)}")
+    profile_name = str(snap.get("name") or "")
     profile_path = str(snap.get("path") or "")
     profile_real = _resolve(profile_path, workspace)
     profile_sha = ""
@@ -402,18 +402,6 @@ def attest(*, metadata: str, attempt: str, task_id: str, workspace: str,
         if expected_body:
             check("profile_content_mismatch", body.strip() == expected_body,
                   profile_path)
-    if require_workspace_profile and source == "project":
-        wanted = os.path.join(workspace, ".zcode", "agents")
-        check("profile_path_outside_workspace",
-              bool(profile_path) and _under(profile_real, wanted),
-              f"path={profile_path!r} 必须在 {wanted}")
-    if source == "user":
-        wanted_user = os.path.join(os.path.expanduser("~"), ".zcode", "agents")
-        check("profile_path_outside_user_dir",
-              bool(profile_path) and _under(profile_real, wanted_user),
-              f"path={profile_path!r} 必须在 {wanted_user}")
-        check("profile_permission_mode_missing", bool(mode),
-              "user Profile 必须显式声明 permissionMode")
 
     # 4. 会话完成与独立性
     check("reviewer_not_completed", str(meta.get("status") or "") == "completed",
@@ -1115,7 +1103,8 @@ def attest(*, metadata: str, attempt: str, task_id: str, workspace: str,
                        else "attempt.consumed only",
                        "profile_sha256": profile_sha,
                        "profile": {
-                           "source": str(snap.get("source") or ""),
+                           "name": profile_name,
+                           "source": source,
                            "path": profile_real,
                            "sha256": profile_sha,
                            "tools": [str(item) for item in tools]
@@ -1129,10 +1118,6 @@ def attest(*, metadata: str, attempt: str, task_id: str, workspace: str,
                            "require_executor_identity":
                                bool(require_executor_identity),
                            "require_model_selection": bool(require_model_selection),
-                           "require_workspace_profile":
-                               bool(require_workspace_profile),
-                           "allowed_profile_sources":
-                               list(allowed_profile_sources),
                            "outside_reads": outside_reads,
                            "diagnostic": not (require_target
                                               and require_executor_identity
@@ -1340,9 +1325,6 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--task-dir", default="")
     ap.add_argument("--executor-agent", default="")
     ap.add_argument("--executor-session", default="")
-    ap.add_argument("--allowed-profile-source", action="append", default=[],
-                    help="允许的 Profile 来源；默认仅 project")
-    ap.add_argument("--allow-user-profile", action="store_true")
     ap.add_argument("--no-model-selection-required", action="store_true")
     ap.add_argument("--outside-reads", choices=("reject", "record"),
                     default="reject")
@@ -1353,9 +1335,6 @@ def main(argv: list[str] | None = None) -> int:
                     help="仅诊断用途：允许不提供执行方身份")
     ap.add_argument("--output", default="")
     args = ap.parse_args(argv)
-    sources = tuple(args.allowed_profile_source or DEFAULT_PROFILE_SOURCES)
-    if args.allow_user_profile and "user" not in sources:
-        sources = sources + ("user",)
     if args.consume_marker and not args.output:
         print(json.dumps({"schema": SCHEMA, "eligible": False,
                           "code": "consume_marker_requires_output",
@@ -1395,7 +1374,6 @@ def main(argv: list[str] | None = None) -> int:
             evidence=args.evidence, db=args.db, task_dir=args.task_dir,
             executor_agent=args.executor_agent,
             executor_session=args.executor_session,
-            allowed_profile_sources=sources,
             require_model_selection=not args.no_model_selection_required,
             require_target=not args.skip_target_check,
             require_executor_identity=not args.skip_executor_check,

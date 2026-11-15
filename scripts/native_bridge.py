@@ -49,7 +49,12 @@ FINDING_SEVERITIES = ("blocking", "major", "minor", "info")
 FINDING_STATUSES = ("open", "resolved", "regressed")
 NATIVE_ASSIGNEES = ("zcode", "deepseek")
 EXECUTOR_KINDS = ("main", "subagent")
+# 独立复核的宿主权限契约：只读工具精确集合 + 必须显式禁用的写入/执行工具 +
+# 可接受的权限模式。判定只看宿主实际施加的有效策略，不看 Profile 名称、来源
+# 或所在路径；`g4_attest` 从 metadata.profileSnapshot 独立复核同一契约。
 REVIEWER_TOOLS = ("Read", "Grep", "Glob")
+REVIEWER_DISALLOWED = ("Write", "Edit", "Bash")
+REVIEWER_PERMISSION_MODES = ("default", "plan")
 
 EVIDENCE_ID_RE = re.compile(r"^E[1-9][0-9]{0,3}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -70,6 +75,67 @@ class BridgeError(ValueError):
 
 def _fail(code: str, message: str) -> None:
     raise BridgeError(code, message)
+
+
+def normalize_profile_policy(snapshot: object) -> dict:
+    """把宿主 profileSnapshot 归一化成 G4 判定用的**有效权限策略**。
+
+    Profile 名称、来源与路径只作为记录事实保留，不参与“是否只读”的判定。
+    """
+    data = snapshot if isinstance(snapshot, dict) else {}
+
+    def _names(key: str) -> list[str]:
+        value = data.get(key)
+        return [str(item) for item in value] if isinstance(value, list) else []
+
+    # skills/mcpServers 保留原值：任何非空值（含类型错误的字符串/对象）都算
+    # 启用，不能像列表那样被静默归一化成“空”。
+    return {
+        "name": str(data.get("name") or "").strip(),
+        "source": str(data.get("source") or "").strip(),
+        "path": str(data.get("path") or "").strip(),
+        "tools": _names("tools"),
+        "disallowedTools": _names("disallowedTools"),
+        "permissionMode": str(data.get("permissionMode") or "").strip(),
+        "skills": data.get("skills"),
+        "mcpServers": data.get("mcpServers"),
+    }
+
+
+def reviewer_policy_problems(policy: object) -> list[tuple[str, str]]:
+    """返回只读复核策略的偏离项；空列表表示等价于只读复核。
+
+    `tools=[]` 在宿主语义里等于“继承父工具”，一律拒绝；`tools` 必须精确等于
+    只读集合，多一个 Bash/Write/MCP 工具都不行。
+    """
+    data = normalize_profile_policy(policy)
+    problems: list[tuple[str, str]] = []
+    tools = data["tools"]
+    if not tools:
+        problems.append(("profile_tools_empty",
+                         "空工具集会被宿主解释为继承父工具"))
+    elif set(tools) != set(REVIEWER_TOOLS):
+        problems.append(("profile_tools_not_exact",
+                         f"tools={tools} 必须精确等于 {list(REVIEWER_TOOLS)}"))
+    disallowed = set(data["disallowedTools"])
+    missing = [name for name in REVIEWER_DISALLOWED if name not in disallowed]
+    if missing:
+        problems.append(("profile_disallowed_missing", ",".join(missing)))
+    mode = data["permissionMode"]
+    if mode and mode not in REVIEWER_PERMISSION_MODES:
+        problems.append(("profile_permission_mode", f"permissionMode={mode!r}"))
+    if data["skills"]:
+        problems.append(("profile_skills_not_allowed",
+                         f"skills={data['skills']}"))
+    if data["mcpServers"]:
+        problems.append(("profile_mcp_servers",
+                         f"mcpServers={data['mcpServers']}"))
+    return problems
+
+
+def _profile_policy_or_none(obj: dict) -> dict | None:
+    value = obj.get("profile")
+    return value if isinstance(value, dict) else None
 
 
 def _obj(value: object, name: str) -> dict:
@@ -413,10 +479,23 @@ def _validate_executor(executor: object, name: str) -> dict:
     if not agent_id or not child or not profile:
         _fail("executor_identity_missing",
               "子代理执行结果必须提供 agent_id / child_session_id / profile_id。")
-    if profile == "reviewer":
-        _fail("reviewer_as_executor", "reviewer Profile 不得承担执行工作项。")
+    # 只读 Profile 不得承担执行工作项。判定按宿主快照的有效策略，不按名称：
+    # 任一只读工具集都跑不了工程执行，名字叫什么都一样。`executor.profile`
+    # 字段必填（缺失失败关闭）；字段存在但未声明 tools 时视为“继承父工具/未知”，
+    # 按宿主语义不构成只读，因此不拒绝——只读判定只认精确的 Read/Grep/Glob。
+    # 权威复核仍由 `test_execution` 读取宿主 metadata 后重做。
+    policy = _profile_policy_or_none(obj)
+    if policy is None:
+        _fail("executor_profile_invalid",
+              "执行结果缺少 executor.profile（宿主 profileSnapshot 派生的有效"
+              "工具策略）；没有策略就无法证明执行方不是只读 Profile。")
+    if not reviewer_policy_problems(policy):
+        _fail("executor_profile_readonly",
+              "执行方 Profile 的有效工具策略等价于只读复核"
+              "（tools 仅 Read/Grep/Glob）；只读 Profile 不得承担工程执行。")
     return {"kind": "subagent", "agent_id": agent_id,
             "child_session_id": child, "profile_id": profile,
+            "profile": normalize_profile_policy(policy),
             "model_reported": model or None}
 
 
@@ -610,15 +689,23 @@ def _validate_reviewer(reviewer: object) -> dict:
     agent_id = _text(obj.get("agent_id"), "reviewer.agent_id")
     child = _text(obj.get("child_session_id"), "reviewer.child_session_id")
     profile = _text(obj.get("profile_id"), "reviewer.profile_id")
-    if profile != "reviewer":
+    profile_policy = _profile_policy_or_none(obj)
+    if profile_policy is None:
         _fail("reviewer_profile_invalid",
-              f"Reviewer 必须使用专用 reviewer Profile（实际 {profile!r}）。")
+              "Reviewer 信封缺少 reviewer.profile（宿主 profileSnapshot 派生的"
+              "有效工具策略）；Profile 名称、来源或路径都不能代替权限证据。")
+    problems = reviewer_policy_problems(profile_policy)
+    if problems:
+        code, detail = problems[0]
+        _fail("reviewer_profile_not_readonly",
+              f"Reviewer 的有效工具策略不满足只读复核（{code}: {detail}）。")
     model = _text(obj.get("model_reported"), "reviewer.model_reported")
     return {
         "kind": "subagent",
         "agent_id": agent_id,
         "child_session_id": child,
         "profile_id": profile,
+        "profile": normalize_profile_policy(profile_policy),
         "model_reported": model,
     }
 
@@ -1146,8 +1233,9 @@ def validate_review_result(envelope: object, dispatch: dict | None, execution: d
         if exec_value and rev_value and exec_value == rev_value:
             _fail("executor_reviewer_same",
                   f"Reviewer 与执行方的 {key} 相同；独立复核必须使用独立子会话。")
-    if str(executor.get("profile_id") or "") == "reviewer":
-        _fail("reviewer_as_executor", "执行方不得使用 reviewer Profile。")
+    if _profile_policy_or_none(executor) is not None and not \
+            reviewer_policy_problems(executor.get("profile")):
+        _fail("executor_profile_readonly", "执行方不得使用只读 Profile。")
     changed = _list(env.get("changed_files") or [], "review.changed_files")
     if changed:
         _fail("review_contaminated",

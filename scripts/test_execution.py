@@ -26,6 +26,7 @@ from datetime import datetime, timezone
 
 import code_scope
 import host_records
+import native_bridge as NB
 from lib_common import sha256_text
 from urllib.parse import quote
 
@@ -377,15 +378,16 @@ def build(execution: dict, attempt: dict, *, db: str,
                 problems.append("executor_metadata_session_mismatch")
             if str(data.get("status") or "") != "completed":
                 problems.append("executor_not_completed")
-            # Profile 自洽：metadata 的 profileId 必须与快照名一致，且执行方
-            # 不能是只读 Reviewer Profile；这只是身份一致性，不是权限证明。
+            # Profile 自洽：metadata 的 profileId 必须与快照名一致；执行方
+            # 不得使用只读 Profile——按宿主有效工具策略判定，与名称无关。
             profile = str(data.get("profileId") or "").strip()
             snap_profile = (data.get("profileSnapshot") or {}).get("name") \
                 if isinstance(data.get("profileSnapshot"), dict) else ""
             if not profile or str(snap_profile or "") != profile:
                 problems.append("executor_profile_mismatch")
-            if profile == "reviewer":
-                problems.append("executor_profile_reviewer")
+            if not NB.reviewer_policy_problems(
+                    NB.normalize_profile_policy(data.get("profileSnapshot"))):
+                problems.append("executor_profile_readonly")
             snapshot = attempt.get("code_snapshot") or {}
             workspace = ""
             if isinstance(snapshot, dict):
@@ -527,7 +529,7 @@ def build(execution: dict, attempt: dict, *, db: str,
                       "test_execution_time_outside_session",
                       "test_execution_after_attempt",
                       "executor_metadata_after_attempt",
-                      "executor_profile_mismatch", "executor_profile_reviewer",
+                      "executor_profile_mismatch", "executor_profile_readonly",
                       "executor_workspace_mismatch",
                       "executor_metadata_file_mismatch",
                       "execution_binding_missing",

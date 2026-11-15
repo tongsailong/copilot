@@ -251,6 +251,9 @@ class RealDistributionTests(unittest.TestCase):
         self.assertFalse([k for k in manifest if k.startswith("legacy/")])
         self.assertFalse([k for k in manifest if k.startswith("tests/")])
         self.assertNotIn("agents/reviewer.md", manifest)
+        # 工作区只读 Profile 由项目工作区加载，不分发。
+        self.assertNotIn("agents/independent-readonly.md", manifest)
+        self.assertFalse([k for k in manifest if k.startswith(".zcode/")])
         for retired in ("scripts/call_gpt.py", "scripts/review_ledger.py",
                         "scripts/reply_protocol.py"):
             self.assertNotIn(retired, manifest)

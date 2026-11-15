@@ -5,8 +5,9 @@
 
     ~/.zcode/skills/copilot        ← SKILL.md、scripts/、references/
 
-阶段九起旧 Reviewer 全局 Profile 已退役；Reviewer 使用工作区级只读 Profile
-（`.zcode/agents/reviewer.md`），不属于本工具的分发范围。
+旧 Reviewer 全局 Profile 已退役；工作区只读权限载体
+（`.zcode/agents/independent-readonly.md`）属于项目工作区配置，不属于本工具的
+分发范围。
 
 用法：
 

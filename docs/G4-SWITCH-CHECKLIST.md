@@ -51,9 +51,10 @@
 5. `sync_runtime.py` 的 Reviewer 分发目标与基线条目。
 6. 旧链专属测试（旧 Bash/preflight、rollout fallback、旧会话信封）改为新链语义或删除。
 
-保留：工作区 `.zcode/agents/reviewer.md`（Read/Grep/Glob、纯 JSON）、ZCode 原生
-Executor/Reviewer 子代理能力、执行方 Bash、`g4_attest`/`test_execution`/`g4_shadow`、
-execution binding、attempt、原始输出持久化、历史 attestation 与旧台账。
+保留：工作区通用只读 Profile `.zcode/agents/independent-readonly.md`（Read/Grep/Glob，
+v6.6.1 起取代 `reviewer.md`；纯 JSON 输出要求随派发 prompt）、ZCode 原生执行/复核子代理
+能力、执行方 Bash、`g4_attest`/`test_execution`/`g4_shadow`、execution binding、attempt、
+原始输出持久化、历史 attestation 与旧台账。
 
 ## 回退
 
@@ -71,7 +72,11 @@ execution binding、attempt、原始输出持久化、历史 attestation 与旧�
 - **真实模型输出**：本轮真实 Reviewer 正常输出小写 `pass`；大写归一化仍只有单元测试。
 - **历史增量基线**：阶段四及更早 attestation 无 `target_source`，需完整复核生成新基线。
 - **执行退出码绑定**：依赖宿主 `tool_usage.exit_code`；宿主库被整体替换不在防护范围。
-- **g4_attest 诊断开关**：CLI 仍保留 `--allow-user-profile` 供人工诊断；正式 shadow 路径
-  固定 `allowed_profile_sources=("project",)`，该开关不进入正式 G4。
+- **Profile 来源/路径不再门禁（v6.6.0）**：`g4_attest` 已移除
+  `allowed_profile_sources`、`require_workspace_profile` 与 CLI
+  `--allowed-profile-source`/`--allow-user-profile`；只读边界按宿主
+  `profileSnapshot` 的有效工具策略判定，Profile 名称/来源/路径只作记录事实
+  （见 `docs/DECISIONS.md` 第 47 条）。专用只读 Profile 文件仍然保留：宿主 3.18.2
+  没有派发期工具白名单，删掉它就无法证明只读。
 - **收口不重读 raw 文件**：G4 gate 核对 `host_sha256` 与 candidate 字段；raw 文件在
   ingest 后被改写不会被 gate 自动发现，需用 `verify_stored` 或独立审计复核。

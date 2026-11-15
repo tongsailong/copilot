@@ -159,6 +159,10 @@ SCENARIOS = {
         "test_bash_review_is_rejected"],
     "reviewer_profile_retired": [
         "tests.test_profile_policy.WorkspaceProfileTests."
+        "test_legacy_reviewer_profile_is_gone",
+        "tests.test_profile_policy.WorkspaceProfileTests."
+        "test_agents_dir_has_only_the_generic_profile",
+        "tests.test_profile_policy.WorkspaceProfileTests."
         "test_profile_disallows_bash_and_writes",
         "tests.test_sync_runtime.RealDistributionTests."
         "test_v6_modules_are_distributed_and_legacy_is_not"],

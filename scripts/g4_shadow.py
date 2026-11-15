@@ -412,13 +412,11 @@ def _empty_record(review: dict, state: dict, *, status: str, agreement: str,
 
 def build(review: dict, state: dict, attempt: dict | None, *,
           state_path: str, db: str = "",
-          allowed_profile_sources: tuple[str, ...] = ("project",),
           expected_target: str = "") -> dict:
     """运行一次影子取证，始终返回可持久化记录，不抛出取证错误。"""
     try:
         return _build(
             review, state, attempt, state_path=state_path, db=db,
-            allowed_profile_sources=allowed_profile_sources,
             expected_target=expected_target)
     except Exception as exc:  # 影子不得把任何取证异常升级为 ingest 失败
         return _empty_record(
@@ -430,7 +428,6 @@ def build(review: dict, state: dict, attempt: dict | None, *,
 
 def _build(review: dict, state: dict, attempt: dict | None, *,
            state_path: str, db: str = "",
-           allowed_profile_sources: tuple[str, ...] = ("project",),
            expected_target: str = "") -> dict:
     source = "state" if expected_target else "envelope"
     attempt_id = str(review.get("review_attempt_id") or "").strip()
@@ -473,7 +470,6 @@ def _build(review: dict, state: dict, attempt: dict | None, *,
             task_dir=task_dir,
             executor_agent=str(executor.get("agent_id") or ""),
             executor_session=str(executor.get("child_session_id") or ""),
-            allowed_profile_sources=allowed_profile_sources,
             require_target=True,
             require_executor_identity=True,
             outside_reads="reject",

@@ -80,7 +80,9 @@ class SnapshotBindingTests(unittest.TestCase):
                           "kind": "file"}],
             "executor": {"kind": "subagent", "agent_id": "agent-exec",
                          "child_session_id": "child-exec",
-                         "profile_id": "executor", "model_reported": "m"},
+                         "profile_id": "executor",
+                         "profile": {"tools": ["*"]},
+                         "model_reported": "m"},
             "timing": {"duration_ms": 10},
             "usage": {"total_tokens": 10},
             "execution_binding": {
@@ -133,7 +135,9 @@ class SnapshotBindingTests(unittest.TestCase):
             "evidence_manifest": list(attempt.get("evidence_manifest") or []),
             "reviewer": {"kind": "subagent", "agent_id": "agent-review",
                          "child_session_id": "child-review",
-                         "profile_id": "reviewer", "model_reported": "m"},
+                         "profile_id": "reviewer",
+                         "profile": F.readonly_profile_policy(),
+                         "model_reported": "m"},
             "host": host,
             "verdict": "pass",
             "findings": [],
@@ -335,7 +339,9 @@ class SnapshotBindingTests(unittest.TestCase):
                           "sha256": NB.sha256_file(evidence), "kind": "file"}],
             "executor": {"kind": "subagent", "agent_id": "agent-exec",
                          "child_session_id": "child-exec",
-                         "profile_id": "executor", "model_reported": "m"},
+                         "profile_id": "executor",
+                         "profile": {"tools": ["*"]},
+                         "model_reported": "m"},
             "timing": {"duration_ms": 1}, "usage": {"total_tokens": 1},
         }
         execution["result_sha256"] = NB.envelope_sha256(execution)

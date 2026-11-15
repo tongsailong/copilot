@@ -16,7 +16,9 @@ ROOT = os.path.dirname(HERE)
 
 SKILL = os.path.join(ROOT, "SKILL.md")
 REFERENCES = os.path.join(ROOT, "references")
-REVIEWER = os.path.join(ROOT, ".zcode", "agents", "reviewer.md")
+READONLY_PROFILE = os.path.join(ROOT, ".zcode", "agents",
+                                "independent-readonly.md")
+LEGACY_PROFILE = os.path.join(ROOT, ".zcode", "agents", "reviewer.md")
 ACTIVE_REFS = ("workflow.md", "runtime.md", "review.md", "agent-bridge.md")
 HISTORICAL_REFS = ("role.md", "role-consult.md", "role-plan.md", "role-review.md",
                    "role-map.md", "review-ledger.md")
@@ -136,7 +138,7 @@ class ReferenceTests(unittest.TestCase):
         self.assertIn("--create-attempt", o["review.md"])
         self.assertIn("native_review_attempt_workspace_drift", o["review.md"])
         self.assertIn("native_review_code_scope_drift", o["review.md"])
-        self.assertIn("code_snapshot", o["agent-bridge.md"] + text(REVIEWER))
+        self.assertIn("code_snapshot", o["agent-bridge.md"])
         self.assertIn("review_attempt_id", o["agent-bridge.md"])
         self.assertIn("review_attempt_created_at", o["agent-bridge.md"])
         self.assertIn("--create-attempt", o["workflow.md"])
@@ -157,17 +159,23 @@ class ReferenceTests(unittest.TestCase):
         self.assertIn("legacy/", doc)
 
 
-class ReviewerProfileTests(unittest.TestCase):
-    def test_workspace_profile_is_read_only_and_no_self_declared_g4(self):
-        doc = text(REVIEWER)
+class ReadonlyProfileTests(unittest.TestCase):
+    def test_workspace_profile_is_generic_read_only(self):
+        doc = text(READONLY_PROFILE)
         front = frontmatter(doc)
-        self.assertIn("copilot-native-review/v2", doc)
-        self.assertIn("plan_id", doc)
-        self.assertNotIn("round_id", doc)
-        self.assertNotIn("gpt-6.1-sol", doc)
         self.assertIn("tools: [Read, Grep, Glob]", front)
         self.assertIn("Bash", front.split("disallowedTools:", 1)[1].split("\n", 1)[0])
         self.assertIn("model: inherit", front)
+        self.assertIn("name: independent-readonly", front)
+        # 通用 Profile 只提供宿主权限，不承担复核输出契约或生命周期。
+        self.assertNotIn("copilot-native-review/v2", doc)
+        self.assertNotIn("plan_id", doc)
+        self.assertNotIn("gpt-6.1-sol", doc)
+        self.assertNotIn("round_id", doc)
+
+    def test_legacy_profiles_are_gone(self):
+        self.assertFalse(os.path.exists(LEGACY_PROFILE),
+                         "旧专用 reviewer 工作区 Profile 已删除")
         self.assertFalse(os.path.exists(os.path.join(ROOT, "agents", "reviewer.md")),
                          "旧 Reviewer 全局 Profile 已退役，不应回到源码")
 

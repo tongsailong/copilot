@@ -16,6 +16,13 @@ sys.path.insert(0, SCRIPTS)
 
 import governance as G  # noqa: E402
 
+# 只读复核 Profile 的有效权限策略：判定只看策略，不看 Profile 名称。
+READONLY_REVIEWER_PROFILE = {
+    "tools": ["Read", "Grep", "Glob"],
+    "disallowedTools": ["Write", "Edit", "Bash"],
+    "permissionMode": "default",
+}
+
 CONTRACT = """## 完成条件
 - 产出可复核的结果文件
 
@@ -334,7 +341,8 @@ class HighRiskGateTests(unittest.TestCase):
             "review_attempt_created_at": attempt["created_at"],
             "result_sha256": "r" * 64,
             "reviewer": {"profile_id": "reviewer", "agent_id": "agent-1",
-                         "child_session_id": "child-1"},
+                         "child_session_id": "child-1",
+                         "profile": READONLY_REVIEWER_PROFILE},
             "host": {"metadata_path": "/tmp/meta.json",
                      "output_file": "/tmp/out.txt",
                      "rollout_path": "/tmp/rollout.jsonl",
@@ -406,7 +414,12 @@ class HighRiskGateTests(unittest.TestCase):
             ({"unverified": ["未验证"]}, "native_review_unverified"),
             ({"changed_files": ["a.py"]}, "native_review_changed_files"),
             ({"g4_eligible": False}, "native_review_not_g4_eligible"),
-            ({"reviewer": {"profile_id": "executor", "agent_id": "agent-1",
+            ({"reviewer": {"profile_id": "reviewer", "agent_id": "agent-1",
+                           "child_session_id": "child-1",
+                           "profile": {**READONLY_REVIEWER_PROFILE,
+                                       "tools": ["Read", "Bash"]}}},
+             "native_review_profile_not_readonly"),
+            ({"reviewer": {"profile_id": "reviewer", "agent_id": "agent-1",
                            "child_session_id": "child-1"}},
              "native_review_profile_invalid"),
             ({"contract_sha256": "0" * 64}, "native_review_contract_mismatch"),

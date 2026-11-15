@@ -9,8 +9,9 @@
    运行时 `~/.zcode/skills/copilot` 是构建产物，只允许由
    `scripts-sync/sync_runtime.py` 单向下发；禁止双向维护，禁止把运行时当第二开发工作区。
    阶段九起旧 Reviewer 全局 Profile（`agents/reviewer.md` → `~/.zcode/agents/reviewer.md`）
-   已退役，Reviewer 使用工作区级 `.zcode/agents/reviewer.md`。依据：迁移前运行时目录不是
-   Git 仓库，也没有独立源码；DesignWise 已验证同一模式。
+   已退役；v6.6.1 起工作区唯一只读权限载体是 `.zcode/agents/independent-readonly.md`
+   （通用只读，不定义 Reviewer 角色）。依据：迁移前运行时目录不是 Git 仓库，也没有
+   独立源码；DesignWise 已验证同一模式。
 
 2. **分发范围固定为** `SKILL.md`、`scripts/**/*.py`、`references/**/*.md`。
    `tests/`、`docs/`、`manifests/`、`scripts-sync/`、`README.md`、`AGENTS.md` 与工作区
@@ -1021,3 +1022,49 @@
       `test_policy` 与四层测试证据均不降低；历史 attestation、旧台账与审计只读保留。
     - 回退使用普通 revert，不删除已消费 marker/新 attestation；不使用 force push。
       依据：用户阶段九授权；阶段八切换准入 PASS；旧机制与新链重复且旧链依赖 rollout。
+
+47. **复核方权限证据与 Profile 身份解耦（2026-11-15，v6.6.0）。**
+    用户要求把独立复核原生化，删除 Copilot 专用 Reviewer Profile。调查确认 ZCode
+    3.18.2 的 Agent 工具没有派发期 `tools` 参数，宿主只在 Agent Profile frontmatter 上
+    强制 `tools`/`disallowedTools`；内置 `general-purpose` 为 `*`、`Explore` 与官方插件
+    Agent 都含 `Bash`。因此本次只完成“判定口径去标识化”，Profile 文件保留。已确认：
+
+    - 只读边界唯一依据是宿主 `profileSnapshot` 派生的有效策略：`tools` 精确等于
+      `Read/Grep/Glob`、`disallowedTools` 含 `Write/Edit/Bash`、无 skills/MCP、
+      `permissionMode` 缺省/空（项目级快照通常不含该字段）或 `default`/`plan`。
+      Profile 名称、来源、路径只作记录事实。
+    - `g4_attest` 不再强制 `source=project`、工作区 `.zcode/agents` 路径或用户目录；
+      CLI 的 `--allowed-profile-source`/`--allow-user-profile` 一并移除。Profile 文件
+      仍须存在且正文等于快照 `systemPrompt`，缺失即 `profile_path_missing`（fail-closed）。
+    - 复核信封新增 `reviewer.profile`（由 metadata 快照派生）；`native_bridge` 缺失或
+      非只读 → `reviewer_profile_invalid` / `reviewer_profile_not_readonly`。
+      `governance` 与 `test_execution` 同步改为策略判定；执行信封必须携带
+      `executor.profile`（缺失 → `executor_profile_invalid`），等价只读策略 →
+      `executor_profile_readonly`。
+    - 工作区只读 Profile **保留**：在宿主支持按派发指定工具前，它是唯一可被宿主验证的
+      只读载体。删除它会让 G4 无法成立，不属于该轮授权内的“移除”。重新评估的触发条件：
+      ZCode 支持派发期工具白名单，或内置只读 Agent。v6.6.1 已按用户授权把它通用化为
+      `independent-readonly.md`（见第 48 条）。
+    - 历史记录：旧复核记录没有 `reviewer.profile`，收口/增量基线检查会按
+      `native_review_profile_invalid` 处理；需要增量复核前先做一次完整复核。
+    - 依据：用户 2026-11-15 授权与边界（原生接口无法可靠限制时不得仅凭 Prompt 声明
+      只读、不得删除现有 Profile、保留 G4 fail-closed）；真实 E2E `task-e2e-v66` 以
+      `independent-readonly` Profile 完成候选 G4 与自动收口。
+
+48. **通用只读权限 Profile 取代 Reviewer 专用 Profile（2026-11-15，v6.6.1）。**
+    用户确认接受一个最小化的通用只读 Profile，因为 ZCode 3.18.2 仍不支持派发期工具
+    白名单。已确认：
+
+    - `.zcode/agents/reviewer.md` 删除，新建 `.zcode/agents/independent-readonly.md`；
+      权限保持 `tools: [Read, Grep, Glob]`、`disallowedTools` 含 `Write/Edit/Bash` 与
+      Agent/Task/WebFetch 等、`permissionMode: default`、`injectAgentsMd: false`。
+    - Profile 只保留通用只读行为约束（只读、不扩范围、给事实/位置/证据、证据不足要说明），
+      删除 Reviewer 身份、复核流程、输出契约与生命周期；`review-json/v2` 的格式要求改由
+      主 Agent 的派发 prompt 提供。
+    - 同一个 `independent-readonly` 子代理既可用于普通只读调查，也可用于独立复核；是否
+      派生子代理、派几个、是否复核由 ZCode 主 Agent 自主决定，Copilot 不设固定轮次。
+    - G4 继续只验证宿主实际生效的工具权限与 Session/attempt/证据/输出绑定，不依赖固定
+      Profile 名称或路径（v6.6 已实现，本轮不重写）。旧复核记录的业务语义（`reviewer`
+      字段、findings、verdict、正式 REVIEW）保留。
+    - 项目级 Profile 由工作区加载，`sync_runtime.py` 不分发；旧全局
+      `~/.zcode/agents/reviewer.md` 不恢复。

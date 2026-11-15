@@ -2044,6 +2044,22 @@ def review_attempt_problems(review: dict, state: dict, *,
     return out
 
 
+def _reviewer_policy_problems(profile: object) -> list[str]:
+    """复核方有效权限策略不满足只读边界时的原因码（空列表表示合格）。
+
+    只读边界只看宿主 `profileSnapshot` 派生的有效策略：Profile 名称、来源与
+    所在路径都不是权限证据。缺策略字段同样失败关闭，不能用“名字看起来对”
+    或 Prompt 声明代替。
+    """
+    if not isinstance(profile, dict):
+        return ["native_review_profile_invalid"]
+    import native_bridge as NB  # 延迟导入：避免状态引擎与信封层在导入期耦合
+
+    if NB.reviewer_policy_problems(profile):
+        return ["native_review_profile_not_readonly"]
+    return []
+
+
 def _review_trust_problems(review: dict, state: dict, *, check_target: bool,
                            target: str = "") -> list[str]:
     """复核记录的可信性检查（可选是否要求绑定当前最终证据）。
@@ -2093,8 +2109,10 @@ def _review_trust_problems(review: dict, state: dict, *, check_target: bool,
         if bound != expected:
             problems.append("native_review_stale")
     reviewer = review.get("reviewer") or {}
-    if str(reviewer.get("profile_id") or "") != "reviewer":
+    if not str(reviewer.get("profile_id") or "").strip():
         problems.append("native_review_profile_invalid")
+    else:
+        problems.extend(_reviewer_policy_problems(reviewer.get("profile")))
     if not str(reviewer.get("agent_id") or "").strip() or not str(
             reviewer.get("child_session_id") or "").strip():
         problems.append("native_review_profile_invalid")

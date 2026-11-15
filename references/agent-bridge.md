@@ -7,8 +7,8 @@ v1 信封（SOL 通道时代）已退役，出现即 `schema_retired`。
 
 | 角色 | 职责 | 约束 |
 |---|---|---|
-| Executor | 执行单个工作项，产出结果与原始证据 | 必须是原生子代理（`kind=subagent`），带 Agent/Child Session 身份；不得使用 `reviewer` Profile |
-| Reviewer | 独立只读复核，给出 verdict/findings | 必须是 `kind=subagent`、`profile_id=reviewer`、工具仅 `Read/Grep/Glob`；不得修改文件、不得与执行方共用 Agent/Child Session |
+| Executor | 执行单个工作项，产出结果与原始证据 | 必须是原生子代理（`kind=subagent`），带 Agent/Child Session 身份；有效工具策略不得等价于只读复核 |
+| Reviewer | 独立只读复核，给出 verdict/findings | 必须是 `kind=subagent`，`reviewer.profile` 有效工具策略为 `tools=[Read,Grep,Glob]`、禁用 `Write/Edit/Bash`、无 skills/MCP；Profile 名称/来源/路径不参与判定；不得修改文件、不得与执行方共用 Agent/Child Session |
 
 Copilot 不派发 Agent、不调用模型、不写别人的会话。它只校验宿主已产生的记录并回填状态。
 `native_agent.py` 从真实 `metadata.json`、宿主 SQLite（`tool_usage`/`part`/`session_entry`）
@@ -60,7 +60,11 @@ Copilot 不派发 Agent、不调用模型、不写别人的会话。它只校验
   "result": "实际结果（文件/命令/diff 摘要）",
   "evidence": [{"id": "E1", "file": "/abs/path", "sha256": "<64 hex>", "kind": "file"}],
   "executor": {"kind": "subagent", "agent_id": "...", "child_session_id": "...",
-               "profile_id": "executor", "model_reported": "..."},
+               "profile_id": "<实际 Profile 名>",
+               "profile": {"name": "...", "source": "built-in|project|user",
+                            "path": "", "tools": ["*"], "disallowedTools": [],
+                            "permissionMode": ""},
+               "model_reported": "..."},
   "timing": {"duration_ms": 1200},
   "usage": {"total_tokens": 321},
   "result_sha256": "<信封自身摘要>"
@@ -79,7 +83,12 @@ Copilot 不派发 Agent、不调用模型、不写别人的会话。它只校验
   `copilot_dispatch.py rerun --state ... --id <工作项> --reason <原因>` 把它重开为
   `pending`（旧结果保留在 `rerun_history`），再回填新的执行结果；不要为了让新结果
   通过而伪造新工作项或改写历史。
-- 执行方不得使用 `reviewer` Profile（`reviewer_as_executor`）。
+- 执行方必须提供 `executor.profile` 有效策略（缺失 → `executor_profile_invalid`），
+  且不得等价于只读复核（`executor_profile_readonly`）；与 Profile 名称无关。
+- **信封文件不要写进代码工作区**：执行信封自身被排除在它自己的代码快照之外，而
+  `reviews` 的 attempt 快照会包含它；两者不一致会得到
+  `execution_code_scope_mismatch`。把 `A1.execution.json`、`A1.review.json` 写在工作区
+  之外（或任务状态目录与代码仓库分离）即可。
 
 ### 2.3 review（`copilot-native-review/v2`）
 
@@ -97,7 +106,12 @@ Copilot 不派发 Agent、不调用模型、不写别人的会话。它只校验
   "based_on_review_sha256": "<增量复核的基线；full 时为空>",
   "evidence_manifest": ["E7", "E8"],
   "reviewer": {"kind": "subagent", "agent_id": "agent-review",
-               "child_session_id": "child-review", "profile_id": "reviewer",
+               "child_session_id": "child-review", "profile_id": "<实际 Profile 名>",
+               "profile": {"name": "...", "source": "project|user|...",
+                            "path": "/abs/<profile>.md",
+                            "tools": ["Read", "Grep", "Glob"],
+                            "disallowedTools": ["Write", "Edit", "Bash", "..."],
+                            "permissionMode": "default"},
                "model_reported": "..."},
   "host": {"metadata_path": "/abs/metadata.json",
            "output_file": "/abs/review-output.json",
@@ -127,6 +141,22 @@ Copilot 不派发 Agent、不调用模型、不写别人的会话。它只校验
 `g4_source` 与 `candidate_g4` 由 `copilot_auto._ingest_review` 写入状态记录，不是
 Reviewer 信封字段。
 
+派发 prompt 必须自带原始输出契约（通用只读 Profile 不定义复核流程或格式）。
+`native_agent.py review` 只从宿主输出取证，并核对下列绑定字段：
+
+```json
+{"schema": "copilot-native-review/v2",
+ "task_id": "...", "plan_id": "...", "dispatch_id": "...",
+ "work_item_id": "A1", "execution_result_sha256": "<被执行结果摘要>",
+ "review_attempt_id": "RA<24 hex>",
+ "verdict": "pass|partial|blocked", "findings": [],
+ "changed_files": [], "unverified": [], "residual_risks": []}
+```
+
+`execution_result_sha256` 与 `work_item_id` 必填；其余绑定字段若填写必须与本次对象
+一致；`changed_files` 必须为空（只读复核不得改动文件）。缺少模板时容易得到
+`review_output_unbound`。
+
 校验要点：
 
 - 必须绑定一条**已回填**的执行结果（`execution_result_sha256`）；先 ingest 执行信封。
@@ -136,9 +166,11 @@ Reviewer 信封字段。
   文件证据内容与 git 工作区代码范围；`review --attempt` 拒绝旧 attempt、已消费 attempt、
   目标过期或代码范围已漂移的 attempt。
 - `work_item_id` / `dispatch_id` / 执行摘要必须与执行结果一致（`review_binding_mismatch`）。
-- Reviewer 必须是独立子代理（`reviewer_invalid`），Profile 必须是 `reviewer`
-  （`reviewer_profile_invalid`），且与执行方不同 Agent / Child Session
-  （`executor_reviewer_same`、`review_contaminated`）。
+- Reviewer 必须是独立子代理（`reviewer_invalid`），且必须携带由宿主
+  `profileSnapshot` 派生的 `reviewer.profile` 有效策略（缺失 → `reviewer_profile_invalid`，
+  不满足只读 → `reviewer_profile_not_readonly`）。Profile 名称、来源与路径都不是权限
+  证据；只有 Prompt 声明只读而没有宿主策略时同样拒绝。Reviewer 与执行方必须使用不同
+  Agent / Child Session（`executor_reviewer_same`、`review_contaminated`）。
 - Reviewer **没有 Bash 权限**：`commands_run` 必须为空，出现任何 Bash 命令直接
   `review_command_unexpected`。`files_inspected` 由 `native_agent.py` 合并自报与宿主
   `tool_usage`/`part` 的 Read/Grep/Glob 路径；`declared_files_unverified` 非空时写入
@@ -151,8 +183,9 @@ Reviewer 信封字段。
   JSON 对象，或**恰好一个** fenced 代码块且围栏外只允许空白；多个围栏/多个对象、
   围栏外叙述、重复键、顶层非对象一律拒收（`review_output_ambiguous` /
   `review_output_outside_text` / `review_output_unparseable` /
-  `review_output_not_object`）。不再接受“围栏外带说明文字”的旧格式；工作区
-  Reviewer Profile 要求只输出纯 JSON，解析器版本记录在 `PARSER_VERSION`。
+  `review_output_not_object`）。不再接受“围栏外带说明文字”的旧格式；纯 JSON 输出
+  要求写在**派发 prompt** 里（通用只读 Profile 不定义输出契约），解析器版本记录在
+  `PARSER_VERSION`。
 - `files_inspected` 若填写，路径必须存在且是普通文件（`review_inspection_invalid`）。
 - `g4_eligible=true` 时必须：`verdict=pass`、无 blocking、`unverified` 为空、
   `changed_files` 为空，并附完整宿主记录（`g4_requires_pass`、`g4_with_unverified`、
@@ -179,8 +212,10 @@ execution binding → 真实 Executor 会话 → 测试执行/证据
 
 `g4_attest.attest` 只读宿主 `metadata.json` 与 SQLite，独立核对：
 
-- Reviewer Profile 工具集精确 `Read/Grep/Glob`、`disallowedTools` 含写工具与 Bash、
-  `permissionMode=default`、无 skills/MCP、工作区级 Profile 内容匹配；
+- Profile 的**有效工具策略**：工具集精确 `Read/Grep/Glob`、`disallowedTools` 含
+  `Write/Edit/Bash`、无 skills/MCP、`permissionMode` 缺省/空或 `default`/`plan`；
+  Profile 名称/来源/路径不参与判定，但快照 `path` 指向的 Profile 文件必须存在且正文
+  等于 `profileSnapshot.systemPrompt`；
 - Agent/Child Session/父会话/trace、会话开始/结束时间晚于 attempt、prompt 携带
   attempt id、`workspaceRoot` 等于 attempt 代码根；
 - `tool_usage`/`part` 的每次调用均只读、计数与 `totalToolUseCount` 一致，无 Bash；
@@ -280,9 +315,9 @@ python3 -B scripts/copilot_auto.py ingest --state T/state.json --review-file A1.
 | schema | `schema_invalid`、`schema_retired`、`hash_invalid` |
 | 任务/合同 | `task_mismatch`、`contract_mismatch`、`credential_missing` |
 | 计划/派发 | `plan_missing`、`plan_unknown`、`plan_mismatch`、`plan_drift`、`dispatch_missing`、`dispatch_empty`、`dispatch_duplicate`、`dispatch_mismatch`、`dispatch_id_drift`、`idempotency_mismatch`、`iteration_mismatch`、`work_item_unknown`、`work_item_terminal` |
-| 执行 | `backend_not_native`、`assignee_unsupported`、`invalid_status`、`executor_identity_missing`、`reviewer_as_executor` |
+| 执行 | `backend_not_native`、`assignee_unsupported`、`invalid_status`、`executor_identity_missing`、`executor_profile_invalid`、`executor_profile_readonly` |
 | 证据 | `evidence_missing`、`evidence_invalid`、`evidence_duplicate`、`evidence_unreadable`、`evidence_sha_mismatch`、`evidence_foreign`、`evidence_conflict` |
-| 复核 | `reviewer_invalid`、`reviewer_profile_invalid`、`review_binding_mismatch`、`executor_reviewer_same`、`review_contaminated`、`invalid_verdict`、`review_attempt_missing`、`review_attempt_invalid`、`review_finding_invalid`、`review_finding_duplicate`、`review_inspection_invalid`、`review_command_unexpected`、`review_output_ambiguous`、`review_output_unparsable`、`review_scope_invalid`、`incremental_base_missing`、`incremental_base_ineligible`、`incremental_manifest_missing`、`incremental_evidence_uncovered`、`incremental_criteria_changed`、`incremental_scope_too_narrow` |
+| 复核 | `reviewer_invalid`、`reviewer_profile_invalid`、`reviewer_profile_not_readonly`、`review_binding_mismatch`、`executor_reviewer_same`、`review_contaminated`、`invalid_verdict`、`review_attempt_missing`、`review_attempt_invalid`、`review_finding_invalid`、`review_finding_duplicate`、`review_inspection_invalid`、`review_command_unexpected`、`review_output_ambiguous`、`review_output_unparsable`、`review_scope_invalid`、`incremental_base_missing`、`incremental_base_ineligible`、`incremental_manifest_missing`、`incremental_evidence_uncovered`、`incremental_criteria_changed`、`incremental_scope_too_narrow` |
 | G4 | `g4_host_record_missing`、`g4_host_record_invalid`、`g4_tool_calls_missing`、`g4_tool_not_readonly`、`g4_not_eligible`、`g4_requires_pass`、`g4_with_unverified`、`g4_with_blocking`、`pass_with_blocking_finding`、`pass_with_unverified`、`host_profile_changed`、`host_session_time_changed`、`host_prompt_changed`、`review_attempt_prompt_unbound`、`review_attempt_session_precedes_attempt`、`native_review_attempt_*`、`native_review_attempt_workspace_drift`、`native_review_code_scope_*`、`incremental_code_changed` 等 |
 
 `g4_host_record_*`、`g4_tool_calls_*`、`host_profile_changed` 等旧宿主校验码只出现在

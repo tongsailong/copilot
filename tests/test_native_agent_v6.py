@@ -84,7 +84,9 @@ class BuildReviewTests(unittest.TestCase):
                           "sha256": NB.sha256_file(self.evidence), "kind": "file"}],
             "executor": {"kind": "subagent", "agent_id": "agent-exec",
                          "child_session_id": "child-exec",
-                         "profile_id": "executor", "model_reported": "m"},
+                         "profile_id": "executor",
+                         "profile": {"tools": ["*"]},
+                         "model_reported": "m"},
             "timing": {"duration_ms": 10},
             "usage": {"total_tokens": 10},
         }
@@ -185,6 +187,52 @@ class BuildReviewTests(unittest.TestCase):
         self.assertEqual(
             sorted(env["host"]["tool_calls"], key=lambda c: c["name"]),
             [{"name": "Grep", "count": 1}, {"name": "Read", "count": 1}])
+
+    def _rewrite_metadata(self, **profile_fields) -> None:
+        path = self.host["metadata_path"]
+        with open(path, encoding="utf-8") as fh:
+            meta = json.load(fh)
+        if "profile_id" in profile_fields:
+            meta["profileId"] = profile_fields.pop("profile_id")
+        meta["profileSnapshot"].update(profile_fields)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(meta, fh, ensure_ascii=False, indent=2)
+            fh.write("\n")
+
+    def test_reviewer_profile_name_is_not_gating(self):
+        # Profile 名称改变不影响合法复核：信封记录真实名称，资格由有效策略决定。
+        self._rewrite_metadata(name="generic-readonly", profile_id="generic-readonly")
+        env = NA.build_review(self._args())
+        self.assertTrue(env["g4_eligible"])
+        self.assertEqual(env["reviewer"]["profile_id"], "generic-readonly")
+        self.assertEqual(env["reviewer"]["profile"]["tools"],
+                         ["Read", "Grep", "Glob"])
+        self.assertEqual(env["reviewer"]["profile"]["name"], "generic-readonly")
+
+    def test_reviewer_profile_with_bash_is_rejected(self):
+        self._rewrite_metadata(tools=["Read", "Grep", "Glob", "Bash"])
+        with self.assertRaises(NA.AgentRecordError) as ctx:
+            NA.build_review(self._args())
+        self.assertIn("profile_tools_not_exact", str(ctx.exception))
+
+    def test_reviewer_profile_with_write_is_rejected(self):
+        self._rewrite_metadata(tools=["Read", "Grep", "Glob", "Write"])
+        with self.assertRaises(NA.AgentRecordError) as ctx:
+            NA.build_review(self._args())
+        self.assertIn("profile_tools_not_exact", str(ctx.exception))
+
+    def test_reviewer_profile_mcp_is_rejected(self):
+        self._rewrite_metadata(mcpServers=["playwright"])
+        with self.assertRaises(NA.AgentRecordError) as ctx:
+            NA.build_review(self._args())
+        self.assertIn("profile_mcp_servers", str(ctx.exception))
+
+    def test_reviewer_policy_missing_fails_closed(self):
+        # 只有 Prompt/README 声明只读、没有宿主有效策略时不得成为复核证据。
+        self._rewrite_metadata(tools=None, disallowedTools=None)
+        with self.assertRaises(NA.AgentRecordError) as ctx:
+            NA.build_review(self._args())
+        self.assertIn("profile_tools_empty", str(ctx.exception))
 
     def test_non_pass_review_is_generated_but_not_g4(self):
         # 高风险 Reviewer 可以如实报告 partial/blocking；官方生成路径不能因此

@@ -8,8 +8,8 @@
 - 多个对象/多个围栏、围栏外叙述、重复键、非对象顶层一律拒收。
 - 不做文案修正、不猜测结论；原始文本 SHA-256 由调用方单独保存。
 
-旧版本 Reviewer 若输出前言/多围栏，会被 fail-closed；工作区 Profile 已要求纯
-JSON，这是明确的版本边界（`PARSER_VERSION`）。
+旧版本若输出前言/多围栏，会被 fail-closed：纯 JSON 要求写在复核派发 prompt 里
+（通用只读 Profile 不定义输出契约），这是明确的版本边界（`PARSER_VERSION`）。
 """
 from __future__ import annotations
 

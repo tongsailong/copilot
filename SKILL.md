@@ -8,7 +8,7 @@ when_to_use: >
   原生完成，不进入本 Skill。
 ---
 
-# copilot：轻量协作治理（v6.5.0）
+# copilot：轻量协作治理（v6.6.1）
 
 Copilot 是运行在 ZCode 内的**协作治理层**，不是决策模型，也不是执行体。它负责把任务变成可
 追踪的合同、状态、证据与收口条件，并在任务没有真正完成时继续推进。
@@ -177,10 +177,12 @@ BLOCKED 表示**不能正常收口或继续受阻动作**，不表示无法记�
 - `drive` 生成 `copilot-native-dispatch/v2`（绑定 task / contract / plan / iteration），工作项
   带稳定 `dispatch_id` 与 `idempotency_key`。
 - 执行方用 `native_agent.py execution` 生成 `copilot-native-result/v2`，绑定计划与执行方身份。
-- 复核方用工作区级 `reviewer` Profile（工具仅 `Read/Grep/Glob`，无 Bash）派发，再用
+- 复核方用 ZCode 原生只读子代理派发：宿主 `profileSnapshot` 的有效工具策略必须是
+  `tools=[Read,Grep,Glob]` 且禁用 `Write/Edit/Bash`、无 skills/MCP；Profile 名称、来源与
+  路径不参与判定（`reviewer.profile`），无宿主策略时失败关闭。再用
   `native_agent.py review` 生成 `copilot-native-review/v2`；`g4_eligible` 只是结构预检，
   正式资格由 `g4_attest` 读取宿主 DB（`tool_usage`/`part`/`session_entry`）独立核验
-  Profile、会话/prompt/工作区、工具调用与原始输出，再由 `test_execution` 与
+  有效权限策略、会话/prompt/工作区、工具调用与原始输出，再由 `test_execution` 与
   `g4_shadow`/候选闭环派生。`commands_run` 必须为空，`files_inspected` 由宿主工具记录合并。
 - **G4 必须先创建 review attempt**：`review-context --create-attempt --workspace <任务仓库>`
   在派发前把 task / contract / plan / dispatch / work item / execution / 当前
@@ -278,15 +280,36 @@ severity）→ 集中修复 → 针对性复核（只验证修复、新问题、
 
 ## 版本
 
-当前版本 **v6.5.0（ZCode Autonomous Development Edition）**。v6.5 完成正式 G4 切换与
-旧 Reviewer 体系退役：
+当前版本 **v6.6.1（ZCode Autonomous Development Edition）**。v6.6.1 把工作区里最后一个
+Reviewer 专用文件改为通用只读权限载体：
+
+- **Profile 通用化**：`.zcode/agents/reviewer.md` → `.zcode/agents/independent-readonly.md`，
+  只声明宿主只读权限（`tools=[Read,Grep,Glob]`、禁用 `Write/Edit/Bash`、无 skills/MCP），
+  不再包含 Reviewer 身份、复核流程、输出契约或生命周期；同一个子代理既可用于普通只读
+  调查，也可用于独立复核。
+- **输出契约随派发走**：`review-json/v2` 的格式要求写在主 Agent 的派发 prompt 里，不再由
+  Profile 承担；G4 判定、Session/attempt/证据绑定与 fail-closed 不变。
+- **调用策略归主 Agent**：是否派生子代理、派几个、是否需要复核由 ZCode 主 Agent 按风险
+  自主决定；Copilot 只做状态治理与取证，不维护 Reviewer 生命周期。
+
+v6.6 把复核方身份与权限证据解耦：
+
+- **有效权限取代 Profile 身份**：复核资格只看宿主 `profileSnapshot` 派生的有效工具策略
+  （`tools=[Read,Grep,Glob]`、禁用 `Write/Edit/Bash`、无 skills/MCP）；Profile 名称、来源
+  与路径只作记录事实，不再参与 G4 判定。缺少策略证据时失败关闭。
+- **范围**：`native_bridge`/`native_agent`/`governance`/`test_execution`/`g4_attest`/
+  `g4_shadow` 同步改为策略判定；执行方只读 Profile 一律拒绝（`executor_profile_readonly`）。
+- **保留**：宿主 `tools` 白名单仍是唯一可证明的只读约束；工作区通用只读 Profile
+  （v6.6.1 起为 `independent-readonly.md`）在原生接口支持按派发指定工具前仍保留。
+
+v6.5 完成正式 G4 切换与旧 Reviewer 体系退役：
 
 - **正式 G4 切换**：`copilot_auto._ingest_review` 只在 `risk=high`、`g4_shadow` 状态
   `attested` 且新链 eligible 时写入正式 `g4_eligible=true`/`g4_source="candidate"`；
   `governance` 拒绝没有 candidate 来源的旧记录。信封自报 `g4_eligible` 不再生效。
-- **旧机制退役**：删除旧全局 `agents/reviewer.md` 与运行时副本，Reviewer 只使用工作区级
+- **旧机制退役**：删除旧全局 `agents/reviewer.md` 与运行时副本，复核只使用工作区级
   只读 Profile（Read/Grep/Glob，无 Bash）；删除 Bash 白名单、rollout 强依赖、旧会话/
-  宿主记录重复校验入口与重复证据计算；`sync_runtime` 不再分发 Reviewer。
+  宿主记录重复校验入口与重复证据计算；`sync_runtime` 不再分发任何 Profile。
 - **合同测试策略**：高风险任务必须显式声明 `test_policy`；合同命令/报告/产物进入合同
   指纹与 binding，调用方只能加严；测试证据按四层判定，只有当前合同显式不要求测试时
   才接受 N/A。

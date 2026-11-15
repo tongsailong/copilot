@@ -373,8 +373,11 @@ def build_execution(args) -> dict:
     dispatch_env, native = _dispatch_for_state(state, args.dispatch)
     action = _find_action(dispatch_env, args.work_item)
     meta = _load_metadata(args.metadata)
-    if meta["profile_id"] == "reviewer":
-        raise AgentRecordError("reviewer Profile 不得作为 Executor。")
+    if not NB.reviewer_policy_problems(
+            NB.normalize_profile_policy(meta["profile_snapshot"])):
+        raise AgentRecordError(
+            f"执行方 Profile {meta['profile_id']!r} 的有效工具策略等价于只读复核"
+            "（tools 仅 Read/Grep/Glob）；只读 Profile 不得承担工程执行。")
     if meta["status"] != "completed":
         raise AgentRecordError(
             f"Executor metadata.status={meta['status']!r}，不是 completed；"
@@ -442,6 +445,7 @@ def build_execution(args) -> dict:
             "agent_id": meta["agent_id"],
             "child_session_id": meta["child_session_id"],
             "profile_id": meta["profile_id"],
+            "profile": NB.normalize_profile_policy(meta["profile_snapshot"]),
             "model_reported": model,
             "model_source": model_source,
         },
@@ -879,10 +883,14 @@ def build_review(args) -> dict:
             "[review_attempt_missing] 高风险 G4 复核必须先创建 review attempt；"
             "用 review-context --create-attempt 固化派发快照后再生成信封。")
     meta = _load_metadata(args.metadata)
-    if meta["profile_id"] != "reviewer":
+    reviewer_policy = NB.normalize_profile_policy(meta["profile_snapshot"])
+    policy_problems = NB.reviewer_policy_problems(reviewer_policy)
+    if policy_problems:
+        code, detail = policy_problems[0]
         raise AgentRecordError(
-            f"Reviewer metadata.profileId={meta['profile_id']!r}，不是 reviewer；"
-            "不得用其他 Profile 冒充独立 Reviewer。")
+            f"[{code}] Reviewer Profile {meta['profile_id']!r} 的宿主有效工具策略"
+            f"不满足只读复核：{detail}。独立复核必须由宿主只读子代理完成，"
+            "不能用 Profile 名称或 Prompt 声明代替权限证据。")
     if meta["status"] != "completed":
         raise AgentRecordError(
             f"Reviewer metadata.status={meta['status']!r}，不是 completed；"
@@ -984,7 +992,10 @@ def build_review(args) -> dict:
             "kind": "subagent",
             "agent_id": meta["agent_id"],
             "child_session_id": meta["child_session_id"],
-            "profile_id": "reviewer",
+            # Profile 名称只是记录事实；独立性由 agent/session 身份与宿主
+            # 有效权限策略共同证明，G4 不依赖任何固定 Profile 名称或路径。
+            "profile_id": meta["profile_id"],
+            "profile": reviewer_policy,
             "model_reported": model,
         },
         "host": host,
