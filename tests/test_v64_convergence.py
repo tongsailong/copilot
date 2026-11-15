@@ -237,6 +237,16 @@ class ReviewContextWarningTests(F.BridgeBase):
             session_created_at=attempt["created_at"])
         env = self.review(self.execution_env, attempt=attempt, host=host)
         AC._ingest_review(self.state_path, env)
+        # 阶段九：旧 PASS 必须来自新链才进入“目标摘要变化”诊断。
+        state = G.load_state(self.state_path)
+        record = state["native_reviews"][-1]
+        record["g4_eligible"] = True
+        record["g4_source"] = "candidate"
+        record["candidate_g4"] = {"eligible": True, "reasons": []}
+        bound = G.find_review_attempt(state, attempt["review_attempt_id"])
+        bound["consumed"] = True
+        bound["consumed_by_result_sha256"] = record["result_sha256"]
+        G.save_state(self.state_path, state)
         review_path = os.path.join(self.dir, "previous.json")
         with open(review_path, "w", encoding="utf-8") as fh:
             json.dump(env, fh, ensure_ascii=False)
@@ -258,7 +268,8 @@ class ReviewOrderTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             state = os.path.join(tmp, "state.json")
             G.start_state(state, goal="目标", contract=CONTRACT,
-                          execution_backend="native", risk="high")
+                          execution_backend="native", risk="high",
+                          test_policy={"required": False})
             G.plan_state(state, {"summary": "实现", "actions": [
                 {"id": "A1", "title": "实现", "goal": "产出结果",
                  "expected_evidence": "结果文件"},

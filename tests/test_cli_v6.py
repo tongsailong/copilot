@@ -245,7 +245,8 @@ class NativeCliTests(unittest.TestCase):
             fh.write(CONTRACT)
         proc = F.run_cli("copilot_dispatch.py", "start", "--state", self.state,
                          "--goal", "目标", "--contract-file", self.contract,
-                         "--risk", "high", "--backend", "native")
+                         "--risk", "high", "--backend", "native",
+                         "--test-policy", '{"required": false}')
         self.assertEqual(proc.returncode, 0, proc.stderr)
         plan = write_json(os.path.join(self.dir, "plan.json"), PLAN)
         self.assertEqual(F.run_cli("copilot_dispatch.py", "plan", "--state", self.state,
@@ -312,7 +313,7 @@ class NativeCliTests(unittest.TestCase):
             "verdict": "pass",
             "findings": [],
             "files_inspected": [self.evidence],
-            "commands_run": ["git status --short"],
+            "commands_run": [],
             "changed_files": [],
             "unverified": [],
             "residual_risks": [],
@@ -357,14 +358,15 @@ class NativeCliTests(unittest.TestCase):
         proc = F.run_cli("copilot_auto.py", "ingest", "--state", self.state,
                          "--review-file", review_file)
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("g4_eligible=True", proc.stdout)
-
-        self.assertEqual(F.run_cli("copilot_dispatch.py", "record", "--state", self.state,
-                                   "--id", "AUTO-G4", "--status", "done",
-                                   "--result", "复核完成").returncode, 0)
-        proc = F.run_cli("copilot_auto.py", "drive", "--state", self.state)
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertTrue(read_json(self.state)["closure"]["closed"])
+        # 阶段九：没有真实 Executor 宿主记录/新链 attestation 的复核不再获得
+        # 正式 G4，即使信封自报 g4_eligible=true。
+        self.assertIn("g4_eligible=False", proc.stdout)
+        state = read_json(self.state)
+        self.assertEqual(state["native_reviews"][0]["g4_source"], "")
+        self.assertTrue(state["native_reviews"][0]["g4_reasons"])
+        attempt = G.find_review_attempt(
+            state, review["review_attempt_id"])
+        self.assertFalse(attempt["consumed"])
 
     def test_tampered_execution_envelope_is_rejected(self):
         F.run_cli("copilot_auto.py", "drive", "--state", self.state,
@@ -400,9 +402,13 @@ class NativeCliTests(unittest.TestCase):
         review_file = write_json(os.path.join(self.dir, "review.json"), review)
         proc = F.run_cli("copilot_auto.py", "ingest", "--state", self.state,
                          "--review-file", review_file)
-        self.assertEqual(proc.returncode, 12)
-        self.assertIn("G4", proc.stderr)
-        self.assertEqual(read_json(self.state)["native_reviews"], [])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        # 新链独立核对 Profile 快照：工具集被改写后影子取证不通过，复核不以
+        # 正式 G4 记录；不再是旧 G4 的 ingest 硬拒绝。
+        review_record = read_json(self.state)["native_reviews"][0]
+        self.assertFalse(review_record["g4_eligible"])
+        self.assertEqual(review_record["g4_source"], "")
+        self.assertTrue(review_record["g4_reasons"])
 
 
 if __name__ == "__main__":

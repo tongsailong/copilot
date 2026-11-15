@@ -33,7 +33,7 @@ if HERE not in sys.path:
 
 import governance as G  # noqa: E402
 
-__version__ = "6.4.0"
+__version__ = "6.5.0"
 
 
 class CLIError(Exception):
@@ -63,6 +63,21 @@ def _load_json_doc(text: str, name: str):
         return json.loads(raw)
     except ValueError as exc:
         raise CLIError(f"{name} 不是合法 JSON：{exc}") from None
+
+
+def _load_test_policy(args):
+    """合同测试策略：--test-policy JSON 或 --test-policy-file；两者都空则不设置。"""
+    inline = str(getattr(args, "test_policy", "") or "").strip()
+    path = str(getattr(args, "test_policy_file", "") or "").strip()
+    if inline and path:
+        raise CLIError("--test-policy 与 --test-policy-file 只能给一个。")
+    if not inline and not path:
+        return None
+    text = _read_text(path) if path else inline
+    value = _load_json_doc(text, "测试策略")
+    if not isinstance(value, dict):
+        raise CLIError("测试策略必须是 JSON 对象。")
+    return value
 
 
 def _load_criteria(path: str):
@@ -119,7 +134,8 @@ def cmd_start(args) -> int:
         _state_path(args), args.goal, contract=contract, criteria=criteria,
         risk=args.risk, execution_backend=args.backend,
         task_id=args.task_id or "", mode=args.mode or "", note=args.note or "",
-        contract_source=args.contract_file or "")
+        contract_source=args.contract_file or "",
+        test_policy=_load_test_policy(args))
     print(f"任务已创建：{state['task_id']}")
     print(f"状态文件：{os.path.abspath(_state_path(args))}")
     print(f"完成条件：{len(state['contract']['criteria'])} 条 "
@@ -599,7 +615,8 @@ def cmd_contract(args) -> int:
                      if args.contract_file else "")
     criteria = _load_criteria(args.criteria_file) if args.criteria_file else None
     result = G.amend_contract(path, contract=contract_text, criteria=criteria,
-                              contract_source=args.contract_file or "")
+                              contract_source=args.contract_file or "",
+                              test_policy=_load_test_policy(args))
     print(f"合同已修订：criteria_sha256={result['criteria_sha256'][:16]}…")
     for criterion in result["criteria"]:
         print(f"- {criterion['criterion_id']} [{criterion['status']}] "
@@ -682,6 +699,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--goal", required=True)
     p.add_argument("--contract-file", default="", help="合同 Markdown；`## 完成条件` 列表")
     p.add_argument("--criteria-file", default="", help="条件 JSON 数组或逐行文本")
+    p.add_argument("--test-policy", default="",
+                   help="合同测试策略 JSON（required/commands/report/artifacts/require_*）")
+    p.add_argument("--test-policy-file", default="",
+                   help="合同测试策略 JSON 文件")
     p.add_argument("--risk", default="normal", choices=G.RISKS,
                    help="high 需要 G4，只能配 --backend native")
     p.add_argument("--backend", default="legacy", choices=G.BACKENDS)
@@ -809,6 +830,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--amend", action="store_true")
     p.add_argument("--contract-file", default="")
     p.add_argument("--criteria-file", default="")
+    p.add_argument("--test-policy", default="",
+                   help="修订合同测试策略 JSON（省略则保留原策略）")
+    p.add_argument("--test-policy-file", default="")
     p.set_defaults(func=cmd_contract)
 
     p = sub.add_parser("authorize-review", help="记录用户对正式 REVIEW 的明确授权")

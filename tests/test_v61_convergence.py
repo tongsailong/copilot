@@ -30,109 +30,6 @@ class CodeAssertions(unittest.TestCase):
         self.assertEqual(ctx.exception.code, code, str(ctx.exception))
 
 
-class ReadonlyPolicyTests(CodeAssertions):
-    """只读策略按实际写风险判定：检查工具放行，写变体失败关闭。"""
-
-    ALLOWED = (
-        "sed -n '1,40p' /abs/file",
-        "sed -n '/\\\\w\\\\+/p' /abs/file",
-        "awk '/pat/ {print $1}' /abs/file",
-        "echo ---- ; printf '%s\\n' a b",
-        "jq -r '.a' /abs/file.json",
-        "for f in a b; do sha256sum \"$f\"; done",
-        "unzip -l /abs/a.apk",
-        "apksigner verify --print-certs /abs/a.apk",
-        "aapt dump badging /abs/a.apk",
-        "aapt2 dump permissions /abs/a.apk",
-        "date -u +%s",
-        "date -u -d '2020-01-01' +%s",
-        "date -ud '2020-01-01' +%s",
-        "date +%Y-%m-%d",
-        "date -Iseconds",
-        "date --iso-8601=seconds",
-        "date -d @0 -u +%FT%TZ",
-        "test -f /abs/file",
-        "git status --short",
-        "awk -F: -v n=1 '{print $1}' /abs/file",
-        "awk 'NR > 1' /abs/file",
-        "awk '$3 > 100 {print $1}' /abs/file",
-        "awk '$1==\"a\" || $2==\"b\"' /abs/file",
-        "awk 'BEGIN{print \"a>b\"}'",
-        "awk 'BEGIN{x=\"print a > b\"; print x}'",
-        "awk 'BEGIN{print (1 > 2)}'",
-        "awk 'BEGIN{print 1 || 2}'",
-        "awk '{print $1==\"a\" || $1==\"b\"}' /abs/file",
-        "awk 'BEGIN{print 1 >= 2}'",
-        "awk -b '{print}' /abs/file",
-        "awk -M '{print}' /abs/file",
-        "awk -W version",
-        "sed -n -e '1,5p' /abs/file",
-        "sed --quiet '1p' /abs/file",
-        "sed 'y/a/w/' /abs/file",
-        "sed 'a\\welcome' /abs/file",
-        "sed -e's/i/x/' /abs/file",
-        "sed --line-len=80 '1p' /abs/file",
-        "xxd -l 64 /abs/file",
-        "file /abs/file",
-        "file -m /abs/magic /abs/file",
-    )
-    REJECTED = (
-        "sed -i 's/a/b/' /abs/file",
-        "sed -n 'w /abs/out' /abs/file",
-        "sed 's/a/b/w' /abs/file",
-        "sed -f /abs/script.sed /abs/file",
-        "sed -ni 'p' /abs/file",
-        "sed --in-pl 'p' /abs/file",
-        "sed --fil=/abs/script.sed /abs/file",
-        "sed -e 'w /abs/out' /abs/file",
-        "awk 'BEGIN{print \"x\" > \"/abs/out\"}'",
-        "awk '{print $1 >> \"/abs/out\"}' /abs/file",
-        "awk '{print $1 | \"sort\"}' /abs/file",
-        "awk '\"date\" | getline x'",
-        "awk '\"date\" |& getline x'",
-        "awk '{print $1 |& \"sort\"}' /abs/file",
-        "awk 'BEGIN{system(\"rm /abs/file\")}'",
-        "awk 'BEGIN{system\t(\"rm /abs/file\")}'",
-        "awk -f /abs/p.awk /abs/file",
-        "awk --fil=/abs/p.awk /abs/file",
-        "awk -p /abs/profile.out /abs/file",
-        "awk --profile=/abs/out /abs/file",
-        "for f in $(ls); do cat $f; done",
-        "for f in a b; do rm $f; done",
-        "date -s '2020-01-01'",
-        "date -snotadate",
-        "date 010100002020",
-        "date -u 010100002020",
-        "date -I 010100002020",
-        "date -Idate 010100002020",
-        "date --iso-8601 010100002020",
-        "date --iso-8601 -s2020-01-01",
-        "date --se='2020-01-01'",
-        "date --s=202001010000",
-        "tree -o /abs/out /abs",
-        "unzip /abs/a.apk",
-        "unzip -d /abs/out /abs/a.apk",
-        "apksigner sign /abs/a.apk",
-        "aapt2 link -o /abs/x",
-        "cat /abs/file > /abs/out",
-        "xxd /abs/file /abs/out",
-        "file -C -m /abs/x.magic",
-        "file --com -m /abs/x.magic",
-        "file --co -m /abs/x.magic",
-    )
-
-    def test_allowed_inspection_commands(self):
-        for command in self.ALLOWED:
-            with self.subTest(command=command):
-                self.assertEqual(NB.validate_review_commands([command]), [command])
-
-    def test_write_variants_rejected(self):
-        for command in self.REJECTED:
-            with self.subTest(command=command):
-                self.assert_code("review_command_not_readonly",
-                                 NB.validate_review_commands, [command])
-
-
 class InspectionFieldTests(F.BridgeBase):
     def test_empty_files_inspected_is_allowed(self):
         execution = self.execution()
@@ -226,6 +123,9 @@ class IncrementalReviewTests(F.BridgeBase):
             self.first, attempt=self.base_attempt,
             target_sha256=G.final_evidence_digest(state))
         base = NB.validate_review_result(base_env, self.dispatch, self.first, state)
+        # 阶段九：可作为增量基线的复核必须来自新链（candidate）。
+        base["g4_source"] = "candidate"
+        base["candidate_g4"] = {"eligible": True, "reasons": []}
         base["host_sha256"] = G._sha256_text(G.canonical_json(base["host"]))
         state = G.load_state(self.state_path)
         F.attach_review(state, base, self.base_attempt)
@@ -274,6 +174,8 @@ class IncrementalReviewTests(F.BridgeBase):
         self.assertEqual(result["evidence_manifest"], ["E2"])
         self.assertTrue(result["g4_eligible"], result.get("g4_reasons"))
         record = {**result,
+                  "g4_source": "candidate",
+                  "candidate_g4": {"eligible": True, "reasons": []},
                   "host_sha256": G._sha256_text(G.canonical_json(result["host"]))}
         state = G.load_state(self.state_path)
         F.attach_review(state, record, self.incremental_attempt)
@@ -320,6 +222,8 @@ class IncrementalReviewTests(F.BridgeBase):
         # 绕过 ingest 直接构造记录：收口期仍要用覆盖快照重算并拒绝。
         record = {**env,
                   "target_sha256": G.final_evidence_digest(state),
+                  "g4_source": "candidate",
+                  "candidate_g4": {"eligible": True, "reasons": []},
                   "coverage": NB.review_coverage(state),
                   "reviewer": {"kind": "subagent", "agent_id": "agent-review",
                                "child_session_id": "child-review",
@@ -342,8 +246,14 @@ class IncrementalReviewTests(F.BridgeBase):
 class HostOutputTests(unittest.TestCase):
     def test_single_fence_is_accepted(self):
         data = NA._extract_review_json(
-            "说明\n```json\n{\"verdict\": \"pass\"}\n```\n结尾", "x")
+            "```json\n{\"verdict\": \"pass\"}\n```", "x")
         self.assertEqual(data, {"verdict": "pass"})
+
+    def test_fence_with_outside_text_is_rejected(self):
+        with self.assertRaises(NA.AgentRecordError) as ctx:
+            NA._extract_review_json(
+                "说明\n```json\n{\"verdict\": \"pass\"}\n```\n结尾", "x")
+        self.assertIn("review_output_outside_text", str(ctx.exception))
 
     def test_two_fences_are_rejected(self):
         with self.assertRaises(NA.AgentRecordError) as ctx:
@@ -359,16 +269,15 @@ class HostOutputTests(unittest.TestCase):
 
 
 class DerivationTests(unittest.TestCase):
-    def test_commands_and_files_come_from_actual_calls(self):
+    def test_files_come_from_actual_host_calls(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "evidence.txt")
             with open(path, "w", encoding="utf-8") as fh:
                 fh.write("x\n")
             calls = [
                 ("Read", "", {"file_path": path}),
-                ("Bash", "git status --short", {"command": "git status --short"}),
+                ("Grep", "", {"pattern": "x", "path": path}),
             ]
-            self.assertEqual(NA._actual_commands(calls), ["git status --short"])
             self.assertEqual(NA._merge_inspected_files([], calls), [path])
             self.assertEqual(NA._declared_files_unverified([path], calls), [])
             self.assertEqual(

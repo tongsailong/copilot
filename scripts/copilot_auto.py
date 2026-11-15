@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -28,9 +29,11 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
+import g4_shadow as SH  # noqa: E402
+import host_records as HR  # noqa: E402
 import governance as G  # noqa: E402
-import native_agent as NA  # noqa: E402
 import native_bridge as NB  # noqa: E402
+import review_output  # noqa: E402
 
 EXIT_DONE = 0
 EXIT_EXECUTE = 10
@@ -235,17 +238,33 @@ def _ingest_execution(path: str, envelope: dict) -> int:
                                 file_path=item["file"], note=item.get("note") or "")
         except G.GovernanceError as exc:
             raise AutoError(f"证据 {item.get('id')} 登记失败：{exc}") from None
-    G.save_state(path, state)
     result_text = f"{normalized['summary']}\n\n{normalized['result']}"
+    # 证据、工作项回填、native_results 与 binding 消费在同一次 save_state 落盘：
+    # 任一步失败都不留下“action=done 但无结果/未消费”的单边成功。
     try:
-        G.record_action(path, normalized["work_item_id"], normalized["status"],
-                        result=result_text,
-                        evidence_ids=[item["id"] for item in normalized["evidence"]])
+        G.record_action_state(
+            state, normalized["work_item_id"], normalized["status"],
+            result=result_text,
+            evidence_ids=[item["id"] for item in normalized["evidence"]])
     except G.GovernanceError as exc:
         raise AutoError(f"工作项回填失败：{exc}") from None
-    state = G.load_state(path)
+    binding = dict(normalized.get("execution_binding") or {})
+    if binding:
+        stored = G.find_execution_binding(state, str(binding.get("binding_id") or ""))
+        if stored is None:
+            raise AutoError(
+                f"执行 binding {binding.get('binding_id')} 不存在；不能回填该执行结果。")
+        if stored.get("consumed"):
+            raise AutoError(
+                "执行 binding 已被消费；同一 binding 不能重放另一份执行结果。")
+        if str(stored.get("nonce") or "") != str(binding.get("nonce") or ""):
+            raise AutoError("执行 binding nonce 与状态记录不一致。")
+        stored["consumed"] = True
+        stored["consumed_by_result_sha256"] = sha
+        stored["consumed_at"] = G.now_iso()
     state.setdefault("native_results", []).append({
         "result_sha256": sha,
+        "task_id": normalized.get("task_id") or "",
         "work_item_id": normalized["work_item_id"],
         "dispatch_id": normalized["dispatch_id"],
         "plan_id": normalized["plan_id"],
@@ -256,8 +275,13 @@ def _ingest_execution(path: str, envelope: dict) -> int:
         "result": normalized["result"][:G.MAX_RESULT_CHARS],
         "evidence": normalized["evidence"],
         "executor": normalized["executor"],
+        "executor_metadata_path": normalized.get("executor_metadata_path") or "",
         "timing": normalized["timing"],
         "usage": normalized["usage"],
+        "test_commands": normalized.get("test_commands") or [],
+        "test_artifacts": normalized.get("test_artifacts") or [],
+        "code_scope_sha256": normalized.get("code_scope_sha256") or "",
+        "execution_binding": binding,
         "received": G.now_iso(),
     })
     G._history(state, "native_result_ingested", {
@@ -271,6 +295,137 @@ def _ingest_execution(path: str, envelope: dict) -> int:
     print(f"执行结果已回填：{normalized['work_item_id']} → {normalized['status']} "
           f"sha256={sha[:16]}… 证据 {', '.join(i['id'] for i in normalized['evidence'])}")
     return EXIT_DONE
+
+
+def _review_output_bytes(state: dict, normalized: dict,
+                         shadow_record: dict) -> tuple[bytes | None, str]:
+    """取 Reviewer 原始输出字节：outputFile 优先，否则宿主 message/part。"""
+    host = normalized.get("host") or {}
+    path = str(host.get("output_file") or "").strip()
+    if path and os.path.isfile(path):
+        with open(path, "rb") as fh:
+            return fh.read(), "outputFile"
+    child = str((normalized.get("reviewer") or {}).get("child_session_id") or "")
+    if child:
+        # 信封生成时的宿主库路径随 host 记录固化；老信封没有该字段时回退默认库。
+        db = str(host.get("host_db") or "").strip() or os.path.expanduser(
+            "~/.zcode/cli/db/db.sqlite")
+        output = HR.assistant_output(db, child)
+        if output:
+            return output["text"].encode("utf-8"), "db.message.part"
+    return None, ""
+
+
+def _finalize_candidate(path: str, state: dict, normalized: dict,
+                        envelope: dict, shadow_record: dict, execution: dict,
+                        review_sha: str) -> dict:
+    """候选 G4 闭环：校验 shadow/TE/binding/attempt/原始输出并一次性标记。
+
+    只写候选字段与 raw output 文件，不改变正式 `g4_eligible` 或正式消费语义。
+    """
+    reasons: list[str] = []
+    attestation = shadow_record.get("attestation") or {}
+    test_execution = shadow_record.get("test_execution") or {}
+    if shadow_record.get("status") != "attested":
+        reasons.append("shadow_not_attested")
+    if shadow_record.get("new_g4_eligible") is not True:
+        reasons.append("shadow_not_eligible")
+    binding_id = str(test_execution.get("execution_binding_id") or "")
+    binding = G.find_execution_binding(state, binding_id) if binding_id else None
+    te_status = str(test_execution.get("status") or "")
+    if te_status == "not_applicable":
+        # 只有当前合同显式声明“不要求测试”时才接受 N/A，且 binding 不能带
+        # 测试要求；amend 后旧 binding 的 N/A 不再有效。
+        if not G.contract_no_test_binding(binding, state):
+            reasons.append("test_execution_not_applicable_invalid")
+    elif te_status != "verified":
+        reasons.append("test_execution_not_verified")
+    if binding is None:
+        reasons.append("execution_binding_missing")
+    elif str(binding.get("consumed_by_result_sha256") or "") != \
+            str(execution.get("result_sha256") or ""):
+        reasons.append("execution_binding_not_bound_to_execution")
+    if binding is not None and str(binding.get("contract_sha256") or "") != \
+            str(state.get("contract_sha256") or ""):
+        reasons.append("execution_binding_contract_changed")
+    attempt = G.find_review_attempt(
+        state, str(normalized.get("review_attempt_id") or ""))
+    if attempt is None:
+        reasons.append("review_attempt_missing")
+    else:
+        previous = str(attempt.get("candidate_consumed_by_result_sha256") or "")
+        if previous and previous != review_sha:
+            reasons.append("candidate_attempt_consumed_by_other")
+        formal_by = str(attempt.get("consumed_by_result_sha256") or "")
+        if attempt.get("consumed") and formal_by and formal_by != review_sha:
+            reasons.append("attempt_consumed_by_other")
+    # 只有其余条件全绿才读取/持久化原始输出；避免留下“未通过却已落盘”的
+    # 半成品证据。宿主原文与信封结论必须一致（防止信封改写结论）。
+    raw = None
+    source = ""
+    if not reasons:
+        raw, source = _review_output_bytes(state, normalized, shadow_record)
+        if raw is None:
+            reasons.append("raw_output_missing")
+        else:
+            raw_sha = hashlib.sha256(raw).hexdigest()
+            expected = str((normalized.get("host") or {}).get("output_sha256")
+                           or attestation.get("output_sha256") or "")
+            if expected and raw_sha != expected.lower():
+                reasons.append("raw_output_sha_mismatch")
+            else:
+                try:
+                    parsed = review_output.parse_review_output(
+                        raw.decode("utf-8", errors="replace"))
+                except review_output.ReviewOutputError:
+                    reasons.append("raw_output_unparseable")
+                    parsed = None
+                if isinstance(parsed, dict):
+                    # 与信封的“原始字段”比对（而非 validate 后的规范化结构）：
+                    # findings 会被补齐六个键并小写 severity，verdict 会被小写，
+                    # 直接比 normalized 会把带 findings 的合法复核误判为不一致。
+                    if str(parsed.get("verdict") or "").strip().lower() != \
+                            str(envelope.get("verdict") or "").strip().lower():
+                        reasons.append("envelope_host_field_mismatch:verdict")
+                    for field in ("findings", "unverified", "changed_files"):
+                        if G.canonical_json(parsed.get(field) or []) != \
+                                G.canonical_json(envelope.get(field) or []):
+                            reasons.append(
+                                f"envelope_host_field_mismatch:{field}")
+                if not reasons and isinstance(
+                        shadow_record.get("attestation"), dict):
+                    try:
+                        stored = G.store_review_output(path, raw, raw_sha)
+                    except (OSError, G.GovernanceError) as exc:
+                        reasons.append(
+                            f"raw_output_persist_failed:{type(exc).__name__}")
+                    else:
+                        attestation["raw_output"] = {
+                            "path": stored["path"], "sha256": stored["sha256"],
+                            "bytes": stored["bytes"], "source": source,
+                            "parser": review_output.PARSER_VERSION,
+                        }
+                elif not reasons:
+                    reasons.append("attestation_missing")
+    candidate = {
+        "eligible": not reasons,
+        "reasons": sorted(set(reasons)),
+        "shadow_id": str(shadow_record.get("shadow_id") or ""),
+        "binding_id": binding_id,
+        "test_execution_status": str(test_execution.get("status") or ""),
+        "raw_output_sha256": str(
+            (attestation.get("raw_output") or {}).get("sha256") or ""),
+        "review_attempt_id": str(
+            normalized.get("review_attempt_id") or ""),
+        "review_sha256": review_sha,
+        "decided_at": G.now_iso(),
+    }
+    if candidate["eligible"] and isinstance(attempt, dict):
+        attempt["candidate_consumed_by_result_sha256"] = review_sha
+        attempt["candidate_consumed_at"] = candidate["decided_at"]
+    shadow_record["attestation"] = attestation
+    shadow_record["candidate"] = candidate
+    return candidate
 
 
 def _ingest_review(path: str, envelope: dict) -> int:
@@ -289,14 +444,38 @@ def _ingest_review(path: str, envelope: dict) -> int:
     if _existing_review(state, sha):
         print(f"复核结果已回填（{sha[:16]}…），幂等跳过。")
         return EXIT_DONE
-    if normalized["g4_eligible"]:
-        problems = NA.verify_review_host_record(envelope)
-        if problems:
-            _record_attempt(path, "review", envelope, "review_host_record_changed",
-                            ", ".join(problems))
-            raise AutoError(
-                "G4 复核的宿主记录复核未通过：" + ", ".join(problems) +
-                "；不得把该结论当作 G4 依据。")
+    shadow_attempt = G.find_review_attempt(
+        state, str(normalized.get("review_attempt_id") or "")) \
+        if normalized.get("review_attempt_id") else None
+    # 影子取证在正式 G4 宿主复核/attempt 判定之前运行；不写 consume marker，
+    # 任何异常只记 g4_attestations，不影响下面的正式放行与退出码。
+    shadow_record = SH.build(
+        normalized, state, shadow_attempt, state_path=path,
+        db=str((normalized.get("host") or {}).get("host_db") or ""),
+        expected_target=G.final_evidence_digest(state))
+    # 正式 G4 由新链决定：高风险任务只有 attested + 新链 eligible 才是正式
+    # eligible；旧 `g4_eligible` 只作为信封结构预检，不参与正式放行。
+    risk_high = str(state.get("risk") or "").lower() == "high"
+    formal_g4 = bool(risk_high
+                     and shadow_record.get("status") == "attested"
+                     and shadow_record.get("new_g4_eligible") is True)
+    reasons = list(shadow_record.get("new_reason") or [])
+    shadow_error = shadow_record.get("error") or {}
+    if isinstance(shadow_error, dict) and shadow_error.get("code"):
+        reasons.append(f"shadow:{shadow_error['code']}")
+    incremental = shadow_record.get("incremental") or {}
+    if isinstance(incremental, dict):
+        reasons.extend(f"shadow:{item}" for item in incremental.get("problems") or [])
+    reasons.extend(f"shadow:{item}" for item in shadow_record.get("differences") or [])
+    test_execution = shadow_record.get("test_execution") or {}
+    if test_execution.get("status") not in ("verified", "not_applicable"):
+        reasons.extend("test_execution:" + str(item)
+                       for item in test_execution.get("problems") or [])
+    normalized["g4_eligible"] = formal_g4
+    normalized["g4_source"] = "candidate" if formal_g4 else ""
+    normalized["g4_reasons"] = sorted(set(str(item) for item in reasons
+                                          if str(item)))
+    if formal_g4:
         # attempt 是派发前固化的不可变快照；ingest 只接受仍与当前状态一致的
         # attempt，并把它消费给这一份结果，防止旧输出换新 target 重放。
         attempt_problems = G.review_attempt_problems(
@@ -346,19 +525,40 @@ def _ingest_review(path: str, envelope: dict) -> int:
                 (normalized.get("reviewer") or {}).get("profile_id") or ""),
             "bound_at": G.now_iso(),
         }
+    candidate = {"eligible": False, "reasons": ["candidate_not_evaluated"]}
+    try:
+        candidate = _finalize_candidate(
+            path, state, normalized, envelope, shadow_record, execution, sha)
+    except Exception as exc:  # 候选异常不得改变正式结果，但必须如实记录
+        candidate = {"eligible": False,
+                     "reasons": [f"candidate_internal_error:{type(exc).__name__}"],
+                     "decided_at": G.now_iso()}
+        shadow_record["candidate"] = candidate
     state.setdefault("native_reviews", []).append({
         **normalized,
+        "candidate_g4": candidate,
         # 宿主记录摘要随记录固化：G4 收口时用它检测记录被改写，避免只信任
         # g4_eligible 布尔值（首次核对已在上面按 metadata/rollout 完成）。
         "host_sha256": G._sha256_text(G.canonical_json(normalized.get("host") or {})),
         "received": G.now_iso(),
     })
+    try:
+        SH.append_attestation(state, shadow_record)
+    except ValueError as exc:
+        # 影子字段损坏不应反向阻断正式复核；把它修复为只含本条记录的新列表，
+        # 并在 history 保留原错误，避免下一轮继续阻断。
+        state["g4_attestations"] = [shadow_record]
+        G._history(state, "g4_shadow_field_repaired", {
+            "shadow_id": shadow_record.get("shadow_id") or "",
+            "error": str(exc),
+        })
     findings = normalized.get("findings") or []
     G._history(state, "native_review_ingested", {
         "work_item_id": normalized["work_item_id"],
         "result_sha256": sha,
         "verdict": normalized["verdict"],
         "g4_eligible": normalized["g4_eligible"],
+        "g4_source": normalized.get("g4_source") or "",
         "review_scope": normalized["review_scope"],
         "based_on_review_sha256": normalized["based_on_review_sha256"],
         "evidence_manifest": normalized["evidence_manifest"],
@@ -368,6 +568,12 @@ def _ingest_review(path: str, envelope: dict) -> int:
         "execution_evidence_unbound": normalized.get(
             "execution_evidence_unbound") or [],
         "review_attempt_id": normalized.get("review_attempt_id") or "",
+        "shadow_id": shadow_record.get("shadow_id") or "",
+        "shadow_status": shadow_record.get("status") or "",
+        "shadow_agreement": shadow_record.get("agreement") or "",
+        "shadow_new_g4_eligible": shadow_record.get("new_g4_eligible"),
+        "candidate_g4_eligible": bool(candidate.get("eligible")),
+        "candidate_g4_reasons": candidate.get("reasons") or [],
     })
     G.save_state(path, state)
     print(f"复核结果已回填：{normalized['work_item_id']} → {normalized['verdict']}"
@@ -422,6 +628,9 @@ def main(argv: list[str] | None = None) -> int:
         return args.func(args) or 0
     except (AutoError, G.GovernanceError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+    except OSError as exc:
+        print(f"ERROR: 状态写入/文件操作失败：{exc}", file=sys.stderr)
         return EXIT_ERROR
 
 

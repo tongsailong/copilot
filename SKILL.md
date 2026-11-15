@@ -8,7 +8,7 @@ when_to_use: >
   原生完成，不进入本 Skill。
 ---
 
-# copilot：轻量协作治理（v6.4.0）
+# copilot：轻量协作治理（v6.5.0）
 
 Copilot 是运行在 ZCode 内的**协作治理层**，不是决策模型，也不是执行体。它负责把任务变成可
 追踪的合同、状态、证据与收口条件，并在任务没有真正完成时继续推进。
@@ -157,10 +157,11 @@ BLOCKED 表示**不能正常收口或继续受阻动作**，不表示无法记�
   都有本任务已登记证据，且文件摘要重新核对一致。
 - **G3 无停摆**：没有 `running` / `failed` / `blocked` 遗留，也没有依赖不可满足的待办。
 - **G4 高风险复核**：`risk=high` 时必须存在绑定的原生独立复核：`verdict=pass`、无 blocking
-  finding、`unverified` 为空、`changed_files` 为空、`g4_eligible=true`、绑定派发前创建的
-  `review_attempt_id`、目标摘要等于当前 `final_evidence_digest`、代码范围快照等于当前工作区、
-  Reviewer Profile 为 `reviewer`，且 ingest 时固化下来的宿主记录摘要、会话时间、工作区与身份
-  仍一致。缺失、过期、代码/证据漂移、会话或工作区不匹配、attempt 重放或被篡改一律 fail-closed。
+  finding、`unverified` 为空、`changed_files` 为空、`g4_eligible=true` 且
+  `g4_source="candidate"`（由新链 `g4_attest` + `test_execution` + `g4_shadow` 派生，
+  不接受信封自述）、`candidate_g4.eligible=true`、绑定派发前创建的 `review_attempt_id`、
+  目标摘要等于当前 `final_evidence_digest`、代码范围快照等于当前工作区。缺失、过期、
+  代码/证据漂移、会话或工作区不匹配、宿主记录/原始输出被篡改、attempt 重放一律 fail-closed。
 - **G2 的代码范围**：G2 除合同/条件/证据外，还检查最近一次已消费 attempt 的代码快照；未登记
   为 evidence 的源码、未跟踪文件、删除/重命名文件同样纳入范围，不能因“没登记证据”绕过。
 
@@ -176,10 +177,11 @@ BLOCKED 表示**不能正常收口或继续受阻动作**，不表示无法记�
 - `drive` 生成 `copilot-native-dispatch/v2`（绑定 task / contract / plan / iteration），工作项
   带稳定 `dispatch_id` 与 `idempotency_key`。
 - 执行方用 `native_agent.py execution` 生成 `copilot-native-result/v2`，绑定计划与执行方身份。
-- 复核方用 `native_agent.py review` 生成 `copilot-native-review/v2`；G4 资格由宿主记录计算，
-  不由 Reviewer 自报：Profile 只读、实际工具调用计数与 metadata 一致、独立 Agent/Child
-  Session、访问过全部文件证据、目标摘要未过期。`commands_run` / `files_inspected` 由宿主
-  rollout 派生，Reviewer 不需要手工复述命令或文件。
+- 复核方用工作区级 `reviewer` Profile（工具仅 `Read/Grep/Glob`，无 Bash）派发，再用
+  `native_agent.py review` 生成 `copilot-native-review/v2`；`g4_eligible` 只是结构预检，
+  正式资格由 `g4_attest` 读取宿主 DB（`tool_usage`/`part`/`session_entry`）独立核验
+  Profile、会话/prompt/工作区、工具调用与原始输出，再由 `test_execution` 与
+  `g4_shadow`/候选闭环派生。`commands_run` 必须为空，`files_inspected` 由宿主工具记录合并。
 - **G4 必须先创建 review attempt**：`review-context --create-attempt --workspace <任务仓库>`
   在派发前把 task / contract / plan / dispatch / work item / execution / 当前
   `final_evidence_digest`、条件摘要、文件证据内容摘要，以及 **git 工作区代码范围**
@@ -188,8 +190,7 @@ BLOCKED 表示**不能正常收口或继续受阻动作**，不表示无法记�
   要求宿主 metadata 的会话创建时间晚于 attempt、prompt 携带该 id、`workspaceRoot` 等于
   attempt 冻结的代码根，信封绑定同一目标；旧会话、旧工作区或旧输出不能换一个新 target
   重新封装。已登记证据由证据快照单独绑定，代码快照不重复纳入。
-- 派发前用 `native_agent.py preflight-commands --file cmds.txt`（或多次 `--command`）预检
-  只读命令清单，`exit=2` 表示有命令会被拒；用 `native_agent.py review-context --state …
+- 用 `native_agent.py review-context --state …
   --dispatch … --execution … --work-item … [--previous-review prev.json]
   [--create-attempt] [--workspace <任务仓库>] [--base <任务开始 commit>]` 生成绑定值、
   证据清单、`execution_evidence_unbound` 漂移、代码范围快照、上轮 findings 与建议 scope，
@@ -199,10 +200,13 @@ BLOCKED 表示**不能正常收口或继续受阻动作**，不表示无法记�
   基线之后新增/变更（含归档）的证据；条件、合同或其他工作项变化则拒绝增量、要求完整复核。
   基线必须是可用的 G4 PASS，所以增量用于高风险复核链路的修复后复验；普通风险任务按需做
   一次完整复核即可。
-- `copilot_auto.py ingest` 校验信封后回填；G4 复核回填前会重新读取 metadata/rollout 核对宿主
-  记录与 attempt，并在同一份状态写入中消费 attempt。被拒的 attempt 不消费，修正后可用同一
-  attempt 重试；已消费的 attempt 不能重放另一份结果。字段与错误码见
-  `references/agent-bridge.md`。
+- `copilot_auto.py ingest` 校验信封后回填；正式 G4 由 shadow/candidate 决定，回填前
+  `g4_attest` 独立核对宿主记录与 attempt、`test_execution` 核对测试证据，并在同一份状态
+  写入中消费 attempt。被拒的 attempt 不消费，修正后可用同一 attempt 重试；已消费的
+  attempt 不能重放另一份结果。字段与错误码见 `references/agent-bridge.md`。
+- **高风险任务必须显式声明 `test_policy`**：`start`/`contract --amend` 与
+  `bind-execution` 都会拒绝没有 captured 策略的高风险任务；合同策略进入合同指纹，
+  `required=false` 才允许测试层 N/A，调用方只能加严，不能删除或放宽合同要求。
 
 ## 复核策略与收敛
 
@@ -274,8 +278,22 @@ severity）→ 集中修复 → 针对性复核（只验证修复、新问题、
 
 ## 版本
 
-当前版本 **v6.4.0（ZCode Autonomous Development Edition）**。v6.4 基于《测试体系与独立
-复核机制过度设计专项审计报告》的真实任务证据，只做三项 P1 收敛：
+当前版本 **v6.5.0（ZCode Autonomous Development Edition）**。v6.5 完成正式 G4 切换与
+旧 Reviewer 体系退役：
+
+- **正式 G4 切换**：`copilot_auto._ingest_review` 只在 `risk=high`、`g4_shadow` 状态
+  `attested` 且新链 eligible 时写入正式 `g4_eligible=true`/`g4_source="candidate"`；
+  `governance` 拒绝没有 candidate 来源的旧记录。信封自报 `g4_eligible` 不再生效。
+- **旧机制退役**：删除旧全局 `agents/reviewer.md` 与运行时副本，Reviewer 只使用工作区级
+  只读 Profile（Read/Grep/Glob，无 Bash）；删除 Bash 白名单、rollout 强依赖、旧会话/
+  宿主记录重复校验入口与重复证据计算；`sync_runtime` 不再分发 Reviewer。
+- **合同测试策略**：高风险任务必须显式声明 `test_policy`；合同命令/报告/产物进入合同
+  指纹与 binding，调用方只能加严；测试证据按四层判定，只有当前合同显式不要求测试时
+  才接受 N/A。
+- **保留**：G1–G4 标准、fail-closed、attempt 绑定、原始输出持久化与一次性消费均不降低；
+  历史 attestation 与旧台账只读保留。
+
+v6.4 基于《测试体系与独立复核机制过度设计专项审计报告》的真实任务证据，只做三项 P1 收敛：
 
 - **BLOCKED 受控写入**：允许在阻塞期间登记证据、工作项结果、条件核销、报告、判断、额外
   阻塞与已授权正式 REVIEW；不自动解除阻塞，不改变合同/授权，`close` 仍拒绝；`plan`、
@@ -294,11 +312,10 @@ severity）→ 集中修复 → 针对性复核（只验证修复、新问题、
 v6.3 基于 10 个真实任务的复核复盘（ad-strategy 7 轮复核、Honor 7 次 G4 尝试、review-perf
 4 次正式 REVIEW、gromore / 腾讯 / journey 等）收敛“无效评审多、重复取证”的机制问题：补齐
 真实只读命令白名单（`git rev-list` / `git cat-file` / `git ls-tree` / `paste` 等）与危险
-长选项缩写拒绝，`&&` 与 `;`/`|` 同等串联只读命令（`cd <dir> && …`），含 `/` 的通配符对
-`sed`/`awk`/`find` 放行；放宽围栏 JSON 解析的真实变体；识别 `cd` / `git -C` 后的相对路径，
-消除“已读却判未访问”的假阴性；finding 增加稳定 ID/根因/状态/去重；新增
-`preflight-commands`、`review-context`、`review-metrics` 与无效信封审计；执行证据漂移进入
-收口提醒；Reviewer Profile 明确“首轮一次看全、后续只验证变化、PASS 即停、每轮新会话”。
+长选项缩写拒绝，`&&` 与 `;`/`|` 同等串联只读命令；放宽围栏 JSON 解析的真实变体；finding
+增加稳定 ID/根因/状态/去重；新增 `review-context`、`review-metrics` 与无效信封审计；
+执行证据漂移进入收口提醒。**v6.5 起 Reviewer 无 Bash，上述命令白名单与 `preflight-commands`
+已随旧机制一并退役；本节只作版本沿革。**
 G1–G4、证据完整性、宿主记录与 fail-closed 语义未放宽；新增能力不扩大任何授权。
 v5.x 及以前的 SOL 决策通道、轮次/预算状态机与远程 REVIEW 裁决已退役；历史文档保留但明确
 标注为历史，不再作为当前规则。协作语义基线为用户级 `AGENTS.md` 与 ChatGPT 自定义指令

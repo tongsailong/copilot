@@ -26,58 +26,6 @@ import native_agent as NA  # noqa: E402
 import native_bridge as NB  # noqa: E402
 
 
-class ReadonlyPolicyV63Tests(unittest.TestCase):
-    ALLOWED = (
-        "git rev-list --count HEAD..origin/main",
-        "git rev-list --objects --all | head -20",
-        "git cat-file -p HEAD:README.md",
-        "git ls-tree -r HEAD",
-        "git describe --tags --always",
-        "git merge-base HEAD origin/main",
-        "git blame -L 1,5 README.md",
-        "paste -sd+ scores.txt",
-        "seq 1 10",
-        "comm -12 a.txt b.txt",
-        "git log --oneline -5",
-        "git diff --text HEAD~1",
-        "cd /tmp && ls -la",
-        "git -C /tmp status && git -C /tmp log -1",
-        "cat a; cat b",
-        "cat a | head -n 2",
-        "awk '{print $1}' app/build/test-results/*/*.xml",
-        "sed -n 1p src/*.md",
-    )
-    REJECTED = (
-        "git cat-file --filters HEAD:app/x",
-        "git cat-file --filt HEAD:app/x",
-        "git log --out=/tmp/x",
-        "git log --output=/tmp/x",
-        "git show --ext-d",
-        "git diff --textc HEAD~1",
-        "git rev-list --output=/tmp/x HEAD",
-        "paste -sd+ > out.txt",
-        "paste -sd+ | tee out.txt",
-        "ls && rm -rf /tmp/x",
-        "sleep 1 &",
-        "cat a || cat b",
-        "cat a &&& cat b",
-        "awk '{print}' *.xml",
-        "sed -i s/a/b/ src/*.md",
-    )
-
-    def test_allowed_commands(self):
-        for command in self.ALLOWED:
-            with self.subTest(command=command):
-                self.assertEqual(NB.validate_review_commands([command]), [command])
-
-    def test_rejected_commands(self):
-        for command in self.REJECTED:
-            with self.subTest(command=command):
-                with self.assertRaises(NB.BridgeError) as ctx:
-                    NB.validate_review_commands([command])
-                self.assertEqual(ctx.exception.code, "review_command_not_readonly")
-
-
 class ReviewOutputParsingV63Tests(unittest.TestCase):
     def parse(self, text: str) -> dict:
         return NA._extract_review_json(text, "output.json")
@@ -87,7 +35,6 @@ class ReviewOutputParsingV63Tests(unittest.TestCase):
             "plain": '{"verdict": "pass"}',
             "newline": '```json\n{"verdict": "pass"}\n```',
             "no newline": '```json{"verdict": "pass"}```',
-            "crlf prose": 'result:\r\n```JSON\r\n{"verdict": "pass"}\r\n```\r\nthanks',
             "tag spaces": '``` json \n{"verdict": "pass"}\n```',
         }
         for name, text in variants.items():
@@ -104,45 +51,6 @@ class ReviewOutputParsingV63Tests(unittest.TestCase):
         with self.assertRaises(NA.AgentRecordError) as ctx:
             self.parse("no json here")
         self.assertIn("review_output_unparsable", str(ctx.exception))
-
-
-class RelativeEvidenceV63Tests(unittest.TestCase):
-    def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.tmp.cleanup)
-        self.dir = self.tmp.name
-        self.report = os.path.join(self.dir, "report-final-v4.md")
-        with open(self.report, "w", encoding="utf-8") as fh:
-            fh.write("report\n")
-
-    def test_cd_relative_path_counts_as_inspected(self):
-        command = f"cd {self.dir}; head -n 60 report-final-v4.md"
-        calls = [("Bash", command, {})]
-        state = {"evidence": [{"id": "E1", "path_hint": self.report}]}
-        self.assertEqual(NA._evidence_not_inspected(state, calls), [])
-        self.assertIn(self.report, NA._command_paths(command))
-
-    def test_git_dash_c_relative_path_counts_as_inspected(self):
-        log = os.path.join(self.dir, "build.log")
-        with open(log, "w", encoding="utf-8") as fh:
-            fh.write("ok\n")
-        command = f"git -C {self.dir} rev-list --count HEAD..origin/main; cat build.log"
-        state = {"evidence": [{"id": "E2", "path_hint": log}]}
-        self.assertEqual(NA._evidence_not_inspected(state, [("Bash", command, {})]), [])
-
-    def test_double_ampersand_relative_path_counts_as_inspected(self):
-        # honor G4 第 7 次尝试的真实写法：`cd <dir> && ls -la`。
-        command = f"cd {self.dir} && head -n 60 report-final-v4.md"
-        state = {"evidence": [{"id": "E1", "path_hint": self.report}]}
-        self.assertEqual(NA._evidence_not_inspected(
-            state, [("Bash", command, {})]), [])
-        self.assertIn(self.report, NA._command_paths(command))
-
-    def test_relative_without_known_directory_still_unverified(self):
-        # 没有 cd / git -C 时无法确定相对路径指向哪里，不猜测。
-        calls = [("Bash", "head -n 60 report-final-v4.md", {})]
-        state = {"evidence": [{"id": "E1", "path_hint": self.report}]}
-        self.assertEqual(NA._evidence_not_inspected(state, calls), [self.report])
 
 
 class FindingMetadataV63Tests(F.BridgeBase):
@@ -236,27 +144,6 @@ class ExecutionDriftV63Tests(unittest.TestCase):
         self.assertEqual(NB.execution_evidence_drift(execution, state), [])
 
 
-class PreflightCliV63Tests(unittest.TestCase):
-    def test_preflight_reports_denied_command(self):
-        proc = F.run_cli("native_agent.py", "preflight-commands",
-                         "--command", "git rev-list --count HEAD",
-                         "--command", "git log --out=/tmp/x")
-        self.assertEqual(proc.returncode, 2, proc.stderr)
-        payload = json.loads(proc.stdout)
-        self.assertFalse(payload["ok"])
-        self.assertEqual(payload["checked"], 2)
-        self.assertEqual(payload["problems"][0]["index"], 2)
-
-    def test_preflight_file_with_comments(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = os.path.join(tmp, "cmds.txt")
-            with open(path, "w", encoding="utf-8") as fh:
-                fh.write("# 注释\n\npaste -sd+ a.txt\n")
-            proc = F.run_cli("native_agent.py", "preflight-commands", "--file", path)
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertTrue(json.loads(proc.stdout)["ok"])
-
-
 class ReviewContextV63Tests(F.BridgeBase):
     def setUp(self):
         super().setUp()
@@ -299,6 +186,17 @@ class ReviewContextV63Tests(F.BridgeBase):
             session_created_at=attempt["created_at"])
         env = self.review(self.execution_env, attempt=attempt, host=host)
         AC._ingest_review(self.state_path, env)
+        # 阶段九：正式基线必须来自新链；夹具把本轮复核标记为 candidate 并消费
+        # attempt，再核销条件以复现“复核后条件变化”的诊断路径。
+        state = G.load_state(self.state_path)
+        record = state["native_reviews"][-1]
+        record["g4_eligible"] = True
+        record["g4_source"] = "candidate"
+        record["candidate_g4"] = {"eligible": True, "reasons": []}
+        bound = G.find_review_attempt(state, attempt["review_attempt_id"])
+        bound["consumed"] = True
+        bound["consumed_by_result_sha256"] = record["result_sha256"]
+        G.save_state(self.state_path, state)
         G.record_criterion(self.state_path, "C1", "met", evidence_ids=["E1"])
         review_path = os.path.join(self.dir, "previous.json")
         with open(review_path, "w", encoding="utf-8") as fh:
@@ -339,8 +237,9 @@ class IngestAuditV63Tests(F.BridgeBase):
         self.assertIn("native_result_ingested", events)
 
     def test_rejected_review_is_logged_as_attempt(self):
-        AC._ingest_execution(self.state_path, self.execution())
-        bad = self.review(self.execution(), verdict="pass", g4_eligible=False,
+        execution = self.execution()
+        AC._ingest_execution(self.state_path, execution)
+        bad = self.review(execution, verdict="pass", g4_eligible=False,
                           target_sha256="", findings=[{
                               "severity": "blocking", "summary": "阻塞",
                               "file": self.evidence, "evidence": "证据"}])
@@ -355,8 +254,8 @@ class IngestAuditV63Tests(F.BridgeBase):
 
     def test_review_build_failure_is_logged_as_attempt(self):
         # 生成阶段被拒也属于无效信封：落进同一份 attempts，指标才完整。
-        AC._ingest_execution(self.state_path, self.execution())
         execution = self.execution()
+        AC._ingest_execution(self.state_path, execution)
         execution_path = os.path.join(self.dir, "execution.json")
         with open(execution_path, "w", encoding="utf-8") as fh:
             json.dump(execution, fh, ensure_ascii=False)
@@ -383,8 +282,7 @@ class IngestAuditV63Tests(F.BridgeBase):
         code = NA.main(["review", "--state", self.state_path,
                         "--dispatch", dispatch_path,
                         "--execution", execution_path,
-                        "--work-item", "A1", "--metadata", metadata,
-                        "--model-rollout", rollout])
+                        "--work-item", "A1", "--metadata", metadata])
         self.assertEqual(code, 2)
         path = os.path.join(os.path.dirname(self.state_path), "review-attempts.jsonl")
         self.assertTrue(os.path.isfile(path))
@@ -394,13 +292,13 @@ class IngestAuditV63Tests(F.BridgeBase):
         self.assertEqual(entry["code"], "review_attempt_missing")
         self.assertEqual(entry["work_item_id"], "A1")
         self.assertEqual(entry["execution_result_sha256"],
-                         self.execution()["result_sha256"])
+                         execution["result_sha256"])
 
     def test_review_ingest_writes_history_event(self):
-        AC._ingest_execution(self.state_path, self.execution())
-        # 非 G4 PASS：g4_eligible=false 时不需要宿主记录重核。
-        review = self.review(self.execution(), g4_eligible=False,
-                             target_sha256="")
+        execution = self.execution()
+        AC._ingest_execution(self.state_path, execution)
+        # 非 G4 PASS：新链不会从信封自述取得正式资格。
+        review = self.review(execution, g4_eligible=False, target_sha256="")
         AC._ingest_review(self.state_path, review)
         state = G.load_state(self.state_path)
         events = [h["event"] for h in state.get("history") or []]

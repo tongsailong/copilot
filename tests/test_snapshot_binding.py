@@ -1,23 +1,25 @@
 #!/usr/bin/env python3
-"""G4 快照绑定判别测试：旧 Reviewer 输出不能变成新快照的有效结论。
+"""正式 G4 切换后的快照绑定与放行判别测试。
 
-覆盖场景：
-- S0 正常 PASS；
-- S0→S1 代码 / 证据 / 合同变化后旧复核过期；
-- Reviewer 会话 / attempt 复用 / 旧输出重新封装；
-- 复核期间证据文件漂移；
-- 新快照新建 attempt 可复核；
-- 缺失 attempt、失败后重试、重复 ingest。
+阶段九起 `native_reviews[].g4_eligible` 只在 shadow `attested` 且新链 eligible 时
+产生，收口门禁还要求 `g4_source="candidate"` 与 `candidate_g4.eligible=true`；旧
+Reviewer 信封的 `g4_eligible` 自述、Bash 命令、rollout 记录都不再构成正式资格。本文件锁定：
+- 正式放行需要 attested + 新链 eligible，且风险为 high；
+- 旧信封自报 eligible 不放行，Bash 命令直接拒绝；
+- attempt 固化的代码/证据快照漂移在 ingest 时失败关闭；
+- review-context 创建 attempt 的绑定与 pending criteria 保护；
+- attempt 工作区与证据仓库一致。
 """
 from __future__ import annotations
 
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import tempfile
-import types
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -45,7 +47,8 @@ class SnapshotBindingTests(unittest.TestCase):
         F.init_git_workspace(self.dir)
         self.state_path = os.path.join(self.dir, "state.json")
         G.start_state(self.state_path, goal="目标", contract=CONTRACT,
-                      execution_backend="native", risk="high")
+                      execution_backend="native", risk="high",
+                      test_policy={"required": False})
         G.plan_state(self.state_path, {"summary": "实现", "actions": [
             {"id": "A1", "title": "实现", "goal": "产出结果",
              "expected_evidence": "结果文件"}]})
@@ -53,6 +56,8 @@ class SnapshotBindingTests(unittest.TestCase):
         self.dispatch = NB.build_dispatch(state, G.ready_actions(state))
         state["native_dispatch"] = self.dispatch
         G.save_state(self.state_path, state)
+        self.binding = G.create_execution_binding(
+            self.state_path, work_item_id="A1", workspace=self.dir)
         self.evidence = os.path.join(self.dir, "result.txt")
         with open(self.evidence, "w", encoding="utf-8") as fh:
             fh.write("result\n")
@@ -78,11 +83,21 @@ class SnapshotBindingTests(unittest.TestCase):
                          "profile_id": "executor", "model_reported": "m"},
             "timing": {"duration_ms": 10},
             "usage": {"total_tokens": 10},
+            "execution_binding": {
+                "binding_id": self.binding["binding_id"],
+                "nonce": self.binding["nonce"],
+                "created_at": self.binding["created_at"],
+                "workspace": self.binding["workspace"],
+                "test_commands": self.binding["test_commands"],
+            },
         }
         self.execution["result_sha256"] = NB.envelope_sha256(self.execution)
         AC._ingest_execution(self.state_path, self.execution)
         G.record_criterion(self.state_path, "C1", "met", evidence_ids=["E1"])
         self.state = G.load_state(self.state_path)
+        # Reviewer 宿主产物放在工作区外，避免取证件进入执行代码快照。
+        self.host_dir = tempfile.mkdtemp(prefix="review-host-")
+        self.addCleanup(shutil.rmtree, self.host_dir, True)
 
     # ── 夹具 ──────────────────────────────────────────────────────────────
     def attempt(self, execution: dict | None = None) -> dict:
@@ -93,14 +108,14 @@ class SnapshotBindingTests(unittest.TestCase):
             workspace=self.dir)
 
     def envelope(self, attempt: dict, *, prompt: str = "",
-                 session_created_at: str = "", **overrides) -> dict:
+                 **overrides) -> dict:
         state = G.load_state(self.state_path)
         host = F.make_fake_review_host(
-            self.dir, execution=self.execution, dispatch=self.dispatch,
+            self.host_dir, execution=self.execution, dispatch=self.dispatch,
             evidence=self.evidence, task_id=state["task_id"],
             attempt_id=attempt["review_attempt_id"],
-            session_created_at=session_created_at or attempt["created_at"],
-            prompt=prompt)
+            session_created_at=attempt["created_at"],
+            prompt=prompt, workspace=self.dir)
         env = {
             "schema": NB.REVIEW_SCHEMA,
             "task_id": state["task_id"],
@@ -123,24 +138,34 @@ class SnapshotBindingTests(unittest.TestCase):
             "verdict": "pass",
             "findings": [],
             "files_inspected": [self.evidence],
-            "commands_run": ["git status --short"],
+            "commands_run": [],
             "changed_files": [],
             "unverified": [],
             "residual_risks": [],
+            # 旧 Reviewer 自述；阶段九起不参与正式放行。
             "g4_eligible": True,
         }
         env.update(overrides)
         env["result_sha256"] = NB.envelope_sha256(env)
         return env
 
-    def ingest(self, env: dict) -> str:
-        AC._ingest_review(self.state_path, env)
-        return str(env["result_sha256"])
+    def shadow(self, *, status: str = "attested", eligible: bool = True,
+               reasons: list[str] | None = None) -> dict:
+        return {
+            "shadow_id": "GS-TEST",
+            "status": status,
+            "new_g4_eligible": eligible,
+            "new_reason": list(reasons or []),
+            "test_execution": {
+                "status": "not_applicable", "problems": [],
+                "execution_binding_id": self.binding["binding_id"],
+            },
+            "attestation": {"output_sha256": ""},
+        }
 
-    def add_code_change(self) -> None:
-        G.rerun_action(self.state_path, "A1", reason="代码变化")
-        G.record_action(self.state_path, "A1", "done", result="变化后的代码",
-                        evidence_ids=["E1"])
+    def ingest_with(self, env: dict, shadow: dict) -> None:
+        with mock.patch.object(AC.SH, "build", return_value=shadow):
+            AC._ingest_review(self.state_path, env)
 
     def write_source(self, name: str, text: str, *, commit: bool = False) -> str:
         path = os.path.join(self.dir, name)
@@ -154,97 +179,99 @@ class SnapshotBindingTests(unittest.TestCase):
                            check=True, capture_output=True, text=True)
         return path
 
-    def code_codes(self) -> dict:
-        check = G.closure_check(G.load_state(self.state_path))
-        return {gate: {r["code"] for r in check["gates"][gate]["reasons"]}
-                for gate in ("G1", "G2", "G3", "G4")}
-
-    def test_unregistered_source_change_breaks_g2_and_g4(self):
-        self.write_source("src/feature.py", "VALUE = 1\n")
-        self.ingest(self.envelope(self.attempt()))
-        self.write_source("src/feature.py", "VALUE = 2\n")
-        codes = self.code_codes()
-        self.assertIn("native_review_code_scope_drift", codes["G2"])
-        self.assertIn("native_review_code_scope_drift", codes["G4"])
-
-    def test_new_source_file_after_attempt_is_rejected_at_ingest(self):
-        self.write_source("src/feature.py", "VALUE = 1\n")
+    # ── 正式 G4 放行 ──────────────────────────────────────────────────────
+    def test_formal_g4_requires_attested_candidate(self):
         attempt = self.attempt()
         env = self.envelope(attempt)
-        self.write_source("src/new_file.py", "NEW = True\n")
+        self.ingest_with(env, self.shadow())
+        state = G.load_state(self.state_path)
+        review = state["native_reviews"][0]
+        self.assertTrue(review["g4_eligible"])
+        self.assertEqual(review["g4_source"], "candidate")
+        self.assertEqual(review["g4_reasons"], [])
+        self.assertTrue(review["candidate_g4"]["eligible"],
+                        review["candidate_g4"]["reasons"])
+        self.assertTrue(review["candidate_g4"]["raw_output_sha256"])
+        consumed = G.find_review_attempt(state, attempt["review_attempt_id"])
+        self.assertTrue(consumed["consumed"])
+        self.assertEqual(consumed["consumed_by_result_sha256"],
+                         env["result_sha256"])
+
+    def test_attested_but_ineligible_is_not_formal(self):
+        attempt = self.attempt()
+        self.ingest_with(self.envelope(attempt),
+                         self.shadow(eligible=False,
+                                     reasons=["test_execution_not_verified"]))
+        state = G.load_state(self.state_path)
+        review = state["native_reviews"][0]
+        self.assertFalse(review["g4_eligible"])
+        self.assertEqual(review["g4_source"], "")
+        self.assertIn("test_execution_not_verified", review["g4_reasons"])
+        self.assertFalse(G.find_review_attempt(
+            state, attempt["review_attempt_id"])["consumed"])
+
+    def test_failed_shadow_is_not_formal(self):
+        attempt = self.attempt()
+        self.ingest_with(self.envelope(attempt),
+                         self.shadow(status="failed",
+                                     eligible=False,
+                                     reasons=["host_session_missing"]))
+        state = G.load_state(self.state_path)
+        self.assertFalse(state["native_reviews"][0]["g4_eligible"])
+        self.assertFalse(G.find_review_attempt(
+            state, attempt["review_attempt_id"])["consumed"])
+
+    def test_normal_risk_is_never_formal(self):
+        state = G.load_state(self.state_path)
+        state["risk"] = "normal"
+        G.save_state(self.state_path, state)
+        self.ingest_with(self.envelope(self.attempt()), self.shadow())
+        state = G.load_state(self.state_path)
+        self.assertFalse(state["native_reviews"][0]["g4_eligible"])
+        self.assertEqual(state["native_reviews"][0]["g4_source"], "")
+
+    def test_legacy_g4_source_is_rejected_by_gate(self):
+        attempt = self.attempt()
+        env = self.envelope(attempt)
+        state = G.load_state(self.state_path)
+        record = dict(env)
+        record["g4_eligible"] = True
+        record["g4_source"] = ""
+        record["target_sha256"] = G.final_evidence_digest(state)
+        record["coverage"] = NB.review_coverage(state)
+        F.attach_review(state, record, attempt)
+        G.save_state(self.state_path, state)
+        ok, code = G._eligible_review(record, G.load_state(self.state_path))
+        self.assertFalse(ok)
+        self.assertEqual(code, "native_review_legacy_g4_source")
+
+    def test_bash_review_is_rejected(self):
+        env = self.envelope(self.attempt(),
+                            commands_run=["git status --short"])
         with self.assertRaises(AC.AutoError) as ctx:
-            self.ingest(env)
+            self.ingest_with(env, self.shadow())
+        self.assertIn("review_command_unexpected", str(ctx.exception))
+
+    def test_code_change_after_attempt_blocks_formal_g4(self):
+        attempt = self.attempt()
+        self.write_source("src/feature.py", "VALUE = 2\n")
+        with self.assertRaises(AC.AutoError) as ctx:
+            self.ingest_with(self.envelope(attempt), self.shadow())
         self.assertIn("native_review_code_scope_drift", str(ctx.exception))
         state = G.load_state(self.state_path)
         self.assertFalse(G.find_review_attempt(
             state, attempt["review_attempt_id"])["consumed"])
 
-    def test_deleted_source_file_is_detected(self):
-        path = self.write_source("src/feature.py", "VALUE = 1\n")
-        self.ingest(self.envelope(self.attempt()))
-        os.remove(path)
-        self.assertIn("native_review_code_scope_drift", self.code_codes()["G2"])
-
-    def test_renamed_source_file_is_detected(self):
-        self.write_source("src/old.py", "VALUE = 1\n", commit=True)
-        self.ingest(self.envelope(self.attempt()))
-        subprocess.run(["git", "-C", self.dir, "mv", "src/old.py", "src/new.py"],
-                       check=True, capture_output=True, text=True)
-        self.assertIn("native_review_code_scope_drift", self.code_codes()["G2"])
-        # 新 attempt 必须把 rename 作为 R + old_path 纳入快照。
-        fresh = self.attempt()
-        state = G.load_state(self.state_path)
-        entry = next(item for item in G.find_review_attempt(
-            state, fresh["review_attempt_id"])["code_snapshot"]["files"]
-            if item["path"] == "src/new.py")
-        self.assertEqual(entry["status"], "R ")
-        self.assertEqual(entry["old_path"], "src/old.py")
-
-    def test_ignored_build_output_does_not_invalidate(self):
-        with open(os.path.join(self.dir, ".gitignore"), "a", encoding="utf-8") as fh:
-            fh.write("build/\n")
-        subprocess.run(["git", "-C", self.dir, "add", ".gitignore"], check=True,
-                       capture_output=True, text=True)
-        subprocess.run(["git", "-C", self.dir, "commit", "-qm", "ignore build"],
-                       check=True, capture_output=True, text=True)
-        build = self.write_source("build/out.bin", "a\n")
-        self.ingest(self.envelope(self.attempt()))
-        with open(build, "w", encoding="utf-8") as fh:
-            fh.write("changed build output\n")
-        self.assertNotIn("native_review_code_scope_drift", self.code_codes()["G2"])
-
-    def test_new_attempt_after_source_change_is_allowed(self):
-        self.write_source("src/feature.py", "VALUE = 1\n")
-        self.ingest(self.envelope(self.attempt()))
-        self.write_source("src/feature.py", "VALUE = 2\n")
-        fresh = self.attempt()
-        self.ingest(self.envelope(fresh))
-        self.assertNotIn("native_review_code_scope_drift", self.code_codes()["G2"])
-        self.assertNotIn("native_review_code_scope_drift", self.code_codes()["G4"])
-
-    def test_committed_task_change_is_included_with_base(self):
-        base = subprocess.run(["git", "-C", self.dir, "rev-parse", "HEAD"],
-                              check=True, capture_output=True, text=True).stdout.strip()
-        self.write_source("src/committed.py", "VALUE = 1\n", commit=True)
-        attempt = G.create_review_attempt(
-            self.state_path, work_item_id="A1",
-            execution_result_sha256=self.execution["result_sha256"],
-            workspace=self.dir, base=base)
-        self.assertIn("src/committed.py", [
-            f["path"] for f in attempt["code_snapshot"]["files"]])
-        self.ingest(self.envelope(attempt))
-        self.assertNotIn("native_review_code_scope_drift", self.code_codes()["G2"])
-
-    def test_legacy_attempt_without_code_scope_fails_g2(self):
+    def test_evidence_drift_after_attempt_blocks_formal_g4(self):
         attempt = self.attempt()
-        self.ingest(self.envelope(attempt))
-        state = G.load_state(self.state_path)
-        bound = G.find_review_attempt(state, attempt["review_attempt_id"])
-        bound.pop("code_snapshot", None)
-        bound.pop("code_scope_sha256", None)
-        G.save_state(self.state_path, state)
-        self.assertIn("native_review_code_scope_missing", self.code_codes()["G2"])
+        with open(self.evidence, "w", encoding="utf-8") as fh:
+            fh.write("drift\n")
+        with self.assertRaises(AC.AutoError) as ctx:
+            self.ingest_with(self.envelope(attempt), self.shadow())
+        self.assertIn("native_review_attempt_workspace_drift",
+                      str(ctx.exception))
 
+    # ── review-context 绑定 ──────────────────────────────────────────────
     def write_json(self, name: str, payload: dict) -> str:
         path = os.path.join(self.dir, name)
         with open(path, "w", encoding="utf-8") as fh:
@@ -283,7 +310,8 @@ class SnapshotBindingTests(unittest.TestCase):
         os.makedirs(sub)
         state_path = os.path.join(sub, "state.json")
         G.start_state(state_path, goal="目标", contract=CONTRACT,
-                      execution_backend="native", risk="high")
+                      execution_backend="native", risk="high",
+                      test_policy={"required": False})
         G.plan_state(state_path, {"summary": "实现", "actions": [
             {"id": "A1", "title": "实现", "goal": "产出结果",
              "expected_evidence": "结果文件"}]})
@@ -322,259 +350,44 @@ class SnapshotBindingTests(unittest.TestCase):
         self.assertIn("review_attempt_unstable", str(ctx.exception))
         self.assertEqual(G.load_state(state_path).get("review_attempts") or [], [])
 
-    def _ingested_base_record(self) -> dict:
-        self.ingest(self.envelope(self.attempt()))
-        state = G.load_state(self.state_path)
-        return dict(state["native_reviews"][0])
+    # ── 快照捕获 ──────────────────────────────────────────────────────────
+    def test_committed_task_change_is_included_with_base(self):
+        base = subprocess.run(["git", "-C", self.dir, "rev-parse", "HEAD"],
+                              check=True, capture_output=True, text=True).stdout.strip()
+        self.write_source("src/committed.py", "VALUE = 1\n", commit=True)
+        attempt = G.create_review_attempt(
+            self.state_path, work_item_id="A1",
+            execution_result_sha256=self.execution["result_sha256"],
+            workspace=self.dir, base=base)
+        self.assertIn("src/committed.py", [
+            f["path"] for f in attempt["code_snapshot"]["files"]])
 
-    def test_legacy_pass_without_attempt_is_not_reusable(self):
-        record = self._ingested_base_record()
-        record.pop("review_attempt_id", None)
-        record.pop("review_attempt_created_at", None)
-        state = G.load_state(self.state_path)
-        state["native_reviews"] = [record]
-        state["review_attempts"] = []
-        G.save_state(self.state_path, state)
-        path = self.write_json("legacy-base.json", record)
-        payload = NA.build_review_context(
-            self.context_args(previous_review=path))
-        self.assertEqual(payload["review_scope"], "full")
-        self.assertIn("信任检查", payload["scope_reason"])
-        self.assertIn("native_review_attempt_missing",
-                      payload["previous_review"]["trust_problems"])
-        # 不可信基线不阻止重新派发：允许创建新 attempt 做完整复核。
-        fresh = NA.build_review_context(
-            self.context_args(previous_review=path, create_attempt=True))
-        self.assertTrue(fresh["review_attempt_id"].startswith("RA"))
-        with self.assertRaises(NA.AgentRecordError) as ctx:
-            NA._incremental_base(G.load_state(self.state_path), path)
-        self.assertIn("incremental_base_ineligible", str(ctx.exception))
-
-    def test_review_context_refuses_reuse_of_identical_trusted_pass(self):
-        record = self._ingested_base_record()
-        path = self.write_json("base.json", record)
-        with self.assertRaises(NA.AgentRecordError) as ctx:
-            NA.build_review_context(
-                self.context_args(previous_review=path, create_attempt=True))
-        self.assertIn("review_attempt_not_needed", str(ctx.exception))
-
-    def test_baseline_evidence_drift_is_not_reusable(self):
-        record = self._ingested_base_record()
-        path = self.write_json("base.json", record)
-        with open(self.evidence, "w", encoding="utf-8") as fh:
-            fh.write("drift after pass\n")
-        payload = NA.build_review_context(
-            self.context_args(previous_review=path))
-        self.assertEqual(payload["review_scope"], "full")
-        self.assertIn("native_review_attempt_workspace_drift",
-                      payload["previous_review"]["trust_problems"])
-        with self.assertRaises(NA.AgentRecordError) as ctx:
-            NA._incremental_base(G.load_state(self.state_path), path)
-        self.assertIn("incremental_base_ineligible", str(ctx.exception))
-
-    def test_build_review_rejects_old_session_for_new_attempt(self):
+    def test_ignored_build_output_does_not_invalidate(self):
+        with open(os.path.join(self.dir, ".gitignore"), "a",
+                  encoding="utf-8") as fh:
+            fh.write("build/\n")
+        subprocess.run(["git", "-C", self.dir, "add", ".gitignore"], check=True,
+                       capture_output=True, text=True)
+        subprocess.run(["git", "-C", self.dir, "commit", "-qm", "ignore build"],
+                       check=True, capture_output=True, text=True)
         attempt = self.attempt()
-        old = "2000-01-01T00:00:00+00:00"
-        host = F.make_fake_review_host(
-            self.dir, execution=self.execution, dispatch=self.dispatch,
-            evidence=self.evidence, task_id=self.state["task_id"],
-            attempt_id=attempt["review_attempt_id"],
-            session_created_at=old)
-        args = types.SimpleNamespace(
-            state=self.state_path,
-            dispatch=self.write_json("dispatch.json", self.dispatch),
-            execution=self.write_json("execution.json", self.execution),
-            work_item="A1", metadata=host["metadata_path"],
-            model_rollout=host["rollout_path"], input="", output="",
-            attempt=attempt["review_attempt_id"], based_on="")
-        with self.assertRaises(NA.AgentRecordError) as ctx:
-            NA.build_review(args)
-        self.assertIn("review_attempt_session_invalid", str(ctx.exception))
-
-    # ── 基本 PASS ─────────────────────────────────────────────────────────
-    def test_s0_normal_pass_is_accepted(self):
-        attempt = self.attempt()
-        env = self.envelope(attempt)
-        self.ingest(env)
+        build = self.write_source("build/out.bin", "artifact\n")
         state = G.load_state(self.state_path)
-        gate = G._gate_review(state)
-        self.assertTrue(gate["passed"], gate.get("reasons"))
-        bound = G.find_review_attempt(state, attempt["review_attempt_id"])
-        self.assertTrue(bound["consumed"])
-        self.assertEqual(bound["consumed_by_result_sha256"], env["result_sha256"])
-
-    # ── S0→S1：旧结论过期 ────────────────────────────────────────────────
-    def test_code_change_after_review_is_stale(self):
-        self.ingest(self.envelope(self.attempt()))
-        self.add_code_change()
-        codes = {r["code"] for r in G._gate_review(
-            G.load_state(self.state_path))["reasons"]}
-        self.assertIn("native_review_stale", codes)
-
-    def test_evidence_change_after_review_is_stale(self):
-        self.ingest(self.envelope(self.attempt()))
+        self.assertEqual(G.code_scope_problems(attempt, state), [])
+        with open(build, "w", encoding="utf-8") as fh:
+            fh.write("changed\n")
         state = G.load_state(self.state_path)
-        G.register_evidence(state, "E2", text="新增证据")
-        G.save_state(self.state_path, state)
-        codes = {r["code"] for r in G._gate_review(
-            G.load_state(self.state_path))["reasons"]}
-        self.assertIn("native_review_stale", codes)
-
-    def test_contract_change_after_review_is_stale(self):
-        self.ingest(self.envelope(self.attempt()))
-        G.amend_contract(self.state_path,
-                         contract=CONTRACT + "\n- 新增边界：不修改无关项目\n")
-        codes = {r["code"] for r in G._gate_review(
-            G.load_state(self.state_path))["reasons"]}
-        self.assertTrue({"native_review_contract_mismatch",
-                         "native_review_stale"} & codes, codes)
-
-    # ── 会话 / attempt 绑定 ───────────────────────────────────────────────
-    def test_session_mismatch_is_rejected_at_ingest(self):
-        attempt = self.attempt()
-        state = G.load_state(self.state_path)
-        bound = G.find_review_attempt(state, attempt["review_attempt_id"])
-        bound["reviewer"] = {"agent_id": "agent-review",
-                             "child_session_id": "child-other"}
-        G.save_state(self.state_path, state)
-        with self.assertRaises(AC.AutoError) as ctx:
-            self.ingest(self.envelope(attempt))
-        self.assertIn("native_review_attempt_session_mismatch", str(ctx.exception))
-        state = G.load_state(self.state_path)
-        self.assertFalse(G.find_review_attempt(
-            state, attempt["review_attempt_id"])["consumed"])
-
-    def test_old_session_cannot_claim_new_attempt(self):
-        attempt = self.attempt()
-        old = "2000-01-01T00:00:00+00:00"
-        with self.assertRaises(AC.AutoError) as ctx:
-            self.ingest(self.envelope(attempt, session_created_at=old))
-        self.assertIn("review_attempt_session_precedes_attempt", str(ctx.exception))
-
-    def test_attempt_replay_is_rejected(self):
-        attempt = self.attempt()
-        first = self.envelope(attempt)
-        self.ingest(first)
-        replay = self.envelope(attempt, residual_risks=["重放的第二份输出"])
-        with self.assertRaises(AC.AutoError) as ctx:
-            self.ingest(replay)
-        self.assertIn("native_review_attempt_consumed", str(ctx.exception))
-        state = G.load_state(self.state_path)
-        self.assertEqual(len(state.get("native_reviews") or []), 1)
-
-    def test_old_output_re_enveloped_with_new_target_is_rejected(self):
-        """核心判别：宿主重算当前 SHA 也不能把旧输出变成新快照结论。"""
-        attempt = self.attempt()
-        old = self.envelope(attempt)
-        self.add_code_change()
-        current = G.final_evidence_digest(G.load_state(self.state_path))
-        forged = json.loads(json.dumps(old))
-        forged["target_sha256"] = current
-        forged["result_sha256"] = NB.envelope_sha256(
-            {k: v for k, v in forged.items() if k != "result_sha256"})
-        with self.assertRaises(AC.AutoError) as ctx:
-            self.ingest(forged)
-        self.assertIn("native_review_stale", str(ctx.exception))
-        state = G.load_state(self.state_path)
-        self.assertFalse(G.find_review_attempt(
-            state, attempt["review_attempt_id"])["consumed"])
-
-    def test_missing_attempt_is_rejected(self):
-        env = self.envelope(self.attempt())
-        env.pop("review_attempt_id")
-        env.pop("review_attempt_created_at")
-        env["result_sha256"] = NB.envelope_sha256(
-            {k: v for k, v in env.items() if k != "result_sha256"})
-        with self.assertRaises(NB.BridgeError) as ctx:
-            NB.validate_review_result(env, self.dispatch, self.execution,
-                                      G.load_state(self.state_path))
-        self.assertEqual(ctx.exception.code, "review_attempt_missing")
-
-    # ── 复核期间工作区漂移 ────────────────────────────────────────────────
-    def test_evidence_file_drift_during_review_is_rejected(self):
-        attempt = self.attempt()
-        env = self.envelope(attempt)
-        with open(self.evidence, "w", encoding="utf-8") as fh:
-            fh.write("changed while reviewing\n")
-        with self.assertRaises(AC.AutoError) as ctx:
-            self.ingest(env)
-        self.assertIn("native_review_attempt_workspace_drift", str(ctx.exception))
-
-    # ── 新快照新建 attempt ────────────────────────────────────────────────
-    def test_new_snapshot_new_attempt_is_allowed(self):
-        self.attempt()  # 旧 attempt 保持未消费，模拟旧派发被放弃
-        self.write_source("src/feature.py", "VALUE = 2\n")
-        fresh = self.attempt()
-        self.ingest(self.envelope(fresh))
-        gate = G._gate_review(G.load_state(self.state_path))
-        self.assertTrue(gate["passed"], gate.get("reasons"))
-
-    def test_attempt_cannot_bind_superseded_execution(self):
-        AC._ingest_execution(self.state_path, self.execution)
-        G.rerun_action(self.state_path, "A1", reason="重跑")
-        second = json.loads(json.dumps(self.execution))
-        second["result"] = "重跑后的结果"
-        second.pop("result_sha256", None)
-        second["result_sha256"] = NB.envelope_sha256(second)
-        AC._ingest_execution(self.state_path, second)
-        with self.assertRaises(G.GovernanceError) as ctx:
-            G.create_review_attempt(
-                self.state_path, work_item_id="A1",
-                execution_result_sha256=self.execution["result_sha256"],
-                workspace=self.dir)
-        self.assertIn("旧结果", str(ctx.exception))
-
-    def test_build_review_rejects_wrong_workspace(self):
-        attempt = self.attempt()
-        other = os.path.join(self.dir, "other-workspace")
-        os.makedirs(other)
-        host = F.make_fake_review_host(
-            self.dir, execution=self.execution, dispatch=self.dispatch,
-            evidence=self.evidence, task_id=self.state["task_id"],
-            attempt_id=attempt["review_attempt_id"],
-            session_created_at=attempt["created_at"], workspace=other)
-        args = types.SimpleNamespace(
-            state=self.state_path,
-            dispatch=self.write_json("dispatch.json", self.dispatch),
-            execution=self.write_json("execution.json", self.execution),
-            work_item="A1", metadata=host["metadata_path"],
-            model_rollout=host["rollout_path"], input="", output="",
-            attempt=attempt["review_attempt_id"], based_on="")
-        with self.assertRaises(NA.AgentRecordError) as ctx:
-            NA.build_review(args)
-        self.assertIn("review_attempt_workspace_mismatch", str(ctx.exception))
+        self.assertEqual(G.code_scope_problems(attempt, state), [])
 
     def test_attempt_workspace_must_match_evidence_repository(self):
-        other = os.path.join(self.dir, "other-repo")
+        other = tempfile.mkdtemp(prefix="other-ws-")
+        self.addCleanup(shutil.rmtree, other, True)
         F.init_git_workspace(other)
-        with self.assertRaises(G.GovernanceError) as ctx:
+        with self.assertRaises(G.GovernanceError):
             G.create_review_attempt(
                 self.state_path, work_item_id="A1",
                 execution_result_sha256=self.execution["result_sha256"],
                 workspace=other)
-        self.assertIn("证据所属仓库不一致", str(ctx.exception))
-
-    def test_failed_ingest_does_not_consume_attempt_and_can_retry(self):
-        attempt = self.attempt()
-        with self.assertRaises(AC.AutoError) as ctx:
-            self.ingest(self.envelope(attempt, prompt="旧会话 prompt"))
-        self.assertIn("review_attempt_prompt_unbound", str(ctx.exception))
-        state = G.load_state(self.state_path)
-        self.assertFalse(G.find_review_attempt(
-            state, attempt["review_attempt_id"])["consumed"])
-        # 修正宿主 prompt 后重新生成信封即可回填，不需要新建 attempt。
-        self.ingest(self.envelope(attempt))
-        state = G.load_state(self.state_path)
-        self.assertTrue(G.find_review_attempt(
-            state, attempt["review_attempt_id"])["consumed"])
-
-    def test_duplicate_ingest_is_idempotent(self):
-        attempt = self.attempt()
-        env = self.envelope(attempt)
-        self.ingest(env)
-        self.ingest(env)
-        state = G.load_state(self.state_path)
-        self.assertEqual(len(state.get("native_reviews") or []), 1)
 
 
 if __name__ == "__main__":

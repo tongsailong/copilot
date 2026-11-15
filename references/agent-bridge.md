@@ -7,11 +7,12 @@ v1 信封（SOL 通道时代）已退役，出现即 `schema_retired`。
 
 | 角色 | 职责 | 约束 |
 |---|---|---|
-| Executor | 执行单个工作项，产出结果与原始证据 | 可以是主代理（`kind=main`）或原生子代理（`kind=subagent`）；不得使用 `reviewer` Profile |
-| Reviewer | 独立只读复核，给出 verdict/findings | 必须是 `kind=subagent`、`profile_id=reviewer`、工具仅 `Read/Grep/Glob/Bash`；不得修改文件、不得与执行方共用 Agent/Child Session |
+| Executor | 执行单个工作项，产出结果与原始证据 | 必须是原生子代理（`kind=subagent`），带 Agent/Child Session 身份；不得使用 `reviewer` Profile |
+| Reviewer | 独立只读复核，给出 verdict/findings | 必须是 `kind=subagent`、`profile_id=reviewer`、工具仅 `Read/Grep/Glob`；不得修改文件、不得与执行方共用 Agent/Child Session |
 
 Copilot 不派发 Agent、不调用模型、不写别人的会话。它只校验宿主已产生的记录并回填状态。
-`native_agent.py` 从真实 `metadata.json`、rollout 与证据文件生成信封，避免主代理手抄身份。
+`native_agent.py` 从真实 `metadata.json`、宿主 SQLite（`tool_usage`/`part`/`session_entry`）
+与证据文件生成信封，避免主代理手抄身份。
 
 ## 2. 信封 v2
 
@@ -100,8 +101,9 @@ Copilot 不派发 Agent、不调用模型、不写别人的会话。它只校验
                "model_reported": "..."},
   "host": {"metadata_path": "/abs/metadata.json",
            "output_file": "/abs/review-output.json",
-           "rollout_path": "/abs/model-io-<child>.jsonl",
-           "tool_calls": [{"name": "Read", "count": 2}, {"name": "Bash", "count": 1}],
+           "rollout_path": "",
+           "host_db": "/home/<user>/.zcode/cli/db/db.sqlite",
+           "tool_calls": [{"name": "Read", "count": 2}, {"name": "Grep", "count": 1}],
            "agent_id": "agent-review", "child_session_id": "child-review",
            "session_created_at": "<metadata.createdAt>",
            "session_completed_at": "<metadata.completedAt>",
@@ -113,7 +115,7 @@ Copilot 不派发 Agent、不调用模型、不写别人的会话。它只校验
                 "root_cause": "...", "category": "...", "status": "open",
                 "related": ["F2"], "reproduce": "..."}],
   "files_inspected": ["/abs/path"],
-  "commands_run": ["git status --short"],
+  "commands_run": [],
   "changed_files": [],
   "unverified": [],
   "residual_risks": [],
@@ -121,6 +123,9 @@ Copilot 不派发 Agent、不调用模型、不写别人的会话。它只校验
   "result_sha256": "<信封自身摘要>"
 }
 ```
+
+`g4_source` 与 `candidate_g4` 由 `copilot_auto._ingest_review` 写入状态记录，不是
+Reviewer 信封字段。
 
 校验要点：
 
@@ -134,44 +139,20 @@ Copilot 不派发 Agent、不调用模型、不写别人的会话。它只校验
 - Reviewer 必须是独立子代理（`reviewer_invalid`），Profile 必须是 `reviewer`
   （`reviewer_profile_invalid`），且与执行方不同 Agent / Child Session
   （`executor_reviewer_same`、`review_contaminated`）。
-- `files_inspected` / `commands_run` 由 `native_agent.py` 从宿主 rollout **派生**：
-  `commands_run` 取实际 Bash 调用，`files_inspected` 合并自报与实际的读取路径；
-  两者可以为空，不再要求 Reviewer 手工复述，也不因自述与记录不完全一致而作废
-  整轮复核。`declared_files_unverified` 非空时会写入复核记录，供审计。
-- 相对路径解析：`cd <dir>; cat report.md` 与 `git -C <dir> …` 之后的相对 token 会按
-  该目录解析成绝对路径再判定“是否访问过证据”，避免已读取却判 `review_file_not_inspected`
-  的假阴性；仍建议 Reviewer 使用绝对路径。
+- Reviewer **没有 Bash 权限**：`commands_run` 必须为空，出现任何 Bash 命令直接
+  `review_command_unexpected`。`files_inspected` 由 `native_agent.py` 合并自报与宿主
+  `tool_usage`/`part` 的 Read/Grep/Glob 路径；`declared_files_unverified` 非空时写入
+  复核记录供审计。
 - finding 元数据：`id`（`F1`–`F9999`，本轮唯一）与 `status`（`open|resolved|regressed`，
   缺省 `open`）可选；`root_cause`/`category`/`related`/`reproduce` 可选。同一轮重复 ID
   或完全相同的 `(severity,file,line,summary)` 会被拒绝（`review_finding_duplicate`），
   用于强制按根因合并而不是重复计数。
-- 宿主输出解析：接受纯 JSON 或**唯一**一个 fenced 代码块（语言标记大小写/带空格、围栏
-  后无换行、CRLF、前后有说明文字均可）；出现两个可解析对象时 `review_output_ambiguous`。
-- 实际执行过的 Bash 命令必须全部只读；任何写操作、输出重定向、`-delete`、`-exec`、
-  `--output`、`sort -o`、`git grep -O`、`sed -i`、awk 写文件/`system(` 等一律
-  `review_command_not_readonly`。只读检查工具（`sed -n`、`awk` 只读程序、`echo`、
-  `jq`、`unzip -l`/`-p`/`-c`、`aapt dump`、`apksigner verify`、单输入 `xxd`、不带
-  `-C` 的 `file` 等）与单层字面量 `for` 循环允许。
-- 不在 `PATH` 的 Android/JDK 检查工具可用绝对路径调用
-  （`/path/build-tools/36.0.0/aapt2 dump ...`）：只有 `aapt`/`aapt2`/`apksigner`/
-  `dexdump`/`javap` 做路径归一化，且 realpath 必须**不在被复核工作区内**（工作区根取
-  当前目录最近的 `.git` 祖先；在仓库子目录取证不改变边界）。相对路径可执行文件
-  （`./tools/aapt2`）与通用命令的绝对路径（`/usr/bin/git`、`/tmp/x/cat`）一律拒绝：
-  同名二进制可能由被复核内容写入，通用命令必须走 `PATH`。
-- 未加引号的通配符（`*`/`?`/`[`）只对**没有输出位置参数、也没有写/执行选项**的只读族
-  放行（`ls`、`cat`、`sha256sum`、`grep`、`diff`、`jq`、`zipinfo`、`aapt2` 等）；
-  `sed`/`awk`/`find` 在通配符**含 `/`** 时也放行（展开结果仍带 `/`，不会变成 `-` 开头的
-  选项，写操作另有 `sed -i`、`awk print >`、`find -delete` 校验）：真实复核用
-  `awk '…' app/build/test-results/*/*.xml` 统计用例数。shell 展开会把文件名变成额外参数，
-  所以 `file -C`、`rg --pre`、`git grep --textconv`、`unzip`、`sort -o`、`uniq`、`xxd`
-  等族仍要求加引号（`file "*.apk"`）。
-- 顶层 `;`、`|`、`&&` 可以串联多条只读命令（`cd app/build/test-results && ls -la`）；
-  两侧各自仍须通过只读校验（`ls && rm -rf x` 的第二段会被拒）。单独的 `&`（后台执行）、
-  `||`、重定向（`/dev/null` 抑制除外）、命令替换（`$(...)`/反引号）、花括号展开一律拒绝；
-  未加引号的 `$` 也拒绝（`$?`、`$1`、`$VAR`，例如 `echo "exit:"$?` 会让整轮复核作废），
-  只有文档允许的单层 `for f in a b; do … "$f" …; done` 字面量循环例外。解释器单行命令
-  （`python3`/`python`/`perl`/`node`/`ruby`/`sh -c`）不在白名单，取证请用 `sha256sum`、
-  `grep`、`sed -n`、`head`、`wc`、`diff`、`stat`。
+- 宿主输出解析（`review-json/v2`，`scripts/review_output.py`）：整段文本必须是一个
+  JSON 对象，或**恰好一个** fenced 代码块且围栏外只允许空白；多个围栏/多个对象、
+  围栏外叙述、重复键、顶层非对象一律拒收（`review_output_ambiguous` /
+  `review_output_outside_text` / `review_output_unparseable` /
+  `review_output_not_object`）。不再接受“围栏外带说明文字”的旧格式；工作区
+  Reviewer Profile 要求只输出纯 JSON，解析器版本记录在 `PARSER_VERSION`。
 - `files_inspected` 若填写，路径必须存在且是普通文件（`review_inspection_invalid`）。
 - `g4_eligible=true` 时必须：`verdict=pass`、无 blocking、`unverified` 为空、
   `changed_files` 为空，并附完整宿主记录（`g4_requires_pass`、`g4_with_unverified`、
@@ -183,40 +164,48 @@ Copilot 不派发 Agent、不调用模型、不写别人的会话。它只校验
   `evidence_manifest`；基线之后新增/变更的证据必须全部列入清单，条件状态与
   其他工作项不得变化，否则拒绝并要求完整复核（`incremental_*` 原因码）。
 
-## 3. 宿主记录与 G4 资格
+## 3. 宿主记录与新链 G4 资格
 
-`g4_eligible` 由**脚本按宿主记录计算**，Reviewer 不能自述。`native_agent.py review`
-读取：
+阶段九起正式 `g4_eligible` **不再由 `native_agent.py review` 计算**，也不接受 Reviewer
+或信封自述。`native_agent.py review` 生成的 `g4_eligible` 只是信封结构预检；正式资格由
+`copilot_auto._ingest_review` 的新链决定：
 
-- `metadata.json`：`agentId`、`childSessionId`、`profileId`、`profileSnapshot`
-  （`tools` 必须是 `Read/Grep/Glob/Bash`，`disallowedTools` 必须含 `Write`/`Edit`）、
-  `status=completed`、`totalToolUseCount`、`outputFile`、`createdAt`、`completedAt` 与
-  `prompt`（G4 attempt 的会话时间/prompt 绑定）。
-- rollout（`~/.zcode/cli/rollout/model-io-<childSessionId>.jsonl`）：实际工具调用序列、
-  模型 provider/model。
-- `outputFile`：Reviewer 原始结论（verdict/findings/…），只能提供判断内容，不能提供身份。
+```
+execution binding → 真实 Executor 会话 → 测试执行/证据
+→ review attempt → 真实 Reviewer 会话 → 原始输出持久化
+→ g4_attest.attest（独立宿主核验）→ test_execution.build
+→ g4_shadow（候选判定）→ 正式 g4_eligible/g4_source → 一次性消费 → 收口
+```
 
-回填 G4 复核时，`copilot_auto.py ingest` 会再次调用 `verify_review_host_record` 重新读取
-metadata/rollout，确认：
+`g4_attest.attest` 只读宿主 `metadata.json` 与 SQLite，独立核对：
 
-| 检查 | 失败码 |
-|---|---|
-| Profile 仍是 `reviewer` | `host_profile_changed` |
-| Agent / Child Session 与信封一致 | `host_agent_mismatch` / `host_session_mismatch` |
-| `output_file` 与 metadata 的 `outputFile` 一致 | `host_output_mismatch` |
-| `session_created_at` / `prompt_sha256` 与 metadata 一致 | `host_session_time_changed` / `host_prompt_changed` |
-| 会话创建时间不早于 attempt 创建 | `review_attempt_session_precedes_attempt` |
-| 宿主 prompt 包含 attempt id | `review_attempt_prompt_unbound` |
-| rollout 工具调用计数与 `host.tool_calls` 完全一致 | `host_tool_calls_changed` |
-| rollout 中没有非只读工具或写命令 | `host_*` / `review_command_not_readonly` |
-| metadata 声称的调用数与 rollout 实际一致 | `host_tool_calls_changed` |
-| 信封 verdict / findings / unverified / changed_files 与宿主 outputFile 原文一致 | `host_verdict_changed` / `host_findings_changed` / `host_unverified_changed` / `host_changed_files_changed` |
-| attempt 存在、绑定本任务、未消费给其他结果、目标仍是当前摘要、会话一致 | `native_review_attempt_*` / `native_review_stale` |
-| attempt 冻结的文件证据内容未变化 | `native_review_attempt_workspace_drift` |
-| attempt 冻结的 git 代码范围未变化 | `native_review_code_scope_drift` |
-| 宿主 `workspaceRoot` 等于 attempt 代码根 | `native_review_attempt_workspace_missing` / `native_review_attempt_workspace_mismatch` |
+- Reviewer Profile 工具集精确 `Read/Grep/Glob`、`disallowedTools` 含写工具与 Bash、
+  `permissionMode=default`、无 skills/MCP、工作区级 Profile 内容匹配；
+- Agent/Child Session/父会话/trace、会话开始/结束时间晚于 attempt、prompt 携带
+  attempt id、`workspaceRoot` 等于 attempt 代码根；
+- `tool_usage`/`part` 的每次调用均只读、计数与 `totalToolUseCount` 一致，无 Bash；
+- 原始输出（`outputFile` 优先，缺失时回退 `message/part`，两者都在时 SHA 必须一致）
+  通过 `review-json/v2` 严格解析，verdict/findings/unverified/changed_files 与信封一致；
+- 证据文件 SHA、inspect 记录、敏感路径/越界读取、attempt 的 `code_snapshot` 代码范围
+  快照（含 submodule/嵌套仓库）；
+- 高风险任务必须有 execution binding、真实 Executor 会话与测试执行层级。
 
-任何问题都拒绝回填，结论不得作为 G4 依据。
+`test_execution.build` 在合同 `test_policy` 约束下判定：
+`command_execution_verified`、`expected_test_verified`、`test_result_verified`（JUnit）、
+`artifact_integrity_verified` 四层；只有当前合同显式 `required=false` 且 binding 来自
+合同、策略/报告/产物一致时才接受 `not_applicable`。
+
+`g4_shadow` 汇总上述结果：`status=attested` 且 `new_g4_eligible=true` 才是候选可用。
+`copilot_auto._ingest_review` 仅在 `risk=high` 且 shadow attested/eligible 时写入正式
+`g4_eligible=true`、`g4_source="candidate"`，并消费 attempt；否则正式为 false，旧信封
+自报 `g4_eligible=true` 不生效。`governance._review_trust_problems` 还会拒绝没有
+`g4_source="candidate"` 或 `candidate_g4.eligible!=true` 的旧记录
+（`native_review_legacy_g4_source` / `native_review_candidate_not_eligible`）。
+
+`g4_attest.attest` 与 `verify_stored` 把原始输出持久化到任务目录 `review-outputs/`，
+记录 `raw_output{path,sha256,bytes,source,parser}`；收口/复核时可只凭持久化输出重算
+SHA、解析与 findings 摘要，不依赖宿主 DB 或 metadata。旧记录没有 findings 摘要时只做
+raw 复核并记录 limitation。
 
 **局限**：这些检查保证“不靠主代理记忆或手抄身份”，不是宿主签名；能写本机文件的人仍可伪造。
 G4 是本地可得的最强原生复核，不等于密码学证明。
@@ -224,6 +213,10 @@ G4 是本地可得的最强原生复核，不等于密码学证明。
 ## 4. `native_agent.py` 用法
 
 ```bash
+# 派发前创建 execution binding：合同测试策略 + 工作区 + nonce
+python3 -B scripts/native_agent.py bind-execution --state T/state.json \
+  --work-item A1 --workspace "$(git rev-parse --show-toplevel)"
+
 # 执行信封：身份/证据/摘要全部由脚本从真实记录提取
 python3 -B scripts/native_agent.py execution --state T/state.json \
   --dispatch T/state.dispatch.json --work-item A1 \
@@ -242,19 +235,24 @@ python3 -B scripts/native_agent.py review --state T/state.json \
   --work-item A1 --attempt RA... --metadata <agent-review>/metadata.json \
   --input reviewer.raw.json --output A1.review.json
 
-# 派发前预检 Reviewer 只读命令清单（不执行；失败 exit=2）
-python3 -B scripts/native_agent.py preflight-commands --file cmds.txt
 ```
 
+- `bind-execution` 从合同 `test_policy` 派生测试命令与 `require_test_result`/
+  `require_artifact_integrity`：调用方只能加严，不能换掉合同命令或关闭合同要求的层；
+  合同显式 `required=false` 时对应层为 NOT APPLICABLE（`test_execution.status=
+  not_applicable`），普通任务不被强制跑无意义测试。影子与候选只在**当前合同**
+  有 captured 策略、`required=false`、binding `requirement_source=contract` 且
+  `contract_sha256` 等于当前合同、策略/报告/产物与当前合同一致时接受 N/A；
+  amend 后旧 binding 或伪造 contract-source binding 不放行。
+- 合同 `report`/`artifacts` 路径必须位于 workspace 内，且必须出现在本次声明的测试
+  产物中；缺失或越界判 `failed`。产物 mtime 必须晚于本轮测试命令启动。
 - 子命令在写文件前调用 `native_bridge` 的正式校验；失败不产生输出文件。
 - `review-context --create-attempt` 只允许高风险 G4；存在未核销完成条件、执行证据漂移或
   工作区不是 git 仓库时拒绝创建，避免把即将过期/不可证明的快照交给 Reviewer。它把
   attempt id 与代码范围写入输出；派发时必须把该 id 放进 Reviewer prompt。
-- `review --attempt` 会核对 attempt 属于本任务、未消费、绑定与当前执行一致、目标摘要与
-  代码范围仍等于当前状态，并核对宿主 `createdAt`、`prompt` 与 `workspaceRoot`；旧会话/
-  旧工作区无法冒充新 attempt。
-- `preflight-commands` 只做静态只读校验（`--file` 每行一条或 JSON 字符串数组）；它不
-  执行命令，也不能证明 Reviewer 的输出格式合规。
+- `review` 只从宿主 DB 读取 Reviewer 的模型、工具调用与最终输出；不再依赖 rollout，
+  也不再接受 Bash 命令。会话时间、prompt 与工作区绑定由 `g4_attest` 在 ingest 时
+  独立复核；旧会话/旧工作区无法冒充新 attempt。
 - `review-context` 输出 `execution_evidence_unbound`（执行证据摘要与 live 证据
   不一致/已归档/未登记）、`evidence_manifest` 与建议 scope；ingest 会重新校验。
 - 证据 SHA-256 由脚本读取文件计算，不接受调用方传入。
@@ -284,7 +282,10 @@ python3 -B scripts/copilot_auto.py ingest --state T/state.json --review-file A1.
 | 计划/派发 | `plan_missing`、`plan_unknown`、`plan_mismatch`、`plan_drift`、`dispatch_missing`、`dispatch_empty`、`dispatch_duplicate`、`dispatch_mismatch`、`dispatch_id_drift`、`idempotency_mismatch`、`iteration_mismatch`、`work_item_unknown`、`work_item_terminal` |
 | 执行 | `backend_not_native`、`assignee_unsupported`、`invalid_status`、`executor_identity_missing`、`reviewer_as_executor` |
 | 证据 | `evidence_missing`、`evidence_invalid`、`evidence_duplicate`、`evidence_unreadable`、`evidence_sha_mismatch`、`evidence_foreign`、`evidence_conflict` |
-| 复核 | `reviewer_invalid`、`reviewer_profile_invalid`、`review_binding_mismatch`、`executor_reviewer_same`、`review_contaminated`、`invalid_verdict`、`review_attempt_missing`、`review_attempt_invalid`、`review_finding_invalid`、`review_finding_duplicate`、`review_inspection_invalid`、`review_command_not_readonly`、`review_output_ambiguous`、`review_output_unparsable`、`review_scope_invalid`、`incremental_base_missing`、`incremental_base_ineligible`、`incremental_manifest_missing`、`incremental_evidence_uncovered`、`incremental_criteria_changed`、`incremental_scope_too_narrow` |
+| 复核 | `reviewer_invalid`、`reviewer_profile_invalid`、`review_binding_mismatch`、`executor_reviewer_same`、`review_contaminated`、`invalid_verdict`、`review_attempt_missing`、`review_attempt_invalid`、`review_finding_invalid`、`review_finding_duplicate`、`review_inspection_invalid`、`review_command_unexpected`、`review_output_ambiguous`、`review_output_unparsable`、`review_scope_invalid`、`incremental_base_missing`、`incremental_base_ineligible`、`incremental_manifest_missing`、`incremental_evidence_uncovered`、`incremental_criteria_changed`、`incremental_scope_too_narrow` |
 | G4 | `g4_host_record_missing`、`g4_host_record_invalid`、`g4_tool_calls_missing`、`g4_tool_not_readonly`、`g4_not_eligible`、`g4_requires_pass`、`g4_with_unverified`、`g4_with_blocking`、`pass_with_blocking_finding`、`pass_with_unverified`、`host_profile_changed`、`host_session_time_changed`、`host_prompt_changed`、`review_attempt_prompt_unbound`、`review_attempt_session_precedes_attempt`、`native_review_attempt_*`、`native_review_attempt_workspace_drift`、`native_review_code_scope_*`、`incremental_code_changed` 等 |
 
-错误码只用于定位与修复，不提供绕过开关；修正记录后重新生成信封。
+`g4_host_record_*`、`g4_tool_calls_*`、`host_profile_changed` 等旧宿主校验码只出现在
+v6.4 及更早的历史记录；v6.5 正式路径使用 `g4_attest` 的 reason/difference 与
+`native_review_legacy_g4_source`/`native_review_candidate_not_eligible`。错误码只用于
+定位与修复，不提供绕过开关；修正记录后重新生成信封。

@@ -31,117 +31,10 @@ class CodeAssertions(unittest.TestCase):
         self.assertEqual(ctx.exception.code, code, str(ctx.exception))
 
 
-class ReadonlyPolicyV62Tests(CodeAssertions):
-    """真实复核里出现过、v6.1 仍误拒的只读写法。"""
-
-    ALLOWED = (
-        # SDK/JDK 专用检查工具常以绝对路径调用；只有这几个族做路径归一化
-        "/media/vdb/Android/Sdk/build-tools/36.0.0/aapt2 dump badging /abs/a.apk",
-        "/media/vdb/Android/Sdk/build-tools/36.0.0/apksigner verify "
-        "--print-certs /abs/a.apk",
-        # 解压到标准输出不落盘
-        "unzip -p /abs/a.apk classes.dex",
-        "unzip -p /abs/a.apk classes.dex | strings",
-        "unzip -c /abs/a.apk META-INF/MANIFEST.MF",
-        # -x 的排除列表在下个选项处结束，不吞选项
-        "unzip -l /abs/a.zip -x 'META-INF/*'",
-        # zipinfo 模式（-Z）下 -T 只改日期显示格式，不写归档
-        "unzip -Z -T /abs/a.zip",
-        # 无输出位置参数、无写/执行选项的只读族允许未加引号的通配符
-        "sha256sum /abs/evidence/*.png",
-        "ls /abs/*/release/*.apk",
-        "grep -rn 'x' /abs/src/*.java",
-        "jq . /abs/*.json",
-        "ls \"/abs/a b/*.png\"",
-        # 风险族加引号后仍可用：通配符由目标命令自己解释，不参与 argv 注入
-        "file \"*.apk\"",
-        "rg -n \"x\" \"src/*.java\"",
-        "git grep -n x -- '*.java'",
-    )
-    REJECTED = (
-        # 未知可执行文件与相对路径可执行文件不能按 basename 冒充白名单命令；
-        # 通用命令必须走 PATH（绝对路径只对 _PATH_EXEC_FAMILIES 放行）
-        "/abs/tools/evil.sh --help",
-        "./tools/aapt2 dump badging /abs/a.apk",
-        "../bin/ls /abs",
-        "/tmp/evil/cat /etc/passwd",
-        "/opt/evil/sha256sum /abs/x",
-        "/opt/custom/git status",
-        "/usr/bin/git -C /abs/repo status --short",
-        # 带输出位置参数的族不允许未加引号的通配符
-        "sort -o /abs/out.txt /abs/*.txt",
-        "uniq /abs/*.txt",
-        "xxd /abs/a.bin /abs/out/*.bin",
-        "sed -i 's/a/b/' /abs/*.md",
-        "find /abs -delete",
-        # 展开可把以 `-` 开头的文件名变成写/执行选项的族，必须加引号
-        "file *",
-        "rg --pre x *",
-        "git grep -n 'x' -- *.java",
-        # 落盘解包、值吞选项、改写时间戳与重定向仍然拒绝
-        "unzip -d /abs/out /abs/a.apk",
-        "unzip -P -l /abs/a.zip",
-        "unzip -I -l /abs/a.zip",
-        "unzip -O -l /abs/a.zip",
-        "unzip -l -T /abs/a.zip",
-        "ls /abs/* > /abs/out.txt",
-    )
-
-    def test_allowed_commands(self):
-        for cmd in self.ALLOWED:
-            with self.subTest(cmd=cmd):
-                NB.validate_review_commands([cmd])
-
-    def test_rejected_commands(self):
-        for cmd in self.REJECTED:
-            with self.subTest(cmd=cmd):
-                self.assert_code("review_command_not_readonly",
-                                 NB.validate_review_commands, [cmd])
-
-    def test_glob_rejection_names_family_and_fix(self):
-        with self.assertRaises(NB.BridgeError) as ctx:
-            NB.validate_review_commands(["sort -o out.txt *.txt"])
-        message = str(ctx.exception)
-        self.assertIn("sort", message)
-        self.assertIn("引号", message)
-
-    def test_workspace_executable_is_rejected_from_subdirectory(self):
-        # 工作区根取 cwd 最近的 .git 祖先：Reviewer 在仓库子目录取证时，
-        # 仓库根下的同名二进制仍必须拒绝。用例把 cwd 切到临时仓库的子目录。
-        root = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, root, True)
-        os.makedirs(os.path.join(root, ".git"))
-        sub = os.path.join(root, "app")
-        os.makedirs(sub)
-        exe = os.path.join(root, "tools", "aapt2")
-        old = os.getcwd()
-        os.chdir(sub)
-        self.addCleanup(os.chdir, old)
-        with self.assertRaises(NB.BridgeError) as ctx:
-            NB.validate_review_commands([f"{exe} dump badging a.apk"])
-        self.assertIn("工作区内", str(ctx.exception))
-
-    def test_workspace_symlink_to_outside_is_rejected(self):
-        # 工作区内的链接指向工作区外时，realpath 在工作区外，但链接本身由被复核
-        # 内容控制：字面路径也必须参与判定。
-        root = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, root, True)
-        os.makedirs(os.path.join(root, ".git"))
-        os.makedirs(os.path.join(root, "tools"))
-        exe = os.path.join(root, "tools", "aapt2")
-        os.symlink("/bin/true", exe)
-        old = os.getcwd()
-        os.chdir(root)
-        self.addCleanup(os.chdir, old)
-        with self.assertRaises(NB.BridgeError) as ctx:
-            NB.validate_review_commands([f"{exe} dump badging a.apk"])
-        self.assertIn("工作区内", str(ctx.exception))
-
-
 class ReviewDiagnosticsTests(F.BridgeBase):
     def _state_with_review(self, **overrides) -> dict:
-        state = G.load_state(self.state_path)
         review = self.review()
+        state = G.load_state(self.state_path)
         target = str(overrides.get("target_sha256") or review["target_sha256"])
         attempt = F.fake_attempt(
             state, target=target, work_item="A1", consumed=True,
@@ -154,6 +47,8 @@ class ReviewDiagnosticsTests(F.BridgeBase):
         })
         review["review_attempt_id"] = attempt["review_attempt_id"]
         review["review_attempt_created_at"] = attempt["created_at"]
+        review["g4_source"] = "candidate"
+        review["candidate_g4"] = {"eligible": True, "reasons": []}
         review["coverage"] = NB.review_coverage(state)
         review.update(overrides)
         state["native_reviews"] = [review]

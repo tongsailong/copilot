@@ -6,16 +6,18 @@
 ## 已确认
 
 1. **唯一源码是 `/media/vdb/projects/copilot`。**
-   运行时 `~/.zcode/skills/copilot` 与 `~/.zcode/agents/reviewer.md` 是构建产物，只允许
-   由 `scripts-sync/sync_runtime.py` 单向下发；禁止双向维护，禁止把运行时当第二开发工作区。
-   依据：迁移前运行时目录不是 Git 仓库，也没有独立源码；DesignWise 已验证同一模式。
+   运行时 `~/.zcode/skills/copilot` 是构建产物，只允许由
+   `scripts-sync/sync_runtime.py` 单向下发；禁止双向维护，禁止把运行时当第二开发工作区。
+   阶段九起旧 Reviewer 全局 Profile（`agents/reviewer.md` → `~/.zcode/agents/reviewer.md`）
+   已退役，Reviewer 使用工作区级 `.zcode/agents/reviewer.md`。依据：迁移前运行时目录不是
+   Git 仓库，也没有独立源码；DesignWise 已验证同一模式。
 
-2. **分发范围固定为** `SKILL.md`、`scripts/**/*.py`、`references/**/*.md`、
-   `agents/reviewer.md`。`tests/`、`docs/`、`manifests/`、`scripts-sync/`、`README.md`、
-   `AGENTS.md` 属于源码仓库的开发/项目管理内容，不进入运行时。
+2. **分发范围固定为** `SKILL.md`、`scripts/**/*.py`、`references/**/*.md`。
+   `tests/`、`docs/`、`manifests/`、`scripts-sync/`、`README.md`、`AGENTS.md` 与工作区
+   Profile 属于源码仓库的开发/项目管理内容，不进入运行时。
 
-3. **每次同步同时覆盖 Skill 和 Reviewer。** 不提供“只同步 Skill”的开关，避免
-   Skill 已更新而 Reviewer 仍是旧版本。两侧任一侧漂移，`--check` 都返回 1。
+3. **每次同步只覆盖 Skill。** 阶段九起不再分发 Reviewer 全局 Profile；`--check` 只比较
+   Skill 受管理文件，漂移返回 1。
 
 4. **默认只检查、不写入。** `--apply` 才写入；`--prune` 必须与 `--apply` 同时显式使用。
    首次同步不清理运行时文件。
@@ -603,10 +605,10 @@
     回归测试。不得为了让检索结果里不再出现 SOL 而删除历史证据。依据：用户明确要求保留历史
     可读性与版本可追溯性。
 
-34. **运行时分发范围更新。** 继续分发 `SKILL.md`、`scripts/**/*.py`、`references/**/*.md`、
-    `agents/reviewer.md`；`legacy/`、`tests/`、`docs/`、`manifests/`、`scripts-sync/`、
-    `README.md`、`AGENTS.md` 不进入运行时。退役脚本不进入分发清单。依据：第 2 条分发边界
-    在 v6 的延续。
+34. **运行时分发范围更新。** 分发 `SKILL.md`、`scripts/**/*.py`、`references/**/*.md`；
+    `legacy/`、`tests/`、`docs/`、`manifests/`、`scripts-sync/`、`README.md`、`AGENTS.md`
+    与工作区 Profile 不进入运行时。退役脚本不进入分发清单。依据：第 2 条分发边界在 v6
+    的延续；阶段九起旧 Reviewer 全局 Profile 不再分发。
 
 35. **v6.1 复核收敛与自主推进优化（2026-11-13）。** 基于最近两个真实任务（tencent 6 轮、
     honor 7 次 G4 尝试）的复盘，确认主要浪费不是 Reviewer 判断质量，而是复核机制本身：
@@ -811,6 +813,155 @@
     多个 commit，调用方需用 `--base` 指定任务开始 commit，否则只能覆盖工作区相对 HEAD 的
     变更。
 
+41. **G4 影子取证与工作区只读 Profile（2026-11-15，阶段四，未正式切换）。**
+    新取证器先以影子模式接入，正式 G4 放行仍由旧路径计算：
+
+    - `copilot_auto._ingest_review` 在正式 attempt 消费前调用 `g4_shadow.build`；影子只写
+      `state.g4_attestations`，不写 consume marker、不改变 `native_reviews`/`g4_eligible`/
+      退出码。影子失败保留 `error.code/detail`，不伪装为成功，也不能阻断或放宽旧 G4。
+    - 影子记录与复核在同一次状态写入中落盘；按确定性 `shadow_id` 幂等去重。正式 attempt
+      消费仍只由现有 ingest 完成，影子不提前消费、不重复消费。影子在正式 G4 宿主复核
+      之前运行，expected_target 取当前 `final_evidence_digest(state)`，不复用 attempt
+      自身摘要；任何取证异常由 shadow 顶层兜底成失败记录，`g4_attestations` 类型损坏
+      修复为新列表并记 history `g4_shadow_field_repaired`，不得反向阻断正式复核。
+    - 工作区级 `.zcode/agents/reviewer.md` 是新的只读 Profile：tools 精确
+      `Read/Grep/Glob`，disallowed 含 `Write/Edit/Bash` 与 Agent/Task，无 MCP、无
+      bypass、`injectAgentsMd=false`。它不进入 `scripts-sync` 分发范围；旧
+      `agents/reviewer.md` 在正式切换前保留，不能被删除或覆盖。
+    - `g4_attest` 独立重算 `code_scope` 的规范化 digest；`kind=other` 必须是
+      `git submodule status` 列出的已检出 submodule（含 `.git`），否则拒绝。增量复核在
+      影子层额外要求基线记录可用（PASS、g4_eligible、attempt 已消费、coverage 非空）。
+    - 真实 ZCode 会话已验证新 Profile 由宿主加载；影子用 SQLite `part`/`tool_usage` 取证，
+      在子会话 rollout 已被清理时仍可给出 eligible=true。旧正式 G4 依赖 rollout 派生工具
+      调用，子会话 rollout 常被清理，因此当前无法用真实会话产出旧 G4 `eligible=true`；
+      这是影子记录出现 `new_looser` 的唯一已解释原因，不是新门禁放宽。
+    - **Bash 白名单退役条件**：只有在正式 G4 切换到新取证器、工作区 Profile 成为唯一
+      Reviewer Profile、且旧 `agents/reviewer.md` 不再被派发后，才可删除
+      `native_bridge` 的 Reviewer Bash 白名单与 `native_agent` 的 Bash 工具许可。
+      阶段九已满足条件并执行删除（见第 46 条）。
+    - **未解决**：执行信封没有 `exit_code` 字段，命令退出码未绑定；历史已入账 review
+      不回填影子（幂等早退在取证之前，避免对已消费 attempt 重新取证）；旧/新 Profile
+      输出契约（是否允许 JSON 外短前言）需在正式切换时统一。
+42. **真实测试执行证据与正式切换前置条件（2026-11-15，阶段五，未切换）。**
+    退出码只来自 ZCode 宿主 SQLite：`tool_usage.exit_code/status/started_at/
+    completed_at/trace_id/turn_id` 与 `part` 同 `callID` 的 `state.input.command`。
+    新增 `scripts/test_execution.py`：
+
+    - execution 信封可选 `test_commands` / `test_artifacts` / `code_scope_sha256`；
+      `build_execution` 采集工作区快照，`validate_execution_result` 校验 artifact 属于本次
+      证据且摘要合法。测试命令必须逐字匹配 executor child session 的 Bash 记录，命令
+      `completed` 且 `exit_code=0` 才 `verified`；非 0 为 `failed`，缺 DB/字段为
+      `unverified`。产物必须在 execution evidence 与 attempt evidence_snapshot 中 SHA
+      一致，且 execution 与 attempt 的 code_scope 必须相等。
+    - execution 信封持久化 `executor_metadata_path`；取证器核对 metadata 的
+      agentId/childSessionId/parentSessionId/status、metadataFile 路径一致、
+      profileId/profileSnapshot 一致且非 reviewer、metadata 工作区与 attempt 一致
+      （metadataFile 指向他处、profile 不符、工作区不符为 failed；metadataFile 或
+      工作区字段缺失为 unverified），核对宿主 `session` 行的 parent/task_type/trace，并要求调用时间
+      落在 metadata 会话窗口内、早于 attempt。这是同源自洽校验，可发现替换/错配/越界，
+      但不能证明会话确属本任务；正式接入前需把 Executor prompt 与任务/attempt 绑定。
+    - 新 G4 影子在 `test_execution` 非 `verified` 时判不合格；不能用模型自述的“测试通过”
+      替代退出码或产物。`verified` 只证明“某条匹配命令在该会话 completed 且 exit 0、
+      声明的产物三方 SHA 一致”，不证明测试充分性或产物由该命令生成。测试执行到
+      execution 信封生成之间的代码变化无宿主时间戳可证，只作为明确 limitation。
+    - 增量基线重放读取持久化 attestation、attempt、target/code_scope/verdict/session/
+      coverage，并重算当前变化集；变化证据必须逐条列入 manifest（允许超集、禁止未知
+      id），无任何变化时拒绝增量（`incremental_without_change`），代码/其他工作项/
+      条件有变化即拒绝；被复核工作项自身的 action 变化按 `native_bridge` 规则放行。
+      基线 attestation 必须带 `target_source=state`，用信封自报 target 的记录不能当
+      增量基线；该字段随影子摘要持久化，旧记录（无字段）需重新完整复核一次生成新基线。
+      基线 attempt 必须已被正式消费：未消费时影子 attestation 不得补发信任，直接拒绝
+      并要求完整复核；因此正式 G4 rollout 不可用期间不会产生新的正式增量链。
+    - `code_scope.snapshot_digest` 是唯一快照摘要实现；`capture_code_snapshot` 与
+      `g4_attest` 共用。`kind=other` 必须是 submodule status 中的已检出目录。
+    - 影子差异记录 old/new verdict、reason、agreement、difference_category、
+      evidence_summary、old_reason_source、old_host_reproducible；旧 G4 仅因
+      rollout 缺失、或旧 Reviewer 宿主 metadata 已不可复查而拒绝的样本归为
+      `incomparable`，不误判为 new_looser。
+    - **正式切换前置**：正式 G4 工具调用来源必须脱离短期 rollout；新 Profile 必须成为
+      唯一 Reviewer 派发 Profile；test_execution、attestation、增量重放接入正式 ingest；
+      旧/新输出契约统一。切换需单独授权，清单见 `docs/G4-SWITCH-CHECKLIST.md`。
+
+
+43. **宿主持久化取证、Executor 绑定与测试证据分层（2026-11-15，阶段六，未切换）。**
+    - Reviewer 最终输出以宿主 `message/part` 为持久来源：取最后一条非空 assistant
+      消息并按 part 顺序拼接 text；真实会话与 `outputFile` 字节一致。outputFile 存在
+      时两者必须一致，缺失时回退 DB 并标注 `output_source=db.message.part`，都没有则
+      `host_output_missing` 失败关闭。rollout 只在存在时作辅助核对；缺失时
+      `build_review` 用 DB 模型/调用生成信封，但追加 `review_rollout_missing` 使旧 G4
+      保持不合格（不修改正式放行逻辑）。
+    - Executor 新鲜绑定：主代理在启动执行方前创建 `execution_bindings`（task/work_item/
+      dispatch/workspace/预期命令/nonce/created_at）；execution 信封携带 binding；
+      bridge 校验存在/未消费/任务/工作项/命令/工作区；ingest 一次性消费到 result_sha；
+      `test_execution` 要求 prompt 逐字含 nonce、session 晚于 binding、binding 消费给
+      本结果；高风险任务生成执行信封时强制要求 binding。旧 completed 会话不能冒充
+      本轮执行方（影子/新 G4 取证；正式 ingest/G4 收口尚未接入，见第 43 条末段）。
+    - 测试证据四级：`command_execution_verified`、`expected_test_verified`（命令来自
+      binding 的预先声明）、`test_result_verified`（JUnit XML 的 tests/failures/errors/
+      skipped；要求 testcase 与 passed>0，失败子元素即使无属性也算失败）、
+      `artifact_integrity_verified`（execution/attempt/当前文件三方 SHA）。
+      `layers_required` 逐层记录；只要求任务实际声明的层级；`verified` 不等于测试质量
+      或产物由命令生成。
+    - `code_scope` 递归记录 submodule HEAD 与脏工作区内容（tracked/untracked/删除/
+      重命名/嵌套），纳入摘要；status 非零、嵌套读取失败、未初始化、真实路径越界时
+      快照不可用（fail-closed）。摘要公式扩展
+      会使阶段五及更早快照失效，需重新取证。
+    - 正式切换前置更新：新 G4 输出/模型/调用已不依赖 rollout；仍缺正式接入、旧
+      Reviewer/Pash 白名单退役、目标版本 T4 与真实生产演练。切换需单独授权。
+
+
+44. **候选 G4 闭环、原始输出持久化与统一解析（2026-11-15，阶段七，未切换）。**
+    - 候选链在现有 ingest 内闭环：shadow attested + 新 G4 eligible + TE verified +
+      binding 消费给该 execution + attempt 未被其他结果消费 + 原始输出 SHA 一致，
+      才写 `candidate_consumed_by_result_sha256`；候选字段与正式 `g4_eligible`/正式
+      消费隔离，正式放行逻辑不变。重复 ingest 按结果 SHA 幂等；不同结果复用同一
+      attempt/binding 被拒绝。
+    - Reviewer 原始输出以字节保存到 `<task_dir>/review-outputs/<sha>.txt`（原子写、
+      回读校验、纳入治理排除），attestation 记录路径/SHA/字节/来源；`verify_stored`
+      可在宿主 Session 被清理后仅凭持久化文件复核，不重读 DB/metadata。
+    - 输出解析统一为 `review-json/v2`：整段 JSON 或唯一围栏且围栏外仅空白；多围栏、
+      围栏外叙述、重复键、非对象 fail-closed；不做文案修正。旧“叙述容忍”是明确
+      版本边界，不再保留两套规则。
+    - `code_scope` 递归未声明 submodule 的嵌套 Git 仓库（`.git` 目录或文件），记录
+      HEAD 与脏工作区并纳入摘要；submodule/嵌套仓库内部也扫描被 `.gitignore` 忽略的
+      仓库；深度/数量超限或越界一律 fail-closed（不静默截断）。
+    - 候选与宿主原文的比对对象是**原始信封字段**（verdict 仅小写，其余 canonical
+      JSON），不是 `validate_review_result` 重建后的结构；否则 findings 补键与
+      verdict 小写会把合法复核误判为不一致。
+    - 原子性：复核路径候选标记/attestation/正式消费同一次原子 `save_state`；执行路径
+      证据/工作项回填/`native_results`/binding 消费也合并为一次保存。故障注入验证
+      保存失败不产生部分消费。T4 隔离矩阵覆盖 20 个场景，真实 ZCode e2e 通过（早于
+      最终候选比对修复，切换验收需重跑）。
+    - **正式切换仍待授权**：候选 eligibility 不等于正式 G4 PASS；正式链替换、旧
+      Profile/Bash 白名单退役与 binding/TE 接入正式收口需用户单独批准。
+
+
+45. **合同冻结测试要求与切换准入演练（2026-11-15，阶段八，未切换）。**
+    - 测试要求属于合同：`start_state`/`amend_contract` 的 `test_policy` 进入
+      `contract_sha256` 指纹；binding 从合同派生命令与 require 层，调用方只能加严。
+      合同要求的测试命令、结构化报告与产物在执行前确定，执行后不可由 Executor、
+      Reviewer 或调用方关闭；篡改 binding 降低要求会被 bridge 拒绝。
+    - 合同显式不要求测试时，`test_execution` 返回 `not_applicable`；影子/候选只在
+      当前合同有 captured 策略且 required=false、binding 的 `contract_sha256`
+      等于当前合同、策略/报告/产物与当前合同一致时接受，避免把无测试任务判成
+      “已验证”，也避免为普通任务强加测试。amend 后旧 binding 的 N/A 失效。
+    - E2E 暴露的 `_gate_criteria` 合同指纹漏带 `test_policy` 已修复：带策略任务
+      不会因四门重算而误判合同漂移，也不会误派生空工作项。
+    - 测试产物除三方 SHA 外还要求 mtime 晚于本轮测试命令启动：旧报告即使
+      SHA 未变也判 `test_artifact_stale`，避免用历史结果冒充本轮测试。
+    - 最终源码真实 E2E（干净状态、中性 prompt、无手工改状态）覆盖 binding →
+      执行 → attempt → 原生只读 Reviewer → attestation → 影子/候选 → 消费 →
+      closure；F1 修复在真实 findings 上生效。真实模型均输出小写 `pass`，大写
+      归一化仍由真实 bridge 归一化的定向用例覆盖。
+    - 复核后加固：CLI 可写 `test_policy`；影子层与候选共用
+      `contract_no_test_binding` 接受合同 N/A；bridge 逐项比对策略/报告/产物；
+      合同策略存在时 normal 也要求 binding；TE 要求合同路径在 workspace 内；
+      `verify_stored` 对新记录比对 findings id/severity（旧记录缺摘要时只核对
+      raw 并记 limitation）。
+    - **正式切换仍待授权**：本阶段只形成准入结论；不改正式 G4 放行逻辑，不删旧
+      Reviewer/Bash 白名单，不同步运行时。
+
+
 ## 建议（未采纳）
 
 > 以下为 v5 时期记录，保留原文；其中涉及 `call_gpt.py`、SOL 预算或远程 REVIEW 的建议
@@ -846,3 +997,27 @@
 - **运行时残留测试与历史备份的长期保留策略**。
 - **Phase 4 剩余范围**：Reviewer 自动派发与可信复核记录升级仍需单独授权与实现。
   (v6) PARTIAL 推进已由第 30 条以本地派生实现；SOL 自动重判/收口已退役，不再属于剩余范围。
+
+46. **正式 G4 切换与旧 Reviewer 体系退役（2026-11-15，阶段九）。**
+    用户明确授权把正式 G4 切换到阶段七/八验证过的候选链，并退役旧 Reviewer 专属机制。
+    已确认：
+
+    - `copilot_auto._ingest_review` 不再从信封自述或旧宿主复核取正式资格；`risk=high`
+      且 `g4_shadow` 状态 `attested`、`new_g4_eligible=true` 时才写
+      `g4_eligible=true`/`g4_source="candidate"`，并在同一状态写入中消费 attempt。
+    - `governance._review_trust_problems` 只接受 `g4_source="candidate"` 且
+      `candidate_g4.eligible=true` 的记录；旧 G4 记录不参与新放行。
+    - 旧全局 Reviewer Profile（源码 `agents/reviewer.md` 与运行时
+      `~/.zcode/agents/reviewer.md`）已删除；工作区 `.zcode/agents/reviewer.md`
+      （Read/Grep/Glob，无 Bash）是唯一 Reviewer Profile。
+    - `native_bridge` 的 Reviewer Bash 白名单、`native_agent` 的 rollout 强依赖/旧会话与
+      宿主记录重复校验入口、重复证据计算、`preflight-commands` 一并删除；Reviewer 的
+      身份、工具调用与原始输出只从宿主 metadata + SQLite 取证，由 `g4_attest` 独立核验。
+    - `sync_runtime.py` 不再分发 Reviewer；基线清单只覆盖 Skill。
+    - 高风险任务必须在 `start_state`/`amend_contract` 显式声明 `test_policy`；
+      `create_execution_binding` 拒绝没有 captured 合同策略的高风险任务，避免调用方
+      自选测试命令形成正式 G4。
+    - G1–G4 标准、fail-closed、attempt 绑定、原始输出持久化、一次性消费、合同
+      `test_policy` 与四层测试证据均不降低；历史 attestation、旧台账与审计只读保留。
+    - 回退使用普通 revert，不删除已消费 marker/新 attestation；不使用 force push。
+      依据：用户阶段九授权；阶段八切换准入 PASS；旧机制与新链重复且旧链依赖 rollout。

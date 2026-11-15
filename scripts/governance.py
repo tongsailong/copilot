@@ -18,6 +18,7 @@ Copilot 不再是「远程模型决策通道」，而是运行于 ZCode 内的**
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -108,6 +109,19 @@ def _bool(value: object, name: str) -> bool:
 
 
 # ── 状态加载 / 原子保存 ────────────────────────────────────────────────────
+def _default_test_policy() -> dict:
+    return {
+        "captured": None,
+        "source": "",
+        "required": False,
+        "commands": [],
+        "report": "",
+        "artifacts": [],
+        "require_test_result": False,
+        "require_artifact_integrity": False,
+    }
+
+
 def _default_contract() -> dict:
     return {
         "done_criteria_text": "",
@@ -115,9 +129,42 @@ def _default_contract() -> dict:
         "criteria": [],
         "criteria_sha256": "",
         "criteria_state": "draft",
+        "test_policy": _default_test_policy(),
         "captured": None,
         "history": [],
     }
+
+
+def _normalize_test_policy(raw: object) -> dict:
+    """把合同里的测试要求固化成可信策略；执行方不能事后降低。"""
+    if raw in (None, {}):
+        return _default_test_policy()
+    if not isinstance(raw, dict):
+        raise GovernanceError("test_policy 必须是对象。")
+    commands = [str(item).strip() for item in raw.get("commands") or []
+                if str(item).strip()]
+    artifacts = [str(item).strip() for item in raw.get("artifacts") or []
+                 if str(item).strip()]
+    required = raw.get("required")
+    if not isinstance(required, bool):
+        raise GovernanceError("test_policy.required 必须是布尔值。")
+    report = str(raw.get("report") or "").strip()
+    if required and not commands:
+        raise GovernanceError(
+            "test_policy.required=true 时必须同时给出 commands（执行前确定测试命令）。")
+    require_result = bool(raw.get("require_test_result")) or bool(report) or required
+    require_artifacts = bool(raw.get("require_artifact_integrity")) or bool(artifacts)
+    return {
+        "captured": now_iso(),
+        "source": str(raw.get("source") or "contract").strip()[:64],
+        "required": required,
+        "commands": commands,
+        "report": report,
+        "artifacts": artifacts,
+        "require_test_result": require_result,
+        "require_artifact_integrity": require_artifacts,
+    }
+
 
 
 def _default_closure() -> dict:
@@ -160,6 +207,9 @@ def _default_state() -> dict:
         "native_dispatch": None,
         "native_results": [],
         "native_reviews": [],
+        "review_attempts": [],
+        "g4_attestations": [],
+        "execution_bindings": [],
         "formal_reviews": [],
         "formal_review_authorization": None,
         "closure": _default_closure(),
@@ -430,12 +480,20 @@ def criteria_digest(criteria: list[dict]) -> str:
 
 
 def _contract_fingerprint(goal: str, contract_text: str,
-                          criteria: list[dict]) -> str:
-    return _sha256_text(canonical_json({
+                          criteria: list[dict],
+                          test_policy: dict | None = None) -> str:
+    payload = {
         "goal": (goal or "").strip(),
         "contract": (contract_text or "").strip(),
         "criteria": criteria_digest(criteria),
-    }))
+    }
+    # 只有显式合同测试策略才进入指纹：旧任务不带策略时哈希口径保持不变。
+    if test_policy and test_policy.get("captured"):
+        payload["test_policy"] = {
+            key: test_policy.get(key) for key in
+            ("required", "commands", "report", "artifacts",
+             "require_test_result", "require_artifact_integrity")}
+    return _sha256_text(canonical_json(payload))
 
 
 def _contract_source_record(path: str) -> dict:
@@ -479,7 +537,8 @@ def contract_source_warnings(state: dict) -> list[str]:
 def start_state(path: str, goal: str, *, contract: str = "", criteria: object = None,
                 risk: str = "normal", execution_backend: str = "legacy",
                 task_id: str = "", mode: str = "", note: str = "",
-                contract_source: str = "") -> dict:
+                contract_source: str = "",
+                test_policy: dict | None = None) -> dict:
     if os.path.exists(path):
         raise GovernanceError(f"任务状态已存在：{path}；续跑请直接使用，勿重建。")
     goal = (goal or "").strip()
@@ -505,6 +564,11 @@ def start_state(path: str, goal: str, *, contract: str = "", criteria: object = 
             "派发链路产生；请用 --backend native 创建高风险任务。")
     raw_criteria = criteria if criteria else _criteria_from_text(contract)
     items = _normalize_criteria(raw_criteria)
+    policy = _normalize_test_policy(test_policy)
+    if risk == "high" and not policy.get("captured"):
+        raise GovernanceError(
+            "risk=high 必须在合同中显式声明 test_policy（required/commands/report/"
+            "artifacts 等）；测试要求进入合同指纹，不能由执行方事后自选。")
     # 去掉初始化辅助字段；初始引用在合同确认后由 criterion 显式登记。
     for item in items:
         item.pop("_initial_refs", None)
@@ -521,13 +585,14 @@ def start_state(path: str, goal: str, *, contract: str = "", criteria: object = 
         "note": (note or "").strip(),
         "risk": risk,
         "execution_backend": backend,
-        "contract_sha256": _contract_fingerprint(goal, contract, items),
+        "contract_sha256": _contract_fingerprint(goal, contract, items, policy),
     })
     state["contract"].update({
         "done_criteria_text": (contract or "").strip(),
         "boundaries": _section_text(contract, "边界"),
         "criteria": items,
         "criteria_sha256": criteria_digest(items),
+        "test_policy": policy,
         # v6 不再等待远程模型确认：完成条件在 start/amend 时由本地合同直接生效。
         "criteria_state": "confirmed",
         "captured": now_iso(),
@@ -552,7 +617,8 @@ def _history(state: dict, event: str, detail: dict | None = None) -> None:
 
 def amend_contract(path: str, *, contract: str = "",
                    criteria: object = None,
-                   contract_source: str = "") -> dict:
+                   contract_source: str = "",
+                   test_policy: dict | None = None) -> dict:
     """用户/任务范围内修订合同与完成条件；保留同描述条件的既有核销记录。
 
     BLOCKED 时允许修订：阻塞常常正是因为合同条款不可执行，禁止修订只会逼出
@@ -579,11 +645,17 @@ def amend_contract(path: str, *, contract: str = "",
             item["updated_iteration"] = previous.get("updated_iteration")
             item["history"] = previous.get("history") or []
     sha = criteria_digest(items)
+    policy = (_normalize_test_policy(test_policy) if test_policy is not None
+              else (current.get("test_policy") or _default_test_policy()))
+    if str(state.get("risk") or "").lower() == "high" and not policy.get("captured"):
+        raise GovernanceError(
+            "risk=high 修订合同时不能移除 test_policy；测试要求必须保留在合同中。")
     state["contract"].update({
         "done_criteria_text": body,
         "boundaries": _section_text(body, "边界") or current.get("boundaries") or "",
         "criteria": items,
         "criteria_sha256": sha,
+        "test_policy": policy,
         "criteria_state": "confirmed",
         "captured": now_iso(),
     })
@@ -593,7 +665,7 @@ def amend_contract(path: str, *, contract: str = "",
         "criteria": [c["criterion_id"] for c in items],
     })
     state["contract_sha256"] = _contract_fingerprint(
-        state.get("goal") or "", body, items)
+        state.get("goal") or "", body, items, policy)
     source = _contract_source_record(contract_source)
     if source:
         state["contract"]["source"] = source
@@ -956,9 +1028,10 @@ def _validate_evidence_refs(state: dict, refs: list) -> list[dict]:
     return out
 
 
-def record_action(path: str, aid: str, status: str, *, result: str = "",
-                  evidence_ids: list[str] | None = None) -> dict:
-    state = load_state(path)
+def record_action_state(state: dict, aid: str, status: str, *,
+                        result: str = "",
+                        evidence_ids: list[str] | None = None) -> dict:
+    """在内存状态里记录工作项结果，不落盘；调用方负责与其它写入一次保存。"""
     # 阻塞期间其他工作仍可能完成；记录真实执行结果不等于解除阻塞。
     _assert_open(state, "回填工作项", allow_blocked=True)
     status = str(status or "").strip().lower()
@@ -986,6 +1059,14 @@ def record_action(path: str, aid: str, status: str, *, result: str = "",
         action["fail_streak"] = 0
     _history(state, "action_recorded", {"id": aid, "status": status,
                                         "evidence_ids": action["evidence_ids"]})
+    return action
+
+
+def record_action(path: str, aid: str, status: str, *, result: str = "",
+                  evidence_ids: list[str] | None = None) -> dict:
+    state = load_state(path)
+    action = record_action_state(state, aid, status, result=result,
+                                 evidence_ids=evidence_ids)
     save_state(path, state)
     return action
 
@@ -1332,7 +1413,8 @@ def _gate_criteria(state: dict) -> dict:
     reasons = []
     expected = _contract_fingerprint(state.get("goal") or "",
                                      contract.get("done_criteria_text") or "",
-                                     criteria)
+                                     criteria,
+                                     contract.get("test_policy") or {})
     if str(state.get("contract_sha256") or "") != expected:
         reasons.append({"code": "contract_fingerprint_mismatch",
                         "detail": "合同指纹与当前目标/合同正文/完成条件不一致。"})
@@ -1671,6 +1753,213 @@ def create_review_attempt(path: str, *, work_item_id: str,
     return attempt
 
 
+def store_review_output(path: str, raw: bytes, sha256: str) -> dict:
+    """把 Reviewer 原始输出原子写入任务目录，供 Session 清理后独立复核。
+
+    返回 {path, sha256, bytes}；写入后回读校验 SHA，失败抛 GovernanceError。
+    这不改变任务目标摘要：目录在 governance_paths 中排除。
+    """
+    if not re.fullmatch(r"[0-9a-f]{64}", str(sha256 or "")):
+        raise GovernanceError("复核原始输出 SHA-256 格式非法。")
+    task_dir = os.path.dirname(os.path.abspath(path))
+    out_dir = os.path.join(task_dir, "review-outputs")
+    os.makedirs(out_dir, exist_ok=True)
+    target = os.path.join(out_dir, f"{sha256}.txt")
+    if os.path.isfile(target):
+        with open(target, "rb") as fh:
+            if _sha256_bytes(fh.read()) == sha256:
+                return {"path": target, "sha256": sha256,
+                        "bytes": len(raw)}
+    fd, tmp = tempfile.mkstemp(prefix=".review-output-", dir=out_dir)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(raw)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, target)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    with open(target, "rb") as fh:
+        stored = fh.read()
+    if _sha256_bytes(stored) != sha256:
+        raise GovernanceError("复核原始输出写入后 SHA 不一致。")
+    return {"path": target, "sha256": sha256, "bytes": len(stored)}
+
+
+def _sha256_bytes(raw: bytes) -> str:
+    return hashlib.sha256(raw).hexdigest()
+
+
+EXECUTION_BINDING_SCHEMA = "copilot-execution-binding/v1"
+
+
+def create_execution_binding(path: str, *, work_item_id: str,
+                             test_commands: list[str] | None = None,
+                             workspace: str = "",
+                             require_test_result: bool = False,
+                             require_artifact_integrity: bool = False) -> dict:
+    """在执行方启动前固化一次 execution binding（task/work_item/命令/nonce）。
+
+    绑定不是代码快照：Executor 之后可以写代码；它证明“本轮执行会话是在这次
+    任务派发之后新建的”，并防止复用同工作区旧 completed 子会话。
+    """
+    state = load_state(path)
+    _assert_open(state, "创建 execution binding")
+    wid = str(work_item_id or "").strip()
+    dispatch = state.get("native_dispatch")
+    if not isinstance(dispatch, dict):
+        raise GovernanceError("状态没有 native_dispatch；先 drive 生成派发。")
+    action = next((a for a in dispatch.get("actions") or []
+                   if isinstance(a, dict)
+                   and str(a.get("work_item_id") or "") == wid), None)
+    if action is None:
+        raise GovernanceError(f"dispatch 中没有工作项 {wid!r}；不能创建执行绑定。")
+    commands = [str(item).strip() for item in (test_commands or [])
+                if str(item).strip()]
+    policy = (state.get("contract") or {}).get("test_policy") or {}
+    policy_captured = bool(policy.get("captured"))
+    if str(state.get("risk") or "").lower() == "high" and not policy_captured:
+        raise GovernanceError(
+            "risk=high 的 execution binding 必须来自合同 test_policy；"
+            "不接受调用方自选测试命令的 caller binding。")
+    contract_commands = [str(item) for item in policy.get("commands") or []]
+    if policy_captured and contract_commands:
+        if commands and commands != contract_commands:
+            raise GovernanceError(
+                "测试命令与合同登记不一致；合同要求的测试不能由执行方事后更换："
+                f"{commands} vs {contract_commands}")
+        commands = contract_commands
+    if policy_captured and policy.get("required") and not commands:
+        raise GovernanceError(
+            "合同要求运行测试，但 binding 没有任何测试命令；请在合同 test_policy "
+            "中先确定命令，再创建执行绑定。")
+    require_result = bool(require_test_result) or bool(
+        policy.get("require_test_result") if policy_captured else False)
+    require_artifacts = bool(require_artifact_integrity) or bool(
+        policy.get("require_artifact_integrity") if policy_captured else False)
+    ws = os.path.realpath(os.path.abspath(os.path.expanduser(
+        workspace or os.getcwd())))
+    binding = {
+        "schema": EXECUTION_BINDING_SCHEMA,
+        "binding_id": "EB" + secrets.token_hex(12),
+        "nonce": secrets.token_hex(16),
+        "task_id": str(state.get("task_id") or ""),
+        "contract_sha256": str(state.get("contract_sha256") or ""),
+        "work_item_id": wid,
+        "dispatch_id": str(action.get("dispatch_id") or ""),
+        "workspace": ws,
+        "test_commands": commands,
+        "require_test_result": require_result,
+        "require_artifact_integrity": require_artifacts,
+        # 合同策略随 binding 冻结：调用方只能加严，不能在执行后关闭合同要求的层。
+        "requirement_source": "contract" if policy_captured else "caller",
+        "contract_test_policy": {
+            key: policy.get(key) for key in
+            ("required", "commands", "report", "artifacts",
+             "require_test_result", "require_artifact_integrity")
+        } if policy_captured else {},
+        "contract_report": str(policy.get("report") or "") if policy_captured else "",
+        "contract_artifacts": [str(item) for item in policy.get("artifacts") or []]
+        if policy_captured else [],
+        "created_at": now_iso(),
+        "created_by": "zcode-native",
+        "consumed": False,
+        "consumed_by_result_sha256": "",
+        "consumed_at": "",
+    }
+    state.setdefault("execution_bindings", []).append(binding)
+    _history(state, "execution_binding_created", {
+        "binding_id": binding["binding_id"],
+        "work_item_id": wid,
+        "test_command_count": len(commands),
+    })
+    save_state(path, state)
+    return binding
+
+
+def contract_no_test_binding(binding: object, state: dict | None = None) -> bool:
+    """binding 是否来自“合同显式不要求测试”的策略；仅此情形允许 TE N/A。
+
+    传入 state 时还要求 binding 仍对应当前合同、且当前合同确实显式不要求测试，
+    防止 amend 后旧 binding 或伪造的 contract-source binding 继续放行 N/A。
+    """
+    if not isinstance(binding, dict):
+        return False
+    policy = binding.get("contract_test_policy") or {}
+    base = bool(binding.get("requirement_source") == "contract"
+                and policy and policy.get("required") is False
+                and not binding.get("test_commands")
+                and not binding.get("contract_artifacts")
+                and not binding.get("contract_report"))
+    if not base:
+        return False
+    if state is None:
+        # 合同来源的 N/A 必须由当前状态复核；缺少 state 时 fail-closed。
+        return False
+    contract = state.get("contract") or {}
+    current = contract.get("test_policy") or {}
+    if not current.get("captured") or current.get("required") is not False:
+        return False
+    if str(binding.get("contract_sha256") or "") != str(
+            state.get("contract_sha256") or ""):
+        return False
+    expected = {key: current.get(key) for key in
+                ("required", "commands", "report", "artifacts",
+                 "require_test_result", "require_artifact_integrity")}
+    if canonical_json(policy) != canonical_json(expected):
+        return False
+    return (str(binding.get("contract_report") or "")
+            == str(current.get("report") or "")
+            and sorted(str(item) for item in
+                       binding.get("contract_artifacts") or [])
+            == sorted(str(item) for item in current.get("artifacts") or []))
+
+
+def find_execution_binding(state: dict, binding_id: str) -> dict | None:
+    for binding in state.get("execution_bindings") or []:
+        if isinstance(binding, dict) and \
+                str(binding.get("binding_id") or "") == str(binding_id or ""):
+            return binding
+    return None
+
+
+def execution_binding_problems(state: dict, binding_id: str,
+                               *, work_item_id: str = "",
+                               test_commands: list[str] | None = None,
+                               workspace: str = "") -> list[str]:
+    """校验 execution binding 与本次执行对象一致且未被消费。"""
+    binding = find_execution_binding(state, binding_id)
+    if binding is None:
+        return ["execution_binding_missing"]
+    problems: list[str] = []
+    if str(binding.get("schema") or "") != EXECUTION_BINDING_SCHEMA:
+        problems.append("execution_binding_schema")
+    if not str(binding.get("nonce") or ""):
+        problems.append("execution_binding_nonce_missing")
+    if str(binding.get("task_id") or "") != str(state.get("task_id") or ""):
+        problems.append("execution_binding_cross_task")
+    if str(binding.get("contract_sha256") or "") != str(
+            state.get("contract_sha256") or ""):
+        problems.append("execution_binding_contract_changed")
+    if work_item_id and str(binding.get("work_item_id") or "") != work_item_id:
+        problems.append("execution_binding_work_item_mismatch")
+    if binding.get("consumed"):
+        problems.append("execution_binding_consumed")
+    expected = [str(item) for item in binding.get("test_commands") or []]
+    if expected and [str(item) for item in (test_commands or [])] != expected:
+        problems.append("execution_binding_command_mismatch")
+    ws = os.path.realpath(os.path.abspath(os.path.expanduser(
+        workspace or binding.get("workspace") or "")))
+    if ws and str(binding.get("workspace") or "") and \
+            ws != str(binding.get("workspace") or ""):
+        problems.append("execution_binding_workspace_mismatch")
+    return problems
+
+
 def review_attempt_problems(review: dict, state: dict, *,
                             check_current: bool = True) -> list[str]:
     """检查复核记录是否属于当前有效 attempt，且快照仍与当前状态一致。"""
@@ -1781,6 +2070,11 @@ def _review_trust_problems(review: dict, state: dict, *, check_target: bool,
         problems.append("native_review_changed_files")
     if review.get("g4_eligible") is not True:
         problems.append("native_review_not_g4_eligible")
+    elif str(review.get("g4_source") or "") != "candidate":
+        # 切换后只接受新链产出的 G4；旧 G4 记录没有 candidate 来源，不能放行。
+        problems.append("native_review_legacy_g4_source")
+    elif (review.get("candidate_g4") or {}).get("eligible") is not True:
+        problems.append("native_review_candidate_not_eligible")
     else:
         # G4 必须绑定派发前创建的 attempt；仅有一个“生成时算出的 target”
         # 不能证明 Reviewer 实际审查的是同一快照。
@@ -1804,10 +2098,9 @@ def _review_trust_problems(review: dict, state: dict, *, check_target: bool,
     if not str(reviewer.get("agent_id") or "").strip() or not str(
             reviewer.get("child_session_id") or "").strip():
         problems.append("native_review_profile_invalid")
-    # G4 收口重新核对宿主记录的绑定，而不是只信任状态里的 g4_eligible 布尔值：
-    # 复核记录必须带上 ingest 时从 metadata/rollout 读出的宿主事实，且摘要未变、
-    # 与 Reviewer 自报身份一致。首次核对发生在 ingest（verify_review_host_record），
-    # 这里保证记录确实来自该路径、并检测记录被改写。
+    # G4 收口重新核对宿主记录摘要，而不是只信任状态里的 g4_eligible 布尔值：
+    # 宿主事实由 ingest 时的 g4_attest 独立核验并固化，这里检测记录在 ingest 后
+    # 被改写，并核对宿主身份与 Reviewer 自报一致。
     host = review.get("host")
     if not isinstance(host, dict) or not host:
         problems.append("native_review_host_missing")

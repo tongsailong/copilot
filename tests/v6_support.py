@@ -119,9 +119,12 @@ class BridgeBase(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.dir = self.tmp.name
         init_git_workspace(self.dir)
+        with open(os.path.join(self.dir, "work.py"), "w", encoding="utf-8") as fh:
+            fh.write("VALUE = 1\n")
         self.state_path = os.path.join(self.dir, "state.json")
         G.start_state(self.state_path, goal="目标", contract=CONTRACT,
-                      execution_backend="native", risk="high")
+                      execution_backend="native", risk="high",
+                      test_policy={"required": False})
         G.plan_state(self.state_path, {"summary": "两个工作项", "actions": [
             {"id": "A1", "title": "实现一", "goal": "产出结果",
              "expected_evidence": "结果文件"},
@@ -133,6 +136,25 @@ class BridgeBase(unittest.TestCase):
         with open(self.evidence, "w", encoding="utf-8") as fh:
             fh.write("result\n")
         self.dispatch = NB.build_dispatch(self.state, G.ready_actions(self.state))
+        self._bindings: dict[str, dict] = {}
+
+    def binding(self, wid: str = "A1") -> dict:
+        current = self._bindings.get(wid)
+        if current:
+            state = G.load_state(self.state_path)
+            stored = G.find_execution_binding(state, current["binding_id"])
+            if stored is not None and not stored.get("consumed"):
+                return current
+        state = G.load_state(self.state_path)
+        if state.get("native_dispatch") != self.dispatch:
+            state["native_dispatch"] = self.dispatch
+            G.save_state(self.state_path, state)
+        self._bindings[wid] = G.create_execution_binding(
+            self.state_path, work_item_id=wid, workspace=self.dir)
+        loaded = G.load_state(self.state_path)
+        self.state.clear()
+        self.state.update(loaded)
+        return self._bindings[wid]
 
     # ── 信封构造 ──────────────────────────────────────────────────────────
     def item(self, wid: str = "A1") -> dict:
@@ -164,6 +186,12 @@ class BridgeBase(unittest.TestCase):
             },
             "timing": {"duration_ms": 1200},
             "usage": {"total_tokens": 321},
+        }
+        bound = self.binding(wid)
+        env["execution_binding"] = {
+            "binding_id": bound["binding_id"], "nonce": bound["nonce"],
+            "created_at": bound["created_at"], "workspace": bound["workspace"],
+            "test_commands": bound["test_commands"],
         }
         env.update(overrides)
         env["result_sha256"] = NB.envelope_sha256(env)
@@ -219,15 +247,14 @@ class BridgeBase(unittest.TestCase):
             },
             "host": {
                 **self.host_files(),
-                "tool_calls": [{"name": "Read", "count": 2},
-                               {"name": "Bash", "count": 1}],
+                "tool_calls": [{"name": "Read", "count": 2}],
                 "agent_id": "agent-review", "child_session_id": "child-review",
                 "workspace_root": self.dir,
             },
             "verdict": "pass",
             "findings": [],
             "files_inspected": [self.evidence],
-            "commands_run": ["git status --short"],
+            "commands_run": [],
             "changed_files": [],
             "unverified": [],
             "residual_risks": [],
@@ -248,7 +275,7 @@ def make_fake_review_host(directory: str, *, execution: dict, dispatch: dict,
                           attempt_id: str = "",
                           session_created_at: str = "",
                           prompt: str = "", workspace: str = "") -> dict:
-    """写一套可被 verify_review_host_record 重新核对的 Reviewer 宿主记录。"""
+    """写一套模拟真实 Reviewer 宿主 metadata/output/rollout 的夹具。"""
     agent = "agent-review"
     child = "child-review"
     output = os.path.join(directory, "review-output.json")
@@ -264,7 +291,7 @@ def make_fake_review_host(directory: str, *, execution: dict, dispatch: dict,
         "verdict": "pass",
         "findings": [],
         "files_inspected": [evidence],
-        "commands_run": ["git status --short"],
+        "commands_run": [],
         "changed_files": [],
         "unverified": [],
         "residual_risks": [],
@@ -274,7 +301,8 @@ def make_fake_review_host(directory: str, *, execution: dict, dispatch: dict,
         fh.write("\n")
     calls = [
         {"id": "t1", "name": "Read", "input": {"file_path": evidence}},
-        {"id": "t2", "name": "Bash", "input": {"command": "git status --short"}},
+        {"id": "t2", "name": "Grep", "input": {"pattern": "result",
+                                               "path": evidence}},
     ]
     rows = [
         {"sessionId": child,
@@ -287,11 +315,14 @@ def make_fake_review_host(directory: str, *, execution: dict, dispatch: dict,
     metadata = {
         "agentId": agent,
         "childSessionId": child,
+        "parentSessionId": "sess_parent",
         "profileId": "reviewer",
         "profileSnapshot": {
             "name": "reviewer",
-            "tools": ["Read", "Grep", "Glob", "Bash"],
-            "disallowedTools": ["Write", "Edit"],
+            "tools": ["Read", "Grep", "Glob"],
+            "disallowedTools": ["Write", "Edit", "Bash", "WebFetch",
+                                "WebSearch", "Agent", "Task", "TodoWrite",
+                                "NotebookEdit"],
         },
         "status": "completed",
         "totalToolUseCount": len(calls),
@@ -310,7 +341,7 @@ def make_fake_review_host(directory: str, *, execution: dict, dispatch: dict,
     return {"metadata_path": meta, "output_file": output,
             "rollout_path": rollout,
             "tool_calls": [{"name": "Read", "count": 1},
-                           {"name": "Bash", "count": 1}],
+                           {"name": "Grep", "count": 1}],
             "agent_id": agent, "child_session_id": child,
             "session_created_at": metadata["createdAt"],
             "session_completed_at": metadata["completedAt"],

@@ -1,6 +1,466 @@
 # STATUS
 
-更新：2026-11-14 CST。本文件只记录现场可核实的事实；规划与未完成事项单独标注。
+更新：2026-11-15 CST。本文件只记录现场可核实的事实；规划与未完成事项单独标注。
+
+## 正式 G4 切换与旧 Reviewer 退役（2026-11-15，阶段九）
+
+在阶段八切换准入 PASS 的最终源码上执行正式切换：正式 G4 改由新链
+`g4_attest` + `test_execution` + `g4_shadow`/候选派生，旧 Reviewer 全局 Profile、
+Bash 白名单、rollout 强依赖与重复校验入口退役。
+
+- **正式切换**：`copilot_auto._ingest_review` 仅在 `risk=high`、shadow `attested` 且
+  `new_g4_eligible=true` 时写 `g4_eligible=true`/`g4_source="candidate"`；信封自报
+  `g4_eligible` 不再生效。`governance._review_trust_problems` 只接受 candidate 来源与
+  `candidate_g4.eligible=true`，旧记录报 `native_review_legacy_g4_source`。
+- **退役**：删除源码 `agents/reviewer.md` 与运行时 `~/.zcode/agents/reviewer.md`；
+  Reviewer 只使用工作区 `.zcode/agents/reviewer.md`（`tools: [Read,Grep,Glob]`，
+  disallowed 含 Bash/Write/Edit，`injectAgentsMd=false`）。`native_bridge` Reviewer Bash
+  白名单、`native_agent` 的 rollout/旧会话/重复证据校验、`preflight-commands` 删除；
+  `sync_runtime.py` 不再分发 Reviewer。
+- **合同测试要求**：高风险任务显式 `test_policy` 进入合同指纹；binding 从合同派生并
+  记录 `requirement_source`/`contract_*`，调用方只能加严；TE 四层 A/B/C/D 与 N/A
+  当前合同校验保留。
+- **真实 E2E（最终源码/运行时）**：`/tmp/copilot-e2e-stage9e`，task `task-stage9e-e2e`、
+  contract `630a0bd2…`、binding `EBace3fd…`、executor `agent_b9618acf…`
+  （`bash run-tests.sh` exit 0）、execution `07c38ce5…`、attempt `RAe3297a…`、
+  reviewer `agent_8eb506b1…`（profile `reviewer`，4×Read）、review `0174ba43…`、
+  raw 2857 字节 SHA `0d67f731…`、attestation `813a58b5…`、TE layers 全 true、
+  候选 `eligible=true`（0 reasons）、正式/影子 `pass`、`consistent`、attempt+binding
+  消费、`drive` 直接 `CLOSED/pass`（无手工改状态）。
+- **原始输出复核**：`verify_stored` 对上述 attestation `ok=true`；把 raw verdict 改为
+  `partial` 后 `ok=false`。
+- **Headless 新会话**：`sess_b4e6c9c2…` 加载 Skill `v6.5.0`（标题
+  `# copilot：轻量协作治理（v6.5.0）`），实际 `Read(.zcode/agents/reviewer.md)`，
+  tools `[Read,Grep,Glob]`；`global_profile_exists=false`。宿主 DB 的 tool_usage 与
+  part 记录一致。
+- **测试**：活动 `541 tests OK`（38.8s）；历史 `853 OK (skipped=31)`；T4 隔离矩阵
+  34/34 场景、T0–T3 全过（T0 0.6s / T1 18.6s / T2 39.4s / T3 91.5s）。
+- **运行时**：`sync_runtime.py --apply` 写入 15 个受管理文件；`--check` 缺失 0 /
+  不同 0；8 个未受管理运行时文件保留；基线 25 个文件。
+- **未完成/未验证**：尚无正式 REVIEW；未在真实 GUI 会话人工观察；大写 `PASS`
+  归一化仍只有单元测试；metadata/SQLite 无签名；未做主动 Bash 渗透测试。
+
+## 正式切换准入验证与最终演练（2026-11-15，阶段八，未正式切换）
+
+在阶段七最终源码上重做真实 Executor → Reviewer → 候选 G4 → ingest → closure 链路，
+把测试要求冻结进合同，修复 E2E 暴露的合同指纹缺口，并完成 T4 与历史证据复核。
+正式 G4、旧 Reviewer、Bash 白名单、全局配置/Profile、运行时均未改动；未提交/推送/同步。
+
+- **合同测试策略**：`start_state`/`amend_contract` 接受 `test_policy`（`required` /
+  `commands` / `report` / `artifacts` / 两个 require 标志），并纳入
+  `contract_sha256` 指纹；旧任务不传策略时指纹口径不变。`create_execution_binding`
+  从合同派生命令与层要求，调用方只能加严：合同命令不可换、合同要求的层不能被关闭；
+  binding 记录 `requirement_source` / `contract_test_policy` / `contract_report` /
+  `contract_artifacts`。`native_bridge` 回填时再次核对，被篡改降低要求会
+  `execution_binding_policy_weakened`。合同显式不要求测试时，`test_execution`
+  返回 `not_applicable`（A–D 全部 NOT APPLICABLE），候选只在该合同策略下接受；
+  无合同策略的旧 binding 不会变成 N/A。
+- **E2E 暴露并修复的真实缺陷**：`_gate_criteria` 重算合同指纹时没有带
+  `test_policy`，导致带测试策略的任务永远 `contract_fingerprint_mismatch`，
+  drive 误派生 `AUTO-NEXT` 并使复核目标过期。已修复并加回归用例；E2E 状态中由该缺陷
+  派生的空工作项已移除（测试状态清理），四门重算后通过。
+- **最终真实 E2E（干净状态、中性 Reviewer prompt）**：`/tmp/copilot-e2e-stage8e`，
+  task `task-1c17b4dff6e43809`、binding `EB833128…`（CLI `--test-policy-file` 创建，
+  合同命令 `bash run-tests.sh`、两个 require 层 true）、executor child
+  `sess_subagent_agent_d2d5d251…`（真实 `bash run-tests.sh` exit 0）、execution
+  `025c12ad…`、attempt `RA89bf8d…`、reviewer child
+  `sess_subagent_agent_1fa2dd5f…`（Profile `reviewer`，工具仅 Read/Grep/Glob，Read×4）、
+  原始输出 2,705 字节 SHA `8c048b50…`、attestation `5a672314…`、TE 四层 A/B/C/D 全 true、
+  候选 `eligible=true`（0 reasons）、正式与影子 `pass`、`consistent/equivalent`、attempt
+  正式+候选消费、binding 消费给 execution、`drive` 直接收口 `CLOSED/pass`（无手工改状态）。
+  Reviewer prompt 只给文件清单与绑定值，未预置 verdict/findings；模型自行给出 pass、
+  3 条 findings（1 minor + 2 info），原始 JSON 未被改写。
+- **复核后加固**：合同策略增加 CLI `start/contract --test-policy[-file]`；影子层接受
+  合同显式不要求测试的 `not_applicable`（与候选同一 `G.contract_no_test_binding`）；
+  bridge 回填逐项比对 `contract_test_policy`/`contract_report`/`contract_artifacts`，
+  删除/改写即 `execution_binding_policy_weakened`；合同策略存在时 normal 风险也要求
+  binding；TE 要求合同路径位于 workspace 内且 binding 的 `contract_sha256` 等于
+  当前合同（amend 后旧 binding 的 N/A/旧命令失效）；N/A 还要求当前合同确有 captured
+  不要求测试策略（伪造 contract-source binding 不放行）；`verify_stored` 对新记录
+  比对 findings id/severity，旧记录无摘要时只核对 raw 并显式记 limitation。
+- **篡改/边界拒绝（真实数据）**：改 verdict 为 partial → `g4_requires_pass`；改
+  finding summary → `host_findings_changed`；改 unverified → `g4_with_unverified`；
+  `expected_output_sha256` 不符 → attest `host_output_sha_mismatch`（eligible=False）；
+  重复 ingest 幂等（review/attestation 数量与 `save_seq` 不变）。
+- **历史证据独立复核**：阶段七、阶段八 attestation 均 `verify_stored.ok=true`；
+  阶段八新记录含 findings 摘要并可逐条比对，阶段七旧记录无摘要时明确 limitation
+  （只核对 raw）。raw 字节 SHA、verdict、findings（新记录）由 `verify_stored` 复核；
+  attempt `code_scope`、execution binding、trace/turn/tool_call_ids 由独立重算/
+  状态追溯核对。SHA 一致只证明文件完整性与同源记录，不是
+  密码学身份认证。
+- **新旧 G4 对照**：6 个样本中 4 个 `consistent/equivalent`（阶段七、阶段八 c/d/e），
+  2 个 `new_stricter`：一个因 execution/attempt 代码快照漂移
+  （`execution_code_scope_mismatch`），一个因 task_dir 在 workspace 外且代码快照为空
+  （`task_dir_outside_workspace`、`code_scope_empty`）。未出现 `new_looser`；
+  正式 G4 放行逻辑未改。
+- **测试**：活动套件 `587 tests OK`（47.2s）；历史 `853 OK (skipped=31)`；T4 隔离
+  矩阵 30/30 场景、T0–T3 全过（T0 0.6s / T1 19.4s / T2 48.6s / T3 89.5s）。
+  产物增加 mtime 检查：早于本轮测试命令启动的文件即使 SHA 未变也判
+  `test_artifact_stale`；该检查已在真实 E2E 数据上重放，TE 仍 verified。
+
+## 候选 G4 闭环与 T4 验收（2026-11-15，阶段七，未正式切换）
+
+在阶段六基础上把 binding/test_execution/attestation 接入候选闭环、持久化原始输出、统一
+输出解析、纳入未声明嵌套 Git 仓库，并完成隔离 T4。正式 G4、旧 Reviewer、Bash 白名单、
+运行时与全局 Profile 均未改动；未提交/推送/同步。
+
+- **候选闭环**：`copilot_auto._ingest_review` 在正式判定后、单次 `save_state` 前调用
+  `_finalize_candidate`：要求 shadow `attested`、新 G4 eligible、TE `verified`、
+  execution binding 已消费给该 execution、review attempt 未被其他结果消费、原始输出
+  存在且 SHA 与信封/attestation 一致；全部满足才在 attempt 上写
+  `candidate_consumed_by_result_sha256` 并持久化原始输出。候选字段
+  （`native_reviews[].candidate_g4`、`g4_attestations[].candidate`）与正式
+  `g4_eligible`/正式 attempt 消费互不影响。重复 ingest 按结果 SHA 幂等跳过；不同结果
+  复用同一 attempt/binding 被候选拒绝。
+- **原始输出持久化**：`governance.store_review_output` 将 Reviewer 原始字节原子写入
+  `<task_dir>/review-outputs/<sha>.txt`（0600、fsync、replace、回读校验；目录已加入
+  code_scope 治理排除）。attestation 记录 `raw_output{path,sha256,bytes,source,parser}`；
+  `g4_attest.verify_stored` 可在不读宿主 DB/metadata 的情况下复核：文件存在、SHA 与
+  摘要一致、`review_sha256` 一致、可解析为合法 JSON、verdict 与记录一致。真实阶段七
+  样本 raw_output 1346 字节、SHA 一致、`verify_stored.ok=true`。
+- **输出契约统一**：新增 `scripts/review_output.py`（`review-json/v2`）：整段 JSON 或
+  恰好一个围栏且围栏外仅空白；多围栏/围栏外叙述/重复键/非对象一律拒绝；不做文案修正。
+  `native_agent` 与 `g4_attest` 的语法解析都调用该模块（语义/绑定检查仍各自执行）。
+  旧版本“围栏外可带叙述”的兼容已移除，属明确的版本边界；工作区 Profile 已要求纯 JSON。
+- **未声明嵌套 Git 仓库**：`code_scope` 新增 `nested_repos`：从变更路径向上发现含
+  `.git`（目录或文件形式）的最近仓库根，递归记录 HEAD/tracked/untracked/删除/重命名/
+  更深嵌套并纳入摘要；`_submodule_dirty_state` 内部也递归未声明嵌套。无法读取时快照
+  不可用（fail-closed）。真实仓库矩阵覆盖脏 tracked、untracked、嵌套内外层；摘要公式
+  再次扩展，阶段六及更早快照需重新取证。
+- **原子性与故障注入**：候选标记、attestation、复核记录与正式消费在同一次
+  `save_state`（mkstemp+fsync+replace）落盘；模拟保存失败后重读状态：
+  `native_reviews`、attempt 消费、`save_seq` 均未变化，证明不会留下部分消费。
+  binding 在执行 ingest 时一次性消费到 result_sha；候选再校验其归属。状态损坏
+  （`g4_attestations` 非数组）修复为只含本条记录并写 history，不伪造 PASS。
+- **真实端到端（阶段七）**：`/tmp/copilot-e2e-stage7`：binding `EB162037…`（nonce 写入
+  prompt）→ 真实 executor child `bash run-tests.sh`（exit 0）→ 真实 reviewer 纯 JSON →
+  正式 G4 与影子 `eligible=true`、`consistent/equivalent`、TE `verified`（A/B/D）→
+  ingest 后 candidate `eligible=true`、raw output 持久化、attempt 正式+候选消费、
+  binding 消费到 execution；`verify_stored` 在仅用持久化文件时 ok=true。
+- **T4 隔离验收**：`tests/t4_acceptance.py` 仅用临时目录/夹具，运行 T0–T3 与 20 个
+  场景矩阵（正常、旧会话、命令不符、非零退出、报告失败、产物过期、越界读、非法输出、
+  原始输出丢失、DB 缺失、清理后复核、attempt/binding 重放、submodule/嵌套仓库、
+  ingest 中断、增量基线失效、合同变化），报告 `/tmp/copilot-t4-report.json`：
+  全部 layer 与 scenario 通过。
+- **独立复核与修复**：阶段七两轮独立只读复核。首轮 partial（F2 major + F3/F4/F5/F8/F9）
+  已修：`native_agent` 补 `sqlite3` 导入，DB 查询失败抛 `AgentRecordError`；候选把 raw
+  解析结果与信封交叉核对；`nested_repos` 增加被忽略的未声明仓库扫描并递归内层；
+  `_default_state` 补字段、`store_review_output` 先校验 64 位 hex；CLI `OSError` 映射
+  错误退出码。第二轮 partial（F1 major：候选把 raw 与“规范化后”的复核记录比对，带
+  findings/大写 verdict 的合法复核会被误判；F2/F3/F4/F5/F6 minor/info）修复如下：
+  - 候选改为与**原始信封字段**比对（verdict 仅小写比较，findings/unverified/
+    changed_files 用 canonical JSON），不再与 `validate_review_result` 重建后的结构比较；
+    新增合 findings+`verdict="PASS"` 的正向用例与“候选不改正式字段”断言。
+  - 执行 ingest 改为一次 `save_state`：证据、工作项回填、`native_results`、binding
+    消费同批落盘；新增保存失败注入用例（状态无 done 工作项、无证据/结果、`save_seq`
+    不变）。
+  - 嵌套仓库扫描深度超限改为 fail-closed（`nested_repo_scan_depth_exceeded`），
+    submodule/嵌套仓库内部也扫描被 `.gitignore` 忽略的仓库；新增两项真实 Git 用例。
+  - `host.host_db` 随信封固化，候选回退读宿主库时使用同一库（旧信封仍回退默认库）。
+  - `references/agent-bridge.md` 更新为 `review-json/v2` 严格契约。
+  F7（require 标志默认 False）与 F13（raw_output 记在 attestation 内）作为已知设计/限制，
+  见切换清单残余风险。
+- **测试**：活动套件 `558 tests OK`（46.9s）；历史 `853 OK (skipped=31)`；T4
+  `all_layers_ok`、`all_scenarios_ok` 均为 true（T0–T3 + 20/20 场景）。修复后未重跑真实
+  ZCode e2e（首轮 e2e 早于 F1 修复，候选 findings 路径由真实归一化单测覆盖）。
+- **未解决/限制**：候选 `eligible` 不改变正式 G4 放行，也不改变正式链的消费语义；
+  `verify_stored` 只证明持久化输出自洽，不重读宿主记录；DB/metadata/outputFile 仍
+  同用户可写、无签名；旧信封无 `output_sha256` 时交叉核对只能跳过；T4 的“真实
+  reviewer 旧会话复用”等场景由合成夹具 + 真实 e2e 组合覆盖，未对每个场景重跑真实
+  ZCode 子代理。
+
+## 宿主持久化取证与执行证据加固（2026-11-15，阶段六，未正式切换）
+
+在阶段五基础上消除 Reviewer rollout 依赖、建立 Executor 新鲜绑定、拆分测试证据层级、
+纳入 submodule 脏工作区。正式 G4、旧 Reviewer、Bash 白名单、运行时与全局 Profile 均未改动；
+未提交/推送/同步。
+
+- **Reviewer 输出持久化**：新增 `scripts/host_records.py`（只读 SQLite）。Reviewer 最终输出
+  取 `message.role=assistant` 的最后一条非空消息，按 `part(sequence)` 拼接 `type=text`
+  文本；真实会话验证其与 metadata `outputFile` **字节一致**（DB 重建 SHA = 文件 SHA）。
+  `g4_attest` 优先读 outputFile，两者都在时必须一致（`host_output_db_mismatch`）；
+  outputFile 被清理时用 DB 重建（`output_source=db.message.part`），记录 message/part id、
+  文本 SHA 与字节数；两者都缺失 → `host_output_missing` 失败关闭。影子把复核信封的
+  `host.output_sha256` 传给取证器交叉核对，DB 文本被事后替换会 `host_output_sha_mismatch`
+  （旧信封无该字段时只能记录限制，不能回填）。**注意**：G4 合格信封仍要求 outputFile
+  存在；DB 回退适用于已有信封后的取证/影子，不是 build_review 的 G4 生成路径。真实验证：移走
+  outputFile 与 rollout 后，新 G4 仍 `eligible=true`（DB 输出 SHA 与复核记录一致）；
+  DB 同步删除 message/text part 后 → `host_output_missing` 拒绝。
+- **rollout 降为辅助**：`native_agent review` 在 rollout 缺失时从 `session_entry/
+  runtime/model_selection` 取模型、从 `tool_usage+part` 取调用，生成可取证信封；
+  `host.tool_call_source=db.tool_usage+part`、`model_source=session_entry/...`，
+  同时追加 `review_rollout_missing` 使旧 G4 保持 `false`（不修改正式放行逻辑）。
+  `execution` 同样在 rollout 缺失时从 DB 取模型。`native_bridge` 允许 G4 不合格信封
+  缺少 rollout/outputFile 路径，但要求 output SHA 格式合法；G4 合格信封仍强制三件套。
+- **Executor 新鲜绑定**：新增 `native_agent bind-execution` 与状态字段
+  `execution_bindings`。主代理在启动 Executor **之前**创建 binding（task/work_item/
+  dispatch/workspace/预期测试命令/nonce/created_at）；execution 信封携带 binding，
+  bridge 校验 binding 存在、未消费、任务/工作项/命令/工作区一致；ingest 一次性消费并
+  绑定 result_sha；`test_execution` 要求 `metadata.prompt` 逐字含 nonce、session
+  `createdAt ≥ binding.created_at`、binding 被本执行结果消费。高风险任务生成执行
+  信封时强制要求 binding（`execution_binding_required`）。旧 completed 子会话的 prompt
+  不含本轮 nonce、创建时间早于 binding，因此不能冒充本轮执行方。**正式 ingest/G4 收口
+  尚未接入 binding/test_execution**，当前正式放行逻辑不因缺少 binding 改变。
+- **测试证据四级**：`test_execution.layers` 分别记录
+  `command_execution_verified`（真实命令/退出码/会话）、`expected_test_verified`
+  （命令等于 binding 预先声明的预期命令）、`test_result_verified`（JUnit XML 解析
+  tests/failures/errors/skipped；要求每个报告 testcase 数与 tests 属性一致、至少一个
+  执行用例，`<failure/>`/`<error/>`/`<skipped/>` 子元素即使无属性也计入）、
+  `artifact_integrity_verified`（产物在 execution/attempt/当前文件三方 SHA 一致）。
+  `layers_required` 逐层记录是否要求，由 binding 的 `require_test_result` /
+  `require_artifact_integrity` 或是否声明产物决定；未要求层即使为 true 也不参与
+  `verified` 判定。`verified` 仍只是 A 层事实，不等同
+  测试质量或产物由该命令生成。
+- **submodule 脏工作区**：`code_scope.capture_code_snapshot` 新增
+  `submodule_worktrees`，递归记录 HEAD、tracked/untracked/删除/重命名/嵌套 submodule
+  的文件状态与 SHA；纳入快照摘要。嵌套 submodule 按声明的 nested 路径递归；status
+  非零 → `submodule_status_failed`，嵌套读取失败/未初始化/真实路径越界 →
+  `submodule_state_unreadable`，均 `available=false`，fail-closed。真实 Git 矩阵
+  覆盖 tracked 修改、untracked、嵌套 submodule 与未初始化拒绝。**注意：摘要公式已扩展，
+  阶段五及更早的 execution/attempt 快照会因 digest 变化判为漂移，需重新取证。**
+- **真实端到端（阶段六）**：`/tmp/copilot-e2e-stage6` 新任务；binding
+  `EBba3e2a…`（nonce 写入 Executor prompt）→ 真实 executor child 执行
+  `cd … && bash run-tests.sh`（exit 0）→ 正式 G4 与影子均 `eligible=true`、
+  `agreement=consistent`/`equivalent`；`test_execution=verified`，layers
+  A/B/D=true、C=false（任务未要求结构化报告）；binding 被本执行结果一次性消费。
+  真实负向：Reviewer 读取工作区外 contract → 影子 `read_outside_workspace`
+  （new_stricter）；rollout 在 build 与 ingest 之间被清理 → 正式 ingest
+  `g4_host_record_invalid`；移走 outputFile/rollout 后新 G4 仍可取证；DB 无最终输出 →
+  `host_output_missing`。
+- **测试**：活动套件 `528 tests OK`；历史 `853 OK (skipped=31)`。新增
+  `test_host_records.py` 5 项、`test_execution_binding.py` 6 项；`test_g4_attest` 166、
+  `test_g4_shadow` 41、`test_test_execution` 45（含 JUnit 负向）、
+  `test_code_scope_unified` 10（含嵌套/未初始化 submodule）。
+- **未解决/限制**：`native_agent` 与 `g4_attest` 的 JSON 围栏解析口径不同（前者较宽、
+  后者拒绝围栏外叙述），可能产生假 `new_stricter`；旧信封无 `host.output_sha256` 时
+  SHA 交叉核对只能跳过；DB 与 metadata 同用户可写、无密码学签名；DB 输出重建依赖 message/
+  part 未被清理（session 删除会级联清理）；metadata 被清理时仍无法取证；binding 依赖
+  Executor prompt 原样携带 nonce 与命令（模型改写会 unverified）；`test_result_verified`
+  目前只解析 JUnit XML；产物仍不证明由该命令生成；阶段五快照需因摘要公式变化重新生成。
+
+## G4 安全证据收敛（2026-11-15，阶段五，未正式切换）
+
+本阶段完成真实测试执行证据、incremental 基线重放、代码快照统一、影子差异收敛与
+正式切换验收清单。正式 G4、旧 Reviewer、Bash 白名单、运行时与全局 Profile 均未改动；
+未提交/推送/同步。阶段三、四成果保留。
+
+- **真实测试退出码**：宿主 SQLite `tool_usage` 有真实 `exit_code`/`status`/`started_at`/
+  `completed_at`/`output_bytes`/`trace_id`/`turn_id`；`part` 的同一 `callID` 提供
+  `state.input.command` 与 `state.output`。`scripts/test_execution.py` 按 executor
+  `child_session_id` 合并两表，要求命令逐字匹配、`status=completed`、`exit_code` 存在且
+  为 0，才判 `verified`；非 0 判 `failed`，缺字段判 `unverified`。真实 executor 会话
+  `agent_9fedf983…` 的 `node --test` 记录 `exit_code=0`；失败探针
+  `node -e "process.exit(3)"` 记录 `exit_code=3`，绑定判 `failed`。
+- **执行方身份绑定（一致性校验，非防伪）**：execution 信封持久化
+  `executor_metadata_path`；`test_execution` 读取该 metadata 并核对
+  `agentId`/`childSessionId`/`parentSessionId`/`status=completed`、`metadataFile` 与传入
+  路径一致、`profileId` 与 `profileSnapshot.name` 一致且不是只读 Reviewer Profile、
+  metadata 的 `workspaceRoot`（存在时）必须等于 attempt 工作区，没有 `workspaceRoot` 时
+  `cwd` 必须等于工作区或位于其下（允许在子目录启动）；再核对宿主 `session` 行的
+  `parent_id`/`task_type=subagent_child`/`trace_id` 与工具调用 `trace_id` 一致，并要求
+  每条测试调用时间落在 metadata `createdAt..completedAt` 内、早于 attempt `created_at`。
+  替换会话/换 agent/非子会话/父会话不符/trace 不符/工作区不符/时间越界不能 `verified`；其中
+  metadataFile 指向他处、profile 不符、工作区不符为 `failed`，metadataFile 或工作区
+  字段缺失为 `unverified`（证据不足而非证明不符）。`build_execution` 对缺失
+  metadataFile 保持兼容接受，但影子不会据此判 `verified`。
+  **限制**：这些字段同源于 execution 信封与本机 metadata，不能证明会话确属本任务；
+  “同一工作区里挑一个真实旧 completed 子会话并声明其命令”仍可能满足一致性校验，正式
+  接入前需要把 Executor prompt 与任务/attempt 绑定（见切换清单残余风险）。
+- **产物与代码绑定**：execution 信封可选携带 `test_commands`、`test_artifacts`（证据 id）
+  与 `code_scope_sha256`；`build_execution` 自动采集工作区快照，`validate_execution_result`
+  只校验字段格式（artifact 属于本次证据、SHA 与 code_scope 格式合法）；artifact 在
+  attempt `evidence_snapshot` 中冻结、当前 SHA 未漂移、execution 与 attempt 的
+  `code_scope_sha256` 相等，均由 `test_execution` 在影子取证时判定，正式 ingest 目前
+  不据此拒绝。`native_results`
+  持久化这些字段，影子 `g4_attestations[].test_execution` 保存 binding_id、命令/
+  tool_call_id/trace/turn/退出码/时间/产物 SHA/metadata 路径与 SHA/session 父会话与 trace/
+  limitations；同一输入 binding_id 确定性。
+- **Incremental 基线重放**：影子读取基线 review、attempt、持久化 attestation 与 coverage，
+  核对 schema/attestation_id/attempt_id/target/code_scope/evidence SHA/verdict/eligible/
+  session/父会话/消费方/重复 attestation/跨任务/合同变化；覆盖集按当前
+  `review_coverage` 重算，变化证据必须逐条列入 manifest（允许超集、禁止未知 id），
+  代码、**其他**工作项、完成条件变化一律拒绝；被复核工作项自身的 action 变化按 `native_bridge` 同一规则放行。
+  **基线 attempt 必须已被正式消费**，未消费时影子 attestation 不能补发信任，直接
+  `baseline_attempt_not_consumed` 并要求完整复核。基线 attestation 必须带
+  `target_source=state`。真实端到端基线（已消费、attestation 可复核、带一处新增证据）
+  重放 `problems=[]`；覆盖无变化按 `incremental_without_change` 拒绝（应复用基线结论）；
+  tamper/跨任务/未消费/合同变化/覆盖不足均拒绝。
+- **代码快照统一**：`code_scope.snapshot_digest` 成为唯一摘要公式，
+  `capture_code_snapshot` 与 `g4_attest` 都调用它；SHA 文本/文件 helper 统一到
+  `lib_common`。真实 Git 矩阵覆盖初始/修改/新增/删除/重命名/`--base`/symlink/
+  治理与构建目录排除/submodule gitlink；所有快照的 digest 与两处重算一致。
+- **影子差异收敛**：记录新增 `old_verdict`/`old_reason`/`new_verdict`/`new_reason`/
+  `difference_category`/`evidence_summary`，并标注 `old_reason_source` 与
+  `old_host_reproducible`。旧 G4 仅因 rollout 缺失而拒绝、或旧 Reviewer 宿主 metadata
+  已不可复查时归为 `incomparable`，不再误记为 new_looser；同一证据口径下的真实收紧仍记
+  `new_stricter`。`test_execution` 未验证时新 G4 直接不合格，避免“测试未证明却 PASS”。
+- **复杂度与职责**：`g4_attest` 1,305 行、`g4_shadow` 583 行、`test_execution` 444 行、
+  `code_scope` 252 行。已消除快照摘要与确定性 JSON 序列化的重复实现
+  （`code_scope.canonical_json` 与 `snapshot_digest` 为唯一实现）；测试证据、增量重放与差异比较各自独立；
+  保留 `native_agent` 的 Profile/attempt/evidence 交叉检查（独立门禁，不与取证器合并）。
+  旧 Reviewer Bash 白名单仍被正式路径使用，退役条件见 `docs/DECISIONS.md` 第 41/42 条。
+- **真实隔离端到端（阶段五最终轮）**：`/tmp/copilot-e2e-stage5b` 新任务：真实 executor
+  child 运行 `cd /tmp/copilot-e2e-stage5b && bash run-tests.sh`（内部 `node --test`），
+  `tool_usage.exit_code=0`；真实 reviewer child（工作区 Profile）只读代码/证据并返回 JSON；
+  正式 G4 与影子均为 eligible=true，`agreement=consistent`、
+  `difference_category=equivalent`、`test_execution=verified`（命令逐字匹配、metadata SHA、
+  session 父会话/trace、产物 SHA 三方一致）、attempt 由正式 ingest 一次性消费。该轮同时
+  验证了三条真实负向：execution 与 attempt 代码快照不等 → `execution_code_scope_mismatch`
+  （改 Profile 后旧执行结果自动失效）；真实 child 自行加了 `cd … &&` 前缀 →
+  `test_command_not_found`；reviewer rollout 在 ingest 前被宿主清理 →
+  `g4_host_record_invalid` 拒绝入账。
+- **测试**：活动套件 `482 tests OK`（`test_g4_attest` 160、`test_g4_shadow` 40、
+  `test_test_execution` 30、`test_code_scope_unified` 5、`test_profile_policy` 4）；
+  历史套件 `853 tests OK (skipped=31)`。T1 定向 239 项 OK。正式切换验收清单见
+  `docs/G4-SWITCH-CHECKLIST.md`。
+- **未解决**：测试执行到 execution 信封生成之间的代码变化没有宿主时间戳可证（只以
+  execution/attempt 快照相等限制后续窗口）；工作区快照包含未跟踪的 `.zcode` Profile，
+  任何 Profile 编辑都会使既有 execution/attempt 失效（安全上正确，操作上要求先稳定
+  Profile 再取证）；旧正式 G4 仍依赖 rollout，而 ZCode 只保留最近少量 rollout，子会话
+  rollout 可能在 ingest 前被清理，因此正式 G4 必须在 Reviewer 会话结束后立即
+  build+ingest，否则失败关闭；执行信封 `test_commands` 需与 Executor 实际命令逐字一致
+  （模型自行改写命令会使绑定 unverified）；任何 exit 0 命令都可被声明为测试、任意稳定
+  文件都可声明为产物，当前只证明“某条匹配命令在该会话成功、产物三方 SHA 一致”，不证明
+  测试充分性，也不证明产物由该命令生成；executor 会话绑定是同源自洽校验，不能阻止同
+  工作区旧会话复用；submodule 脏工作区内容不进入
+  快照摘要；executor metadata/SQLite 无密码学签名，不是 OS 沙箱。
+
+## G4 影子集成与新只读 Profile（2026-11-15，阶段四，未正式切换）
+
+在用户第四阶段任务授权下完成影子接入、持久化、工作区只读 Profile 与真实隔离验证。
+**正式 G4 放行逻辑、旧 `agents/reviewer.md`、全局 `~/.zcode/agents` 和运行时 Skill 均未修改**；
+未提交/推送/同步。阶段三成果完整保留。
+
+- **影子接入点**：`copilot_auto._ingest_review` 在 Reviewer 信封校验通过、正式 G4 宿主复核
+  与 attempt 消费**之前**调用 `g4_shadow.build`；它只读 metadata/SQLite/attempt/证据/输出，
+  不写 consume marker，失败只写 `g4_attestations`，不改变 `native_reviews`、`g4_eligible`、
+  attempt 消费或退出码。影子记录与复核记录在同一次 `G.save_state` 落盘，避免“复核已入账
+  但取证缺失”的中间态。
+- **持久化**：新增 state 字段 `g4_attestations`；记录包含 shadow_id（确定性）、
+  review_result_sha256、old/new G4 资格、agreement（consistent / new_stricter /
+  new_looser / unavailable / not_applicable）、差异、attestation 摘要（attestation_id、
+  schema_version、attempt/target、agent/child/parent session、trace/turn、profile_snapshot、
+  model_selection、工具计数与 call ids、证据 SHA、code_scope_sha256、verdict、checks、
+  rejections、residuals、limitations、created_at）、incremental 基线与 test_binding。
+  `append_attestation` 按 shadow_id 幂等去重；正式 attempt 仍只由现有 ingest 消费。
+- **工作区 Profile**：新增 `.zcode/agents/reviewer.md`（工作区级，不发布到全局）。
+  ZCode 新进程实际加载后 `profileSnapshot.source=project`、`tools=[Read,Grep,Glob]`、
+  `disallowedTools` 含 Write/Edit/Bash/Agent/Task/WebFetch/WebSearch/TodoWrite/NotebookEdit、
+  `injectAgentsMd=false`、无 MCP、无 bypass；真实会话工具记录只有 Read/Grep。
+  旧 `agents/reviewer.md` 保留不动（仍含 Bash，正式 G4 继续接受；新取证器会拒绝）。
+- **快照缺口修复**：`g4_attest` 按 `code_scope.capture_code_snapshot` 的同一规范化公式
+  重算 code_snapshot.digest；`kind=other` 必须是 `git submodule status` 中列出的已检出
+  submodule 目录（含 `.git`），否则拒绝；真实 submodule gitlink 漂移已用本地仓库复现
+  （capture 输出 `kind=other`、`+<sha> sub`，digest 与 `g4_attest` 重算一致）。
+- **增量与测试绑定**：影子记录核对增量基线存在、verdict=PASS、g4_eligible、attempt 已消费、
+  coverage 非空；缺失/不可用时新 G4 判不合格。test_binding 记录 commands_run、
+  files_inspected 与执行证据 SHA；当前执行信封没有 exit_code 字段，退出码绑定明确标记
+  `exit_code_bound=false`（未解决，不在本轮伪造）。
+- **真实隔离端到端**：`/tmp/copilot-e2e-stage4`（独立 git 工作区 + 工作区 Profile）完成
+  attempt → 真实 ZCode child session → Read 代码/证据 → 纯 JSON → metadata/SQLite →
+  `g4_attest`（eligible=true、0 rejections、8 次工具调用）→ 影子 ingest → 持久化。旧 G4
+  因宿主 rollout 已被清理（仅保留父会话文件）判 `review_rollout_missing`，影子用 DB 判 true，
+  当时记录为 `new_looser` 并解释 `old_reason:review_rollout_missing`；阶段五已把这类
+  旧证据不可用的差异重分类为 `incomparable`；attempt 未被影子消费。
+  由于正式 `build_review` 依赖已清理的 rollout，本次 review 信封是按真实宿主记录手工
+  组装为 `g4_eligible=false`（`host` 省略、由影子按 agentId 定位 metadata），只用于影子
+  取证，不作为正式 G4 信封；重复 ingest 的幂等由 `tests/test_g4_shadow.py` 的集成用例
+  验证，不由该临时 state 的 history 证明。
+- **真实负向矩阵**：同一真实会话上验证 candidate 自身/执行方同 agent 或同 session →
+  `reviewer_not_independent`；改代码 → `code_scope_drift`；改证据 → `evidence_drift`；
+  删证据 → `evidence_missing`；工作区符号链接指向 `/etc/hostname` 的真实 Read →
+  `read_symlink_escape`；错误 expected_target → `target_stale`；删 DB/旧会话/已有 consume
+  marker → 分别 `host_db_unavailable` / `attempt_session_precedes` / `attempt_replayed`；
+  恢复文件后重新 eligible。
+- **测试**：活动套件 `431 tests OK`（`tests/test_g4_shadow.py` 24 项、
+  `tests/test_profile_policy.py` 4 项、`tests/test_g4_attest.py` 160 项，覆盖 submodule/
+  摘要复算/中文边界/异常兜底/幂等）；历史套件 `853 tests OK (skipped=31)`。
+- **独立只读复核**：工作区 Profile 由真实宿主加载后，独立 Reviewer 只读取证首轮判
+  PARTIAL，发现并已修复 3 个问题：影子未穷尽捕获异常（现由 `build` 顶层兜底，任何异常
+  记 `shadow_internal_error` 而不阻断 ingest）；非 G4 复核的 expected_target 回退成
+  attempt 自身导致 target 自证（现由 ingest 传当前 `final_evidence_digest(state)`）；
+  `g4_attestations` 类型损坏会让 append 抛错阻断复核（现修复为新列表并写 history
+  `g4_shadow_field_repaired`，不阻断正式放行）。其余 minor：历史已入账复核不回填影子，
+  已在限制中记录。第二轮只读复核 PASS（仅剩 info/minor），随后又收紧了影子异常兜底、
+  移除 attempt 自证回退、校验 host metadata 身份并补齐对应测试。
+- **复杂度审计**：`g4_attest` 1,312 行、`g4_shadow` 357 行；与 `native_agent` 的 Profile/
+  attempt/evidence 检查有职责重叠，但这是独立门禁的交叉取证而非单纯重复。`native_bridge`
+  的 Reviewer Bash 白名单仍被正式 G4 使用，不能在新 Profile 切换前删除；退役条件见
+  `docs/DECISIONS.md` 第 41 条。证据/代码 SHA 的重复计算保留为独立复算，不合并。
+- **未解决/限制**：正式 G4 仍以 rollout 为工具调用来源，而真实 ZCode 只保留最近少量父会话
+  rollout，子会话 rollout 常被清理，因此当前无法用真实会话得到旧 G4 `eligible=true`；
+  影子 DB 取证已能在同一会话上给出 eligible=true，但本阶段不切换正式门禁。旧 Profile 与
+  新 Profile 的输出契约差异（短前言）仍有待正式切换时对齐；历史低风险 review 不回填影子；
+  退出码未绑定；metadata/SQLite 无密码学签名，不是 OS 沙箱。Profile 在会话启动时缓存：
+  当前长会话仍可能使用旧 Profile，新建进程/会话才会加载工作区 `.zcode/agents/reviewer.md`；
+  本次验证使用新 headless 进程。
+
+## G4 宿主取证器（阶段三成果，现以影子模式接入）
+
+在用户第三阶段任务授权下新增 `scripts/g4_attest.py` 与 L2 测试。**未切换现有 G4 入口**，
+未删除 `agents/reviewer.md`，未同步运行时，未提交/推送。
+
+- **只读取证**：metadata.json + SQLite（`session` / `part` / `tool_usage` /
+  `session_entry`，`mode=ro`）+ attempt JSON + 证据文件 + Reviewer `outputFile`；不调用
+  模型、不联网、不执行 Bash、不写宿主数据库。
+- **校验**：Profile 工具精确等于 `{Read,Grep,Glob}`、空集拒绝、`disallowedTools ⊇
+  {Write,Edit,Bash}`、`permissionMode` 不放宽、无 skills/MCP、来源与路径属于工作区级；
+  会话完成、attempt 时间/prompt/workspace/target 绑定、`trace_id`/`turn_id`/Session 一致；
+  `tool_usage` 与 `part` 的数量、名称、状态一致；`read_only=1` 且 `side_effect_scope=none`；
+  每条文件证据必须有成功的精确 `Read.file_path`；代码快照与证据 SHA 不得漂移；执行方与
+  复核方相互独立；attempt 只能消费一次。
+- **路径边界**：原生只读 Profile 没有 OS 级路径沙箱。取证按 workspace、任务目录与已登记
+  证据文件构成允许集合做 `realpath` 检查；越界（含符号链接、`..`、敏感文件名）默认拒绝
+  G4；`--outside-reads record` 仅用于诊断，并写入 residual。
+- **持久化**：输出 `copilot-g4-attestation/v1`，含 agent/child/parent session、
+  `trace_id`/`turn_id`、`tool_call_id`、工具计数、证据 SHA、代码快照（digest/head/files/
+  submodules）、attempt/metadata/review SHA、Reviewer verdict 与 findings 计数、检查项、
+  拒绝原因与 `limitations`，以及本次使用的策略开关（`policy`）、attempt 绑定字段与
+  `rollout_checked`（rollout 只保留最近少量文件，存在时按 `tool_usage` 子集核对），
+  模型身份取 `session_entry` 的 `runtime/model_selection`。
+- **独立复核后的加固**：Reviewer 结论强制类型与绑定校验（`schema` 必须为
+  `copilot-native-review/v2`；findings/unverified 必须为 list；severity 大小写归一后限
+  blocking/major/minor/info；task/plan/dispatch/work_item/execution 在 attempt
+  有值时必须在结论中逐字回写，contract 若主动回写则必须一致）；空对象 `{}`、重复 JSON
+  键、多个可解析对象、围栏解析失败或
+  围栏外叙述均不视为有效结论；`tool_usage` 与 `part` 按 `tool_call_id` 逐调用比对名称与
+  状态，`trace`/`turn` 必须唯一且非空；证据必须位于 workspace/任务目录，符号链接越界、
+  敏感文件名、offset/limit 部分读取均拒绝，snapshot 条目必须带 path/id/sha256；
+  `unverified` 提及证据路径/文件名/证据 ID/代码路径/工作项 ID（含句末句点）视为阻断，
+  环境类未验证只进 residual；代码快照要求非空、`kind` 必须显式且 file/symlink 与实际类型一致、
+  `git_root` 为 workspace 或含 `.git` 的祖先目录（拒绝 `/`）、`code_scope_sha256` 与
+  digest 都非空且一致、`kind=other`（子模块 gitlink）只记 residual；`--task-dir` 必须位于
+  workspace 内或恰为 attempt/metadata 目录，否则拒绝；`outputFile` 必须与 metadata 同目录；
+  `--output` / `--consume-marker` 不得指向 metadata、attempt、DB、证据、`outputFile`、
+  Profile 或代码快照文件；`--consume-marker` 必须与 `--output` 同时使用；执行方身份与
+  attempt 消费标记显式校验；`--outside-reads record` 与跳检开关会把 `policy.diagnostic`
+  置为 true，消费方必须同时检查该字段。
+- **记录内容**：除核心绑定/摘要/检查项外，还保存 `profile`（source/path/sha256/tools/
+  disallowedTools/permissionMode）、`review_findings_detail`（id/severity）、`policy`
+  开关与 `replay_protection`；`review_sha256` 对 outputFile 原始字节取 SHA，可与
+  `sha256sum` 直接核对。
+- **测试**：阶段三完成时活动套件 `400 tests OK`（`tests/test_g4_attest.py` 157 项）；
+  阶段四当前计数见上方影子集成小节。历史套件 `853 tests OK (skipped=31)` 未变化。
+- **独立只读复核**：同一原生 Reviewer 独立上下文连续三轮（每轮只读、未改文件），最终结论 PASS、无 blocking；期间修复了解析器围栏叙述、绑定缺失、`task_dir` 扩大允许根、`kind=other` 假拒绝、声明摘要缺失、证据条目弱校验、trace/turn 空值、`unverified` 中文紧邻漏判等问题。
+- **真实宿主验证**：在隔离 `/tmp/copilot-g4-probe` 用真实 ZCode 子代理会话完成一次端到端
+  取证：`attest-v4-real.json` 为 `eligible=true`、0 failed checks（13 次工具调用、
+  trace/turn/session/evidence/代码快照全部绑定，review SHA 与 `sha256sum` 一致）；
+  `attest-v4-replay.json` 被 `attempt_replayed` 拒绝。旧 v3 探针是旧版代码的产物，
+  其宿主记录（metadata/SQLite/part/tool_usage）在旧实现下通过；当前代码还会因缺少
+  `kind`、旧输出缺少绑定字段而拒绝它，因此不再用它证明当前版本的兼容性。
+- **已确认限制**：metadata 与本地 SQLite 没有密码学签名；未重跑 git，attempt 之后新增的
+  未跟踪文件与 submodule 提交仍由 G2 `code_scope` 负责；`kind=other`（子模块 gitlink）只记
+  residual，不校验内容；incremental 只检查 `evidence_manifest` 与
+  `based_on_review_sha256` 存在，未重放基线结论；路径检查只能拒绝 G4，不能阻止
+  越界内容已经进入模型上下文。当前正式 `agents/reviewer.md` 仍含 Bash，会被
+  `profile_tools_not_exact`/`profile_disallowed_missing` 拒绝；其输出契约允许一句短前言
+  加单个围栏，而本模块要求 JSON 外无任何文本，两者对齐（改 Profile 或放宽解析）属于
+  下一阶段授权范围。
+- **运行时状态**：按本阶段要求未同步；当前 `sync_runtime.py --check` 为 `缺失 2`
+  （`g4_attest.py`/`g4_shadow.py`）、`不同 3`（`copilot_auto.py`/`governance.py`/
+  `native_bridge.py`）、Reviewer `same`。正式切换与同步前不应把该检查当作回归。
+- **下一步**：阶段四已完成影子接入、持久化与真实隔离验证；正式切换 G4、删除旧 Bash
+  白名单与旧 Reviewer Profile 仍需另阶段授权。
 
 ## v6.4.0（2026-11-14，当前）：质量保障精简
 

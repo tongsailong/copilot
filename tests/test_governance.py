@@ -271,7 +271,8 @@ class HighRiskGateTests(unittest.TestCase):
         init_git(self.dir)
         self.state = os.path.join(self.dir, "state.json")
         G.start_state(self.state, goal="目标", contract=CONTRACT, risk="high",
-                      execution_backend="native")
+                      execution_backend="native",
+                      test_policy={"required": False})
         G.plan_state(self.state, {"summary": "s", "actions": [
             {"id": "A1", "title": "实现", "goal": "产出结果",
              "expected_evidence": "结果文件"}]})
@@ -326,6 +327,8 @@ class HighRiskGateTests(unittest.TestCase):
             "unverified": [],
             "changed_files": [],
             "g4_eligible": True,
+            "g4_source": "candidate",
+            "candidate_g4": {"eligible": True, "reasons": []},
             "target_sha256": target,
             "review_attempt_id": attempt_id,
             "review_attempt_created_at": attempt["created_at"],
@@ -453,8 +456,50 @@ class HighRiskGateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "state.json")
             with self.assertRaises(G.GovernanceError):
-                G.start_state(path, goal="目标", contract=CONTRACT, risk="high")
+                G.start_state(path, goal="目标", contract=CONTRACT, risk="high",
+                              test_policy={"required": False})
             self.assertFalse(os.path.exists(path))
+
+    def test_high_risk_requires_explicit_test_policy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "state.json")
+            with self.assertRaises(G.GovernanceError) as ctx:
+                G.start_state(path, goal="目标", contract=CONTRACT, risk="high",
+                              execution_backend="native")
+            self.assertIn("test_policy", str(ctx.exception))
+            self.assertFalse(os.path.exists(path))
+            with self.assertRaises(G.GovernanceError):
+                G.start_state(path, goal="目标", contract=CONTRACT, risk="high",
+                              execution_backend="native", test_policy={})
+
+    def test_high_risk_binding_requires_contract_policy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "state.json")
+            G.start_state(path, goal="目标", contract=CONTRACT,
+                          execution_backend="native")
+            G.plan_state(path, {"summary": "s", "actions": [
+                {"id": "A1", "title": "实现", "goal": "产出结果",
+                 "expected_evidence": "结果文件"}]})
+            state = G.load_state(path)
+            state["risk"] = "high"
+            state["native_dispatch"] = {"actions": [
+                {"work_item_id": "A1", "dispatch_id": "d-legacy"}]}
+            G.save_state(path, state)
+            with self.assertRaises(G.GovernanceError) as ctx:
+                G.create_execution_binding(path, work_item_id="A1",
+                                           workspace=tmp)
+            self.assertIn("test_policy", str(ctx.exception))
+
+    def test_high_risk_amend_cannot_drop_test_policy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "state.json")
+            G.start_state(path, goal="目标", contract=CONTRACT, risk="high",
+                          execution_backend="native",
+                          test_policy={"required": False})
+            with self.assertRaises(G.GovernanceError):
+                G.amend_contract(path, contract=CONTRACT, test_policy={})
+            state = G.load_state(path)
+            self.assertTrue((state["contract"]["test_policy"] or {}).get("captured"))
 
 
 class StateIntegrityTests(unittest.TestCase):

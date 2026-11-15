@@ -21,7 +21,7 @@ python3 -B scripts/copilot_dispatch.py <子命令> --state <state.json> [参数]
 
 | 子命令 | 用途 | 关键参数 |
 |---|---|---|
-| `start` | 创建任务合同 | `--goal`、`--contract-file`、`--criteria-file`、`--risk normal\|high`、`--backend legacy\|native`、`--task-id`、`--mode`、`--note`；`--risk high` 必须配 `--backend native` |
+| `start` | 创建任务合同 | `--goal`、`--contract-file`、`--criteria-file`、`--test-policy`/`--test-policy-file`（JSON：`required`/`commands`/`report`/`artifacts`/`require_*`）、`--risk normal\|high`、`--backend legacy\|native`、`--task-id`、`--mode`、`--note`；`--risk high` 必须配 `--backend native` |
 | `plan` | 登记 ZCode 本地计划 | `--plan <plan.json>`（或 stdin）、`--source` |
 | `status` / `next` | 查看阶段、工作项、四门、下一步 | `--json` |
 | `record` | 回填工作项结果 | `--id`、`--status`、`--result`、`--evidence E1`（可重复） |
@@ -37,7 +37,7 @@ python3 -B scripts/copilot_dispatch.py <子命令> --state <state.json> [参数]
 | `closure` | 收口（必须四门通过） | `--close`、`--by` |
 | `reopen` | 用户授权后重开 | `--reason`、`--authorized-by user`（必填） |
 | `handoff` | 只读列出生效交付清单：分支/HEAD/上游、已暂存、未暂存、未跟踪分类 | `--state`（可选）、`--cwd`、`--limit`、`--json`；不提交、不删除、不改 `.gitignore` |
-| `contract` | 查看/修订合同与条件 | `--show`、`--amend --contract-file/--criteria-file`；BLOCKED 时也可修订；登记源文件摘要，文件被改动时 `status` 给出非阻断提醒 |
+| `contract` | 查看/修订合同与条件 | `--show`、`--amend --contract-file/--criteria-file`、`--test-policy`/`--test-policy-file`（省略则保留原策略）；BLOCKED 时也可修订；登记源文件摘要，文件被改动时 `status` 给出非阻断提醒 |
 | `authorize-review` | 记录用户对正式 REVIEW 的授权 | `--authorized-by user`（必填，调用方声明）、`--reason`、`--scope` |
 | `formal-review` | 登记正式 REVIEW 结论或修订 | 新结论：`--verdict`、`--summary`；非实质修订：`--amend <review_id> --reason`；实质变化：`--supersedes <review_id> --reason`；均支持 `--review-ref`/`--reviewer` |
 | `legacy-status` | 只读查看 v1/v2 SOL 历史状态与台账 | `--state`、`--audit-log`、`--ledger`、`--json` |
@@ -118,9 +118,11 @@ python3 -B scripts/copilot_auto.py ingest --state <state.json> [--result-file f]
 
 - `--result-file`：`copilot-native-result/v2` 执行信封；校验绑定与证据后回填工作项状态，
   重复回填同一 `result_sha256` 是幂等成功。
-- `--review-file`：`copilot-native-review/v2` 复核信封；G4 复核会重新读取宿主记录
-  （metadata / rollout）核对会话时间、prompt 与 attempt，并在同一次状态写入中消费
-  attempt 后才登记。被拒的 attempt 不消费，修正后可用同一 attempt 重试。
+- `--review-file`：`copilot-native-review/v2` 复核信封；正式 G4 由 `g4_attest` 读取
+  宿主 metadata 与 SQLite（`tool_usage`/`part`/`session_entry`）独立核对 Profile、
+  会话/prompt/工作区、原始输出与证据，再由 `test_execution` 与 `g4_shadow` 判定；
+  只有 shadow attested 且新链 eligible 才写正式资格并消费 attempt。被拒的 attempt
+  不消费，修正后可用同一 attempt 重试。
 - 被拒绝时退出码 12，错误码写在 stderr，状态不被部分写入。
 
 ## 4. 标准回合

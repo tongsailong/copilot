@@ -15,16 +15,16 @@ SHA-256 或计划绑定写错/编造。这里把这些字段从实际记录中�
 失败关闭：
 
 * 执行方身份只来自 `agent-*/metadata.json`；
-* 实际模型只来自 `~/.zcode/cli/rollout/model-io-<childSessionId>.jsonl`；
+* 实际模型来自宿主持久化记录（Executor 可回退 rollout；Reviewer 只读 DB）；
 * 证据 SHA-256 由脚本读取证据文件计算，不接受调用方传入；
 * `plan_id` / `plan_sha256` / `dispatch_id` / `idempotency_key` 只从本地计划
   与 dispatch 复制；
 * 复核身份只来自 Reviewer 的 metadata，Reviewer 原始结论只提供
-  verdict/findings/files_inspected/commands_run 等判断内容；
-* 复核实际调用的工具与 Bash 命令只来自 rollout：工具白名单、只读校验、
-  `commands_run` 必须与实际调用一致、调用计数必须与 metadata 相符；
-* `g4_eligible` 由本脚本按宿主记录计算（Profile 工具集、实际只读调用、独立
-  Agent/Child Session、最终证据摘要绑定），Reviewer 不能自述。
+  verdict/findings/files_inspected 等判断内容；
+* 复核实际调用的工具只来自宿主 `tool_usage`/`part`：Reviewer 无 Bash 权限，
+  `commands_run` 恒为空，调用计数必须与 metadata 相符；
+* 官方 G4 资格由 `g4_attest` 对新链宿主记录独立核验；本脚本生成的
+  `g4_eligible` 只是信封结构预检，Reviewer 不能自述正式资格。
 
 仍然不是密码学证明
 ------------------
@@ -56,13 +56,15 @@ import argparse
 import json
 import os
 import re
-import shlex
+import sqlite3
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
-import governance as G  # noqa: E402
+import governance as G
+import host_records
+import review_output  # noqa: E402
 import native_bridge as NB  # noqa: E402
 
 EXIT_OK, EXIT_USAGE = 0, 2
@@ -70,9 +72,9 @@ MAX_JSON_BYTES = 4 << 20
 MAX_RESULT_CHARS = 200_000
 _EVIDENCE_RE = re.compile(r"^(E[1-9][0-9]{0,3})=(.+)$")
 _MODEL_SCAN_LINES = 200
-# Reviewer Profile 只启用这四个工具；任何其他工具出现在实际记录里都说明
-# 复核越界（或 Profile 被改写），必须拒绝生成可接纳的复核信封。
-_REVIEW_TOOL_NAMES = frozenset({"Read", "Grep", "Glob", "Bash"})
+# Reviewer Profile 只启用这三个只读工具；任何其他工具（包括 Bash）出现在
+# 实际记录里都说明复核越界（或 Profile 被改写），必须拒绝生成可接纳的复核信封。
+_REVIEW_TOOL_NAMES = frozenset({"Read", "Grep", "Glob"})
 
 
 class AgentRecordError(Exception):
@@ -204,116 +206,6 @@ def _rollout_model(meta: dict, override: str = "") -> str:
         "无法确认实际模型。")
 
 
-def _review_tool_calls(meta: dict, override: str = "") -> list[tuple[str, str, dict]]:
-    """读取 Reviewer 实际工具调用记录，并校验只读边界与记录完整性。
-
-    返回 `(tool_name, bash_command, input_payload)` 列表；非 Bash 调用的命令为空串。
-    这里只读宿主已经落盘的 rollout，不执行任何 Agent 或模型调用。调用记录
-    缺失、损坏、计数不一致或出现非只读命令时失败关闭：不能把“自报安全”当成
-    “实际只读”。
-    """
-    child = meta["child_session_id"]
-    path = _rollout_path(meta, override)
-    if not os.path.isfile(path):
-        raise AgentRecordError(
-            f"[review_rollout_missing] 找不到 Agent {child} 的 rollout 调用记录：{path}；"
-            "没有实际调用记录时不得生成复核信封。")
-    total = meta["data"].get("totalToolUseCount")
-    if (not isinstance(total, int) or isinstance(total, bool) or total < 0):
-        raise AgentRecordError(
-            "[review_tool_count_missing] metadata.totalToolUseCount 缺失或非法；无法证明复核工具调用记录完整。")
-    calls: list[tuple[str, str, dict]] = []
-    seen: set[str] = set()
-    try:
-        with open(path, "r", encoding="utf-8") as fh:
-            for idx, line in enumerate(fh, 1):
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    row = json.loads(line)
-                except ValueError:
-                    continue
-                if not isinstance(row, dict):
-                    continue
-                session = str(row.get("sessionId") or "").strip()
-                if session and session != child:
-                    raise AgentRecordError(
-                        f"[review_session_mismatch] rollout {path} 第 {idx} 行 sessionId={session!r} 与 "
-                        f"Child Session {child!r} 不一致；拒绝把别的会话调用当作本复核。")
-                response = row.get("response")
-                if response is None:
-                    continue
-                if not isinstance(response, dict):
-                    raise AgentRecordError(
-                        f"[review_toolcalls_invalid] rollout {path} 第 {idx} 行 response "
-                        "不是对象；无法校验工具调用记录，拒绝复核信封。")
-                raw_calls = response.get("toolCalls")
-                if raw_calls is None:
-                    continue
-                if not isinstance(raw_calls, list):
-                    raise AgentRecordError(
-                        f"[review_toolcalls_invalid] rollout {path} 第 {idx} 行 response.toolCalls 不是数组。")
-                for pos, call in enumerate(raw_calls, 1):
-                    if not isinstance(call, dict):
-                        raise AgentRecordError(
-                            f"[review_toolcalls_invalid] rollout {path} 第 {idx} 行 toolCalls[{pos}] 不是对象。")
-                    name = str(call.get("name") or "").strip()
-                    if name not in _REVIEW_TOOL_NAMES:
-                        raise AgentRecordError(
-                            f"[review_tool_not_allowed] 复核实际调用了未授权工具 {name!r}；Reviewer 只允许 "
-                            f"{sorted(_REVIEW_TOOL_NAMES)}。")
-                    cid = str(call.get("id") or "").strip()
-                    if cid:
-                        if cid in seen:
-                            raise AgentRecordError(
-                                f"[review_rollout_duplicate_call] rollout {path} 出现重复 tool call id {cid!r}；"
-                                "调用记录不唯一，无法据条目数判断完整性。")
-                        seen.add(cid)
-                    payload = call.get("input")
-                    if not isinstance(payload, dict):
-                        raise AgentRecordError(
-                            f"[review_toolcalls_invalid] rollout {path} 第 {idx} 行 {name} 的 input 不是对象。")
-                    command = ""
-                    if name == "Bash":
-                        command = str(payload.get("command") or "").strip()
-                        if not command:
-                            raise AgentRecordError(
-                                f"[review_toolcalls_invalid] rollout {path} 第 {idx} 行 Bash 调用缺少 command。")
-                    calls.append((name, command, payload))
-    except OSError as exc:
-        raise AgentRecordError(f"无法读取 rollout {path}：{exc}") from None
-    if len(calls) != total:
-        raise AgentRecordError(
-            f"[review_toolcalls_incomplete] rollout {path} 记录 {len(calls)} 次工具调用，但 "
-            f"metadata.totalToolUseCount={total}；调用记录不完整，拒绝复核信封。")
-    bash_commands = [cmd for _, cmd, _ in calls if cmd]
-    if bash_commands:
-        try:
-            NB.validate_review_commands(bash_commands)
-        except NB.BridgeError as exc:
-            raise AgentRecordError(
-                f"Reviewer 实际执行的 Bash 命令未通过只读校验 [{exc.code}]：{exc}"
-            ) from None
-    return calls
-
-
-def _actual_commands(calls: list[tuple[str, str, dict]]) -> list[str]:
-    """实际执行过的 Bash 命令（保持首次出现顺序，去重）。
-
-    v6.1 起复核信封的 `commands_run` 由宿主 rollout 派生，不再采信 Reviewer
-    自述：自述命令既可能漏报也可能多报，宿主记录才是可用证据。
-    """
-    out: list[str] = []
-    for _tool, command, _payload in calls:
-        if command and command not in out:
-            out.append(command)
-    return out
-
-
-_PAYLOAD_PATH_KEYS = ("file_path", "path", "pattern")
-
-
 def _absolute_file(value: str) -> str:
     if not value or "\n" in value:
         return ""
@@ -321,83 +213,15 @@ def _absolute_file(value: str) -> str:
     return path if os.path.isfile(path) else ""
 
 
-def _absolute_dir(value: str) -> str:
-    if not value or "\n" in value:
-        return ""
-    path = os.path.abspath(os.path.expanduser(value))
-    return path if os.path.isdir(path) else ""
-
-
-def _join_dir(directory: str, token: str) -> str:
-    """把相对文件 token 解析到已知目录；未知目录或选项 token 返回空。"""
-    if not directory or not token or token.startswith("-"):
-        return ""
-    candidate = token if os.path.isabs(token) else os.path.join(directory, token)
-    return _absolute_file(candidate)
-
-
-def _command_contexts(command: str) -> list[tuple[str, list[str], str]]:
-    """按顶层 `;`/`|`/`&&` 切段，返回 (工作目录, argv, 原始片段)。
-
-    真实复核常用 `cd <dir>; cat report.md`、`cd <dir> && head x` 或
-    `git -C <dir> show ...` 在子目录取证。此前只解析绝对路径，导致
-    `report-final-v4.md` 这类相对读取被判成“未访问证据”（honor G4 第 6 次
-    尝试）。这里跟踪段内 `cd` 与 `git -C` 建立的目录，仅用于把相对 token
-    解析成绝对路径，不改变只读校验。
-    """
-    contexts: list[tuple[str, list[str], str]] = []
-    cwd = ""
-    for part in re.split(r"[;|\n]|&&", command):
-        text = part.strip()
-        if not text:
-            continue
-        try:
-            argv = shlex.split(text, posix=True)
-        except ValueError:
-            contexts.append((cwd, [], text))
-            continue
-        head = os.path.basename(argv[0]) if argv else ""
-        if head == "cd" and len(argv) >= 2:
-            target = argv[1]
-            resolved = _absolute_dir(
-                target if os.path.isabs(target)
-                else os.path.join(cwd or os.getcwd(), target))
-            if resolved:
-                cwd = resolved
-                contexts.append((cwd, argv, text))
-                continue
-        elif head == "git":
-            idx = 1
-            while idx + 1 < len(argv) and argv[idx] == "-C":
-                target = argv[idx + 1]
-                resolved = _absolute_dir(
-                    target if os.path.isabs(target)
-                    else os.path.join(cwd or os.getcwd(), target))
-                if resolved:
-                    cwd = resolved
-                idx += 2
-        contexts.append((cwd, argv, text))
-    return contexts
-
-
-def _command_paths(command: str) -> list[str]:
-    """从 Bash 命令里提取真实存在的文件路径（仅用于补充 inspected 清单）。"""
-    out: list[str] = []
-    for cwd, argv, _text in _command_contexts(command):
-        for token in argv:
-            path = _absolute_file(token) or _join_dir(cwd, token)
-            if path and path not in out:
-                out.append(path)
-    return out
+_PAYLOAD_PATH_KEYS = ("file_path", "path", "pattern")
 
 
 def _merge_inspected_files(declared: object,
                            calls: list[tuple[str, str, dict]]) -> list[str]:
     """合并自报与宿主实际的读取清单。
 
-    自报文件只在真实存在时保留；宿主读取（Read/Grep/Glob 的路径参数、Bash
-    命令里的绝对文件）一律并入。G4 的证据覆盖仍单独按实际调用计算，这份清单
-    只作说明，不构成放行依据。
+    自报文件只在真实存在时保留；宿主读取（Read/Grep/Glob 的路径参数）一律并入。
+    G4 的证据覆盖仍单独按实际调用计算，这份清单只作说明，不构成放行依据。
     """
     out: list[str] = []
     if isinstance(declared, list):
@@ -405,10 +229,8 @@ def _merge_inspected_files(declared: object,
             path = _absolute_file(str(item or "").strip())
             if path and path not in out:
                 out.append(path)
-    for _tool, command, payload in calls:
+    for _tool, _command, payload in calls:
         candidates: list[str] = []
-        if command:
-            candidates.extend(_command_paths(command))
         for key in _PAYLOAD_PATH_KEYS:
             value = payload.get(key)
             if isinstance(value, str):
@@ -519,6 +341,33 @@ def _find_action(dispatch_env: dict, work_item: str) -> dict:
     raise AgentRecordError(f"dispatch 不含工作项 {work_item}。")
 
 
+def bind_execution(args) -> dict:
+    """在执行方启动前固化 execution binding，返回 nonce 供写入 Executor prompt。"""
+    state_path = os.path.abspath(args.state)
+    binding = G.create_execution_binding(
+        state_path, work_item_id=str(args.work_item),
+        test_commands=list(getattr(args, "test_command", []) or []),
+        workspace=str(getattr(args, "workspace", "") or "") or os.getcwd(),
+        require_test_result=bool(getattr(args, "require_test_result", False)),
+        require_artifact_integrity=bool(
+            getattr(args, "require_artifact_integrity", False)))
+    return {
+        "schema": "copilot-execution-binding-result/v1",
+        "task_id": binding["task_id"],
+        "binding_id": binding["binding_id"],
+        "nonce": binding["nonce"],
+        "work_item_id": binding["work_item_id"],
+        "workspace": binding["workspace"],
+        "test_commands": binding["test_commands"],
+        "require_test_result": binding["require_test_result"],
+        "require_artifact_integrity": binding["require_artifact_integrity"],
+        "created_at": binding["created_at"],
+        "prompt_requirement": (
+            "Executor 的 prompt 必须包含该 nonce 原文；会话创建时间必须晚于 "
+            "binding.created_at。"),
+    }
+
+
 def build_execution(args) -> dict:
     state = G.load_state(os.path.abspath(args.state))
     dispatch_env, native = _dispatch_for_state(state, args.dispatch)
@@ -530,7 +379,20 @@ def build_execution(args) -> dict:
         raise AgentRecordError(
             f"Executor metadata.status={meta['status']!r}，不是 completed；"
             "不得把未完成的运行记录当作正式执行结果。")
-    model = _rollout_model(meta, args.model_rollout)
+    rollout_path = _rollout_path(meta, args.model_rollout)
+    if os.path.isfile(rollout_path):
+        model = _rollout_model(meta, args.model_rollout)
+        model_source = "rollout"
+    else:
+        selection = host_records.model_selection(
+            str(getattr(args, "db", "") or "") or os.path.expanduser(
+                "~/.zcode/cli/db/db.sqlite"), meta["child_session_id"])
+        if not selection:
+            raise AgentRecordError(
+                "[executor_model_missing] rollout 已清理且宿主 session_entry "
+                "没有模型记录；无法确认执行方实际模型。")
+        model = f"{selection['provider_id']}/{selection['model_id']}"
+        model_source = selection["source"]
     if args.result_file and args.result_text:
         raise AgentRecordError("--result-file 与 --result-text 只能提供一个。")
     if args.result_file:
@@ -541,6 +403,25 @@ def build_execution(args) -> dict:
     if not result:
         raise AgentRecordError("执行结果正文为空；请提供 --result-file 或 --result-text。")
     summary = _text(args.summary, "--summary")
+    binding_id = str(getattr(args, "binding", "") or "").strip()
+    if not binding_id and str(state.get("risk") or "").lower() == "high":
+        raise AgentRecordError(
+            "[execution_binding_required] 高风险任务必须先运行 bind-execution，"
+            "并让 Executor prompt 携带 nonce；不能用旧会话生成执行信封。")
+    binding_env = {}
+    if binding_id:
+        binding = G.find_execution_binding(state, binding_id)
+        if binding is None:
+            raise AgentRecordError(
+                f"状态中没有 execution binding {binding_id!r}；先运行 bind-execution。")
+        binding_env = {
+            "binding_id": str(binding["binding_id"]),
+            "nonce": str(binding["nonce"]),
+            "created_at": str(binding["created_at"]),
+            "workspace": str(binding["workspace"]),
+            "test_commands": [str(item) for item in
+                              binding.get("test_commands") or []],
+        }
     env = {
         "schema": NB.RESULT_SCHEMA,
         "task_id": state["task_id"],
@@ -555,16 +436,47 @@ def build_execution(args) -> dict:
         "summary": summary,
         "result": result,
         "evidence": _parse_evidence(args.evidence),
+        "executor_metadata_path": meta["path"],
         "executor": {
             "kind": "subagent",
             "agent_id": meta["agent_id"],
             "child_session_id": meta["child_session_id"],
             "profile_id": meta["profile_id"],
             "model_reported": model,
+            "model_source": model_source,
         },
         "timing": _timing(meta),
         "usage": _usage(meta),
     }
+    commands = [str(item).strip() for item in
+                (getattr(args, "test_command", None) or [])
+                if str(item).strip()]
+    artifacts = [str(item).strip() for item in
+                 (getattr(args, "test_artifact", None) or [])
+                 if str(item).strip()]
+    known = {item["id"] for item in env["evidence"]}
+    for eid in artifacts:
+        if eid not in known:
+            raise AgentRecordError(
+                f"--test-artifact {eid} 不在本次 --evidence 中；测试产物必须是"
+                "本次执行登记的文件证据。")
+    workspace = str(getattr(args, "workspace", "") or "").strip() \
+        or os.getcwd()
+    excluded = list(G._evidence_paths(state)) + list(G.governance_paths(args.state))
+    for item in env["evidence"]:
+        if isinstance(item, dict) and item.get("file"):
+            excluded.append(str(item["file"]))
+    for extra in (getattr(args, "output", ""), getattr(args, "result_file", "")):
+        if str(extra or "").strip():
+            excluded.append(os.path.abspath(os.path.expanduser(str(extra))))
+    snapshot = G.capture_code_snapshot(
+        workspace, exclude_paths=excluded,
+        base=str(getattr(args, "base", "") or ""))
+    env["test_commands"] = commands
+    env["test_artifacts"] = sorted(set(artifacts))
+    env["execution_binding"] = binding_env
+    env["code_scope_sha256"] = str(snapshot.get("digest") or "") \
+        if snapshot.get("available") else ""
     env["result_sha256"] = NB.envelope_sha256(env)
     try:
         NB.validate_execution_result(env, native, state)
@@ -593,66 +505,73 @@ def _review_fields(data: dict) -> dict:
     return out
 
 
-_FENCED_JSON_RE = re.compile(
-    r"```[ \t]*(?P<tag>[A-Za-z0-9_+.-]*)[ \t]*\r?\n?(?P<body>.*?)```", re.S)
-
-
 def _extract_review_json(text: str, path: str) -> dict:
-    """从宿主输出里取出唯一的 JSON 对象。
-
-    v6.1 起不再要求“纯 JSON 且无任何叙述”：模型偶尔会把对象包在围栏里或前后
-    加一句说明，这不应让整轮复核作废。v6.3 进一步容忍真实输出里的围栏变体：
-    语言标记大小写/带空格、开头围栏后没有换行、CRLF 行尾、前后有说明文字。
-    但不做模糊解析：只接受 (1) 整段就是 JSON，或 (2) 恰好一个围栏且围栏内是
-    单个 JSON 对象。多个可解析对象或无法解析时失败关闭，避免从叙述里猜结论；
-    围栏外的说明文字不参与解析（结论只取那唯一一个可解析对象）。
-    """
+    """按统一 review_output 契约解析宿主输出；失败关闭并保留错误码。"""
     try:
-        data = json.loads(text)
-    except ValueError:
-        data = None
-    if isinstance(data, dict):
-        return data
-    parsed = []
-    for match in _FENCED_JSON_RE.finditer(text):
-        try:
-            candidate = json.loads(match.group("body").strip())
-        except ValueError:
-            continue
-        if isinstance(candidate, dict):
-            parsed.append(candidate)
-    if len(parsed) == 1:
-        return parsed[0]
-    if len(parsed) > 1:
+        return review_output.parse_review_output(text)
+    except review_output.ReviewOutputError as exc:
+        code = exc.code
+        detail = exc.detail or str(exc)
+        if code == "review_output_ambiguous":
+            raise AgentRecordError(
+                f"[review_output_ambiguous] {path}：{detail}；无法确定正式结论。"
+            ) from None
+        if code == "review_output_outside_text":
+            raise AgentRecordError(
+                f"[review_output_outside_text] {path}：{detail}。") from None
         raise AgentRecordError(
-            f"[review_output_ambiguous] 宿主输出含 {len(parsed)} 个 JSON 对象；"
-            "无法确定正式结论，拒绝复核信封。")
-    raise AgentRecordError(
-        f"[review_output_unparsable] 无法把宿主输出解析为 JSON 对象：{path}；"
-        "请让 Reviewer 以单个 JSON 对象输出结论。")
+            f"[review_output_unparsable] {path}：{code} {detail}；"
+            "请让 Reviewer 以单个 JSON 对象输出结论。") from None
 
 
-def _review_host_output(meta: dict) -> dict:
-    """读取宿主为 Reviewer 落盘的**实际输出**（metadata.outputFile）。
+def _review_host_output(meta: dict, db: str = "") -> tuple[dict, dict]:
+    """读取 Reviewer 实际输出；outputFile 被清理时回退到持久化 message/part。
 
-    结论只能以宿主记录为准：调用方 `--input` 是可复制的文件，改一个词就能把
-    `partial` 改成 `pass`。`outputFile` 由宿主在 Agent 结束时写入，且必须与
-    metadata.json 同目录（拒绝被 metadata 指向任意外部文件）。
+    结论只能以宿主记录为准：调用方 `--input` 是可复制的文件。`outputFile` 由宿主
+    在 Agent 结束时写入，且必须与 metadata.json 同目录；文件缺失时只接受 DB 中
+    该 child session 最后一条 assistant 文本（文本 SHA 可复算），两者都存在时
+    必须一致。无法取得时失败关闭，不用调用方副本代替。
     """
     raw = str((meta.get("data") or {}).get("outputFile") or "").strip()
-    if not raw:
-        raise AgentRecordError(
-            "[review_output_missing] 宿主 metadata 没有 outputFile：无法取得 Reviewer "
-            "实际输出；不得用调用方保存的副本代替正式复核结论。")
-    path = os.path.abspath(os.path.expanduser(raw))
-    if os.path.dirname(path) != os.path.dirname(meta["path"]):
+    path = os.path.abspath(os.path.expanduser(raw)) if raw else ""
+    db = db or os.path.expanduser("~/.zcode/cli/db/db.sqlite")
+    file_present = bool(path) and os.path.isfile(path)
+    if file_present and os.path.dirname(os.path.realpath(path)) != \
+            os.path.dirname(os.path.realpath(meta["path"])):
         raise AgentRecordError(
             f"[review_output_misplaced] outputFile 不在 metadata 同目录：{path}；"
             "拒绝使用外部（可能被替换的）文件作为复核结论。")
-    data = _extract_review_json(_read_text(path).strip(), path)
+    db_output = host_records.assistant_output(
+        db, str(meta.get("child_session_id") or ""))
+    if file_present:
+        text = _read_text(path)
+        info = {"source": "outputFile", "path": path,
+                "sha256": NB.sha256_text(text),
+                "message_id": "", "part_ids": [], "db_sha256": ""}
+        if db_output:
+            if db_output["sha256"] != info["sha256"]:
+                raise AgentRecordError(
+                    "[review_output_db_mismatch] outputFile 与宿主 message/part "
+                    f"文本不一致：file={info['sha256'][:16]} "
+                    f"db={db_output['sha256'][:16]}；拒绝取证。")
+            info.update({"message_id": db_output["message_id"],
+                         "part_ids": db_output["part_ids"],
+                         "db_sha256": db_output["sha256"]})
+    elif db_output:
+        text = db_output["text"]
+        info = {"source": "db.message.part", "path": path,
+                "sha256": db_output["sha256"],
+                "message_id": db_output["message_id"],
+                "part_ids": db_output["part_ids"],
+                "db_sha256": db_output["sha256"]}
+    else:
+        raise AgentRecordError(
+            "[review_output_missing] metadata/outputFile 与宿主 message/part 都没有 "
+            "Reviewer 最终输出；不得用调用方副本代替正式复核结论。")
+    data = _extract_review_json(text.strip(), info["path"] or "db:message/part")
     if not isinstance(data, dict):
         raise AgentRecordError("Reviewer 实际输出顶层必须是对象。")
-    return data
+    return data, info
 
 
 def _bind_review_output(data: dict, execution: dict, dispatch_env: dict,
@@ -745,146 +664,86 @@ def _mentions_path(path: str, blob: str) -> bool:
     return False
 
 
-def _attempt_session_problems(meta: dict, attempt: dict,
-                              attempt_created: str) -> list[str]:
-    """Reviewer 会话必须晚于 attempt 创建，且 prompt 明确携带 attempt id。
-
-    仅靠 Reviewer 在结论里复述 attempt id/SHA 不能证明“这就是为本次快照启动的
-    会话”：旧会话也可以复述新值。这里用宿主 metadata 的会话创建时间与宿主实际
-    prompt 做绑定，两个条件同时满足才允许生成 G4 信封。
-    """
-    problems: list[str] = []
-    data = meta["data"]
-    created = str(data.get("createdAt") or "").strip()
-    expected_time = str(attempt.get("created_at") or attempt_created or "").strip()
-    started = G._parse_time(created)
-    bound = G._parse_time(expected_time)
-    if not created:
-        problems.append("review_attempt_session_time_missing")
-    elif started is None or bound is None or \
-            (started.tzinfo is None) != (bound.tzinfo is None):
-        problems.append("review_attempt_session_time_invalid")
-    elif started < bound:
-        problems.append("review_attempt_session_precedes_attempt")
-    attempt_id = str(attempt.get("review_attempt_id") or "").strip()
-    prompt = str(data.get("prompt") or "")
-    if not attempt_id or attempt_id not in prompt:
-        problems.append("review_attempt_prompt_unbound")
-    reviewer = attempt.get("reviewer") or {}
-    if isinstance(reviewer, dict):
-        for key in ("agent_id", "child_session_id"):
-            value = str(reviewer.get(key) or "").strip()
-            if value and value != str(meta.get(key) or ""):
-                problems.append("review_attempt_session_mismatch")
-    snapshot = attempt.get("code_snapshot") or {}
-    expected_root = str(snapshot.get("git_root") or snapshot.get("workspace") or "")
-    actual_root = str(data.get("workspaceRoot") or "").strip()
-    if expected_root:
-        if not actual_root:
-            problems.append("review_attempt_workspace_missing")
-        elif os.path.realpath(actual_root) != os.path.realpath(expected_root):
-            problems.append("review_attempt_workspace_mismatch")
-    return problems
-
-
-def _review_profile_problems(meta: dict) -> list[str]:
-    """按宿主快照核对 Reviewer Profile 的工具边界。"""
-    snapshot = meta["profile_snapshot"]
-    tools = snapshot.get("tools")
-    disallowed = snapshot.get("disallowedTools")
-    problems: list[str] = []
-    if not isinstance(tools, list) or not tools:
-        problems.append("profile_tools_missing")
-    else:
-        extra = sorted({str(t) for t in tools} - set(_REVIEW_TOOL_NAMES))
-        if extra:
-            problems.append("profile_tools_not_readonly:" + ",".join(extra))
-    if isinstance(disallowed, list):
-        # disallowedTools 是「被禁用的工具」；Reviewer Profile 必须显式禁用写工具。
-        # （旧实现把只读工具出现在这里当成放宽，语义正好相反。）
-        disabled = {str(t) for t in disallowed}
-        missing = [t for t in ("Write", "Edit") if t not in disabled]
-        if missing:
-            problems.append("profile_disallowed_missing:" + ",".join(missing))
-    return problems
-
-
 def _call_blobs(calls: list[tuple[str, str, dict]]) -> list[str]:
-    blobs: list[str] = []
-    for _tool, command, payload in calls:
-        if command:
-            for cwd, argv, text in _command_contexts(command):
-                resolved = [p for p in (_join_dir(cwd, token) for token in argv) if p]
-                if resolved:
-                    # 追加解析后的绝对路径：相对读取（`cd <dir>; head x.md`）与
-                    # 绝对证据路径因此能在组件边界上命中，避免假阴性。
-                    text = f"{text} {' '.join(resolved)}"
-                blobs.append(text)
-        else:
-            blobs.append(json.dumps(payload, ensure_ascii=False))
-    return blobs
+    return [json.dumps(payload, ensure_ascii=False)
+            for _tool, _command, payload in calls]
 
 
-def _evidence_not_inspected(state: dict,
-                            calls: list[tuple[str, str, dict]],
-                            only_ids: set[str] | None = None) -> list[str]:
-    """G4 复核必须实际访问当前任务的文件证据。
+def _db_review_tool_calls(meta: dict, db: str) -> list[tuple[str, str, dict]]:
+    """从宿主 `tool_usage`/`part` 读取 Reviewer 工具调用。
 
-    `only_ids` 非空时只要求这些证据（增量复核只对基线之后新增/变更的证据
-    负责）；完整复核要求全部未归档证据。无论哪种模式都按宿主实际调用判定，
-    不看自述清单。
+    Reviewer 无 Bash 权限；缺失、计数不符或出现非只读工具时失败关闭。
     """
-    blobs = _call_blobs(calls)
-    missing: list[str] = []
-    for entry in state.get("evidence") or []:
-        if not isinstance(entry, dict) or entry.get("dropped"):
+    child = meta["child_session_id"]
+    total = meta["data"].get("totalToolUseCount")
+    if not isinstance(total, int) or isinstance(total, bool) or total < 0:
+        raise AgentRecordError(
+            "[review_tool_count_missing] metadata.totalToolUseCount 缺失或非法；"
+            "无法证明复核工具调用记录完整。")
+    db = db or os.path.expanduser("~/.zcode/cli/db/db.sqlite")
+    try:
+        con = host_records.connect_ro(db)
+    except (OSError, sqlite3.Error) as exc:
+        raise AgentRecordError(
+            f"[review_host_db_unavailable] 无法读取宿主数据库：{exc}") from None
+    try:
+        rows = con.execute(
+            "select tool_call_id, tool_name from tool_usage "
+            "where session_id=? order by started_at, rowid", (child,)).fetchall()
+        parts = con.execute(
+            "select data from part where session_id=?", (child,)).fetchall()
+    except sqlite3.Error as exc:
+        raise AgentRecordError(
+            f"[review_host_db_unavailable] 读取工具记录失败：{exc}") from None
+    finally:
+        con.close()
+    payloads: dict[str, dict] = {}
+    for (raw,) in parts:
+        try:
+            data = json.loads(raw)
+        except (TypeError, ValueError):
             continue
-        eid = str(entry.get("id") or "")
-        if only_ids is not None and eid not in only_ids:
+        if not isinstance(data, dict) or data.get("type") != "tool":
             continue
-        hint = str(entry.get("path_hint") or "")
-        if not hint or hint == "<inline>":
-            continue
-        if not any(_mentions_path(hint, blob) for blob in blobs):
-            missing.append(hint)
-    return missing
+        call_id = str(data.get("callID") or "")
+        state = data.get("state") if isinstance(data.get("state"), dict) else {}
+        payload = state.get("input") if isinstance(state.get("input"), dict) else {}
+        if call_id:
+            payloads[call_id] = payload
+    calls: list[tuple[str, str, dict]] = []
+    seen: set[str] = set()
+    for call_id, name in rows:
+        cid = str(call_id or "")
+        tool = str(name or "").strip()
+        if tool not in _REVIEW_TOOL_NAMES:
+            raise AgentRecordError(
+                f"[review_tool_not_allowed] 复核实际调用了未授权工具 {tool!r}；"
+                f"Reviewer 只允许 {sorted(_REVIEW_TOOL_NAMES)}。")
+        if cid:
+            if cid in seen:
+                raise AgentRecordError(
+                    f"[review_rollout_duplicate_call] 宿主记录出现重复 tool call id {cid!r}。")
+            seen.add(cid)
+        payload = payloads.get(cid)
+        if not isinstance(payload, dict):
+            raise AgentRecordError(
+                f"[review_toolcalls_invalid] 宿主 part 缺少 {tool} 的 input：{cid}")
+        calls.append((tool, "", payload))
+    if len(calls) != total:
+        raise AgentRecordError(
+            f"[review_toolcalls_incomplete] 宿主记录 {len(calls)} 次工具调用，但 "
+            f"metadata.totalToolUseCount={total}；拒绝复核信封。")
+    return calls
 
 
-def _g4_problems(meta: dict, calls: list[tuple[str, str, dict]], raw: dict,
-                 execution: dict, state: dict, target_sha: str,
-                 evidence_ids: set[str] | None = None) -> list[str]:
-    """按宿主记录计算 G4 资格；任何一项不满足都不得标记 g4_eligible。"""
-    problems = _review_profile_problems(meta)
-    if not calls:
-        problems.append("review_no_tool_calls")
-    if meta["status"] != "completed":
-        problems.append("reviewer_not_completed")
-    verdict = str(raw.get("verdict") or "").strip().lower()
-    if verdict != "pass":
-        problems.append("review_verdict_not_pass")
-    findings = raw.get("findings") or []
-    if isinstance(findings, list) and any(
-            isinstance(f, dict) and str(f.get("severity") or "") == "blocking"
-            for f in findings):
-        problems.append("blocking_findings")
-    if raw.get("unverified"):
-        problems.append("unverified_items")
-    if raw.get("changed_files"):
-        problems.append("changed_files")
-    executor = execution.get("executor") or {}
-    for key in ("agent_id", "child_session_id"):
-        exec_value = str(executor.get(key) or "").strip()
-        rev_value = str(meta.get(key) or "").strip()
-        if exec_value and rev_value and exec_value == rev_value:
-            problems.append(f"reviewer_not_independent:{key}")
-    if str(state.get("risk") or "").lower() != "high":
-        problems.append("risk_not_high")
-    if target_sha != G.final_evidence_digest(state):
-        problems.append("target_stale")
-    if _evidence_not_inspected(state, calls, evidence_ids):
-        problems.append("evidence_not_inspected")
-    return problems
-
+def _db_model(meta: dict, db: str) -> dict:
+    db = db or os.path.expanduser("~/.zcode/cli/db/db.sqlite")
+    selection = host_records.model_selection(db, meta["child_session_id"])
+    if not selection:
+        raise AgentRecordError(
+            f"[review_model_missing] rollout 已清理且宿主 session_entry 没有模型记录："
+            f"{meta['child_session_id']}；无法确认实际模型。")
+    return selection
 
 def _incremental_base(state: dict, path: str) -> dict:
     """读取已回填的基线复核记录（按 result_sha256 匹配状态）。"""
@@ -1020,14 +879,6 @@ def build_review(args) -> dict:
             "[review_attempt_missing] 高风险 G4 复核必须先创建 review attempt；"
             "用 review-context --create-attempt 固化派发快照后再生成信封。")
     meta = _load_metadata(args.metadata)
-    if attempt is not None:
-        session_problems = _attempt_session_problems(
-            meta, attempt, str(attempt.get("created_at") or ""))
-        if session_problems:
-            raise AgentRecordError(
-                "[review_attempt_session_invalid] " + ", ".join(session_problems)
-                + "：Reviewer 会话必须晚于 attempt 创建，且宿主 prompt 携带该 "
-                "attempt id；不能使用旧会话输出。")
     if meta["profile_id"] != "reviewer":
         raise AgentRecordError(
             f"Reviewer metadata.profileId={meta['profile_id']!r}，不是 reviewer；"
@@ -1036,27 +887,30 @@ def build_review(args) -> dict:
         raise AgentRecordError(
             f"Reviewer metadata.status={meta['status']!r}，不是 completed；"
             "不得把未完成的复核记录当作正式结论。")
-    model = _rollout_model(meta, args.model_rollout)
-    host_output = _review_host_output(meta)
+    db_path = str(getattr(args, "db", "") or "") or os.path.expanduser(
+        "~/.zcode/cli/db/db.sqlite")
+    # 新链只从持久化宿主 DB 取证；rollout 不再是 G4 依赖。
+    model_info = _db_model(meta, db_path)
+    model = f"{model_info['provider_id']}/{model_info['model_id']}"
+    model_source = model_info["source"]
+    calls = _db_review_tool_calls(meta, db_path)
+    tool_call_source = "db.tool_usage+part"
+    host_output, output_info = _review_host_output(meta, db_path)
     _bind_review_output(host_output, execution, dispatch_env, state)
     raw = _review_fields(host_output)
     if getattr(args, "input", ""):
         _assert_input_matches_host(_review_input(args.input), raw)
-    calls = _review_tool_calls(meta, args.model_rollout)
     # 复核范围：默认完整；--based-on 指定一条已回填的 PASS 复核做增量复核。
     scope = "full"
     based_on = ""
     manifest: list[str] = []
-    delta_ids: set[str] | None = None
     based_on_path = str(getattr(args, "based_on", "") or "").strip()
     if based_on_path:
         base = _incremental_base(state, based_on_path)
         manifest = _incremental_evidence(state, base)
         scope = "incremental"
         based_on = str(base.get("result_sha256") or "")
-        delta_ids = set(manifest)
     files = _merge_inspected_files(raw.get("files_inspected"), calls)
-    commands = _actual_commands(calls)
     undeclared = _declared_files_unverified(raw.get("files_inspected"), calls)
     if attempt is not None:
         if scope != str(attempt.get("review_scope") or ""):
@@ -1077,8 +931,8 @@ def build_review(args) -> dict:
         target_sha = str(attempt.get("target_sha256") or "")
     else:
         target_sha = G.final_evidence_digest(state)
-    problems = _g4_problems(meta, calls, raw, execution, state, target_sha,
-                            delta_ids)
+    # 正式 G4 由 g4_attest + test_execution 决定；这里只做信封结构预检。
+    problems: list[str] = []
     counts: dict[str, int] = {}
     for name, _command, _payload in calls:
         counts[name] = counts.get(name, 0) + 1
@@ -1086,7 +940,16 @@ def build_review(args) -> dict:
         "metadata_path": meta["path"],
         "output_file": os.path.abspath(
             os.path.expanduser(str(meta["data"].get("outputFile") or ""))),
-        "rollout_path": os.path.abspath(_rollout_path(meta, args.model_rollout)),
+        "rollout_path": "",
+        "tool_call_source": tool_call_source,
+        "model_source": model_source,
+        "output_sha256": str(output_info.get("sha256") or ""),
+        "output_source": str(output_info.get("source") or ""),
+        "output_message_id": str(output_info.get("message_id") or ""),
+        "output_part_ids": list(output_info.get("part_ids") or []),
+        # 宿主库路径随记录固化：outputFile 被清理后候选回退读库时必须用同一库，
+        # 否则非默认 --db 场景会静默拿不到原始输出。
+        "host_db": os.path.abspath(os.path.expanduser(db_path)),
         "tool_calls": [{"name": name, "count": count}
                        for name, count in sorted(counts.items())],
         "agent_id": meta["agent_id"],
@@ -1127,15 +990,26 @@ def build_review(args) -> dict:
         "host": host,
         "verdict": raw.get("verdict"),
         "findings": raw.get("findings") or [],
-        # commands_run/files_inspected 由宿主 rollout 派生；Reviewer 的自述只作补充。
+        # Reviewer 无 Bash 权限（commands_run 恒为空）；files_inspected 由宿主
+        # 工具记录派生，Reviewer 的自述只作补充。
         "files_inspected": files,
-        "commands_run": commands,
+        "commands_run": [],
         "declared_files_unverified": undeclared,
         "changed_files": raw.get("changed_files") or [],
         "unverified": raw.get("unverified") or [],
         "residual_risks": raw.get("residual_risks") or [],
-        "g4_eligible": not problems,
-        "g4_reasons": problems,
+        # 结构预检：只有高风险且结论本身可放行时才标 eligible；partial/
+        # unverified/blocking 复核仍可生成信封供 ingest 记录，但不能伪装 G4。
+        "g4_eligible": bool(risk == "high"
+                            and str(raw.get("verdict") or "").strip().lower()
+                            == "pass"
+                            and not raw.get("unverified")
+                            and not any(
+                                isinstance(f, dict)
+                                and str(f.get("severity") or "").strip().lower()
+                                == "blocking"
+                                for f in raw.get("findings") or [])),
+        "g4_reasons": [],
     }
     env["result_sha256"] = NB.envelope_sha256(env)
     try:
@@ -1144,142 +1018,6 @@ def build_review(args) -> dict:
         raise AgentRecordError(
             f"生成的信封未通过正式校验 [{exc.code}]：{exc}") from None
     return env
-
-
-def verify_review_host_record(envelope: dict) -> list[str]:
-    """回填前重新核对 G4 复核引用的宿主记录；返回问题列表（空表示可用）。
-
-    只在 `g4_eligible=true` 时调用。重新读取 metadata 与 rollout，确认：
-    Profile 仍是 reviewer 且工具只读、Agent/Child Session 未被改指、实际工具
-    调用计数仍与 metadata 一致、没有出现非只读命令。任何一项失败都拒绝 G4。
-    """
-    if envelope.get("g4_eligible") is not True:
-        return ["g4_not_eligible"]
-    host = envelope.get("host") or {}
-    if not isinstance(host, dict):
-        return ["host_record_invalid"]
-    try:
-        meta = _load_metadata(str(host.get("metadata_path") or ""))
-    except AgentRecordError as exc:
-        return [f"host_metadata_unreadable:{exc}"]
-    problems = []
-    if meta["profile_id"] != "reviewer":
-        problems.append("host_profile_changed")
-    attempt_id = str(envelope.get("review_attempt_id") or "").strip()
-    attempt_created = str(envelope.get("review_attempt_created_at") or "").strip()
-    if not attempt_id:
-        problems.append("review_attempt_missing")
-    else:
-        session_created = str(host.get("session_created_at") or "").strip()
-        actual_created = str(meta["data"].get("createdAt") or "").strip()
-        if not session_created or session_created != actual_created:
-            problems.append("host_session_time_changed")
-        prompt = str(meta["data"].get("prompt") or "")
-        if str(host.get("prompt_sha256") or "") != NB.sha256_text(prompt):
-            problems.append("host_prompt_changed")
-        if attempt_id not in prompt:
-            problems.append("review_attempt_prompt_unbound")
-        if str(host.get("workspace_root") or "").strip() != str(
-                meta["data"].get("workspaceRoot") or "").strip():
-            problems.append("host_workspace_changed")
-        started = G._parse_time(actual_created)
-        bound = G._parse_time(attempt_created)
-        if started is None or bound is None or \
-                (started.tzinfo is None) != (bound.tzinfo is None):
-            problems.append("review_attempt_session_time_invalid")
-        elif started < bound:
-            problems.append("review_attempt_session_precedes_attempt")
-    if meta["agent_id"] != str((envelope.get("reviewer") or {}).get("agent_id") or ""):
-        problems.append("host_agent_mismatch")
-    if meta["child_session_id"] != str(
-            (envelope.get("reviewer") or {}).get("child_session_id") or ""):
-        problems.append("host_session_mismatch")
-    if os.path.abspath(str(host.get("output_file") or "")) != os.path.abspath(
-            str(meta["data"].get("outputFile") or "")):
-        problems.append("host_output_mismatch")
-    try:
-        calls = _review_tool_calls(meta, str(host.get("rollout_path") or ""))
-    except AgentRecordError as exc:
-        return problems + [f"host_rollout_unreadable:{exc}"]
-    if not calls:
-        problems.append("host_no_tool_calls")
-    expected = {str(c.get("name")): int(c.get("count") or 0)
-                for c in host.get("tool_calls") or [] if isinstance(c, dict)}
-    actual: dict[str, int] = {}
-    for name, _command, _payload in calls:
-        actual[name] = actual.get(name, 0) + 1
-    if expected != actual:
-        problems.append("host_tool_calls_changed")
-    if _review_profile_problems(meta):
-        problems.extend(_review_profile_problems(meta))
-    # 信封的结论必须与宿主落盘的原文一致：只核对宿主文件存在与调用计数，
-    # 手工伪造一份“pass”信封仍可能被当成 G4。宿主 outputFile 是结论来源，
-    # ingest 时重新解析并对照 verdict/findings/unverified/changed_files。
-    try:
-        raw = _review_host_output(meta)
-    except AgentRecordError as exc:
-        problems.append(f"host_output_unreadable:{exc}")
-    else:
-        if str(raw.get("verdict") or "").strip().lower() != str(
-                envelope.get("verdict") or "").strip().lower():
-            problems.append("host_verdict_changed")
-        if NB.canonical_json(raw.get("findings") or []) != NB.canonical_json(
-                envelope.get("findings") or []):
-            problems.append("host_findings_changed")
-        if NB.canonical_json(raw.get("unverified") or []) != NB.canonical_json(
-                envelope.get("unverified") or []):
-            problems.append("host_unverified_changed")
-        if NB.canonical_json(raw.get("changed_files") or []) != NB.canonical_json(
-                envelope.get("changed_files") or []):
-            problems.append("host_changed_files_changed")
-    return problems
-
-
-def build_preflight(args) -> dict:
-    """派发前校验一份 Reviewer 命令清单，避免整轮复核因一条命令作废。
-
-    只做静态只读校验，不执行命令；实际执行的命令仍由宿主 rollout 逐条复核。
-    真实记录里 ad-strategy 第 2/7 轮、honor G4 多次尝试都是“其余部分都对，只因
-    一条命令不在白名单或输出格式不合法而整轮作废”，预检把这类失败提前到派发前。
-    """
-    commands: list[str] = [str(c).strip() for c in (args.command or [])
-                           if str(c).strip()]
-    path = str(getattr(args, "file", "") or "").strip()
-    if path:
-        text = _read_text(path)
-        stripped = text.lstrip()
-        if stripped.startswith("["):
-            try:
-                data = json.loads(stripped)
-            except ValueError as exc:
-                raise AgentRecordError(
-                    f"--file 不是合法 JSON 数组：{exc}") from None
-            if not isinstance(data, list):
-                raise AgentRecordError("--file 的 JSON 顶层必须是字符串数组。")
-            commands.extend(str(item).strip() for item in data if str(item).strip())
-        else:
-            for line in text.splitlines():
-                line = line.strip()
-                if line and not line.startswith("#"):
-                    commands.append(line)
-    if not commands:
-        raise AgentRecordError(
-            "preflight-commands 需要 --command 或 --file 提供至少一条命令。")
-    problems: list[dict] = []
-    for idx, command in enumerate(commands, 1):
-        try:
-            NB.validate_review_commands([command])
-        except NB.BridgeError as exc:
-            problems.append({"index": idx, "command": command,
-                             "code": exc.code, "message": str(exc)})
-    return {
-        "schema": "copilot-native-preflight/v1",
-        "ok": not problems,
-        "checked": len(commands),
-        "problems": problems,
-        "note": "预检只证明命令通过只读白名单；实际执行的命令仍由宿主 rollout "
-                "逐条复核，写操作与输出格式问题仍需 Reviewer 自己守住。",
-    }
 
 
 def _execution_evidence_drift(execution: dict, state: dict) -> list[dict]:
@@ -1537,6 +1275,20 @@ def main(argv: list[str] | None = None) -> int:
         description="从 ZCode 实际运行记录生成 Native Bridge 正式信封")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
+    p = sub.add_parser("bind-execution",
+                       help="在启动 Executor 前创建 execution binding（task/work_item/nonce）")
+    p.add_argument("--state", required=True)
+    p.add_argument("--work-item", required=True)
+    p.add_argument("--test-command", action="append", default=[],
+                   help="本轮预期测试命令；可多次；Executor 必须原样执行")
+    p.add_argument("--workspace", default="",
+                   help="执行工作区（默认当前目录）")
+    p.add_argument("--require-test-result", action="store_true",
+                   help="要求结构化测试结果（当前支持 JUnit XML）")
+    p.add_argument("--require-artifact-integrity", action="store_true",
+                   help="要求测试产物完整性")
+    p.add_argument("--output", default="")
+
     p = sub.add_parser("execution", help="生成 copilot-native-result/v2 执行信封")
     p.add_argument("--state", required=True)
     p.add_argument("--dispatch", required=True,
@@ -1551,6 +1303,19 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--result-text", default="")
     p.add_argument("--evidence", action="append", default=[],
                    help="E1=/abs/path；可多次；SHA-256 由脚本计算")
+    p.add_argument("--test-command", action="append", default=[],
+                   help="真实执行过的测试命令；可多次；会按宿主 Bash 记录核对")
+    p.add_argument("--test-artifact", action="append", default=[],
+                   help="测试产物对应的 --evidence id；可多次")
+    p.add_argument("--workspace", default="",
+                   help="执行代码快照的工作区（默认当前目录）")
+    p.add_argument("--base", default="",
+                   help="任务开始 commit；与 review-context --base 使用同一基准")
+    p.add_argument("--binding", default="",
+                   help="bind-execution 返回的 binding_id；高风险任务必填")
+    p.add_argument("--db", default=os.path.expanduser(
+        "~/.zcode/cli/db/db.sqlite"),
+        help="宿主 SQLite；rollout 被清理时从 session_entry 读取模型")
     p.add_argument("--model-rollout", default="",
                    help="仅离线测试/非默认 rollout 路径使用；仍校验 sessionId")
     p.add_argument("--output", default="")
@@ -1572,15 +1337,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--attempt", default="",
                    help="派发前由 review-context --create-attempt 创建的 "
                         "review_attempt_id；高风险 G4 必填")
-    p.add_argument("--model-rollout", default="")
-    p.add_argument("--output", default="")
-
-    p = sub.add_parser("preflight-commands",
-                       help="派发前校验 Reviewer 只读命令清单（不执行命令）")
-    p.add_argument("--file", default="",
-                   help="命令文件：每行一条，或 JSON 字符串数组")
-    p.add_argument("--command", action="append", default=[],
-                   help="单条命令；可多次")
+    p.add_argument("--db", default=os.path.expanduser(
+        "~/.zcode/cli/db/db.sqlite"),
+        help="宿主 SQLite；从 message/part/session_entry 取证")
     p.add_argument("--output", default="")
 
     p = sub.add_parser("review-context",
@@ -1603,16 +1362,15 @@ def main(argv: list[str] | None = None) -> int:
 
     args = ap.parse_args(argv)
     try:
+        if args.cmd == "bind-execution":
+            payload = bind_execution(args)
+            return _emit(payload, args.output)
         if args.cmd == "execution":
             payload = build_execution(args)
             return _emit(payload, args.output)
         if args.cmd == "review":
             payload = build_review(args)
             return _emit(payload, args.output)
-        if args.cmd == "preflight-commands":
-            payload = build_preflight(args)
-            code = _emit(payload, args.output)
-            return code if payload["ok"] else EXIT_USAGE
         payload = build_review_context(args)
         return _emit(payload, args.output)
     except (AgentRecordError, G.GovernanceError, OSError) as exc:

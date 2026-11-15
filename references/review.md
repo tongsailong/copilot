@@ -138,14 +138,12 @@ finding 必须有可达的缺陷机制、实际影响与可核实证据（文件
   为 `residual_risks`，不要为了让 finding 归零而修改已通过的证据再重开完整复核。
 - **PASS 绑定快照**：如果 PASS 之后出现实质代码、证据、合同或风险变化，原 PASS 不再覆盖
   新快照；按新范围重新完整或增量复核。不得用“及时停止”作为旧结论覆盖新代码的理由。
-- **每轮新会话**：不要续跑同一 Reviewer 会话；宿主按新 rollout 统计工具调用，续跑会
-  重置 `totalToolUseCount` 并使信封因 `review_toolcalls_incomplete` 被拒。
+- **每轮新会话**：不要续跑同一 Reviewer 会话；宿主按 child session 统计 `tool_usage`，
+  续跑会重置 `totalToolUseCount` 并使信封因 `review_toolcalls_incomplete` 被拒。
 
 ### 派发前预检与上下文
 
-- `native_agent.py preflight-commands --file cmds.txt`（每行一条或 JSON 数组）或多次
-  `--command`：派发前校验只读命令清单，`exit=2` 表示存在会被拒绝的命令。它只做静态
-  校验，不执行命令，也不保证输出格式。
+- Reviewer 没有 Bash 权限，不再需要、也不再提供命令白名单预检；`commands_run` 必须为空。
 - `native_agent.py review-context --state … --dispatch … --execution … --work-item …
   [--previous-review prev.json]`：输出绑定值、当前证据（含 live/dropped）、完成条件、
   执行证据漂移 `execution_evidence_unbound`、上轮 findings 与建议 scope。把这份清单和
@@ -155,13 +153,11 @@ finding 必须有可达的缺陷机制、实际影响与可核实证据（文件
 
 ### 记录与边界
 
-- 由 `reviewer` Profile 的只读子代理执行（工具仅 `Read`/`Grep`/`Glob`/`Bash`）。
+- 由工作区级 `reviewer` Profile 的只读子代理执行（工具仅 `Read`/`Grep`/`Glob`，无 Bash）。
 - 检查真实文件、diff、测试日志与原始证据，给出 verdict 与 findings（含文件位置与证据）。
-- 复核命令与实际读取由 `native_agent.py` 从宿主 rollout 派生，不要求 Reviewer 手工
-  复述命令；实际执行的 Bash 命令仍逐条做只读校验。
-- `cd <dir>; cat 相对路径` 与 `git -C <dir> …` 后的相对路径会被解析到实际目录，用于
-  判定证据是否真的被访问；但优先使用绝对路径，避免歧义。
-- 结论可用 `native_agent.py review` 生成信封并回填；`g4_eligible` 由宿主记录决定。
+- 实际读取由 `native_agent.py` 从宿主 `tool_usage`/`part` 合并，不要求 Reviewer 手工
+  复述；`commands_run` 恒为空。结论可用 `native_agent.py review` 生成信封并回填；
+  `g4_eligible` 只是信封结构预检，正式资格由新链 `g4_attest`/`g4_shadow` 决定。
 - **普通复核 PASS 不等于 G4**；`g4_eligible=false` 的结论只能作参考。
 - 失败处理：复核信封被拒时先看原因码——绑定/过期/只读边界是流程问题，修流程后
   重试；finding 是实质问题，修复后复核。不要因为复核失败就把任务标为 BLOCKED；被拒
@@ -189,6 +185,23 @@ finding 必须有可达的缺陷机制、实际影响与可核实证据（文件
 
 ## 3. G4：高风险收口门禁
 
+### 链路
+
+正式 G4 由新链派生，旧 Reviewer 信封自述不生效：
+
+1. `bind-execution` 固化合同 `test_policy`、工作区与 nonce；
+2. 真实 Executor 子会话执行并产出证据；`execution` 绑定执行记录与代码快照；
+3. `review-context --create-attempt` 冻结目标/证据/代码范围；真实 Reviewer 子会话只读复核；
+4. `g4_attest.attest` 独立核对宿主 DB、Profile、会话、证据与原始输出；
+5. `test_execution.build` 判定四层测试证据；`g4_shadow` 汇总候选资格；
+6. `copilot_auto._ingest_review` 只在 shadow `attested` 且 `new_g4_eligible=true` 时
+   写入正式 `g4_eligible=true`、`g4_source="candidate"` 并一次性消费 attempt；
+7. 收口重算 G1–G4；任何证据不足、绑定不符或门禁未过都失败关闭。
+
+高风险任务必须在合同里显式声明 `test_policy`；`start_state`/`amend_contract` 与
+`create_execution_binding` 都会拒绝没有 captured 策略的高风险任务，没有策略时新链
+不把 `not_applicable` 当作测试通过。合同策略进入合同指纹，调用方只能加严。
+
 ### 触发
 
 `start --risk high --backend native` 的任务。`risk` 缺失或非法时 G4 **fail-closed**
@@ -205,7 +218,8 @@ finding 必须有可达的缺陷机制、实际影响与可核实证据（文件
 | 无 `blocking` finding | 没有阻断性缺陷 |
 | `unverified` 为空 | 没有未验证项 |
 | `changed_files` 为空 | 复核方未改动任何文件 |
-| `g4_eligible=true` | 宿主记录判定其具备 G4 资格 |
+| `g4_eligible=true` 且 `g4_source="candidate"` | 由新链 attestation 派生，不是信封自述 |
+| `candidate_g4.eligible=true` | `g4_shadow`/`_finalize_candidate` 判定候选可用 |
 | `review_attempt_id` 有效且未被重放 | 复核绑定派发前创建、只消费一次的 attempt |
 | 代码范围快照等于当前 git 工作区 | 未登记为证据的源码、未跟踪/删除/重命名文件也在范围内 |
 | Reviewer `workspaceRoot` == attempt 代码根 | Reviewer 确实在任务工作区运行 |
@@ -214,10 +228,11 @@ finding 必须有可达的缺陷机制、实际影响与可核实证据（文件
 | 证据文件内容仍等于 attempt 快照 | 复核期间文件被改动时旧结论失效 |
 | `reviewer.profile_id == "reviewer"` | 复核方是 Reviewer Profile |
 | `host` 存在且 `host_sha256` 与内容一致 | ingest 固化的宿主记录未被改写 |
-| `host.agent_id` / `child_session_id` 与 `reviewer` 一致 | 宿主记录的复核方身份与自报一致 |
-| `host.tool_calls` 非空 | 宿主记录里有实际只读工具调用 |
+| `g4_attest` 独立核验宿主 DB | Profile 精确只读、会话/prompt/工作区绑定、工具调用与原始输出一致 |
+| `test_execution` 四层通过 | 合同要求的命令/结果/产物完整性已验证（或合同显式 N/A） |
 
-任何一项不满足都会记录原因码（`native_review_missing` / `native_review_not_pass` /
+任何一项不满足都会记录原因码；旧宿主记录相关代码（`native_review_host_*`、
+`host_*`）只用于历史记录，新链改用 `g4_attest` 原因码（`native_review_missing` / `native_review_not_pass` /
 `native_review_blocking` / `native_review_unverified` / `native_review_changed_files` /
 `native_review_not_g4_eligible` / `native_review_stale` / `native_review_profile_invalid` /
 `native_review_foreign` / `native_review_contract_mismatch` / `native_review_host_missing` /
@@ -228,7 +243,8 @@ finding 必须有可达的缺陷机制、实际影响与可核实证据（文件
 `native_review_attempt_session_mismatch` / `native_review_attempt_workspace_missing` /
 `native_review_attempt_workspace_mismatch` / `native_review_attempt_workspace_drift` /
 `native_review_attempt_not_consumed` / `native_review_code_scope_missing` /
-`native_review_code_scope_unavailable` / `native_review_code_scope_drift`），G4 失败，
+`native_review_code_scope_unavailable` / `native_review_code_scope_drift` /
+`native_review_legacy_g4_source` / `native_review_candidate_not_eligible`），G4 失败，
 任务不能 CLOSED。
 
 增量复核（`review_scope=incremental`）同样要满足上表全部条件，另外收口时会重算
@@ -263,7 +279,8 @@ python3 -B scripts/native_agent.py review ... --work-item A1 --attempt RA...
   已登记证据由证据快照单独绑定，代码快照不重复纳入。
 - `review --attempt` 要求：attempt 属于本任务、未被消费、所有绑定与当前执行一致、
   attempt 的目标仍是当前 `final_evidence_digest`；宿主 metadata 的 `createdAt` 不早于
-  attempt 创建时间，且宿主 prompt 确实包含该 attempt id。
+  attempt 创建时间、prompt 携带 attempt id、`workspaceRoot` 等于 attempt 代码根，
+  由 `g4_attest` 在 ingest 时独立核验。
 - ingest 是 attempt 的唯一消费点：先复核宿主记录与 attempt，再在同一份状态写入中标记
   `consumed` 并记录 Reviewer 会话。被拒的 attempt 不消费，修正后可重试；已消费的 attempt
   不能用于另一份结果。

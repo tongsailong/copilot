@@ -14,8 +14,10 @@ Copilot 是运行于 ZCode 内的**轻量协作治理 Skill**：负责任务承�
 - **v6.0.0 起 SOL 决策通道退役**：活动路径不得调用任何远程模型，不得把其他远程大模型设为
   强制决策节点，也不得设置等待远程返回的状态门禁。历史实现归档在 `legacy/`，历史审计、
   裁决、台账与证据只读保留。
-- 本仓库是**唯一源码**。`~/.zcode/skills/copilot` 与 `~/.zcode/agents/reviewer.md`
-  是构建产物，只能由 `scripts-sync/sync_runtime.py` 单向下发，不得直接编辑。
+- 本仓库是**唯一源码**。`~/.zcode/skills/copilot` 是构建产物，只能由
+  `scripts-sync/sync_runtime.py` 单向下发，不得直接编辑。阶段九起旧 Reviewer 全局
+  Profile 已退役；Reviewer 使用工作区级 `.zcode/agents/reviewer.md`（只读
+  Read/Grep/Glob，无 Bash），不属于同步分发范围。
 - 运行时临时修复必须先回迁本仓库，再同步下发；不使用符号链接替代副本。
 - 源码与运行时的分工见 `docs/DECISIONS.md`。
 

@@ -9,8 +9,9 @@ Copilot 是运行于 ZCode 内的**轻量协作治理 Skill**：用户侧 ChatGP
 返回的状态门禁，也不新增其他远程大模型充当强制决策节点。历史调用记录、REVIEW 裁决、任务
 台账与证据原样保留，可只读查看。角色边界见 `docs/PROJECT-CHARTER.md`。
 
-本仓库是**唯一源码**；`~/.zcode/skills/copilot` 与 `~/.zcode/agents/reviewer.md` 是构建
-产物，只允许从本仓库单向下发。
+本仓库是**唯一源码**；`~/.zcode/skills/copilot` 是构建产物，只允许从本仓库单向下发。
+阶段九起旧 Reviewer 全局 Profile 已退役，Reviewer 使用工作区级只读 Profile
+`.zcode/agents/reviewer.md`（Read/Grep/Glob，无 Bash）。
 
 ## 目录
 
@@ -27,7 +28,7 @@ copilot/
 │   ├── bridge_evidence.py   # 证据采集：脱敏、截断标记、清单
 │   └── lib_common.py        # 公共工具
 ├── references/              # 协议与操作参考（分发）
-├── agents/reviewer.md       # Reviewer Profile（分发到 ~/.zcode/agents/）
+├── .zcode/agents/reviewer.md # 工作区级只读 Reviewer Profile（不分发）
 ├── legacy/                  # v5 SOL 实现与历史测试（不分发，仅追溯）
 ├── tests/                   # 当前开发测试（不分发）
 ├── docs/                    # 项目管理文档（不分发）
@@ -65,7 +66,7 @@ copilot/
 
 ## 同步边界
 
-- 分发：`SKILL.md`、`scripts/**/*.py`、`references/**/*.md`、`agents/reviewer.md`。
+- 分发：`SKILL.md`、`scripts/**/*.py`、`references/**/*.md`。
 - 不分发：`legacy/`、`tests/`、`docs/`、`manifests/`、`scripts-sync/`、`README.md`、`AGENTS.md`。
 - 永不同步：`.env*`、密钥/凭据、`.audit/` 审计日志、临时状态、`__pycache__`、符号链接。
 - 每次运行同时检查 Skill 与 Reviewer，避免两者版本不一致。

@@ -6,9 +6,9 @@
 * DISPATCH：把 `governance.py` 中已登记的计划工作项交给宿主，绑定
   task / contract / plan（不再绑定任何远程模型轮次）；
 * RESULT：执行方回传实际结果、原始证据文件及其 SHA-256、运行元数据；
-* REVIEW：独立 Reviewer 回传复核结论，绑定它检查过的执行结果 SHA；G4 资格
-  由宿主运行记录（Profile、实际工具调用、独立子会话）计算，不由 Reviewer
-  自述。
+* REVIEW：独立 Reviewer 回传复核结论，绑定它检查过的执行结果 SHA；正式 G4
+  资格由 `g4_attest`/`test_execution`/`g4_shadow` 新链独立核验，不由 Reviewer
+  自述，也不由本模块计算。
 
 安全边界
 --------
@@ -20,8 +20,8 @@
 4. Reviewer 不得改动文件；`changed_files` 非空即视为污染并拒绝。
 5. PASS 不得带 blocking finding 或未验证事项。
 6. 本模块的校验是**本地完整性与绑定校验**，不是密码学签名，也不是宿主可信
-   身份证明；`g4_eligible` 在 ingest 时由 `native_agent.py` 按宿主 metadata/rollout
-   重新计算，治理层收口时再核对固化下来的宿主记录摘要与身份一致性。
+   身份证明；本模块的 `g4_eligible` 只是信封结构预检，正式资格在 ingest 时由
+   `g4_attest` 读取宿主 metadata/SQLite 后派生，治理层收口只接受 candidate 来源。
 """
 from __future__ import annotations
 
@@ -49,185 +49,12 @@ FINDING_SEVERITIES = ("blocking", "major", "minor", "info")
 FINDING_STATUSES = ("open", "resolved", "regressed")
 NATIVE_ASSIGNEES = ("zcode", "deepseek")
 EXECUTOR_KINDS = ("main", "subagent")
-REVIEWER_TOOLS = ("Read", "Grep", "Glob", "Bash")
+REVIEWER_TOOLS = ("Read", "Grep", "Glob")
 
 EVIDENCE_ID_RE = re.compile(r"^E[1-9][0-9]{0,3}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _REVIEW_ATTEMPT_RE = re.compile(r"^RA[0-9a-f]{24}$")
-# Reviewer 可以用 Bash 读取现场，但只允许这些只读前缀。真正的写保护仍由
-# Reviewer Profile 的 instructions + 宿主工具权限负责；这里是第二道失败关闭。
-# v6.1 起不再要求「命令形式完美」：白名单覆盖复核实际需要的只读工具，写操作由
-# 命令族检查与 shell 层重定向/元字符拒绝负责；`sed -i`、`sort -o`、`unzip` 解包
-# 等仍失败关闭。复核不因命令形式自我作废。
-_READONLY_COMMAND_PREFIXES = (
-    "git diff", "git status", "git log", "git show", "git grep",
-    "git rev-parse", "git ls-files", "rg ", "grep ", "cat ",
-    "head ", "tail ", "wc ", "ls ", "find ", "stat ", "sha256sum ",
-    "diff ", "cmp ", "sort ", "cd ", "uniq ", "cut ", "tr ", "nl ",
-    "basename ", "dirname ", "realpath ", "readlink ", "md5sum ", "sha1sum ",
-    # 只写 stdout / 只读取的常用检查工具（v6.1）
-    "echo ", "printf ", "pwd", "date ", "file ", "xxd ", "od ", "strings ",
-    "jq ", "tree ", "du ", "test ",
-    # v6.3：真实复核里被用来确认提交区间、对象内容与重命名历史的只读 git
-    # 子命令。此前缺 `git rev-list` 直接导致整轮复核信封被拒（ad-strategy）。
-    # 危险长选项（--output/--ext-diff/--textconv/--filters 等）由 argv 检查拒绝。
-    "git rev-list", "git cat-file", "git ls-tree", "git show-ref",
-    "git for-each-ref", "git describe", "git merge-base", "git name-rev",
-    "git check-ignore", "git check-attr", "git diff-tree", "git diff-index",
-    "git diff-files", "git shortlog", "git blame", "git count-objects",
-    # v6.3：文本流检查工具，全部只写 stdout；真实复核用 `paste -sd+` 汇总
-    # 证据校验和时曾被白名单误拒。
-    "paste ", "comm ", "join ", "tac ", "rev ", "fold ", "expand ",
-    "unexpand ", "column ", "cksum ", "seq ", "base64 ",
-    # 带参数级写检查的命令族（见 _family_readonly_checks）
-    "sed ", "awk ", "unzip ", "zipinfo ",
-    # Android/Java 只读检查（复核 APK/dex 的常规工具）
-    "aapt ", "aapt2 ", "apksigner ", "dexdump ", "javap ",
-)
-# 这些命令族本身只读，但带写参数/子命令时会改工作区，必须在 argv 层再检查。
-# `date -s` 改系统时间；`tree -o` 写输出文件；`unzip` 默认解包；`aapt2 link`
-# 生成文件；`apksigner sign` 改写 APK。只读用法继续放行，写用法失败关闭。
-_TREE_WRITE_OPTIONS = frozenset({"-o", "--output"})
-# 只输出到 stdout 的 unzip 模式：列目录（-l/-v/-t/-Z）与解压到标准输出
-# （-p/-c）。G4 复核 APK 内的 dex/资源时常用 `unzip -p a.apk classes.dex |
-# strings`；它不落盘，落盘写仍被重定向规则与 -d 拒绝。
-_UNZIP_STDOUT_OPTIONS = ("-l", "-v", "-t", "-Z", "-p", "-c")
-_AAPT_READONLY_SUBCOMMANDS = frozenset({"dump", "list", "badging", "version"})
-_AAPT2_READONLY_SUBCOMMANDS = frozenset({"dump", "version"})
-_APKSIGNER_READONLY_SUBCOMMANDS = frozenset({"verify"})
-# xxd 的第二个位置参数是输出文件；带值选项先按值消费，避免把值误当位置参数。
-_XXD_VALUE_OPTIONS = frozenset({"-c", "-g", "-l", "-s", "-o", "-n"})
-# sed/awk 的长选项一律按白名单匹配：GNU getopt 接受无歧义缩写（`--in-pl`、
-# `--fil=`），只比较全名会被绕过。白名单不含写文件、加载脚本或加载扩展的选项。
-_SED_READONLY_LONG_OPTIONS = frozenset({
-    "quiet", "silent", "regexp-extended", "separate", "unbuffered", "posix",
-    "debug", "sandbox", "follow-symlinks", "binary", "null-data", "help",
-    "version",
-})
-_AWK_READONLY_LONG_OPTIONS = frozenset({
-    "field-separator", "assign", "sandbox", "posix", "traditional",
-    "characters-as-bytes", "csv", "optimize", "re-interval", "bignum",
-    "non-decimal-data", "use-lc-numeric", "lint", "help", "version",
-})
-# awk 程序里的写操作只可能出现在 print/printf 的输出重定向（`>`、`>>`、`|`）
-# 或 `"cmd" | getline`（执行外部命令）；比较运算（`NR > 1`、`||`）与字符串
-# 字面量里的符号不是写。按语句与字符串边界扫描，避免把只读程序误判成写。
-_AWK_PRINT_RE = re.compile(r"(?<![A-Za-z0-9_])printf?(?![A-Za-z0-9_])")
-_AWK_PIPE_GETLINE_RE = re.compile(r"(?<!\|)\|&?[ \t]*getline")
-_AWK_SYSTEM_RE = re.compile(r"system[ \t]*\(")
-# sed 脚本的 `w`/`W`/`e` 命令写文件或执行外部程序；`s///w file`、`s///e` 的
-# 标志位同样如此。按脚本语法扫描，避免把 `s/\w/x/` 这类正则误判成写命令。
-_SED_WRITE_COMMANDS = frozenset("wWe")
-_SED_SUB_WRITE_FLAGS = frozenset("wWe")
-# 分号/管道是只读复核里常见的组合形式（`find ... | sort; stat ...`）。这里按
-# **引号感知**拆分后逐段校验，只把顶层 `;` / `|` 当作分隔符；`&&`、重定向、
-# 命令替换、反引号、换行一律拒绝。花括号也拒绝：bash 的 brace expansion 会把
-# `{-,-}delete` 展开成 `-delete`，校验时看不到危险谓词。未引用的 `*`/`?`/`[`
-# 见 _GLOB_META：只有无输出位置参数的只读族放行。拆分不改变只读边界：每一段
-# 仍走同一白名单。
-_COMMAND_SHELL_META = "&><`$\n\r{}"
-_GLOB_META = "*?["
-# 未加引号的通配符会由 shell 展开成多个参数，校验时看到的 argv 就不等于实际
-# 执行的 argv。对**没有输出位置参数、也没有写/执行选项**的只读族，展开最多把
-# 文件名当参数（`sha256sum evidence/*.png`、`ls */release/*.apk`）。仍有三类风险
-# 所以边界保守：① `sort -o`、`uniq`、`xxd` 的输出位置参数；② `file -C`、
-# `git grep -O/--textconv`、`rg --pre` 这类写/执行选项——目录里以 `-` 开头的
-# 文件名会被展开成选项；③ `sed`/`awk`/`find` 的写操作。这些族默认要求加引号，
-# 但含路径分隔符的通配符（`/path/*.xml`、`dir/*.log`）对 `sed`/`awk`/`find`
-# 例外：展开结果仍带 `/`，不可能变成以 `-` 开头的选项，写操作另有
-# `sed -i` / `awk print >` / `find -delete` 校验。真实复核用
-# `awk '…' app/build/test-results/*/*.xml` 统计用例数，此前整轮信封因通配符被拒。
-_GLOB_SAFE_FAMILIES = frozenset({
-    "ls", "cat", "head", "tail", "wc", "stat", "strings",
-    "sha256sum", "md5sum", "sha1sum", "grep", "diff", "cmp",
-    "basename", "dirname", "realpath", "readlink", "du", "jq",
-    "zipinfo", "aapt", "aapt2",
-})
-# 有输出位置参数、但写操作已在参数级校验的族：`sed -i`、`awk print >`、
-# `find -delete/-fprint/-exec` 都会被拒，所以**带路径分隔符**的通配符可以展开
-# （展开结果仍含 `/`，不会变成 `-` 开头的选项）。`uniq`/`sort -o`/`xxd` 不在
-# 此列：第二个位置参数就是输出文件，展开后会写文件。
-_GLOB_PATH_SAFE_FAMILIES = frozenset({"awk", "sed", "find"})
-# 允许以绝对路径调用的工具族：Android SDK / JDK 的检查工具通常不在 PATH，
-# 复核需要 `/path/to/build-tools/36.0.0/aapt2 dump ...`。只对这类专用工具做
-# 路径归一化；通用命令（cat/grep/git/sha256sum 等）必须走 PATH，否则任意目录下
-# 的同名二进制都能冒充白名单命令。
-_PATH_EXEC_FAMILIES = frozenset({
-    "aapt", "aapt2", "apksigner", "dexdump", "javap",
-})
-# Shell 的 token 分隔空白**只有**空格与制表符（换行已被拒绝）。Python 的
-# `str.isspace()` 还认 U+00A0、U+000B 等 Unicode 空白，但 bash 会把它们当作普通
-# 词内字符：`input<NBSP>2>/dev/null` 的 `2` 属于参数，按 isspace 判定会再次删掉
-# 普通 argv 字符。所有 token 边界与分段裁剪统一用这个集合。
-_SHELL_SPACE = " \t"
-# `git -C <dir>` 只切换目录，不写文件；只剥离大写 `-C` 及其路径值，后续子命令
-# 仍由白名单校验（小写 `-c` 可注入 external pager，必须落回拒绝路径）。
-_GIT_C_PREFIX_RE = re.compile(
-    r"^git[ \t]+-C[ \t]+(?:'[^']*'|\"[^\"]*\"|[^\s'\"]+)[ \t]+")
-# 目标是 /dev/null 的重定向不写工作区，是只读检查里常见的噪声抑制；只放行
-# 独立成 token 的 `>` / `2>` 且目标恰为 /dev/null，其他重定向仍然失败关闭。
-# 必须在 token 边界上匹配：`sort -k2>/dev/null` 里的 `2` 是参数 `-k2` 的一部分，
-# 整体替换会把校验用文本改成 `sort -k -o out`，使真实 argv 里的 `-o` 被当成
-# `-k` 的参数值跳过（校验参数 ≠ 实际 argv）。
-_NULL_REDIRECT_AT_RE = re.compile(r">[ \t]*/dev/null(?=[ \t]|[;|]|$)")
-# 引号会骗过纯文本正则：`git diff "--output=/tmp/x"` 在 shell 展开后仍是写文件。
-# 每段用 shlex 取 argv，对参数 token 做一次与引号无关的拒绝。危险参数只按 argv
-# 判定，不再用纯文本搜整段：否则 `grep -e rm`、`git grep -e '-O'` 这类“参数值”
-# 会被误伤。顶层命令名仍由白名单限制。
-_ARGV_DENY_RE = re.compile(
-    r"^(?:--output(?:=|$)|--output-file(?:=|$)|--ext-diff$|--textconv$|"
-    r"--open-files-in-pager(?:=|$)|--pre(?:=|$)|--pre-glob(?:=|$)|"
-    r"--hostname-bin(?:=|$)|--search-zip(?:=|$)|--filters(?:=|$)|"
-    r"-delete$|-exec(?:dir)?$|-ok(?:dir)?$|-fprint(?:0|f)?$|-fprintf$|-fls$)")
-# GNU getopt 与 git parse-options 允许长选项唯一前缀缩写：`sort --o=/tmp/x`
-# 会写文件，`git grep --ope='...'` 会执行外部程序。只匹配完整名不够，按命令族
-# 列出危险完整名，token 是其前缀同样拒绝；精确匹配的合法选项先放行。
-# v6.3 起覆盖 git diff/log/show/cat-file 等族：`git log --out=/tmp/x` 写文件、
-# `git show --ext-d` 执行外部 diff、`git cat-file --filt` 执行 smudge filter。
-_ABBREV_FORBIDDEN = {
-    "git grep": ("--open-files-in-pager", "--textconv"),
-    "git diff": ("--output", "--output-file", "--ext-diff", "--textconv",
-                 "--open-files-in-pager"),
-    "git log": ("--output", "--output-file", "--ext-diff", "--textconv",
-                "--open-files-in-pager"),
-    "git show": ("--output", "--output-file", "--ext-diff", "--textconv",
-                 "--open-files-in-pager"),
-    "git diff-tree": ("--output", "--output-file", "--ext-diff", "--textconv",
-                      "--open-files-in-pager"),
-    "git diff-index": ("--output", "--output-file", "--ext-diff", "--textconv",
-                       "--open-files-in-pager"),
-    "git diff-files": ("--output", "--output-file", "--ext-diff", "--textconv",
-                       "--open-files-in-pager"),
-    "git cat-file": ("--filters", "--textconv", "--output", "--output-file"),
-    "sort": ("--output", "--compress-program", "--temporary-directory"),
-}
-_ABBREV_ALLOW_EXACT = {
-    "git grep": ("--only-matching",),
-    # `--text` 是合法 diff 选项，且是 `--textconv` 的前缀；按全名精确放行，
-    # 缩写形式（`--textc`）仍被下面拒绝。
-    "git diff": ("--text",),
-    "git log": ("--text",),
-    "git show": ("--text",),
-    "git diff-tree": ("--text",),
-    "git diff-index": ("--text",),
-    "git diff-files": ("--text",),
-    "sort": ("--check",),
-}
-# 短选项聚簇：o/T 写文件。t/k/S 自身带参，其后的字符是参数值，不是选项。
-_SORT_SHORT_WRITE = frozenset("oT")
-_SORT_SHORT_VALUE = frozenset("tkS")
-# git grep 短选项带参：e/f/m/A/B/C 之后的字符属于参数值（如 -eO 是匹配 "O"）。
-_GIT_GREP_SHORT_VALUE = frozenset("efmABC")
-# rg 的 -z 会按扩展名调用外部解压程序；e/f/g/t/T/A/B/C/m/j/M/E/r/d 带参。
-_RG_SHORT_VALUE = frozenset("efgtTABCmjMErd")
-# 分离形式（`-e PATTERN`、`sort -t SEP`）的选项参数值不是选项，不再当作命令参数
-# 扫描，避免 `git grep -e '-O'`、`sort -t -o` 这类只读用法被误拒。
-_VALUE_TOKENS = {
-    "sort": frozenset({"-t", "-k", "-S"}),
-    "git grep": frozenset({"-e", "-f", "-m", "-A", "-B", "-C"}),
-    "rg": frozenset({"-e", "-f", "-g", "-t", "-T", "-A", "-B", "-C", "-m",
-                     "-j", "-M", "-E", "-r", "-d"}),
-}
+_FINDING_ID_RE = re.compile(r"^F[1-9][0-9]{0,3}$")
 # 这些路径不得作为 Reviewer 的 inspected 文件：设备/管道/目录不是可复核内容。
 _NON_REGULAR_PREFIXES = ("/dev/", "/proc/", "/sys/")
 
@@ -686,958 +513,13 @@ def _validate_files_inspected(raw: object, *, check_files: bool) -> list[str]:
     return out
 
 
-def _normalize_git_dir(segment: str) -> str:
-    """剥离只切换目录的 `git -C <dir>`，其余子命令仍走只读白名单。
-
-    `-C` 只改变后续 git 命令的工作目录，本身不写文件；不剥离的话
-    `git -C <dir> show` 会被前缀白名单误拒，而子进程无法靠 `cd` 保持目录。
-    只接受大写 `-C <路径>`：小写 `-c <k=v>` 可注入 `core.pager` 等执行外部程序，
-    剥不掉，继续落在白名单外。
-    """
-    while True:
-        match = _GIT_C_PREFIX_RE.match(segment)
-        if not match:
-            return segment
-        segment = "git " + segment[match.end():]
-
-
-def _strip_git_dir(argv: list[str]) -> list[str]:
-    if not argv or os.path.basename(argv[0]) != "git":
-        return argv
-    idx = 1
-    while idx + 1 < len(argv) and argv[idx] == "-C":
-        idx += 2
-    return [argv[0]] + argv[idx:]
-
-
-def _path_within(path: str, root: str) -> bool:
-    """`path` 是否在 `root` 之内；root 为 `/` 时也正确。"""
-    try:
-        return os.path.commonpath([path, root]) == root
-    except ValueError:
-        return False
-
-
-def _workspace_root() -> str:
-    """当前复核工作区的根目录：cwd 向上第一个含 `.git` 的目录，否则 cwd。
-
-    Reviewer 经常在仓库子目录里取证（`cd app; ...`）。只比较 cwd 会把
-    `<repo>/tools/aapt2` 当成“工作区外”，而它其实由被复核内容控制。`.git`
-    可能是目录（普通仓库）或文件（worktree/submodule），存在即可。
-    """
-    current = os.path.realpath(os.getcwd())
-    probe = current
-    while True:
-        if os.path.exists(os.path.join(probe, ".git")):
-            return probe
-        parent = os.path.dirname(probe)
-        if parent == probe:
-            return current
-        probe = parent
-
-
-def _normalize_executable_path(segment: str, name: str) -> str:
-    """把 `.../aapt2 dump ...` 的第一个 token 归一化成 `aapt2 dump ...`。
-
-    复核经常用绝对路径调用 SDK 工具（`/media/.../build-tools/36.0.0/aapt2 dump
-    badging x.apk`），前缀白名单按字符串比较会把它误拒，而 argv 层检查本来就按
-    basename 判族。只有同时满足以下条件才归一化：
-
-    - 以 `/` 开头的绝对路径（相对路径不归一化：工作区相对的可执行文件可能由
-      被复核内容写入，不能按 basename 冒充只读工具）；
-    - basename 属于 `_PATH_EXEC_FAMILIES`（专用检查工具；通用命令走 PATH）；
-    - realpath 不在复核工作区内（工作区根取 cwd 最近的 `.git` 祖先，防止用
-      仓库内的同名二进制绕过只读边界）。
-
-    命令本身仍必须命中白名单，参数级写检查照旧执行；Bash 不是沙箱，这一层只判断
-    argv 语义，不证明二进制来源可信。
-    """
-    token_end = len(segment)
-    for idx, ch in enumerate(segment):
-        if ch in _SHELL_SPACE:
-            token_end = idx
-            break
-    token, rest = segment[:token_end], segment[token_end:]
-    if "/" not in token or not token.startswith("/"):
-        return segment
-    if token.endswith("/") or any(ch in token for ch in _GLOB_META):
-        return segment
-    base = os.path.basename(token)
-    if base not in _PATH_EXEC_FAMILIES:
-        return segment
-    resolved = os.path.realpath(token)
-    literal = os.path.abspath(token)
-    workspace = _workspace_root()
-    # 同时检查 realpath 与未解析符号链接的字面路径：工作区内的链接指向工作区外时，
-    # 只按 realpath 判断会把“被复核内容控制的链接”当成工作区外。
-    if (_path_within(resolved, workspace) or _path_within(literal, workspace)):
-        _fail("review_command_not_readonly",
-              f"{name} 拒绝执行工作区内的可执行文件（可能由被复核内容写入，"
-              f"不能按 basename 当作只读工具）：{token}")
-    return base + rest
-
-
-def _segment_tokens(segment: str) -> list[str]:
-    """把已读到的命令片段按 shell 空白切成近似 argv，并剥掉成对引号。
-
-    只用于通配符放行时的族名判定：片段可能因为引号未闭合而不完整，但命令名与
-    子命令在通配符出现前总已完整读入。反斜杠转义按字面保留，族名判定不受影响。
-    """
-    tokens: list[str] = []
-    buf: list[str] = []
-    quote: str | None = None
-    for ch in segment:
-        if quote is None:
-            if ch in _SHELL_SPACE:
-                if buf:
-                    tokens.append("".join(buf))
-                    buf = []
-                continue
-            if ch in ("'", '"'):
-                quote = ch
-                continue
-        elif ch == quote:
-            quote = None
-            continue
-        buf.append(ch)
-    if buf:
-        tokens.append("".join(buf))
-    return tokens
-
-
-def _segment_family(segment: str) -> str:
-    """推断片段所属的只读命令族，判定口径与 `_argv_readonly_checks` 一致。"""
-    tokens = _segment_tokens(segment)
-    if not tokens:
-        return ""
-    argv = _strip_git_dir(tokens)
-    head = os.path.basename(argv[0])
-    if head == "git" and len(argv) > 1:
-        return f"git {argv[1]}"
-    return head
-
-
-def _is_readonly_prefix(segment: str, name: str) -> bool:
-    segment = _normalize_git_dir(_normalize_executable_path(segment, name))
-    for prefix in _READONLY_COMMAND_PREFIXES:
-        if prefix.endswith(" "):
-            if segment == prefix.rstrip() or segment.startswith(prefix):
-                return True
-        elif segment == prefix or segment.startswith(prefix + " "):
-            return True
-    return False
-
-
-def _space_is_escaped(buf: list[str], at: int) -> bool:
-    """`buf[at]` 处的 shell 空白是否被反斜杠转义（连续反斜杠数为奇数）。
-
-    `cat /tmp/input\\ 2>/dev/null` 里空格被转义，shell 词法上 `2` 属于普通参数
-    `/tmp/input 2`，不是文件描述符编号；把它当 fd 删掉会让校验 argv 与实际 argv
-    不一致。`a\\\\ 2>`（转义的反斜杠 + 裸空格）则相反，仍是 fd 编号。
-    """
-    if at < 0 or at >= len(buf) or buf[at] not in _SHELL_SPACE:
-        return False
-    count = 0
-    idx = at - 1
-    while idx >= 0 and buf[idx] == "\\":
-        count += 1
-        idx -= 1
-    return count % 2 == 1
-
-
-def _consume_null_redirect(cmd: str, idx: int, buf: list[str], name: str) -> int:
-    """消费一个独立成 token 的 `>/dev/null` 或 `2>/dev/null`，返回新下标。
-
-    只接受 token 边界上的重定向：`>` 前必须是段首或 shell 空白；`2>` 的 `2` 前也必须是
-    段首或**未转义**的 shell 空白（此时 `2` 是文件描述符编号，从缓冲区移除）。紧贴参数
-    的写法（`sort -k2>/dev/null`）在 shell 中属于参数值，删掉它会让校验用 argv 与
-    实际执行 argv 不一致，直接失败关闭。被转义的空格不构成 token 边界：
-    `input\\ 2>/dev/null` 中的 `2` 属于普通参数，只消费重定向本体。Unicode 空白
-    （如 U+00A0）不是 shell 分隔符，前后紧贴 `2` 同样按「紧贴参数」拒绝。
-    """
-    fd_two = False
-    if buf and buf[-1] == "2" and (len(buf) == 1 or buf[-2] in _SHELL_SPACE):
-        fd_two = len(buf) >= 2 and not _space_is_escaped(buf, len(buf) - 2)
-    elif buf and buf[-1] not in _SHELL_SPACE:
-        _fail("review_command_not_readonly",
-              f"{name} 含紧贴参数的重定向（校验参数会与实际 argv 不一致）：{cmd}")
-    match = _NULL_REDIRECT_AT_RE.match(cmd, idx)
-    if not match:
-        _fail("review_command_not_readonly",
-              f"{name} 只允许指向 /dev/null 的重定向：{cmd}")
-    if fd_two:
-        buf.pop()
-    return match.end()
-
-
-def _split_readonly_segments(cmd: str, name: str) -> list[str]:
-    """把顶层 `;` / `|` / `&&` 拆成独立命令段；引号内的分隔符保持原样。
-
-    只做拆分与拒绝，不做 shell 展开：单独的 `&`（后台执行）、`||`、指向
-    /dev/null 之外的重定向、反引号、`$`、换行和未闭合引号都直接失败关闭。
-    拆分后的每一段仍由 `_validate_commands` 逐段套用只读
-    前缀与破坏性参数校验。
-    """
-    segments: list[str] = []
-    if not cmd.strip():
-        _fail("review_command_not_readonly", f"{name} 是空命令。")
-    buf: list[str] = []
-    quote: str | None = None
-    idx = 0
-    while idx < len(cmd):
-        ch = cmd[idx]
-        if quote is None:
-            if ch in ("'", '"'):
-                quote = ch
-                buf.append(ch)
-                idx += 1
-                continue
-            if ch == "\\":
-                if idx + 1 >= len(cmd):
-                    _fail("review_command_not_readonly",
-                          f"{name} 以未转义的反斜杠结尾：{cmd}")
-                nxt = cmd[idx + 1]
-                if nxt in "\n\r":
-                    _fail("review_command_not_readonly",
-                          f"{name} 使用反斜杠续行，拒绝隐藏命令边界：{cmd}")
-                buf.append(ch)
-                buf.append(nxt)
-                idx += 2
-                continue
-            if ch == ">":
-                idx = _consume_null_redirect(cmd, idx, buf, name)
-                continue
-            if ch in (";", "|"):
-                if ch == "|" and idx + 1 < len(cmd) and cmd[idx + 1] == "|":
-                    _fail("review_command_not_readonly",
-                          f"{name} 含 `||` 控制操作符：{cmd}")
-                segment = "".join(buf).strip(_SHELL_SPACE)
-                if not segment:
-                    _fail("review_command_not_readonly",
-                          f"{name} 含空命令片段（多余分隔符）：{cmd}")
-                segments.append(segment)
-                buf = []
-                idx += 1
-                continue
-            if ch == "&":
-                # `&&` 与 `;` 等价：只是条件串联，两侧各自仍须通过只读校验
-                # （`ls && rm -rf` 的第二段会被拒）。单独的 `&` 是后台执行，
-                # 无法保证命令在工作区快照内结束，继续拒绝。
-                if idx + 1 < len(cmd) and cmd[idx + 1] == "&":
-                    segment = "".join(buf).strip(_SHELL_SPACE)
-                    if not segment:
-                        _fail("review_command_not_readonly",
-                              f"{name} 含空命令片段（多余分隔符）：{cmd}")
-                    segments.append(segment)
-                    buf = []
-                    idx += 2
-                    continue
-                _fail("review_command_not_readonly",
-                      f"{name} 含单独的 `&`（后台执行）：{cmd}")
-            if ch in _GLOB_META:
-                # 未加引号的通配符只对没有输出位置参数的只读族放行：展开后只
-                # 增加输入文件，校验看到的参数个数变化不影响只读语义。
-                family = _segment_family("".join(buf))
-                token = re.split(r"[ \t]", "".join(buf))[-1]
-                if (family not in _GLOB_SAFE_FAMILIES
-                        and not (family in _GLOB_PATH_SAFE_FAMILIES
-                                 and "/" in token)):
-                    _fail("review_command_not_readonly",
-                          f"{name} 的 {family or '未知'} 命令不支持未加引号的通配符 "
-                          f"{ch!r}（请加引号，例如 \"*.apk\"）：{cmd}")
-                buf.append(ch)
-                idx += 1
-                continue
-            if ch in _COMMAND_SHELL_META:
-                _fail("review_command_not_readonly",
-                      f"{name} 含 shell 元字符 {ch!r}，可能改变工作区：{cmd}")
-            buf.append(ch)
-            idx += 1
-            continue
-        if quote == "'":
-            if ch in "\n\r":
-                _fail("review_command_not_readonly",
-                      f"{name} 的单引号字符串含换行：{cmd}")
-            buf.append(ch)
-            if ch == "'":
-                quote = None
-            idx += 1
-            continue
-        # 双引号内仍禁止命令替换；反斜杠只转义下一个字符（不含换行）。
-        if ch in "\n\r":
-            _fail("review_command_not_readonly",
-                  f"{name} 的双引号字符串含换行：{cmd}")
-        if ch == "\\":
-            if idx + 1 >= len(cmd):
-                _fail("review_command_not_readonly",
-                      f"{name} 以未转义的反斜杠结尾：{cmd}")
-            nxt = cmd[idx + 1]
-            if nxt in "\n\r":
-                _fail("review_command_not_readonly",
-                      f"{name} 使用反斜杠续行，拒绝隐藏命令边界：{cmd}")
-            buf.append(ch)
-            buf.append(nxt)
-            idx += 2
-            continue
-        if ch in "`$":
-            _fail("review_command_not_readonly",
-                  f"{name} 含命令替换 {ch!r}：{cmd}")
-        buf.append(ch)
-        if ch == '"':
-            quote = None
-        idx += 1
-    if quote is not None:
-        _fail("review_command_not_readonly",
-              f"{name} 的引号未闭合：{cmd}")
-    segment = "".join(buf).strip(_SHELL_SPACE)
-    if not segment:
-        _fail("review_command_not_readonly",
-              f"{name} 为空或只有空白：{cmd}")
-    segments.append(segment)
-    return segments
-
-
-def _short_option_write_checks(argv: list[str], start: int, *, name: str,
-                               segment: str, value_tokens: frozenset[str],
-                               value_chars: frozenset[str],
-                               write_chars: frozenset[str],
-                               label: str) -> None:
-    """逐字符解析短选项，跳过 `--` 之后与分离形式的选项参数值。"""
-    after_dd = False
-    skip_next = False
-    for token in argv[start:]:
-        if skip_next:
-            skip_next = False
-            continue
-        if token == "--" and not after_dd:
-            after_dd = True
-            continue
-        if after_dd or not token.startswith("-") or token.startswith("--"):
-            continue
-        if token in value_tokens:
-            skip_next = True
-            continue
-        for ch in token[1:]:
-            if ch in write_chars:
-                _fail("review_command_not_readonly",
-                      f"{name} 的 {label} 含写文件/执行外部程序短选项 "
-                      f"{token!r}（原命令：{segment}）")
-            if ch in value_chars:
-                break
-
-
-def _sed_script_writes(script: str) -> bool:
-    """扫描 sed 脚本里的 `w`/`W`/`e` 命令与 `s///w`/`s///e` 标志。
-
-    正则里的 `w`（如 `s/\\w/x/`）不是命令，不能误判；命令只出现在地址之后，
-    因此先跳过行号、`,`、`$`、`!` 与 `/regex/` 地址，再看命令字符。
-    """
-    idx, size = 0, len(script)
-    while idx < size:
-        ch = script[idx]
-        if ch in " \t\n;{}":
-            idx += 1
-            continue
-        while idx < size and script[idx] in "0123456789$,! \t":
-            idx += 1
-        if idx < size and script[idx] == "/":
-            idx += 1
-            while idx < size:
-                if script[idx] == "\\":
-                    idx += 2
-                    continue
-                if script[idx] == "/":
-                    idx += 1
-                    break
-                idx += 1
-            while idx < size and script[idx] in "! \t":
-                idx += 1
-        if idx >= size:
-            break
-        ch = script[idx]
-        if ch in _SED_WRITE_COMMANDS:
-            return True
-        if ch == "s":
-            delim = script[idx + 1] if idx + 1 < size else ""
-            if delim and delim not in "\n\\":
-                pos, fields = idx + 2, 0
-                while pos < size and fields < 2:
-                    if script[pos] == "\\":
-                        pos += 2
-                        continue
-                    if script[pos] == delim:
-                        fields += 1
-                    pos += 1
-                while pos < size and script[pos] not in "\n;{}":
-                    if script[pos] in _SED_SUB_WRITE_FLAGS:
-                        return True
-                    pos += 1
-                idx = pos
-                continue
-        if ch == "y":
-            # y/src/dst/ 与 s/// 结构相同：两个字段都被分隔符包裹，内容是文本，
-            # 不是命令；跳过整个 transliterate 命令。
-            delim = script[idx + 1] if idx + 1 < size else ""
-            if delim and delim not in "\n\\":
-                pos, fields = idx + 2, 0
-                while pos < size and fields < 2:
-                    if script[pos] == "\\":
-                        pos += 2
-                        continue
-                    if script[pos] == delim:
-                        fields += 1
-                    pos += 1
-                idx = pos
-                continue
-        if ch in "aic":
-            # a\/i\/c\ 后面直到行尾是插入/追加/替换文本；其中的 w/e 不是命令。
-            pos = idx + 1
-            while pos < size and script[pos] != "\n":
-                pos += 1
-            idx = pos
-            continue
-        idx += 1
-    return False
-
-
-def _sed_program_writes(tokens: list[str], *, name: str, segment: str) -> None:
-    programs: list[str] = []
-    positionals: list[str] = []
-    has_expression = False
-    idx = 0
-    while idx < len(tokens):
-        token = tokens[idx]
-        if token == "--":
-            positionals.extend(tokens[idx + 1:])
-            break
-        if token.startswith("--"):
-            option, has_value, value = token[2:].partition("=")
-            if len(option) >= 2 and "expression".startswith(option):
-                if has_value:
-                    programs.append(value)
-                elif idx + 1 < len(tokens):
-                    programs.append(tokens[idx + 1])
-                    idx += 1
-                else:
-                    _fail("review_command_not_readonly",
-                          f"{name} 的 sed --expression 缺少脚本：{segment}")
-                has_expression = True
-                idx += 1
-                continue
-            if len(option) >= 2 and "line-length".startswith(option):
-                idx += 1 if has_value else 2
-                continue
-            if option not in _SED_READONLY_LONG_OPTIONS:
-                if len(option) >= 2 and "in-place".startswith(option):
-                    _fail("review_command_not_readonly",
-                          f"{name} 的 sed 使用就地编辑（-i/--in-place）：{segment}")
-                if len(option) >= 2 and "file".startswith(option):
-                    _fail("review_command_not_readonly",
-                          f"{name} 的 sed 从文件加载脚本，无法确认只读：{segment}")
-                _fail("review_command_not_readonly",
-                      f"{name} 的 sed 长选项 --{option} 不在只读白名单：{segment}")
-            idx += 1
-            continue
-        if token.startswith("-") and token != "-":
-            flags = token[1:]
-            # -e 之后整个剩余部分是脚本，不能按选项字母扫描（`-es/i/x/` 是
-            # 合法脚本，不是就地编辑）；只有 -e 之前的字母才是选项。
-            if "e" in flags:
-                before_e = flags.split("e", 1)[0]
-            else:
-                before_e = flags
-            if "i" in before_e:
-                _fail("review_command_not_readonly",
-                      f"{name} 的 sed 使用就地编辑（-i/--in-place）：{segment}")
-            if "f" in before_e:
-                _fail("review_command_not_readonly",
-                      f"{name} 的 sed 从文件加载脚本，无法确认只读：{segment}")
-            if "e" in flags:
-                rest = flags[flags.index("e") + 1:]
-                if rest:
-                    programs.append(rest)
-                elif idx + 1 < len(tokens):
-                    programs.append(tokens[idx + 1])
-                    idx += 1
-                else:
-                    _fail("review_command_not_readonly",
-                          f"{name} 的 sed -e 缺少脚本：{segment}")
-                has_expression = True
-            elif "l" in before_e and not before_e[before_e.index("l") + 1:]:
-                idx += 1  # -l 后跟独立的行宽参数
-            idx += 1
-            continue
-        positionals.append(token)
-        idx += 1
-    if not has_expression and positionals:
-        programs.append(positionals[0])
-    for program in programs:
-        if _sed_script_writes(program):
-            _fail("review_command_not_readonly",
-                  f"{name} 的 sed 脚本含写文件/执行外部程序命令 "
-                  f"（w/W/e）：{segment}")
-
-
-def _awk_strip_strings(program: str) -> str:
-    """把 awk 字符串字面量替换为空串（保留引号位置），用于命令/管道检测。"""
-    out: list[str] = []
-    idx, size = 0, len(program)
-    while idx < size:
-        if program[idx] == '"':
-            out.append('""')
-            idx += 1
-            while idx < size:
-                if program[idx] == "\\":
-                    idx += 2
-                    continue
-                if program[idx] == '"':
-                    idx += 1
-                    break
-                idx += 1
-            continue
-        out.append(program[idx])
-        idx += 1
-    return "".join(out)
-
-
-def _awk_in_string(program: str, pos: int) -> bool:
-    """pos 是否位于 awk 字符串字面量内部（用于排除字符串里的 print 字样）。"""
-    idx, in_string = 0, False
-    while idx < pos:
-        ch = program[idx]
-        if in_string:
-            if ch == "\\":
-                idx += 2
-                continue
-            if ch == '"':
-                in_string = False
-        elif ch == '"':
-            in_string = True
-        idx += 1
-    return in_string
-
-
-def _awk_print_redirects(program: str) -> bool:
-    """只检查 print/printf 语句顶层的输出重定向与管道。
-
-    比较运算（`NR > 1`）、逻辑或（`||`）与括号内的比较表达式不是写操作；
-    `print (a > b)` 里的 `>` 位于括号内，也不判写。
-    """
-    for match in _AWK_PRINT_RE.finditer(program):
-        if _awk_in_string(program, match.start()):
-            continue
-        idx = match.end()
-        depth = 0
-        while idx < len(program):
-            ch = program[idx]
-            if ch == '"':
-                idx += 1
-                while idx < len(program):
-                    if program[idx] == "\\":
-                        idx += 2
-                        continue
-                    if program[idx] == '"':
-                        idx += 1
-                        break
-                    idx += 1
-                continue
-            if ch in "([":
-                depth += 1
-            elif ch in ")]":
-                depth = max(0, depth - 1)
-            elif depth == 0 and ch in ";\n}":
-                break
-            elif depth == 0 and ch == ">":
-                # `>` 是输出重定向；`>=` 是比较运算符，不写文件。
-                if program.startswith("=", idx + 1):
-                    idx += 2
-                    continue
-                return True
-            elif depth == 0 and ch == "|":
-                # `||` 是逻辑或；`|` 后跟命令名或 `|&` 才是管道。
-                if program.startswith("|", idx + 1):
-                    idx += 2
-                    continue
-                return True
-            idx += 1
-    return False
-
-
-def _awk_program_writes(tokens: list[str], *, name: str, segment: str) -> None:
-    programs: list[str] = []
-    positionals: list[str] = []
-    idx = 0
-    while idx < len(tokens):
-        token = tokens[idx]
-        if token == "--":
-            positionals.extend(tokens[idx + 1:])
-            break
-        if token.startswith("--"):
-            option, has_value, _ = token[2:].partition("=")
-            if option not in _AWK_READONLY_LONG_OPTIONS:
-                _fail("review_command_not_readonly",
-                      f"{name} 的 awk 长选项 --{option} 不在只读白名单"
-                      f"（可能是写文件/加载脚本）：{segment}")
-            idx += 1 if has_value or option not in ("field-separator", "assign") else 2
-            continue
-        if token.startswith("-") and token != "-":
-            flag = token[1:2]
-            if flag in ("F", "v"):
-                idx += 1 if len(token) > 2 else 2
-                continue
-            if flag in ("b", "s", "M") and len(token) == 2:
-                idx += 1
-                continue
-            if flag == "W" and token[2:] in ("", "version"):
-                if token[2:] == "version":
-                    idx += 1
-                elif idx + 1 < len(tokens) and tokens[idx + 1] == "version":
-                    idx += 2
-                else:
-                    _fail("review_command_not_readonly",
-                          f"{name} 的 awk -W 只允许 version：{segment}")
-                continue
-            _fail("review_command_not_readonly",
-                  f"{name} 的 awk 短选项 -{flag} 不在只读白名单"
-                  f"（可能是写文件/加载脚本）：{segment}")
-        positionals.append(token)
-        idx += 1
-    if positionals:
-        programs.append(positionals[0])
-    for program in programs:
-        # 反斜杠续行会把 `system\` + 换行 + `(` 拆开，先归一化再匹配。
-        normalized = program.replace("\\\n", "")
-        stripped = _awk_strip_strings(normalized)
-        if _AWK_SYSTEM_RE.search(stripped):
-            _fail("review_command_not_readonly",
-                  f"{name} 的 awk 程序执行外部命令（system）：{segment}")
-        if _AWK_PIPE_GETLINE_RE.search(stripped):
-            _fail("review_command_not_readonly",
-                  f"{name} 的 awk 程序通过管道执行外部命令：{segment}")
-        if _awk_print_redirects(normalized):
-            _fail("review_command_not_readonly",
-                  f"{name} 的 awk print/printf 语句含输出重定向/管道：{segment}")
-
-
-def _subcommand_check(argv: list[str], allowed: frozenset[str], *,
-                      family: str, name: str, segment: str) -> None:
-    for token in argv[1:]:
-        if token.startswith("-"):
-            continue
-        if token not in allowed:
-            _fail("review_command_not_readonly",
-                  f"{name} 的 {family} 子命令 {token!r} 不是只读用法；"
-                  f"只允许 {', '.join(sorted(allowed))}：{segment}")
-        return
-    _fail("review_command_not_readonly",
-          f"{name} 的 {family} 缺少只读子命令：{segment}")
-
-
-def _family_readonly_checks(argv: list[str], family: str, *, name: str,
-                            segment: str) -> None:
-    """对白名单里“本身只读、但带写参数”的命令族做 argv 级检查。"""
-    tokens = argv[1:]
-    if family == "date":
-        idx = 0
-        while idx < len(tokens):
-            token = tokens[idx]
-            if token.startswith("--"):
-                option, has_value, _ = token[2:].partition("=")
-                if len(option) >= 1 and "set".startswith(option):
-                    _fail("review_command_not_readonly",
-                          f"{name} 的 date 在设置系统时间（-s/--set）：{segment}")
-                # 只有必需取值的选项才消费下一个 token；`--iso-8601[=FMT]` 的
-                # 参数必须紧贴（写成 `--iso-8601 FMT` 时 FMT 仍是位置参数）。
-                takes_value = len(option) >= 2 and sum(
-                    1 for candidate in ("date", "file", "reference", "rfc-3339")
-                    if candidate.startswith(option)) == 1
-                idx += 1 if has_value or not takes_value else 2
-                continue
-            if token.startswith("-") and token != "-":
-                flags = token[1:]
-                take_next = False
-                for pos, flag in enumerate(flags):
-                    if flag == "s":
-                        _fail("review_command_not_readonly",
-                              f"{name} 的 date 在设置系统时间（-s/--set）：{segment}")
-                    if flag == "I":
-                        # `-I[FMT]` 的可选参数只能紧贴（余下字符即格式）；
-                        # 绝不消费下一个 token。
-                        break
-                    if flag in "dfr":
-                        # 聚簇开关里只有 `-d/-f/-r` 取值；位于末尾时才吃下一个 token。
-                        take_next = pos == len(flags) - 1
-                        break
-                idx += 2 if take_next else 1
-                continue
-            if not token.startswith("+"):
-                # `date MMDDhhmm[[CC]YY]` 是设置日期/时间的写法；只放行输出格式。
-                _fail("review_command_not_readonly",
-                      f"{name} 的 date 位置参数会设置日期/时间：{segment}")
-            idx += 1
-    elif family == "tree":
-        for token in tokens:
-            if token in _TREE_WRITE_OPTIONS or token.startswith("--output="):
-                _fail("review_command_not_readonly",
-                      f"{name} 的 tree 写入输出文件（-o/--output）：{segment}")
-    elif family == "xxd":
-        positionals: list[str] = []
-        idx = 0
-        while idx < len(tokens):
-            token = tokens[idx]
-            if token == "--":
-                positionals.extend(tokens[idx + 1:])
-                break
-            if token.startswith("-") and token != "-":
-                idx += 2 if token in _XXD_VALUE_OPTIONS else 1
-                continue
-            positionals.append(token)
-            idx += 1
-        if len(positionals) > 1:
-            _fail("review_command_not_readonly",
-                  f"{name} 的 xxd 第二个位置参数是输出文件：{segment}")
-    elif family == "file":
-        for token in tokens:
-            if token.startswith("--"):
-                option = token[2:].split("=", 1)[0]
-                # `--co` 已是 --compile 的唯一缩写（--checking-printout 以 "ch"
-                # 开头，不构成竞争），两字母也必须拒绝。
-                if option.startswith("co"):
-                    _fail("review_command_not_readonly",
-                          f"{name} 的 file 编译 magic 文件会写入磁盘"
-                          f"（-C/--compile）：{segment}")
-            elif token.startswith("-") and token != "-" and "C" in token[1:]:
-                _fail("review_command_not_readonly",
-                      f"{name} 的 file 编译 magic 文件会写入磁盘"
-                      f"（-C/--compile）：{segment}")
-    elif family == "unzip":
-        # -P <password> / -I <charset> / -O <charset> 是取值选项：不同实现/版本下
-        # 可能吞掉后续 token，使按 token 前缀扫描看到的模式与实际执行不一致
-        # （只读检查不需要它们，统一拒绝，跨平台 fail-closed）。-x 的排除列表在
-        # 下个选项处结束，不吞选项，所以仍允许（`unzip -l a.zip -x 'META-INF/*'`）。
-        zipinfo_mode = any(
-            t.startswith("-") and not t.startswith("--") and "Z" in t[1:]
-            for t in tokens)
-        for token in tokens:
-            if token == "--":
-                break
-            if token.startswith("--"):
-                if token.split("=", 1)[0] == "--password":
-                    _fail("review_command_not_readonly",
-                          f"{name} 的 unzip 使用会吞掉后续参数的选项：{segment}")
-                continue
-            if token.startswith("-") and token != "-" and any(
-                    ch in token[1:] for ch in ("P", "I", "O")):
-                _fail("review_command_not_readonly",
-                      f"{name} 的 unzip 使用 -P/-I/-O 会吞掉后续参数，"
-                      f"模式校验不可靠：{segment}")
-        shorts = [t for t in tokens
-                  if t.startswith("-") and not t.startswith("--") and t != "-"]
-        if not any(t.startswith(_UNZIP_STDOUT_OPTIONS) for t in shorts):
-            _fail("review_command_not_readonly",
-                  f"{name} 的 unzip 不是只读模式"
-                  f"（需要 -l/-v/-t/-Z/-p/-c 之一）：{segment}")
-        for token in tokens:
-            if token == "-d" or token.startswith("--directory") or (
-                    token.startswith("-") and not token.startswith("--")
-                    and "d" in token[1:]):
-                _fail("review_command_not_readonly",
-                      f"{name} 的 unzip 指定解包目录（-d/--directory）：{segment}")
-            if token.startswith("-") and not token.startswith("--") and \
-                    "T" in token[1:] and not zipinfo_mode:
-                # zipinfo 模式（-Z）下 -T 只改变日期输出格式，不写归档。
-                _fail("review_command_not_readonly",
-                      f"{name} 的 unzip -T 会改写归档时间戳（写操作）：{segment}")
-    elif family == "aapt":
-        _subcommand_check(argv, _AAPT_READONLY_SUBCOMMANDS, family=family,
-                          name=name, segment=segment)
-    elif family == "aapt2":
-        _subcommand_check(argv, _AAPT2_READONLY_SUBCOMMANDS, family=family,
-                          name=name, segment=segment)
-    elif family == "apksigner":
-        _subcommand_check(argv, _APKSIGNER_READONLY_SUBCOMMANDS, family=family,
-                          name=name, segment=segment)
-    elif family == "sed":
-        _sed_program_writes(tokens, name=name, segment=segment)
-    elif family == "awk":
-        _awk_program_writes(tokens, name=name, segment=segment)
-
-
-def _argv_readonly_checks(segment: str, name: str) -> None:
-    """对 shell 展开后的 argv 做一次引号无关的写操作/外部程序检查。"""
-    try:
-        argv = shlex.split(segment, posix=True)
-    except ValueError as exc:
-        _fail("review_command_not_readonly",
-              f"{name} 的命令无法解析引号：{exc}（原命令：{segment}）")
-    if not argv:
-        _fail("review_command_not_readonly", f"{name} 是空命令。")
-    argv = _strip_git_dir(argv)
-    head = os.path.basename(argv[0])
-    family = f"git {argv[1]}" if head == "git" and len(argv) > 1 else head
-    value_tokens = _VALUE_TOKENS.get(family, frozenset())
-    after_dd = False
-    skip_next = False
-    for token in argv[1:]:
-        if skip_next:
-            skip_next = False
-            continue
-        # find 的 `--` 只是选项终止符，不是表达式终止符：GNU find/bfs 仍会把
-        # 其后的 `-delete`/`-exec`/`-fprint` 当谓词执行，因此 find 不跳过
-        # `--` 之后的 token。其他命令族的 `--` 之后是操作数，按只读放行。
-        if token == "--" and family != "find":
-            after_dd = True
-            continue
-        if after_dd:
-            continue
-        if token in value_tokens:
-            skip_next = True
-            continue
-        if _ARGV_DENY_RE.match(token):
-            _fail("review_command_not_readonly",
-                  f"{name} 含破坏性参数 {token!r}（原命令：{segment}）")
-        if token.startswith("--"):
-            opt = token.split("=", 1)[0]
-            if opt not in _ABBREV_ALLOW_EXACT.get(family, ()):
-                for bad in _ABBREV_FORBIDDEN.get(family, ()):
-                    if bad == opt or bad.startswith(opt):
-                        _fail("review_command_not_readonly",
-                              f"{name} 的 {family} 使用危险长选项缩写/全名 "
-                              f"{token!r}（原命令：{segment}）")
-    if family == "sort":
-        _short_option_write_checks(
-            argv, 1, name=name, segment=segment,
-            value_tokens=_VALUE_TOKENS["sort"],
-            value_chars=_SORT_SHORT_VALUE, write_chars=_SORT_SHORT_WRITE,
-            label="sort")
-    if family == "git grep":
-        _short_option_write_checks(
-            argv, 2, name=name, segment=segment,
-            value_tokens=_VALUE_TOKENS["git grep"],
-            value_chars=_GIT_GREP_SHORT_VALUE,
-            write_chars=frozenset("O"), label="git grep")
-    if family == "rg":
-        _short_option_write_checks(
-            argv, 1, name=name, segment=segment,
-            value_tokens=_VALUE_TOKENS["rg"],
-            value_chars=_RG_SHORT_VALUE, write_chars=frozenset("z"),
-            label="rg")
-    if family == "uniq":
-        # uniq 的第二个位置参数是输出文件；`-`、/dev/stdout 等标准输出仍算只读。
-        # 带参选项（-f/-s/-w 等）先跳过其值，避免把选项参数当成文件。
-        value_opts = {"-f", "-s", "-w", "--skip-fields", "--skip-chars",
-                      "--check-chars"}
-        stdout_targets = {"-", "/dev/stdout", "/dev/fd/1", "/proc/self/fd/1"}
-        positional: list[str] = []
-        after_dd = False
-        idx = 1
-        while idx < len(argv):
-            token = argv[idx]
-            if not after_dd and token == "--":
-                after_dd = True
-                idx += 1
-                continue
-            if not after_dd and token.startswith("-") and token != "-":
-                if token in value_opts and idx + 1 < len(argv):
-                    idx += 2
-                    continue
-                idx += 1
-                continue
-            positional.append(token)
-            idx += 1
-        if len(positional) > 1 and positional[1] not in stdout_targets:
-            _fail("review_command_not_readonly",
-                  f"{name} 的 uniq 带输出文件参数：{positional[1]!r}")
-    _family_readonly_checks(argv, family, name=name, segment=segment)
-
-
-def _validate_readonly_command(cmd: str, name: str) -> None:
-    for segment in _split_readonly_segments(cmd, name):
-        if not _is_readonly_prefix(segment, name):
-            _fail("review_command_not_readonly",
-                  f"{name} 的片段不在只读命令白名单：{segment}（原命令：{cmd}）")
-        _argv_readonly_checks(segment, name)
-
-
-# 复核里常见的批量检查写法：`for f in a b; do sha256sum "$f"; done`。它本身
-# 只是把同一只读命令作用到若干字面参数上，不引入外部输入，因此按字面量展开后
-# 逐条校验。通配符、命令替换、变量拼接仍然拒绝：展开后的实际参数必须可见。
-_LOOP_COMMAND_RE = re.compile(
-    r"^for[ \t]+([A-Za-z_][A-Za-z0-9_]*)[ \t]+in(?:[ \t]+([^;\n]*?))?[ \t]*;"
-    r"[ \t]*do[ \t]+(.+?)[ \t]*;[ \t]*done$", re.S)
-LOOP_MAX_EXPANSIONS = 64
-_LOOP_WORD_FORBIDDEN = "$`*?[]{};|><&'\"\\\n\r"
-
-
-def _loop_expansions(cmd: str, name: str) -> list[str] | None:
-    """把单层 `for VAR in <字面量...>; do <body>; done` 展开成具体命令。
-
-    返回 None 表示不是循环；返回命令行列表表示展开结果。任何不可见输入
-    （通配符、命令替换、变量拼接）都失败关闭，避免“校验看到的参数”与
-    “实际执行的参数”不一致。
-    """
-    match = _LOOP_COMMAND_RE.match(cmd)
-    if not match:
-        return None
-    var, words, body = match.group(1), match.group(2) or "", match.group(3)
-    try:
-        parts = shlex.split(words, posix=True)
-    except ValueError as exc:
-        _fail("review_command_not_readonly",
-              f"{name} 的 for 循环参数无法解析：{exc}（原命令：{cmd}）")
-    if not parts:
-        _fail("review_command_not_readonly",
-              f"{name} 的 for 循环没有字面量参数：{cmd}")
-    if len(parts) > LOOP_MAX_EXPANSIONS:
-        _fail("review_command_not_readonly",
-              f"{name} 的 for 循环参数超过 {LOOP_MAX_EXPANSIONS} 个，"
-              f"请改用单条命令：{cmd}")
-    expanded_patterns = (
-        re.compile(r"\$\{" + re.escape(var) + r"\}"),
-        re.compile(r"\$" + re.escape(var) + r"(?![A-Za-z0-9_])"),
-    )
-    out: list[str] = []
-    for word in parts:
-        bad = [ch for ch in word if ch in _LOOP_WORD_FORBIDDEN]
-        if bad:
-            _fail("review_command_not_readonly",
-                  f"{name} 的 for 循环参数含不可见展开 {bad[0]!r}：{cmd}")
-        text = body
-        for pattern in expanded_patterns:
-            text = pattern.sub(lambda _m, value=word: value, text)
-        out.append(text)
-    return out
-
-
 def _validate_commands(raw: object) -> list[str]:
-    items = _list(raw or [], "commands_run")
-    out: list[str] = []
-    for idx, value in enumerate(items, 1):
-        name = f"commands_run[{idx}]"
-        if not isinstance(value, str):
-            _fail("schema_invalid", f"{name} 必须是字符串。")
-        # 只裁 Shell 空白：Unicode 空白（如 U+00A0）是 argv 的一部分，通用
-        # `.strip()` 会删除实际参数字符，使校验 argv 与 Bash argv 不一致。
-        cmd = value.strip(_SHELL_SPACE + "\r\n")
-        if not cmd:
-            _fail("schema_invalid", f"{name} 不能为空。")
-        expansions = _loop_expansions(cmd, name)
-        if expansions is None:
-            _validate_readonly_command(cmd, name)
-        else:
-            for expanded in expansions:
-                _validate_readonly_command(expanded, name)
-        # 保留原始命令文本：review 信封的 result_sha256 绑定的是 Reviewer 原始输出。
-        out.append(cmd)
-    return out
-
-
-def validate_review_commands(raw: object) -> list[str]:
-    """公开只读校验入口：供 native_agent 复核宿主记录的实际 Bash 命令。"""
-    return _validate_commands(raw)
-
-
-_FINDING_ID_RE = re.compile(r"^F[1-9][0-9]{0,3}$")
+    """新只读 Reviewer 没有 Bash：任何自述命令都不能作为 G4 证据。"""
+    commands = _list(raw or [], "review.commands_run")
+    if commands:
+        _fail("review_command_unexpected",
+              "Reviewer 没有 Bash 权限；commands_run 必须为空。")
+    return []
 
 
 def _optional_text(obj: dict, key: str, name: str) -> str:
@@ -1804,6 +686,33 @@ def validate_execution_result(envelope: object, dispatch: dict | None, state: di
     timing = _validate_timing(env.get("timing"))
     usage = _validate_usage(env.get("usage"))
     evidence = _validate_evidence(env.get("evidence"), state, check_files=check_files)
+    test_commands = [str(item).strip() for item in
+                     _list(env.get("test_commands") or [],
+                           "execution.test_commands")
+                     if str(item).strip()]
+    test_artifacts = [str(item).strip() for item in
+                      _list(env.get("test_artifacts") or [],
+                            "execution.test_artifacts")
+                      if str(item).strip()]
+    known_evidence = {item["id"] for item in evidence}
+    for eid in test_artifacts:
+        if eid not in known_evidence:
+            _fail("test_artifact_unknown",
+                  f"test_artifacts 引用了不存在的证据 {eid}。")
+    executor_metadata_path = str(
+        env.get("executor_metadata_path") or "").strip()
+    if executor_metadata_path:
+        if not os.path.isabs(executor_metadata_path) or not os.path.isfile(
+                executor_metadata_path):
+            _fail("executor_metadata_invalid",
+                  "execution.executor_metadata_path 必须是存在的绝对路径。")
+    binding = _validate_execution_binding(
+        env.get("execution_binding"), state, work_item_id=wid,
+        task_id=task_id, test_commands=test_commands)
+    code_scope = str(env.get("code_scope_sha256") or "").strip().lower()
+    if code_scope and not _SHA256_RE.match(code_scope):
+        _fail("code_scope_invalid",
+              "execution.code_scope_sha256 必须是 64 位十六进制。")
     declared_sha = _sha(env.get("result_sha256"), "execution.result_sha256")
     actual_sha = envelope_sha256(env)
     if declared_sha != actual_sha:
@@ -1824,10 +733,122 @@ def validate_execution_result(envelope: object, dispatch: dict | None, state: di
         "result": result,
         "evidence": evidence,
         "executor": executor,
+        "executor_metadata_path": executor_metadata_path,
         "timing": timing,
         "usage": usage,
+        "test_commands": test_commands,
+        "test_artifacts": sorted(set(test_artifacts)),
+        "execution_binding": binding,
+        "code_scope_sha256": code_scope,
         "result_sha256": declared_sha,
     }
+
+
+def _validate_execution_binding(raw: object, state: dict, *, work_item_id: str,
+                                task_id: str,
+                                test_commands: list[str]) -> dict:
+    """校验 execution 信封自带的 binding 引用与状态中的绑定一致。
+
+    绑定可以缺席（旧信封兼容），但一旦声明就必须属于本任务/工作项、未被消费，
+    且 envelope 的测试命令与绑定的预期命令完全一致。身份时间窗口由
+    test_execution 用 metadata.prompt 与 session 时间核验。
+    """
+    if raw in (None, {}):
+        return {}
+    obj = _obj(raw, "execution.execution_binding")
+    binding_id = _text(obj.get("binding_id"),
+                       "execution.execution_binding.binding_id")
+    nonce = _text(obj.get("nonce"), "execution.execution_binding.nonce")
+    if not re.fullmatch(r"EB[0-9a-f]{24}", binding_id):
+        _fail("execution_binding_invalid", f"binding_id 格式非法：{binding_id}")
+    if not re.fullmatch(r"[0-9a-f]{32}", nonce):
+        _fail("execution_binding_invalid", f"binding nonce 格式非法：{nonce}")
+    stored = next((item for item in state.get("execution_bindings") or []
+                   if isinstance(item, dict)
+                   and str(item.get("binding_id") or "") == binding_id), None)
+    if stored is None:
+        _fail("execution_binding_missing",
+              f"状态中没有 execution binding {binding_id}。")
+    if str(stored.get("nonce") or "") != nonce:
+        _fail("execution_binding_nonce_mismatch",
+              "execution binding nonce 与状态记录不一致。")
+    if stored.get("consumed"):
+        _fail("execution_binding_consumed",
+              "execution binding 已被其他执行结果消费；不能复用旧 binding。")
+    if str(stored.get("task_id") or "") != task_id:
+        _fail("execution_binding_cross_task", "execution binding 属于其他任务。")
+    contract = str(state.get("contract_sha256") or "")
+    if str(stored.get("contract_sha256") or "") != contract:
+        _fail("execution_binding_contract_changed",
+              "任务合同在 binding 创建后已变化；请重新创建 execution binding。")
+    dispatch = state.get("native_dispatch") or {}
+    dispatch_id = ""
+    for action in dispatch.get("actions") or []:
+        if isinstance(action, dict) and str(
+                action.get("work_item_id") or "") == work_item_id:
+            dispatch_id = str(action.get("dispatch_id") or "")
+            break
+    if dispatch_id and str(stored.get("dispatch_id") or "") != dispatch_id:
+        _fail("execution_binding_dispatch_mismatch",
+              "execution binding 的 dispatch 与当前派发不一致。")
+    if str(stored.get("work_item_id") or "") != work_item_id:
+        _fail("execution_binding_work_item_mismatch",
+              "execution binding 的工作项与执行结果不一致。")
+    expected = [str(item) for item in stored.get("test_commands") or []]
+    if expected and expected != test_commands:
+        _fail("execution_binding_command_mismatch",
+              "执行测试命令与 binding 的预期命令不一致；不能事后更换测试命令。")
+    workspace = _text(obj.get("workspace"),
+                      "execution.execution_binding.workspace")
+    if not os.path.isabs(workspace):
+        _fail("execution_binding_invalid",
+              f"binding workspace 必须是绝对路径：{workspace}")
+    if os.path.realpath(workspace) != str(stored.get("workspace") or ""):
+        _fail("execution_binding_workspace_mismatch",
+              "execution binding 的工作区与执行信封不一致。")
+    policy = (state.get("contract") or {}).get("test_policy") or {}
+    if policy.get("captured"):
+        # 合同要求的验证层只能加严：stored binding 若被改写为更低要求，拒绝回填。
+        if bool(policy.get("require_test_result")) and not bool(
+                stored.get("require_test_result")):
+            _fail("execution_binding_policy_weakened",
+                  "合同要求结构化测试结果，但 binding 关闭了该层。")
+        if bool(policy.get("require_artifact_integrity")) and not bool(
+                stored.get("require_artifact_integrity")):
+            _fail("execution_binding_policy_weakened",
+                  "合同要求产物完整性，但 binding 关闭了该层。")
+        contract_commands = [str(item) for item in policy.get("commands") or []]
+        if contract_commands and expected != contract_commands:
+            _fail("execution_binding_command_mismatch",
+                  "binding 的测试命令与合同登记不一致。")
+        # 报告/产物/策略快照也必须与当前合同一致：只保留 require 布尔而清空
+        # contract_report/contract_artifacts 会让 TE 跳过合同要求的产物。
+        contract_policy = {key: policy.get(key) for key in
+                           ("required", "commands", "report", "artifacts",
+                            "require_test_result",
+                            "require_artifact_integrity")}
+        stored_policy = stored.get("contract_test_policy") or {}
+        if (stored.get("requirement_source") != "contract"
+                or canonical_json(stored_policy) != canonical_json(
+                    contract_policy)
+                or str(stored.get("contract_report") or "")
+                != str(policy.get("report") or "")
+                or sorted(str(item) for item in
+                          stored.get("contract_artifacts") or [])
+                != sorted(str(item) for item in policy.get("artifacts") or [])):
+            _fail("execution_binding_policy_weakened",
+                  "binding 的合同测试策略/报告/产物与当前合同不一致。")
+    return {"binding_id": binding_id, "nonce": nonce,
+            "created_at": str(stored.get("created_at") or ""),
+            "workspace": str(stored.get("workspace") or ""),
+            "test_commands": expected,
+            "require_test_result": bool(stored.get("require_test_result")),
+            "require_artifact_integrity": bool(
+                stored.get("require_artifact_integrity")),
+            "requirement_source": str(stored.get("requirement_source") or ""),
+            "contract_test_policy": stored.get("contract_test_policy") or {},
+            "contract_report": str(stored.get("contract_report") or ""),
+            "contract_artifacts": list(stored.get("contract_artifacts") or [])}
 
 
 def _validate_host_record(raw: object, *, required: bool) -> dict:
@@ -1840,16 +861,34 @@ def _validate_host_record(raw: object, *, required: bool) -> dict:
     obj = _obj(raw, "host")
     out: dict = {}
     for key in ("metadata_path", "output_file", "rollout_path"):
-        path = _text(obj.get(key), f"host.{key}")
+        value = str(obj.get(key) or "").strip()
+        if not value:
+            if key == "metadata_path" and required:
+                _fail("g4_host_record_invalid",
+                      "host.metadata_path 缺失：G4 复核必须能重新核对宿主记录。")
+            out[key] = ""
+            continue
+        path = os.path.abspath(os.path.expanduser(value))
         if not os.path.isabs(path):
             _fail("g4_host_record_invalid", f"host.{key} 必须是绝对路径：{path}")
-        if not os.path.isfile(path):
+        if required and key == "metadata_path" and not os.path.isfile(path):
             _fail("g4_host_record_invalid", f"host.{key} 不存在：{path}")
         out[key] = path
+    # rollout/outputFile 被宿主清理时，G4 不合格的信封可标注持久化来源
+    # （db.message.part / session_entry）；这些字段只是溯源标记，不改变资格。
+    for key in ("tool_call_source", "model_source", "output_source"):
+        out[key] = str(obj.get(key) or "").strip()[:80]
+    out["output_sha256"] = str(obj.get("output_sha256") or "").strip().lower()
+    if out["output_sha256"] and not re.fullmatch(r"[0-9a-f]{64}",
+                                                 out["output_sha256"]):
+        _fail("g4_host_record_invalid", "host.output_sha256 格式非法")
+    host_db = str(obj.get("host_db") or "").strip()
+    if host_db:
+        host_db = os.path.abspath(os.path.expanduser(host_db))
+        if not os.path.isabs(host_db):
+            _fail("g4_host_record_invalid", f"host.host_db 必须是绝对路径：{host_db}")
+    out["host_db"] = host_db
     calls = _list(obj.get("tool_calls"), "host.tool_calls")
-    if required and not calls:
-        _fail("g4_tool_calls_missing",
-              "G4 复核必须提供 Reviewer 实际工具调用记录；不能只有自述。")
     normalized = []
     for idx, call in enumerate(calls, 1):
         item = _obj(call, f"host.tool_calls[{idx}]")
@@ -2193,6 +1232,9 @@ def validate_review_result(envelope: object, dispatch: dict | None, execution: d
         # 执行证据与 live 证据的漂移：非阻断，但收口与复核需要看见。
         "execution_evidence_unbound": execution_evidence_drift(execution, state),
         "g4_eligible": g4_eligible,
+        "g4_reasons": [str(item).strip() for item in
+                       _list(env.get("g4_reasons") or [], "review.g4_reasons")
+                       if str(item).strip()],
         "result_sha256": declared_sha,
     }
     declared = [str(item).strip()

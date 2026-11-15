@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
-"""v6 原生复核生成与驱动保护：G4 资格必须由宿主记录计算，驱动上限不是任务终点。"""
+"""v6 原生复核生成与驱动保护。
+
+阶段九起 Reviewer 只允许 Read/Grep/Glob，复核身份、工具调用与最终输出只从宿主
+持久化 DB 取证；`build_review` 生成的 `g4_eligible` 只是结构预检，正式 G4 由
+`g4_attest` 新链决定。驱动上限仍不是任务终点。
+"""
 from __future__ import annotations
 
 import json
 import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -12,6 +18,8 @@ from types import SimpleNamespace
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(os.path.dirname(HERE), "scripts"))
+
+import sqlite3  # noqa: E402
 
 import copilot_auto as auto  # noqa: E402
 import governance as G  # noqa: E402
@@ -37,7 +45,7 @@ def write_json(path: str, payload) -> str:
 
 
 class BuildReviewTests(unittest.TestCase):
-    """`native_agent.py review` 的 G4 资格必须来自 metadata/rollout，而不是自报。"""
+    """`native_agent.py review` 只从 metadata/宿主 DB 取证，不信任自报字段。"""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -46,8 +54,8 @@ class BuildReviewTests(unittest.TestCase):
         F.init_git_workspace(self.dir)
         self.state_path = os.path.join(self.dir, "state.json")
         G.start_state(self.state_path, goal="目标", contract=CONTRACT,
-                      execution_backend="native", risk="high")
-        self.plan_path = write_json(os.path.join(self.dir, "plan.json"), PLAN)
+                      execution_backend="native", risk="high",
+                      test_policy={"required": False})
         G.plan_state(self.state_path, PLAN)
         state = G.load_state(self.state_path)
         self.dispatch = NB.build_dispatch(state, G.ready_actions(state))
@@ -91,67 +99,159 @@ class BuildReviewTests(unittest.TestCase):
             self.state_path, work_item_id="A1",
             execution_result_sha256=self.execution["result_sha256"],
             workspace=self.dir)
+        # Reviewer 宿主产物放在工作区外，避免把取证文件算进执行代码快照。
+        self.host_dir = tempfile.mkdtemp(prefix="review-host-")
+        self.addCleanup(shutil.rmtree, self.host_dir, True)
         self.host = F.make_fake_review_host(
-            self.dir, execution=self.execution, dispatch=self.dispatch,
+            self.host_dir, execution=self.execution, dispatch=self.dispatch,
             evidence=self.evidence, task_id=self.state["task_id"],
             attempt_id=self.attempt["review_attempt_id"],
-            session_created_at=self.attempt["created_at"])
+            session_created_at=self.attempt["created_at"],
+            workspace=self.dir)
+        self.db = self._db()
+
+    def _db(self, *, calls=None, with_output: bool = True,
+            tools_ok: bool = True) -> str:
+        self.db_seq = getattr(self, "db_seq", 0) + 1
+        db = os.path.join(self.host_dir, f"host-{self.db_seq}.sqlite")
+        output = ""
+        if with_output:
+            with open(self.host["output_file"], encoding="utf-8") as fh:
+                output = fh.read()
+        con = sqlite3.connect(db)
+        con.execute("create table session (id text, parent_id text,"
+                    " task_type text, trace_id text)")
+        con.execute("create table session_entry (session_id text, type text,"
+                    " data text, time_created integer)")
+        con.execute("create table tool_usage (tool_call_id text, session_id text,"
+                    " tool_name text, status text, started_at integer)")
+        con.execute("create table part (id text, message_id text,"
+                    " session_id text, data text, sequence integer)")
+        con.execute("create table message (id text, session_id text,"
+                    " sequence integer, time_created integer, data text)")
+        child = self.host["child_session_id"]
+        con.execute("insert into session values (?,?,?,?)",
+                    (child, "sess-parent", "subagent_child", "trace-x"))
+        con.execute("insert into session_entry values (?,?,?,?)",
+                    (child, "runtime/model_selection", json.dumps({
+                        "modelSelection": {"providerId": "fake",
+                                           "modelId": "reviewer-model"}}), 1))
+        if calls is None:
+            calls = [("c1", "Read", {"file_path": self.evidence}),
+                     ("c2", "Grep", {"pattern": "done", "path": self.evidence})]
+        for idx, (cid, name, payload) in enumerate(calls):
+            con.execute("insert into tool_usage values (?,?,?,?,?)",
+                        (cid, child, name, "completed", idx))
+            con.execute("insert into part values (?,?,?,?,?)",
+                        (f"p{idx}", f"m{idx}", child, json.dumps({
+                            "type": "tool", "tool": name, "callID": cid,
+                            "state": {"status": "completed",
+                                      "input": payload}}, ensure_ascii=False),
+                         idx))
+        con.execute("insert into message values (?,?,?,?,?)",
+                    ("m-final", child, 9, 999, json.dumps({
+                        "role": "assistant", "finish": "stop"}, ensure_ascii=False)))
+        if with_output:
+            con.execute("insert into part values (?,?,?,?,?)",
+                        ("p-final", "m-final", child, json.dumps({
+                            "type": "text", "text": output}, ensure_ascii=False), 10))
+        con.commit()
+        con.close()
+        return db
 
     def _args(self, **overrides) -> SimpleNamespace:
         args = SimpleNamespace(
             state=self.state_path, dispatch=self.dispatch_path,
             execution=self.execution_path, work_item="A1",
             metadata=self.host["metadata_path"],
-            model_rollout=self.host["rollout_path"],
             input=self.host["output_file"], output="",
-            attempt=self.attempt["review_attempt_id"])
+            attempt=self.attempt["review_attempt_id"], db=self.db)
         for key, value in overrides.items():
             setattr(args, key, value)
         return args
 
-    def test_g4_eligible_is_computed_from_host_record(self):
+    def test_build_review_uses_db_records_for_identity(self):
         env = NA.build_review(self._args())
-        self.assertTrue(env["g4_eligible"], env["g4_reasons"])
+        # 阶段九：g4_eligible 只是结构预检；正式资格由 g4_attest 决定。
+        self.assertTrue(env["g4_eligible"])
         self.assertEqual(env["schema"], NB.REVIEW_SCHEMA)
-        self.assertEqual(env["reviewer"]["agent_id"],
-                         self.host["agent_id"])
+        self.assertEqual(env["reviewer"]["agent_id"], self.host["agent_id"])
+        self.assertEqual(env["reviewer"]["model_reported"],
+                         "fake/reviewer-model")
+        self.assertEqual(env["host"]["tool_call_source"],
+                         "db.tool_usage+part")
+        self.assertEqual(env["host"]["rollout_path"], "")
+        self.assertEqual(env["commands_run"], [])
         self.assertEqual(
             sorted(env["host"]["tool_calls"], key=lambda c: c["name"]),
-            sorted(self.host["tool_calls"], key=lambda c: c["name"]))
-        # 宿主记录参与了计算：换掉工具调用计数就不再具备 G4 资格。
-        metadata = json.loads(open(self.host["metadata_path"], encoding="utf-8").read())
-        metadata["profileSnapshot"]["disallowedTools"] = []
-        write_json(self.host["metadata_path"], metadata)
+            [{"name": "Grep", "count": 1}, {"name": "Read", "count": 1}])
+
+    def test_non_pass_review_is_generated_but_not_g4(self):
+        # 高风险 Reviewer 可以如实报告 partial/blocking；官方生成路径不能因此
+        # 拒绝整轮复核，但信封不得自称 G4。
+        with open(self.host["output_file"], "w", encoding="utf-8") as fh:
+            json.dump({"schema": NB.REVIEW_SCHEMA,
+                       "task_id": self.state["task_id"],
+                       "plan_id": self.dispatch["plan_id"],
+                       "dispatch_id": self.execution["dispatch_id"],
+                       "work_item_id": "A1",
+                       "execution_result_sha256":
+                           self.execution["result_sha256"],
+                       "verdict": "partial", "findings": [
+                           {"id": "F1", "severity": "major",
+                            "summary": "需要修复", "file": self.evidence,
+                            "evidence": "实际读取"}],
+                       "files_inspected": [self.evidence],
+                       "commands_run": [], "changed_files": [],
+                       "unverified": [], "residual_risks": []},
+                      fh, ensure_ascii=False)
+        con = sqlite3.connect(self.db)
+        con.execute("update part set data=? where id='p-final'", (json.dumps({
+            "type": "text", "text": open(self.host["output_file"],
+                                          encoding="utf-8").read()},
+            ensure_ascii=False),))
+        con.commit(); con.close()
         env = NA.build_review(self._args())
         self.assertFalse(env["g4_eligible"])
-        self.assertTrue(any(reason.startswith("profile_disallowed_missing")
-                            for reason in env["g4_reasons"]), env["g4_reasons"])
+        self.assertEqual(env["verdict"], "partial")
+        self.assertEqual(env["findings"][0]["severity"], "major")
 
-    def test_non_pass_review_is_not_g4_eligible(self):
-        output = json.loads(open(self.host["output_file"], encoding="utf-8").read())
-        output["verdict"] = "partial"
-        write_json(self.host["output_file"], output)
-        env = NA.build_review(self._args())
-        self.assertFalse(env["g4_eligible"])
-        self.assertIn("review_verdict_not_pass", env["g4_reasons"])
+    def test_non_readonly_tool_is_rejected(self):
+        db = self._db(calls=[("c1", "Read", {"file_path": self.evidence}),
+                             ("c2", "Bash", {"command": "git status"})])
+        with self.assertRaises(NA.AgentRecordError) as ctx:
+            NA.build_review(self._args(db=db))
+        self.assertIn("review_tool_not_allowed", str(ctx.exception))
 
-    def test_host_output_change_after_envelope_is_detected(self):
-        env = NA.build_review(self._args())
-        self.assertTrue(env["g4_eligible"], env["g4_reasons"])
-        output = json.loads(open(self.host["output_file"], encoding="utf-8").read())
-        output["verdict"] = "partial"
-        write_json(self.host["output_file"], output)
-        problems = NA.verify_review_host_record(env)
-        self.assertIn("host_verdict_changed", problems)
+    def test_output_file_symlink_outside_agent_dir_is_rejected(self):
+        outside = tempfile.mkdtemp(prefix="outside-output-")
+        self.addCleanup(shutil.rmtree, outside, True)
+        target = os.path.join(outside, "output.json")
+        with open(self.host["output_file"], encoding="utf-8") as src:
+            text = src.read()
+        with open(target, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        os.remove(self.host["output_file"])
+        os.symlink(target, self.host["output_file"])
+        with self.assertRaises(NA.AgentRecordError) as ctx:
+            NA.build_review(self._args())
+        self.assertIn("review_output_misplaced", str(ctx.exception))
 
-    def test_host_unverified_truncation_is_detected(self):
-        env = NA.build_review(self._args())
-        self.assertTrue(env["g4_eligible"], env["g4_reasons"])
-        output = json.loads(open(self.host["output_file"], encoding="utf-8").read())
-        output["unverified"] = ["未验证项 A", "未验证项 B"]
-        write_json(self.host["output_file"], output)
-        problems = NA.verify_review_host_record(env)
-        self.assertIn("host_unverified_changed", problems)
+    def test_db_query_failure_raises_record_error_not_nameerror(self):
+        con = sqlite3.connect(self.db)
+        con.execute("drop table tool_usage")
+        con.commit()
+        con.close()
+        with self.assertRaises(NA.AgentRecordError) as ctx:
+            NA.build_review(self._args())
+        self.assertIn("review_host_db_unavailable", str(ctx.exception))
+
+    def test_output_missing_everywhere_fails_closed(self):
+        os.remove(self.host["output_file"])
+        db = self._db(with_output=False)
+        with self.assertRaises(NA.AgentRecordError) as ctx:
+            NA.build_review(self._args(db=db))
+        self.assertIn("review_output_missing", str(ctx.exception))
 
 
 class DriveGuardTests(unittest.TestCase):
@@ -181,7 +281,8 @@ class RepeatedGapTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "state.json")
             G.start_state(path, goal="目标", contract=CONTRACT,
-                          execution_backend="native", risk="high")
+                          execution_backend="native", risk="high",
+                          test_policy={"required": False})
             G.plan_state(path, PLAN)
             state = G.load_state(path)
             # 模拟连续三轮 G4 工作项被反复派生/标记完成但门禁仍缺。

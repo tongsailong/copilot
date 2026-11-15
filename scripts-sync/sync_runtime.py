@@ -4,10 +4,9 @@
 唯一源码：本仓库（`Project/copilot`）。运行时副本是构建产物：
 
     ~/.zcode/skills/copilot        ← SKILL.md、scripts/、references/
-    ~/.zcode/agents/reviewer.md    ← agents/reviewer.md
 
-两者必须来自同一次源码状态，不能出现 Skill 已更新而 Reviewer 仍是旧版本的情况，
-因此每次运行都会同时检查/同步这两个目标，不提供只同步其中一个的开关。
+阶段九起旧 Reviewer 全局 Profile 已退役；Reviewer 使用工作区级只读 Profile
+（`.zcode/agents/reviewer.md`），不属于本工具的分发范围。
 
 用法：
 
@@ -18,10 +17,9 @@
 
 退出码：0 = 一致或写入成功；1 = 存在漂移或写入失败；2 = 参数、路径或安全校验错误。
 
-默认不删除运行时多出的文件；`--prune` 必须与 `--apply` 一起显式使用，且只作用于
-Skill 目标。Reviewer 目标是单个文件，不存在“多出文件”的概念。
+默认不删除运行时多出的文件；`--prune` 必须与 `--apply` 一起显式使用。
 
-分发范围：只允许 SKILL.md、scripts/、references/ 以及 agents/reviewer.md。
+分发范围：只允许 SKILL.md、scripts/、references/。
 tests/、docs/、manifests/、scripts-sync/、README.md、AGENTS.md 属于源码仓库的
 开发与项目管理内容，不进入运行时。`.env*`、凭据、`.audit/` 审计日志、`__pycache__`、
 临时状态和符号链接一律不同步——`.audit/` 即使出现在运行时目标里也会被忽略且不会被
@@ -42,11 +40,9 @@ import tempfile
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 DEFAULT_SKILL_DEST = "~/.zcode/skills/copilot"
-DEFAULT_REVIEWER_DEST = "~/.zcode/agents/reviewer.md"
 
 # 参与分发的 Skill 顶层条目；其余源码目录/文件不进入运行时。
 DISTRIBUTED_TOP = ("SKILL.md", "scripts", "references")
-REVIEWER_SOURCE = "agents/reviewer.md"
 BASELINE_PATH = "manifests/source-baseline.sha256"
 
 # 运行时目标里允许存在但不受管理的目录：不参与比较，也不会被 --prune 删除。
@@ -243,35 +239,6 @@ def apply_tree(source_root: str, target_root: str, prune: bool = False) -> dict[
             "extra": len(extra) - pruned}
 
 
-def reviewer_state(source_file: str, target_file: str) -> tuple[str, str]:
-    """返回 (状态, 源码/目标说明)：same / missing / different / target_not_file。"""
-    _ensure_regular(source_file, "Reviewer 源码")
-    if os.path.islink(target_file):
-        raise SyncError(f"Reviewer 运行时目标是符号链接，拒绝同步：{target_file}")
-    if not os.path.exists(target_file):
-        return "missing", ""
-    if not os.path.isfile(target_file):
-        return "target_not_file", ""
-    if sha256(source_file) == sha256(target_file):
-        return "same", ""
-    return "different", ""
-
-
-def apply_reviewer(source_file: str, target_file: str) -> bool:
-    source_file = os.path.abspath(source_file)
-    target_file = os.path.abspath(target_file)
-    _assert_disjoint(os.path.dirname(source_file), target_file)
-    state, _ = reviewer_state(source_file, target_file)
-    if state == "target_not_file":
-        raise SyncError(f"Reviewer 运行时目标不是普通文件：{target_file}")
-    if state == "same":
-        return False
-    copy_atomic(source_file, target_file)
-    if sha256(source_file) != sha256(target_file):
-        raise SyncError(f"Reviewer 同步后哈希不一致：{target_file}")
-    return True
-
-
 def _looks_like_copilot_skill(target: str) -> bool:
     skill_md = os.path.join(target, "SKILL.md")
     if not os.path.isfile(skill_md):
@@ -285,9 +252,6 @@ def _looks_like_copilot_skill(target: str) -> bool:
 
 def write_baseline(repo_root: str) -> tuple[str, int]:
     src = source_manifest(repo_root)
-    reviewer = os.path.join(repo_root, REVIEWER_SOURCE)
-    _ensure_regular(reviewer, "Reviewer 源码")
-    src[REVIEWER_SOURCE] = sha256(reviewer)
     out = os.path.join(repo_root, BASELINE_PATH)
     os.makedirs(os.path.dirname(out), exist_ok=True)
     lines = [f"{digest}  {rel}\n" for rel, digest in sorted(src.items())]
@@ -316,8 +280,6 @@ def main(argv=None) -> int:
                     help="配合 --apply：删除 Skill 运行时里源码不存在的文件（默认关闭）")
     ap.add_argument("--skill-dest", default=DEFAULT_SKILL_DEST,
                     help=f"Skill 运行时目录（默认 {DEFAULT_SKILL_DEST}）")
-    ap.add_argument("--reviewer-dest", default=DEFAULT_REVIEWER_DEST,
-                    help=f"Reviewer 运行时文件（默认 {DEFAULT_REVIEWER_DEST}）")
     ap.add_argument("--force", action="store_true",
                     help="目标还不是 Copilot skill 时仍允许写入（仅首次安装/测试用）")
     args = ap.parse_args(argv)
@@ -336,14 +298,10 @@ def main(argv=None) -> int:
         return 0
 
     skill_dest = os.path.abspath(os.path.expanduser(args.skill_dest))
-    reviewer_dest = os.path.abspath(os.path.expanduser(args.reviewer_dest))
-    reviewer_source = os.path.join(REPO_ROOT, REVIEWER_SOURCE)
 
     try:
         _assert_disjoint(REPO_ROOT, skill_dest)
-        _assert_disjoint(REPO_ROOT, reviewer_dest)
         src = source_manifest(REPO_ROOT)
-        review_state, _ = reviewer_state(reviewer_source, reviewer_dest)
         if os.path.isdir(skill_dest):
             dst = target_manifest(skill_dest)
         else:
@@ -355,9 +313,8 @@ def main(argv=None) -> int:
     missing, different, extra = compare_maps(src, dst)
     print(f"源码：{REPO_ROOT}（分发 {len(src)} 个文件）")
     print(f"Skill：{skill_dest}")
-    print(f"Reviewer：{reviewer_source} → {reviewer_dest}")
     print(f"缺失：{len(missing)} · 不同：{len(different)} · "
-          f"运行时不参与分发/多出：{len(extra)} · Reviewer：{review_state}")
+          f"运行时不参与分发/多出：{len(extra)}")
     for rel in missing:
         print(f"  + {rel}")
     for rel in different:
@@ -366,8 +323,7 @@ def main(argv=None) -> int:
         print(f"  - {rel}（未受管理，默认保留）")
 
     if not args.apply:
-        if missing or different or review_state in ("missing", "different",
-                                                    "target_not_file"):
+        if missing or different:
             print("\n结论：存在漂移。确认后用 --apply 单向写入。")
             return 1
         print("\n结论：受管理文件一致（缺失 0，不同 0）。")
@@ -380,31 +336,28 @@ def main(argv=None) -> int:
 
     try:
         result = apply_tree(REPO_ROOT, skill_dest, prune=args.prune)
-        review_written = apply_reviewer(reviewer_source, reviewer_dest)
     except (SyncError, OSError) as exc:
         print(f"错误：{exc}", file=sys.stderr)
         return 2
 
     print(f"\n已写入 Skill：{result['written']} 个文件"
           + (f"，清理 {result['pruned']} 个" if args.prune else "；未清理运行时多出文件"))
-    print(f"Reviewer：{'已写入' if review_written else '无需更新'}")
     if result["extra"] and not args.prune:
         print(f"运行时仍有 {result['extra']} 个未受管理文件（默认保留）。")
 
-    # 写后复查：两个目标都必须一致。
+    # 写后复查：受管理文件必须一致。
     try:
         src2 = source_manifest(REPO_ROOT)
         dst2 = target_manifest(skill_dest)
         m2, d2, _ = compare_maps(src2, dst2)
-        review_state2, _ = reviewer_state(reviewer_source, reviewer_dest)
     except (SyncError, OSError) as exc:
         print(f"错误：同步后复查失败：{exc}", file=sys.stderr)
         return 1
-    if m2 or d2 or review_state2 != "same":
-        print(f"错误：同步后复查不一致（Skill 缺失 {len(m2)}，不同 {len(d2)}，"
-              f"Reviewer {review_state2}）。", file=sys.stderr)
+    if m2 or d2:
+        print(f"错误：同步后复查不一致（Skill 缺失 {len(m2)}，不同 {len(d2)}）。",
+              file=sys.stderr)
         return 1
-    print("同步后复查：Skill 缺失 0、不同 0；Reviewer 一致。")
+    print("同步后复查：Skill 缺失 0、不同 0。")
     return 0
 
 

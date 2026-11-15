@@ -6,14 +6,17 @@
 """
 from __future__ import annotations
 
-import hashlib
 import json
 import os
+import re
 import subprocess
+
+from lib_common import sha256_file, sha256_text
 
 _EXCLUDE_PREFIXES = (".git/", ".copilot-tasks/", ".audit/")
 _EXCLUDE_PARTS = {
     "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache",
+    "review-outputs",
     "node_modules", ".venv", "venv",
 }
 _EXCLUDE_NAMES = {".state.json.lock"}
@@ -24,20 +27,33 @@ def _name_allowed(rel: str) -> bool:
 
 
 def _sha256_text(text: str) -> str:
-    return hashlib.sha256((text or "").encode("utf-8")).hexdigest()
+    return sha256_text(text)
 
 
 def _sha256_file(path: str) -> str:
-    digest = hashlib.sha256()
-    with open(path, "rb") as fh:
-        for chunk in iter(lambda: fh.read(1 << 20), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+    return sha256_file(path)
 
 
-def _canonical_json(value: object) -> str:
+def snapshot_digest(snapshot: dict) -> str:
+    """权威快照摘要；capture 与取证器必须共用这一实现。"""
+    return _sha256_text(_canonical_json({
+        "git_root": str(snapshot.get("git_root") or ""),
+        "git_head": str(snapshot.get("git_head") or ""),
+        "git_base": str(snapshot.get("git_base") or ""),
+        "files": snapshot.get("files") or [],
+        "submodules": snapshot.get("submodules") or [],
+        "submodule_worktrees": snapshot.get("submodule_worktrees") or [],
+        "nested_repos": snapshot.get("nested_repos") or [],
+    }))
+
+
+def canonical_json(value: object) -> str:
+    """确定性 JSON：G4 摘要/绑定 id 的唯一序列化口径。"""
     return json.dumps(value, ensure_ascii=False, sort_keys=True,
                       separators=(",", ":"))
+
+
+_canonical_json = canonical_json
 
 
 def _path_allowed(rel: str) -> bool:
@@ -62,7 +78,8 @@ def governance_paths(state_path: str) -> list[str]:
     task_dir = os.path.dirname(path)
     return [path, path + ".lock",
             os.path.join(task_dir, "review-attempts.jsonl"),
-            os.path.join(task_dir, "evidence")]
+            os.path.join(task_dir, "evidence"),
+            os.path.join(task_dir, "review-outputs")]
 
 
 def git_root(path: str) -> str:
@@ -89,6 +106,246 @@ def evidence_paths(state: dict) -> list[str]:
     return sorted(set(paths))
 
 
+_SUBMODULE_LINE = re.compile(
+    r"^\s*[+-U]?([0-9a-f]{40}|[0-9a-f]{64})\s+(\S+)")
+
+
+def _submodule_dirty_state(repo: str, rel: str, excluded: set[str],
+                           depth: int = 0) -> dict:
+    """递归读取 submodule 工作区真实状态（HEAD + tracked/untracked 内容）。
+
+    git 无法可靠读取时返回 `error`，由调用方 fail-closed；不静默忽略内部改动。
+    """
+    state: dict = {"path": rel, "head": "", "dirty": False, "files": [],
+                   "nested": [], "error": ""}
+    if depth > 8:
+        state["error"] = "submodule_depth_exceeded"
+        return state
+    if not os.path.isdir(repo):
+        state["error"] = "not_a_directory"
+        return state
+    if not os.path.exists(os.path.join(repo, ".git")):
+        state["error"] = "not_initialized"
+        return state
+    head = _git(repo, "rev-parse", "HEAD")
+    if head.returncode != 0:
+        state["error"] = "head_unreadable"
+        return state
+    state["head"] = head.stdout.strip()
+    nested_lines = _git(repo, "submodule", "status", "--recursive")
+    if nested_lines.returncode != 0:
+        state["error"] = "nested_status_failed"
+        return state
+    declared: set[str] = set()
+    for line in nested_lines.stdout.splitlines():
+        match = _SUBMODULE_LINE.match(str(line))
+        if match:
+            declared.add(match.group(2))
+    for rel_nested in sorted(declared):
+        nested_repo = os.path.realpath(os.path.join(repo, rel_nested))
+        if os.path.commonpath([os.path.realpath(repo), nested_repo]) != \
+                os.path.realpath(repo):
+            state["nested"].append({
+                "path": rel.rstrip("/") + "/" + rel_nested,
+                "head": "", "dirty": False, "files": [], "nested": [],
+                "error": "path_outside_root"})
+            continue
+        state["nested"].append(_submodule_dirty_state(
+            nested_repo, rel.rstrip("/") + "/" + rel_nested,
+            excluded, depth + 1))
+    status = _git(repo, "status", "--porcelain=v1", "-z",
+                  "--untracked-files=all")
+    if status.returncode != 0:
+        state["error"] = "status_failed"
+        return state
+    tokens = status.stdout.split("\0")
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        index += 1
+        if not token:
+            continue
+        xy = token[:2]
+        name = token[3:] if len(token) > 3 else ""
+        old = ""
+        if xy[:1] in ("R", "C") or xy[1:2] in ("R", "C"):
+            if index < len(tokens):
+                old = tokens[index]
+                index += 1
+        if not name:
+            continue
+        path = os.path.abspath(os.path.join(repo, name))
+        if os.path.commonpath([repo, path]) != repo:
+            continue
+        if not _path_allowed(name):
+            continue
+        if any(path == item or path.startswith(item + os.sep)
+               for item in excluded):
+            continue
+        if name in declared or any(
+                name == item or name.startswith(item.rstrip("/") + "/")
+                for item in declared):
+            continue
+        file_state = {"path": name.replace("\\", "/"), "status": xy,
+                      "kind": "missing", "sha256": "", "size": 0}
+        if old:
+            file_state["old_path"] = old.replace("\\", "/")
+        if os.path.islink(path):
+            target = os.readlink(path)
+            file_state.update({"kind": "symlink",
+                               "sha256": _sha256_text(target),
+                               "size": len(target.encode("utf-8"))})
+        elif os.path.isfile(path):
+            file_state.update({"kind": "file",
+                               "sha256": _sha256_file(path),
+                               "size": os.path.getsize(path)})
+        elif os.path.exists(path):
+            file_state["kind"] = "other"
+        state["files"].append(file_state)
+    state["files"].sort(key=lambda item: (item["path"], item["status"]))
+    # 未声明为 submodule 的嵌套 Git 仓库：按 status 路径向上找仓库根并递归。
+    nested_roots = _nested_repo_roots(
+        repo, [item["path"] for item in state["files"]], excluded)
+    # 被 .gitignore 隐藏的未声明仓库不会出现在 status 里；在 submodule/嵌套
+    # 仓库内部也要做一次文件系统扫描，否则其改动不进入摘要。
+    try:
+        scanned = _scan_nested_git_dirs(repo, excluded, declared)
+    except ValueError as exc:
+        state["error"] = str(exc) or "nested_repo_scan_failed"
+        return state
+    existing = {item["path"] for item in state["nested"]}
+    real_repo = os.path.realpath(repo)
+    # status 路径找到的仓库根优先登记；随后再补文件系统扫描发现、但不在
+    # status 里的被忽略仓库（含更深嵌套）。
+    for inner_rel, inner_repo in nested_roots:
+        full_rel = rel.rstrip("/") + "/" + inner_rel
+        if full_rel in existing:
+            continue
+        existing.add(full_rel)
+        state["nested"].append(_submodule_dirty_state(
+            inner_repo, full_rel, excluded, depth + 1))
+    for inner_rel in scanned:
+        full_rel = rel.rstrip("/") + "/" + inner_rel
+        if full_rel in existing or any(
+                full_rel.startswith(item.rstrip("/") + "/")
+                for item in existing):
+            continue
+        inner_repo = os.path.realpath(os.path.join(repo, inner_rel))
+        if os.path.commonpath([real_repo, inner_repo]) != real_repo:
+            state["error"] = "nested_repo_outside_root"
+            return state
+        existing.add(full_rel)
+        state["nested"].append(_submodule_dirty_state(
+            inner_repo, full_rel, excluded, depth + 1))
+    state["nested"].sort(key=lambda item: item["path"])
+    state["dirty"] = bool(state["files"] or state["nested"])
+    return state
+
+
+def _submodule_worktrees(root: str, lines: list[str],
+                         excluded: set[str]) -> list[dict]:
+    out: list[dict] = []
+    for line in lines:
+        match = _SUBMODULE_LINE.match(str(line))
+        if not match:
+            continue
+        rel = match.group(2)
+        repo = os.path.realpath(os.path.join(root, rel))
+        if os.path.commonpath([os.path.realpath(root), repo]) != os.path.realpath(root):
+            out.append({"path": rel, "head": "", "dirty": False,
+                        "files": [], "nested": [],
+                        "error": "path_outside_root"})
+            continue
+        out.append(_submodule_dirty_state(repo, rel, excluded))
+    out.sort(key=lambda item: item["path"])
+    return out
+
+
+def _has_git_dir(path: str) -> bool:
+    return os.path.exists(os.path.join(path, ".git"))
+
+
+def _scan_nested_git_dirs(root: str, excluded: set[str],
+                          declared: set[str]) -> list[str]:
+    """扫描工作区内含 `.git` 的目录（含 .gitignore 隐藏的嵌套仓库）。
+
+    深度或数量超过上限、或遇到越界 realpath 时抛 ValueError，由调用方
+    fail-closed；不静默截断（否则更深的嵌套仓库改动不会进入摘要）。
+    """
+    real_root = os.path.realpath(root)
+    excluded = {os.path.realpath(item) for item in excluded}
+    found: list[str] = []
+    for current, dirs, _files in os.walk(root, followlinks=False):
+        real = os.path.realpath(current)
+        if os.path.commonpath([real_root, real]) != real_root:
+            raise ValueError("nested_repo_scan_outside_root")
+        rel = os.path.relpath(current, root).replace("\\", "/")
+        if rel != "." and (rel in declared or any(
+                rel.startswith(item.rstrip("/") + "/") for item in declared)):
+            dirs[:] = []
+            continue
+        dirs[:] = [name for name in dirs
+                   if name not in (".git", "node_modules", "__pycache__")
+                   and not os.path.islink(os.path.join(current, name))
+                   and not any(os.path.realpath(os.path.join(current, name))
+                               == item or
+                               os.path.realpath(os.path.join(current, name))
+                               .startswith(item + os.sep)
+                               for item in excluded)]
+        depth = 0 if rel == "." else len(rel.split("/"))
+        if depth >= 8:
+            if dirs:
+                raise ValueError("nested_repo_scan_depth_exceeded")
+            continue
+        has_git = os.path.exists(os.path.join(current, ".git"))
+        if has_git and current != root:
+            if any(rel == item or rel.startswith(item.rstrip("/") + "/")
+                   for item in found):
+                continue
+            found.append(rel)
+            if len(found) > 64:
+                raise ValueError("nested_repo_scan_overflow")
+    return found
+
+
+def _nested_repo_roots(root: str, rel_paths: list[str],
+                       excluded: set[str]) -> list[tuple[str, str]]:
+    """找出未声明为 submodule 的嵌套 Git 仓库根（含 .git 文件形式）。
+
+    从每个变更路径向上找最近的嵌套仓库；返回 [(rel, realpath)]，外层嵌套
+    优先，内层留给 `_submodule_dirty_state` 递归。
+    """
+    real_root = os.path.realpath(root)
+    found: dict[str, str] = {}
+    for rel in rel_paths:
+        candidate = os.path.abspath(os.path.join(root, rel.rstrip("/")))
+        if str(rel).endswith("/") and os.path.isdir(candidate):
+            current = candidate
+        else:
+            current = os.path.dirname(candidate)
+        while current and os.path.commonpath([real_root, current]) == real_root:
+            if current != root and _has_git_dir(current):
+                found[os.path.relpath(current, root)] = current
+                break
+            parent = os.path.dirname(current)
+            if parent == current:
+                break
+            current = parent
+    roots: list[tuple[str, str]] = []
+    for rel in sorted(found):
+        real = os.path.realpath(found[rel])
+        if any(rel == parent or rel.startswith(parent.rstrip("/") + "/")
+               for parent, _ in roots):
+            continue
+        if any(real == item or real.startswith(item + os.sep)
+               for item in excluded):
+            continue
+        if os.path.commonpath([real_root, real]) != real_root:
+            raise ValueError("nested_repo_outside_root")
+        roots.append((rel.replace("\\", "/"), real))
+    return roots
+
+
 def capture_code_snapshot(workspace: str = "",
                           exclude_paths: list[str] | None = None,
                           base: str = "") -> dict:
@@ -110,6 +367,8 @@ def capture_code_snapshot(workspace: str = "",
         "reason": "",
         "files": [],
         "submodules": [],
+        "submodule_worktrees": [],
+        "nested_repos": [],
         "excluded_paths": sorted(excluded),
         "digest": "",
     }
@@ -206,18 +465,45 @@ def capture_code_snapshot(workspace: str = "",
         files.append(entry)
     files.sort(key=lambda item: (item["path"], item["status"]))
     submodules = _git(root, "submodule", "status", "--recursive")
-    if submodules.returncode == 0:
-        snapshot["submodules"] = [line for line in
-                                  submodules.stdout.splitlines() if line.strip()]
+    if submodules.returncode != 0:
+        snapshot["reason"] = "submodule_status_failed"
+        return snapshot
+    snapshot["submodules"] = [line for line in
+                              submodules.stdout.splitlines() if line.strip()]
     snapshot["files"] = files
+    declared_rels = {match.group(2) for match in
+                     (_SUBMODULE_LINE.match(str(line))
+                      for line in snapshot["submodules"]) if match}
+    nested_candidates = [item["path"] for item in files
+                         if item["path"] not in declared_rels]
+    try:
+        scanned = _scan_nested_git_dirs(root, excluded, declared_rels)
+        nested_candidates.extend(item.rstrip("/") + "/" for item in scanned)
+        nested_roots = _nested_repo_roots(
+            root, nested_candidates, excluded)
+    except ValueError as exc:
+        snapshot["reason"] = str(exc)
+        return snapshot
+    snapshot["nested_repos"] = [
+        _submodule_dirty_state(real, rel, excluded)
+        for rel, real in nested_roots]
+    snapshot["submodule_worktrees"] = _submodule_worktrees(
+        root, snapshot["submodules"], excluded)
+    def _has_error(items: list) -> bool:
+        for item in items:
+            if not isinstance(item, dict):
+                return True
+            if str(item.get("error") or ""):
+                return True
+            if _has_error(item.get("nested") or []):
+                return True
+        return False
+    if _has_error(snapshot["submodule_worktrees"]) or \
+            _has_error(snapshot["nested_repos"]):
+        snapshot["reason"] = "submodule_state_unreadable"
+        return snapshot
     snapshot["available"] = True
-    snapshot["digest"] = _sha256_text(_canonical_json({
-        "git_root": root,
-        "git_head": snapshot["git_head"],
-        "git_base": snapshot["git_base"],
-        "files": files,
-        "submodules": snapshot["submodules"],
-    }))
+    snapshot["digest"] = snapshot_digest(snapshot)
     return snapshot
 
 

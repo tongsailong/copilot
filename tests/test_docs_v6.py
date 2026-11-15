@@ -16,7 +16,7 @@ ROOT = os.path.dirname(HERE)
 
 SKILL = os.path.join(ROOT, "SKILL.md")
 REFERENCES = os.path.join(ROOT, "references")
-REVIEWER = os.path.join(ROOT, "agents", "reviewer.md")
+REVIEWER = os.path.join(ROOT, ".zcode", "agents", "reviewer.md")
 ACTIVE_REFS = ("workflow.md", "runtime.md", "review.md", "agent-bridge.md")
 HISTORICAL_REFS = ("role.md", "role-consult.md", "role-plan.md", "role-review.md",
                    "role-map.md", "review-ledger.md")
@@ -124,8 +124,8 @@ class ReferenceTests(unittest.TestCase):
         self.assertIn("G4", o["review.md"])
         self.assertIn("在任一门失败时拒绝", o["review.md"])
         self.assertIn("copilot-native-dispatch/v2", o["agent-bridge.md"])
-        self.assertIn("host_tool_calls_changed", o["agent-bridge.md"])
-        self.assertIn("native_review_host_changed", o["review.md"])
+        self.assertIn("new_g4_eligible", o["agent-bridge.md"])
+        self.assertIn("native_review_legacy_g4_source", o["review.md"])
         self.assertIn("--authorized-by user", o["workflow.md"])
         self.assertIn("退出码 0", o["workflow.md"])
         self.assertIn("--amend", o["workflow.md"])
@@ -136,7 +136,7 @@ class ReferenceTests(unittest.TestCase):
         self.assertIn("--create-attempt", o["review.md"])
         self.assertIn("native_review_attempt_workspace_drift", o["review.md"])
         self.assertIn("native_review_code_scope_drift", o["review.md"])
-        self.assertIn("code_snapshot.files", o["agent-bridge.md"] + text(REVIEWER))
+        self.assertIn("code_snapshot", o["agent-bridge.md"] + text(REVIEWER))
         self.assertIn("review_attempt_id", o["agent-bridge.md"])
         self.assertIn("review_attempt_created_at", o["agent-bridge.md"])
         self.assertIn("--create-attempt", o["workflow.md"])
@@ -158,18 +158,18 @@ class ReferenceTests(unittest.TestCase):
 
 
 class ReviewerProfileTests(unittest.TestCase):
-    def test_reviewer_uses_v2_bindings_and_no_self_declared_g4(self):
+    def test_workspace_profile_is_read_only_and_no_self_declared_g4(self):
         doc = text(REVIEWER)
         front = frontmatter(doc)
         self.assertIn("copilot-native-review/v2", doc)
         self.assertIn("plan_id", doc)
-        self.assertIn("plan_sha256", doc)
         self.assertNotIn("round_id", doc)
         self.assertNotIn("gpt-6.1-sol", doc)
-        self.assertIn("Do **not** declare `g4_eligible`", doc)
-        self.assertIn("tools: [Read, Grep, Glob, Bash]", front)
-        self.assertIn("disallowedTools: [Write, Edit]", front)
+        self.assertIn("tools: [Read, Grep, Glob]", front)
+        self.assertIn("Bash", front.split("disallowedTools:", 1)[1].split("\n", 1)[0])
         self.assertIn("model: inherit", front)
+        self.assertFalse(os.path.exists(os.path.join(ROOT, "agents", "reviewer.md")),
+                         "旧 Reviewer 全局 Profile 已退役，不应回到源码")
 
 
 class ProjectDocTests(unittest.TestCase):

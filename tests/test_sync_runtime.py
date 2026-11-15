@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """sync_runtime.py 回归：分发范围、漂移检测、原子写入、prune、安全边界。
 
-测试只操作临时目录；不读取也不写入真实的 ~/.zcode/skills/copilot 或
-~/.zcode/agents/reviewer.md。CLI 场景通过 --skill-dest / --reviewer-dest 指向临时目标。
+测试只操作临时目录；不读取也不写入真实的 ~/.zcode/skills/copilot。阶段九起旧
+Reviewer 全局 Profile 已退役，不再参与分发。CLI 场景通过 --skill-dest 指向临时目标。
 """
 from __future__ import annotations
 
@@ -41,7 +41,6 @@ def make_repo(root: str) -> None:
     write(os.path.join(root, "scripts", "a.py"), "print('a')\n", 0o755)
     write(os.path.join(root, "scripts", "b.py"), "print('b')\n")
     write(os.path.join(root, "references", "ref.md"), "# ref\n")
-    write(os.path.join(root, "agents", "reviewer.md"), "---\nname: reviewer\n---\n")
     # 以下都不参与分发
     write(os.path.join(root, "README.md"), "# readme\n")
     write(os.path.join(root, "docs", "X.md"), "# doc\n")
@@ -192,42 +191,15 @@ class SymlinkAndPathTests(unittest.TestCase):
             S._safe_dest(target, "scripts/a.py")
 
 
-class ReviewerTests(unittest.TestCase):
-    def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.tmp.cleanup)
-
-    def test_states_and_apply(self):
-        src = write(os.path.join(self.tmp.name, "src", "reviewer.md"), "v1\n")
-        dst = os.path.join(self.tmp.name, "agents", "reviewer.md")
-        self.assertEqual(S.reviewer_state(src, dst)[0], "missing")
-        self.assertTrue(S.apply_reviewer(src, dst))
-        self.assertEqual(S.reviewer_state(src, dst)[0], "same")
-        self.assertFalse(S.apply_reviewer(src, dst))
-        write(src, "v2\n")
-        self.assertEqual(S.reviewer_state(src, dst)[0], "different")
-        self.assertTrue(S.apply_reviewer(src, dst))
-        self.assertEqual(S.reviewer_state(src, dst)[0], "same")
-
-    def test_symlink_target_is_rejected(self):
-        src = write(os.path.join(self.tmp.name, "src", "reviewer.md"), "v1\n")
-        dst = os.path.join(self.tmp.name, "reviewer.md")
-        os.symlink(src, dst)
-        with self.assertRaises(S.SyncError):
-            S.reviewer_state(src, dst)
-
-
 class CliTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.tmp_root = self.tmp.name
         self.skill_dest = os.path.join(self.tmp_root, "skill")
-        self.reviewer_dest = os.path.join(self.tmp_root, "agents", "reviewer.md")
         # 用真实源码构造一份完整运行时副本，验证 CLI 的 check/apply 行为。
         for rel in S.source_manifest(ROOT):
             S.copy_atomic(os.path.join(ROOT, rel), os.path.join(self.skill_dest, rel))
-        S.apply_reviewer(os.path.join(ROOT, S.REVIEWER_SOURCE), self.reviewer_dest)
 
     def run_cli(self, *args):
         import contextlib
@@ -238,45 +210,31 @@ class CliTests(unittest.TestCase):
         return code, out.getvalue(), err.getvalue()
 
     def test_check_reports_clean_and_drift(self):
-        code, out, _ = self.run_cli("--check", "--skill-dest", self.skill_dest,
-                                    "--reviewer-dest", self.reviewer_dest)
+        code, out, _ = self.run_cli("--check", "--skill-dest", self.skill_dest)
         self.assertEqual(code, 0, out)
         write(os.path.join(self.skill_dest, "SKILL.md"), "drifted\n")
-        code, out, _ = self.run_cli("--check", "--skill-dest", self.skill_dest,
-                                    "--reviewer-dest", self.reviewer_dest)
+        code, out, _ = self.run_cli("--check", "--skill-dest", self.skill_dest)
         self.assertEqual(code, 1, out)
         self.assertIn("SKILL.md", out)
 
-    def test_check_detects_reviewer_drift_even_when_skill_is_clean(self):
-        write(self.reviewer_dest, "old reviewer\n")
-        code, out, _ = self.run_cli("--check", "--skill-dest", self.skill_dest,
-                                    "--reviewer-dest", self.reviewer_dest)
-        self.assertEqual(code, 1, out)
-        self.assertIn("Reviewer：different", out)
-
-    def test_apply_syncs_both_targets_and_reruns_clean(self):
+    def test_apply_syncs_target_and_reruns_clean(self):
         write(os.path.join(self.skill_dest, "SKILL.md"), "drifted\n")
-        write(self.reviewer_dest, "drifted\n")
         code, out, _ = self.run_cli("--apply", "--skill-dest", self.skill_dest,
-                                    "--reviewer-dest", self.reviewer_dest,
                                     "--force")
         self.assertEqual(code, 0, out)
-        code, out, _ = self.run_cli("--check", "--skill-dest", self.skill_dest,
-                                    "--reviewer-dest", self.reviewer_dest)
+        code, out, _ = self.run_cli("--check", "--skill-dest", self.skill_dest)
         self.assertEqual(code, 0, out)
         self.assertIn("缺失 0，不同 0", out)
 
     def test_prune_requires_apply(self):
-        code, _, err = self.run_cli("--prune", "--skill-dest", self.skill_dest,
-                                    "--reviewer-dest", self.reviewer_dest)
+        code, _, err = self.run_cli("--prune", "--skill-dest", self.skill_dest)
         self.assertEqual(code, 2)
         self.assertIn("--prune", err)
 
     def test_apply_refuses_unknown_target_without_force(self):
         other = os.path.join(self.tmp_root, "other")
         os.makedirs(other)
-        code, _, err = self.run_cli("--apply", "--skill-dest", other,
-                                    "--reviewer-dest", self.reviewer_dest)
+        code, _, err = self.run_cli("--apply", "--skill-dest", other)
         self.assertEqual(code, 2)
         self.assertIn("不像 Copilot skill", err)
 
@@ -292,6 +250,7 @@ class RealDistributionTests(unittest.TestCase):
             self.assertIn(rel, manifest)
         self.assertFalse([k for k in manifest if k.startswith("legacy/")])
         self.assertFalse([k for k in manifest if k.startswith("tests/")])
+        self.assertNotIn("agents/reviewer.md", manifest)
         for retired in ("scripts/call_gpt.py", "scripts/review_ledger.py",
                         "scripts/reply_protocol.py"):
             self.assertNotIn(retired, manifest)
