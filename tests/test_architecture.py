@@ -17,7 +17,8 @@ sys.path.insert(0, SCRIPTS)
 import governance as G  # noqa: E402
 
 ACTIVE = ("governance.py", "copilot_dispatch.py", "copilot_auto.py",
-          "native_bridge.py", "native_agent.py", "bridge_evidence.py", "lib_common.py")
+          "agent_policy.py", "native_bridge.py", "native_agent.py",
+          "bridge_evidence.py", "lib_common.py")
 
 
 def _read_bytes(path: str) -> bytes:

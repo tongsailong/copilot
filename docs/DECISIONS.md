@@ -1233,3 +1233,51 @@
       但复核失效（证据漂移/candidate 不可用）才移除 stop；`review-admission --workspace`
       与 execution/attempt 使用同一证据排除集，避免同一快照因排除口径不同被误判为变化。
       `root_cause_aliases` 参与匹配，准入记录补充 `reentry_allowed`/`reentry_code`/`base`。
+
+52. **Agent 调度以主代理为默认，内置子代理按需；G4 只读能力不因便利性放宽（2026-11-16，v6.9.0）。**
+    依据：用户《Copilot Agent 调度与原生子代理机制优化专项》任务书；ZCode 3.18.2 宿主源码、
+    真实 `metadata.json`/SQLite 记录与 486 个原生子代理历史会话。已确认：
+
+    - **默认主代理执行**：简单修改、单模块开发、连续调试、局部测试修复、构建与最终集成、
+      方案已明确实施，以及不值得独立上下文的任务都由主代理直接完成；不为了体现协作强制
+      调用子代理，不设调用比例、默认 Token 预算或强制审批。
+    - **按需子代理**：`Explore` 只做独立只读调查（跨模块/调用链/改动前风险/独立上下文检查），
+      派发时必须提供调查目标、文件范围、项目背景与预期证据；它不注入 AGENTS.md，主代理必须
+      显式提供相关约束。`general-purpose` 只承担范围/文件边界/完成条件明确、与主代理无不可控
+      写入冲突、并行收益明显的独立交付物；它拥有完整工具与 MCP，不能当作只读复核者。
+      通常 0–2 个是合理起点，不是配额；内置子代理不能再创建子代理。
+    - **调度建议的否决顺序**：`agent-policy` 只是只读建议，判定顺序为“子代理不可用 →
+      主代理；写入冲突 → 主代理；`research_only` → `Explore`（只读调查绝不交给全工具
+      general-purpose）；独立交付物需并发且有收益才建议 general-purpose；其余 → 主代理”。
+      先否决再选择，避免只读调查被派给可写代理。
+    - **内置能力基线（ZCode 3.18.2）**：`Explore` 工具集为
+      `Bash,Glob,Grep,Read,WebFetch,WebSearch,TodoWrite`、`injectAgentsMd=false`；
+      `general-purpose` 为 `tools=["*"]` 并继承 MCP。宿主 `Agent` 参数没有按派发覆盖工具的
+      入口，也没有 OS 级只读沙箱；子代理**completed** 的 `Bash` 记录为 `read_only=0`
+      （失败调用可能为 `NULL`）。宿主写工具集合为 `Write/Edit/ApplyPatch/Bash`，执行类
+      `js*` 与代理类 `Agent/Task` 同样能改文件；Profile 级写能力用“已知只读工具集”反向
+      判定，**未知工具一律按可能写入处理**，不靠手工维护写工具清单。
+    - **G4 不放宽**：高风险 G4 仍要求宿主有效策略精确为 `Read/Grep/Glob`、显式禁用
+      `Write/Edit/Bash`、无 skills/MCP；内置 `Explore`（含 Bash）与 `general-purpose`（全工具）
+      都不合格。新增 `native_agent.py capability --metadata ...` 只读诊断实际权限与 G4 资格
+      （`g4.executor`/`precheck_only`/`codes`/`remedy`）与子会话 `host_evidence`：先确认
+      会话存在于宿主 `session` 表（否则 `session_not_found`，不与“0 次调用”混同），再按
+      工具名或 `read_only=0` 统计写能力调用，未知未分类调用单独告警。它不派发、不写状态；
+      `g4.executor` 只是策略预检，Profile 文件/正文一致性、会话与 prompt 绑定、工具调用与
+      原始输出仍由 `g4_attest` 核验，不代表 G4 已通过。没有可证明
+      的只读能力载体时保持 fail-closed，并如实报告为宿主/治理能力缺口，不伪造 PASS，不把
+      general-purpose 当 Reviewer，也不新建自定义只读子代理补位。
+    - **Profile 发现根因**：宿主在会话/进程 bootstrap 时扫描 `~/.zcode/agents`（user）与
+      `<会话工作目录>/.zcode/agents`（project，含 additionalDirectories 命名空间），后加载
+      覆盖前者；Profile 变更不会热更新到已启动会话；Desktop 的
+      `subagentsReadRuntimeConfig` 返回 `built-in-fallback` 时只有内置 Agent；未知
+      `subagent_type` 返回 `UNKNOWN_AGENT_TYPE`，不会静默回退。历史 `profile_tools_not_exact`
+      来自实际派发的 Profile 不精确（旧 user `reviewer` 含 Bash 153 次、`Explore` 153 次、
+      `general-purpose` 109 次真实快照），是正确拒绝，不是名称匹配 bug。判定始终只看有效
+      工具策略，名称/来源/路径只作记录事实。
+    - **失败与持续推进**：子代理不可用、派发失败或返回 PARTIAL 时主代理继续可独立完成的
+      工作；不原样重复同一失败派发；同一缺口已有 `pending`/`running` 工作项时不复制任务；
+      连续失败派生 `AUTO-REPLAN` 换实质不同的路线。普通任务不因 Agent Profile 加载失败而
+      BLOCKED；G4 能力缺口与业务源码缺陷分开报告。
+    - **保留**：任务合同、状态管理、证据与 SHA、G1–G4、PARTIAL 推进、上下文恢复与最终收口；
+      不新增自定义子代理、不修改 Provider/模型路由/账户、不新增 MCP、不引入外部 Reviewer。

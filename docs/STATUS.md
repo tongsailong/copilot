@@ -2,6 +2,116 @@
 
 更新：2026-11-16 CST。本文件只记录现场可核实的事实；规划与未完成事项单独标注。
 
+## Agent 调度与原生子代理机制（2026-11-16，v6.9.0）
+
+针对“Copilot 与 ZCode 原生 Agent 协作效率”的专项优化。基线核实：HEAD `4f0fb33`
+（v6.8.0，已推送，工作区 clean），不是任务书所写的 `203fe97`/v6.6.1；ZCode 3.18.2，
+运行时 Skill 同步前 27 个文件。**本轮未提交、未推送**。
+
+### 根因（现场证据）
+
+- **`profile_tools_not_exact` 不是名称匹配 bug。** 真实 `~/.zcode/cli/agents/*/metadata.json`
+  统计 486 个原生子代理会话：旧 user `reviewer` 含 `Read/Grep/Glob/Bash` 153 次、内置
+  `Explore` 153 次（`Bash,Glob,Grep,Read,WebFetch,WebSearch,TodoWrite`）、
+  `general-purpose` 109 次（`tools=["*"]`）、project `reviewer` 精确只读 43 次、
+  `independent-readonly` 21 次、`readonly-probe` 7 次。当前 G4 契约要求精确
+  `Read/Grep/Glob` 且禁用 `Write/Edit/Bash`，前两类被拒是正确行为。
+- **宿主 Profile 发现**：`rCi` 在会话 bootstrap 扫描 `~/.zcode/agents`（user）与
+  `<会话工作目录>/.zcode/agents`（project，additionalDirectories 带命名空间），后加载
+  覆盖前者；`agents-state.json.disabledAgentIds` 可禁用 user Profile。**加载结果在会话内
+  缓存，文件新建/改名/删除不热更新**。旧 user `reviewer`（含 Bash）与 project 精确
+  `reviewer` 在 2026-11-15 同日并存，证明存在“旧会话沿用启动期缓存”的窗口。
+- **未知类型不静默回退**：宿主源码 `Njn`/`JKa` 对不存在的 `subagent_type` 抛可恢复的
+  `UNKNOWN_AGENT_TYPE` 并列出可用类型；只有省略 `subagent_type` 才等于
+  `general-purpose`。Desktop 的 `subagentsReadRuntimeConfig` 返回 `built-in-fallback`
+  时只有内置 Agent，不扫描工作区目录。
+- **内置能力**：`Explore` 的 `injectAgentsMd=false`，不会自动获得 AGENTS.md；`Bash` 在
+  子代理 `tool_usage` 中，**completed** 调用为 `read_only=0,
+  side_effect_scope=system`（失败调用可能为 `NULL`，`g4_attest` 对 `status=error`
+  允许无副作用分类）。`general-purpose` 为 `tools=["*"]` 并继承 MCP（真实子会话可见
+  `mcp__huashu-chrome__*`）。`Agent` 参数只有
+  `description/prompt/subagent_type/run_in_background`，没有按派发覆盖工具的入口；
+  也没有 OS 级只读沙箱。
+
+### 已实施
+
+- `scripts/agent_policy.py`（新增，纯函数）：内置能力基线、`classify_profile`、
+  `capability_report`、`dispatch_advice`。不派发、不调用模型、不写状态。
+- `native_agent.py capability --metadata ...`：只读诊断子代理实际权限与 G4 资格
+  （`g4.executor`/`codes`/`remedy`）；`build_review` 的只读策略拒绝信息补充内置 Explore /
+  general-purpose 的具体原因，错误码不变（仍为 `profile_tools_not_exact` 等）。
+- `copilot_dispatch.py agent-policy`：五问调度建议（主代理默认 / Explore 调查 /
+  general-purpose 独立交付），只读建议，不是门禁或调度器；版本 `6.9.0`。
+- `SKILL.md`/`references/agent-bridge.md`/`review.md`/`runtime.md`/`workflow.md`/
+  `AGENTS.md`/`README.md`：落地主代理默认、Explore/general-purpose 调用条件、Profile
+  发现与根因、G4 fail-closed 与能力缺口报告、子代理失败降级；新增
+  `docs/DECISIONS.md` 第 52 条。
+- 未删除工作区 `independent-readonly.md`：它是通用只读能力载体（非 Reviewer 角色），
+  不作为普通任务前置；内置 Explore/general-purpose 仍不能替代 G4。未新增任何自定义子代理、
+  未修改 Provider/路由/账户、未新增 MCP。
+
+### 效果基线（历史真实记录，优化前）
+
+从 486 个子代理 metadata 与宿主 DB 汇总（时长为各会话 `totalDurationMs` 之和；工具数为
+`tool_usage` 行数；Bash 为子代理实际发起的 Bash 调用；MCP 为 `mcp__*` 调用）：
+
+| Profile / 策略 | 会话 | 总耗时 | 工具调用 | Bash | MCP |
+|---|---:|---:|---:|---:|---:|
+| `reviewer`（旧 user，含 Bash） | 153 | 51,372 s | 11,497 | 7,943 | 0 |
+| `reviewer`（project，精确只读） | 43 | 5,709 s | 1,398 | 1（error） | 0 |
+| 内置 `Explore` | 153 | 53,188 s | 8,414 | 6,780 | 0 |
+| 内置 `general-purpose` | 109 | 24,901 s | 3,234 | 2,692 | 58 |
+| `independent-readonly` | 21 | 6,516 s | 1,289 | 1（error） | 0 |
+| `readonly-probe` | 7 | 161 s | 55 | 0 | 0 |
+
+这些数字说明优化前的主要成本来自“用带 Bash 的 Profile/内置 Explore 做复核（被 G4 拒绝后
+重做）”与 general-purpose 的 Bash/MCP 调用；优化后真实任务的对比尚未测量（见未验证项），
+不能把上述历史值当作优化后结果。
+
+### 工程验证
+
+- 活动测试（**修复前**基线，对应本轮初始实现）：`743` 通过（含
+  `tests/test_agent_policy.py` 29 项）；修复后该文件扩为 42 项，全量复跑不在本轮最小验证
+  范围内，最终代码的定向证据见下节。
+- 历史回归：`853` 通过（跳过 32）。
+- T4 隔离验收：T0 0.8s / T1 20.3s / T2 68.3s / T3 89.1s，`all_layers_ok=true`，
+  34/34 场景通过（`all_scenarios_ok=true`）；报告 `/tmp/copilot-t4-v690-final.json`
+  （临时文件，不进入仓库）。
+- 运行时分发：28 个文件，`--check` 缺失 0、不同 0；运行时 `copilot_dispatch.py --version`
+  为 `6.9.0`，`agent-policy` 可执行。
+- **未验证/限制**：本轮未发起新的真实子代理派发（项目规则要求真实模型调用单独授权），
+  因此“优化后”真实任务的子代理次数/耗时对比尚未测量；效果基线来自历史 metadata/DB。
+  G4 在只有内置 Agent 的环境下仍会 fail-closed；实际高风险的完整 G4 端到端需在具备宿主
+  只读能力载体的环境单独验证。Desktop `subagentsReadRuntimeConfig` 的 built-in-fallback
+  分支来自宿主源码，本会话未触发。
+
+### 独立只读复核与修复（2026-11-16，v6.9.0 收尾）
+
+- **复核执行者**：原生子代理 `agent_172d02a9-c1ca-4f71-9ba5-3cccdbb9d16e`，profile
+  `independent-readonly`（`source=project`）；宿主 `profileSnapshot.tools=[Read,Grep,Glob]`、
+  `disallowedTools` 含 `Write/Edit/Bash`，`injectAgentsMd=false`。宿主 `tool_usage` 记录
+  165 次调用（Read 62 / Grep 93 / Glob 10），全部 `read_only=1`、0 次写能力调用；
+  `native_agent.py capability` 输出 `g4.executor=true`、`codes=[g4_ready]`、无告警。
+  复核结论：3 Major + 7 Minor + 2 Info。
+- **Major 修复**：
+  1. 写能力判定由“硬编码写工具清单”改为“已知只读工具集反向判定，未知工具 fail-closed”，
+     并补入宿主真实写工具 `ApplyPatch` 与执行类 `js*`；逐调用证据同时使用 `read_only`。
+  2. `agent-policy` 改为先否决后选择：`research_only` 只建议 `Explore`（不再被
+     `independent-deliverable` 抢占为全工具代理），`write_conflict` 一律建议主代理。
+  3. `host_evidence` 先查宿主 `session` 表：会话不存在返回 `session_not_found`，
+     只有“会话存在但 0 次调用”才报 `total_calls=0`。
+- **Minor/Info 处理**：`capability` 的 `g4.executor` 明确为策略预检（`precheck_only`）并
+  区分 `profile_tools_missing`/`profile_snapshot_missing`；新增 `permission_mode_whitespace`
+  告警；测试补宿主 SQLite 夹具（写调用、未分类调用、会话缺失、`ApplyPatch`/`js`/未知工具）；
+  `agent_policy.py` 纳入架构约束与分发断言；`source-baseline.sha256` 重建；
+  `PROJECT-CHARTER` 基线改 v5.5.1 并澄清 Reviewer 只指 G4 执行方；只读 Profile 措辞改为
+  “普通任务不强制、G4 不得删除”；`Bash read_only=0` 限定为 completed 调用；ROADMAP 阶段
+  序号归位。
+- **定向验证（最终代码）**：`tests/test_agent_policy.py` 42 项 OK、`test_native_agent_v6`
+  16 项 OK、`test_profile_policy` + `test_g4_attest` 177 项 OK、`test_architecture` +
+  `test_sync_runtime` 29 项 OK、`test_docs_v6` 16 项 OK；`git diff --check` 通过；
+  运行时重新同步后 `--check` 缺失 0、不同 0（28 个受管理文件）。
+
 ## 独立复核效率专项（2026-11-16，v6.8.0）
 
 针对独立复核耗时过长、重复启动、修复后无条件完整复核、多入口重复触发与缺少停止条件

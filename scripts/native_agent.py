@@ -47,8 +47,12 @@ SHA-256 或计划绑定写错/编造。这里把这些字段从实际记录中�
       --execution T1.execution.json --work-item T1 --create-attempt \
       --output T1.context.json
 
-前两个信封子命令在写文件前都会调用 `native_bridge` 的正式校验；校验失败不会
-产生输出文件。`review-context --create-attempt` 会写入治理层生成的复核 attempt。
+    native_agent.py capability --metadata .../metadata.json [--output cap.json]
+
+`capability` 只读诊断一个原生子代理的实际权限与 G4 资格，不需要任务状态，也不写
+状态；`bind-execution` 只创建执行绑定。前两个信封子命令在写文件前都会调用
+`native_bridge` 的正式校验；校验失败不会产生输出文件。`review-context
+--create-attempt` 会写入治理层生成的复核 attempt。
 """
 from __future__ import annotations
 
@@ -65,6 +69,7 @@ sys.path.insert(0, HERE)
 import governance as G
 import host_records
 import review_output  # noqa: E402
+import agent_policy as AP  # noqa: E402
 import native_bridge as NB  # noqa: E402
 import review_policy as RP  # noqa: E402
 
@@ -340,6 +345,104 @@ def _find_action(dispatch_env: dict, work_item: str) -> dict:
         if isinstance(action, dict) and str(action.get("work_item_id") or "") == work_item:
             return action
     raise AgentRecordError(f"dispatch 不含工作项 {work_item}。")
+
+
+def _host_tool_summary(child: str, db: str) -> dict:
+    """只读汇总宿主 `tool_usage`：实际调用与写入能力，不改变权限判定。
+
+    会话必须真实存在于宿主 `session` 表；只有“会话存在但没有工具调用”才算
+    `total_calls=0`，“会话不存在/已清理”如实返回 `session_not_found`，不把两者
+    混成同一结论。
+    """
+    child = str(child or "").strip()
+    db = db or os.path.expanduser("~/.zcode/cli/db/db.sqlite")
+    if not child:
+        return {"available": False, "reason": "child_session_missing"}
+    try:
+        con = host_records.connect_ro(db)
+    except (OSError, sqlite3.Error) as exc:
+        return {"available": False, "reason": f"host_db_unavailable: {exc}"}
+    try:
+        try:
+            found = con.execute("select 1 from session where id=?",
+                                (child,)).fetchone()
+            session_state = "found" if found else "missing"
+        except sqlite3.Error:
+            session_state = "unverified"
+        if session_state == "missing":
+            return {"available": False, "reason": "session_not_found",
+                    "session_state": session_state,
+                    "db": os.path.abspath(os.path.expanduser(db))}
+        try:
+            rows = con.execute(
+                "select tool_name, coalesce(read_only, -1), status, count(*) "
+                "from tool_usage where session_id=? "
+                "group by tool_name, read_only, status order by tool_name",
+                (child,)).fetchall()
+        except sqlite3.Error as exc:
+            return {"available": False,
+                    "reason": f"tool_usage_query_failed: {exc}",
+                    "session_state": session_state}
+    finally:
+        con.close()
+    calls: list[dict] = []
+    total = 0
+    write_capable = 0
+    unclassified = 0
+    for name, read_only, status, count in rows:
+        tool = str(name or "")
+        amount = int(count or 0)
+        total += amount
+        # 工具名命中写/执行集合，或宿主记录 read_only=0（非只读）都算写能力；
+        # 名称未知且宿主未分类的调用单独计数并告警，不静默当作只读。
+        is_write, is_unclassified = AP.tool_call_is_write(tool, int(read_only))
+        if is_write:
+            write_capable += amount
+        elif is_unclassified:
+            unclassified += amount
+        calls.append({
+            "name": tool,
+            "read_only": int(read_only),
+            "status": str(status or ""),
+            "count": amount,
+            "write_capable": is_write,
+            "unclassified": is_unclassified,
+        })
+    return {
+        "available": True,
+        "session_state": session_state,
+        "db": os.path.abspath(os.path.expanduser(db)),
+        "total_calls": total,
+        "write_capable_calls": write_capable,
+        "unclassified_calls": unclassified,
+        "calls": calls,
+    }
+
+
+def build_capability(args) -> dict:
+    """只读诊断一个原生子代理的实际权限与 G4 资格。
+
+    与 `review` 不同，本命令不需要任务状态/执行信封，也不写入任何状态；用于在派发
+    前后回答“这个 Profile 到底能不能写、能不能做 G4”。缺少字段时如实标注，不猜测。
+    """
+    path = _metadata_path(args.metadata)
+    data = _load_json(path)
+    if not isinstance(data, dict):
+        raise AgentRecordError(f"Agent metadata 顶层必须是对象：{path}")
+    report = AP.capability_report(data, metadata_path=path)
+    report["host_evidence"] = _host_tool_summary(
+        report.get("child_session_id"),
+        str(getattr(args, "db", "") or "")
+        or os.path.expanduser("~/.zcode/cli/db/db.sqlite"))
+    evidence = report["host_evidence"]
+    if report["g4"].get("executor"):
+        # 宿主快照是只读、但实际记录出现写入/执行调用或无法分类的调用：
+        # 不能当作“行为只读”放行，如实告警。
+        if evidence.get("write_capable_calls"):
+            report["warnings"].append("observed_write_capable_calls")
+        if evidence.get("unclassified_calls"):
+            report["warnings"].append("observed_unclassified_calls")
+    return report
 
 
 def bind_execution(args) -> dict:
@@ -917,10 +1020,12 @@ def build_review(args) -> dict:
     policy_problems = NB.reviewer_policy_problems(reviewer_policy)
     if policy_problems:
         code, detail = policy_problems[0]
+        diagnosis = AP.classify_profile(meta["profile_snapshot"])
         raise AgentRecordError(
             f"[{code}] Reviewer Profile {meta['profile_id']!r} 的宿主有效工具策略"
-            f"不满足只读复核：{detail}。独立复核必须由宿主只读子代理完成，"
-            "不能用 Profile 名称或 Prompt 声明代替权限证据。")
+            f"不满足只读复核：{detail}。{diagnosis.get('remedy') or ''}"
+            "独立复核必须由宿主只读子代理完成，不能用 Profile 名称或 Prompt 声明"
+            "代替权限证据。")
     if meta["status"] != "completed":
         raise AgentRecordError(
             f"Reviewer metadata.status={meta['status']!r}，不是 completed；"
@@ -1363,6 +1468,15 @@ def main(argv: list[str] | None = None) -> int:
                    help="要求测试产物完整性")
     p.add_argument("--output", default="")
 
+    p = sub.add_parser("capability",
+                       help="只读诊断原生子代理的实际权限与 G4 资格")
+    p.add_argument("--metadata", required=True,
+                   help="ZCode 原生 Agent 的 metadata.json（或 agent 目录）")
+    p.add_argument("--db", default=os.path.expanduser(
+        "~/.zcode/cli/db/db.sqlite"),
+        help="宿主 SQLite；只读汇总该子会话的 tool_usage（缺失时标注不可用）")
+    p.add_argument("--output", default="")
+
     p = sub.add_parser("execution", help="生成 copilot-native-result/v2 执行信封")
     p.add_argument("--state", required=True)
     p.add_argument("--dispatch", required=True,
@@ -1454,6 +1568,9 @@ def main(argv: list[str] | None = None) -> int:
             _check_output_path(args.output, workspace or os.getcwd(), args.state)
         if args.cmd == "bind-execution":
             payload = bind_execution(args)
+            return _emit(payload, args.output)
+        if args.cmd == "capability":
+            payload = build_capability(args)
             return _emit(payload, args.output)
         if args.cmd == "execution":
             payload = build_execution(args)

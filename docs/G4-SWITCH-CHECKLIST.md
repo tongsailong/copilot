@@ -1,5 +1,10 @@
 # G4 正式切换验收与旧 Reviewer 退役记录
 
+> **历史记录（2026-11-15，v6.5/v6.6.1 切换时）。** 其中的 “Reviewer Profile” 已在
+> v6.6.1 改为通用只读能力载体；当前 Agent 调度、内置 Explore/general-purpose 能力边界与
+> G4 判定以 `SKILL.md`、`references/agent-bridge.md` 第 1.1 节和 `docs/DECISIONS.md`
+> 第 52 条为准。本文件保留当时的真实验收证据，不作为现行操作指南。
+
 更新：2026-11-15 CST。本清单只记录可在本机复核的事实；未执行项不得标记 PASS。
 
 ## 结论

@@ -1,18 +1,24 @@
 # Copilot × ZCode 原生 Agent 协作系统
 
 Copilot 是运行于 ZCode 内的**轻量协作治理 Skill**：用户侧 ChatGPT 负责需求与产品层目标、
-交接与验收；ZCode 原生 Agent 是工程执行与技术决策主体，负责现场调查、规划、实现、调试、
-测试与验证；Copilot 负责任务合同、完成条件、状态、证据、审计与收口门禁，并用 PARTIAL 派生
-持续推进任务；原生只读 Reviewer 承担独立复核与高风险 G4。
+交接与验收；ZCode 原生 Agent（主代理）是工程执行与技术决策主体，负责现场调查、规划、实现、
+调试、测试与验证；Copilot 负责任务合同、完成条件、状态、证据、审计与收口门禁，并用 PARTIAL
+派生持续推进任务；高风险 G4 由宿主可证明只读的子代理承担独立复核。
+
+**v6.9.0 起 Agent 调度以主代理为默认**：`Explore` 只做独立只读调查，`general-purpose` 只
+承担边界清晰的独立交付物；不设调用比例或预算。内置 `Explore` 含 Bash、`general-purpose`
+为全工具，均不能作为 G4 执行者；没有可证明只读能力时 G4 保持 fail-closed。
 
 **v6.0.0 起 SOL（GPT-6.1-SOL）决策通道退役**：不再有远程模型决策依赖，不再有等待 SOL
 返回的状态门禁，也不新增其他远程大模型充当强制决策节点。历史调用记录、REVIEW 裁决、任务
 台账与证据原样保留，可只读查看。角色边界见 `docs/PROJECT-CHARTER.md`。
 
 本仓库是**唯一源码**；`~/.zcode/skills/copilot` 是构建产物，只允许从本仓库单向下发。
-旧 Reviewer 全局 Profile 已退役。v6.6.1 起工作区只保留一个**通用只读权限载体**
+旧 Reviewer 全局 Profile 已退役。工作区保留一个**通用只读能力载体**
 `.zcode/agents/independent-readonly.md`（Read/Grep/Glob，无 Bash/Write/Edit），
-只提供宿主级权限，不定义 Reviewer 身份或复核流程；G4 按宿主实际生效的工具策略判定。
+只提供宿主级权限，不定义 Reviewer 身份或复核流程，普通任务不强制使用；但需要 G4 时它
+是本工作区唯一可被宿主验证的只读载体，不得删除（否则 G4 只能 fail-closed）。G4 按宿主
+实际生效的工具策略判定，名称/来源/路径不参与。
 
 ## 目录
 
@@ -26,6 +32,7 @@ copilot/
 │   ├── copilot_auto.py      # 驱动：drive（推进/工作单/派生）与 ingest（回填信封）
 │   ├── native_bridge.py     # Native Bridge v2 协议与信封校验
 │   ├── native_agent.py      # 从宿主运行记录生成正式执行/复核信封
+│   ├── agent_policy.py      # Agent 调度建议与宿主权限能力判定（只读纯函数）
 │   ├── bridge_evidence.py   # 证据采集：脱敏、截断标记、清单
 │   └── lib_common.py        # 公共工具
 ├── references/              # 协议与操作参考（分发）

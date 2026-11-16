@@ -215,6 +215,29 @@ class BuildReviewTests(unittest.TestCase):
             NA.build_review(self._args())
         self.assertIn("profile_tools_not_exact", str(ctx.exception))
 
+    def test_builtin_explore_is_rejected_with_capability_remedy(self):
+        # 内置 Explore 含 Bash；拒绝信息必须说明它不是只读代理，而不是只报工具不符。
+        self._rewrite_metadata(name="Explore", profile_id="Explore",
+                               source="built-in",
+                               tools=["Bash", "Glob", "Grep", "Read",
+                                      "WebFetch", "WebSearch", "TodoWrite"])
+        with self.assertRaises(NA.AgentRecordError) as ctx:
+            NA.build_review(self._args())
+        message = str(ctx.exception)
+        self.assertIn("profile_tools_not_exact", message)
+        self.assertIn("内置 Explore", message)
+        self.assertIn("Bash", message)
+
+    def test_builtin_general_purpose_is_rejected_as_reviewer(self):
+        self._rewrite_metadata(name="general-purpose",
+                               profile_id="general-purpose", source="built-in",
+                               tools=["*"])
+        with self.assertRaises(NA.AgentRecordError) as ctx:
+            NA.build_review(self._args())
+        message = str(ctx.exception)
+        self.assertIn("profile_tools_not_exact", message)
+        self.assertIn("general-purpose", message)
+
     def test_reviewer_profile_with_write_is_rejected(self):
         self._rewrite_metadata(tools=["Read", "Grep", "Glob", "Write"])
         with self.assertRaises(NA.AgentRecordError) as ctx:

@@ -8,19 +8,24 @@ when_to_use: >
   原生完成，不进入本 Skill。
 ---
 
-# copilot：轻量协作治理（v6.8.0）
+# copilot：轻量协作治理（v6.9.0）
 
 Copilot 是运行在 ZCode 内的**协作治理层**，不是决策模型，也不是执行体。它负责把任务变成可
 追踪的合同、状态、证据与收口条件，并在任务没有真正完成时继续推进。
 
 - **用户**：业务目标、优先级、关键取舍与授权。
 - **ChatGPT（用户侧）**：需求理解、产品与业务判断、目标定义、产品层方案、验收。
-- **ZCode 原生 Agent**：唯一的工程执行与技术决策主体——调查、规划、实现、调试、测试、验证，
-  自主选择技术路线，不需要任何远程模型批准。
+- **ZCode 原生 Agent（主代理）**：唯一的工程执行与技术决策主体——调查、规划、实现、调试、
+  测试、验证，自主选择技术路线，不需要任何远程模型批准。**默认由主代理直接执行**，不为了
+  体现协作而强制调用子代理。
+- **内置子代理（按需）**：`Explore` 只做独立只读调查；`general-purpose` 只承担边界清晰、
+  可独立交付且并行收益明显的工作。二者都由主代理拆分、控制范围并集成结果。
 - **Copilot（本 Skill）**：任务承接、合同与完成条件、状态机、证据桥接、审计、PARTIAL 推进、
   收口门禁。**不做工程实施，不替代技术决策，不设置无意义的审批门。**
-- **Reviewer（原生只读子代理）**：在独立上下文检查真实文件、diff、测试日志与原始证据，给出
-  可复核结论。只读、不发布、不改代码。
+- **G4 只读复核**：高风险任务收口所需的独立复核，要求宿主强制 `Read/Grep/Glob`、禁用
+  `Write/Edit/Bash` 的子代理在独立上下文完成。内置 `Explore` 含 Bash、`general-purpose`
+  为全工具，**都不能充当 G4 执行者**；没有可证明的只读能力时保持 fail-closed，如实报告
+  宿主能力缺口，不伪造 PASS。
 - **DesignWise**：设计方法与设计质量规范；具体设计执行仍由 ZCode 完成，Copilot 不另建流程。
 
 **SOL 已退役。** `gpt-6.1-sol` 决策通道、轮次/预算状态机、`call_gpt.py`、`review_ledger.py`、
@@ -78,6 +83,65 @@ CONSULT / PLAN / REVIEW 是**本地工作模式**，不是审批节点，也不�
 - **G4 与正式 REVIEW 不同**：G4 是高风险任务收口所需的技术复核，要求原生只读 Reviewer 在
   隔离证据与独立上下文下给出 `g4_eligible=true` 的结论；formal review 是用户要求的治理记录。
   两者互不替代，任何模型判断都不等于 G4 证据。
+
+## Agent 调度（v6.9.0）
+
+**主代理直接执行是默认策略。** 子代理只解决“独立上下文、真实并行、独立交付物”三类问题，
+不用来体现协作，也不设调用比例、默认 Token 预算或强制审批。
+
+### 先判断要不要派发
+
+依次回答五个问题；任一答案不支持调用，就由主代理直接完成：
+
+1. 是否需要独立上下文？（跨模块调用链、改动前风险调查、需要不受主代理当前假设影响）
+2. 是否能够真正并行？（子代理工作与主代理当前工作可同时进行）
+3. 是否有明确、独立的交付物？（不是“帮我看看”，而是可验收的结果/补丁/报告）
+4. 是否能减少主代理总工作时间？（并行收益 > 上下文准备 + 集成成本）
+5. 是否值得多一次模型调用与结果核对？
+
+通常 **0–2 个**子代理是合理起点；只有存在真实独立工作才增加并行数量。可用
+`copilot_dispatch.py agent-policy --json` 记录判断依据（只读建议，不是门禁）。判定顺序是
+先否决、后选择：子代理不可用或写入范围冲突 → 主代理；只读调查 → `Explore`（**不交给全工具
+代理**）；独立交付物需并发且有收益 → `general-purpose`；其余 → 主代理。以下任务
+**默认不派发**：简单修改、单模块开发、连续调试、局部测试与修复、构建与最终集成、方案已
+明确实施、以及不值得建立独立上下文的任务。
+
+### Explore（只读调查）
+
+适用：跨模块代码调查、复杂调用链追踪、多个独立方向的只读研究、改动前风险调查、需要独立
+上下文的代码检查、高风险任务的独立只读复核（仅作为调查，不是 G4）。
+
+派发时必须提供：
+
+- 调查目标与需要回答的问题；
+- 文件范围或起始路径；
+- **必要的项目背景与规则**——内置 `Explore` 的 `injectAgentsMd=false`，**不会自动注入
+  AGENTS.md**，主代理必须把相关约束写进 prompt；
+- 预期证据：真实文件路径、行号、命令输出或代码片段。
+
+`Explore` 只调查、不修改工程文件；它的宿主工具集包含 `Bash`（可写/可执行），所以**不是
+只读代理**，不得用于需要证明只读的 G4 复核。
+
+### general-purpose（独立交付）
+
+仅在同时满足以下条件时使用：工作范围明确、文件边界明确、完成条件明确、与主代理正在修改
+的文件没有不可控冲突、并行收益明显高于上下文与集成成本。`general-purpose` 拥有完整工具
+（`tools=["*"]`）并继承 MCP，**不能当作只读复核者**。主代理负责拆分工作、控制授权范围、
+检查文件冲突、集成成果与最终测试验收；内置子代理不能再创建自己的子代理。
+
+### 子代理失败与降级
+
+- **主代理继续**：子代理不可用（`UNKNOWN_AGENT_TYPE`、Profile 未加载、权限不足、超时）时，
+  主代理继续完成可独立完成的工作；普通任务不得因 Agent Profile 加载失败而 BLOCKED。
+- **不机械重派**：同一失败派发不原样重复；先分析错误码（类型不存在、权限不满足、范围冲突），
+  改用主代理、`Explore` 或调整任务边界。同一缺口已有 `pending`/`running` 工作项时不再创建
+  相同子代理任务。
+- **PARTIAL 继续**：子代理返回 PARTIAL 只表示该工作项未完成；主代理分析剩余工作并继续，
+  必要时派生 `AUTO-REPLAN`，不得把局部失败当作任务终点。
+- **结果绑定**：子代理结果必须带来源（`agentId`/`childSessionId`/`profileSnapshot`）、
+  任务范围和原始证据；执行/复核信封由 `native_agent.py` 从宿主记录生成，不接受自报身份。
+- **G4 例外**：高风险 G4 需要宿主证明的只读子代理；若当前环境没有可用的只读能力载体，
+  G4 保持 fail-closed，任务按真实能力缺口报告，不把治理能力缺口误报成业务源码缺陷。
 
 ## PARTIAL 持续推进（硬约束）
 
@@ -226,8 +290,13 @@ verify 的结构化质量报告（`copilot-verify-result/v1`）走报告接入�
 - 执行方用 `native_agent.py execution` 生成 `copilot-native-result/v2`，绑定计划与执行方身份。
 - 复核方用 ZCode 原生只读子代理派发：宿主 `profileSnapshot` 的有效工具策略必须是
   `tools=[Read,Grep,Glob]` 且禁用 `Write/Edit/Bash`、无 skills/MCP；Profile 名称、来源与
-  路径不参与判定（`reviewer.profile`），无宿主策略时失败关闭。再用
-  `native_agent.py review` 生成 `copilot-native-review/v2`；`g4_eligible` 只是结构预检，
+  路径不参与判定（`reviewer.profile`），无宿主策略时失败关闭。内置 `Explore` 含 Bash、
+  `general-purpose` 为 `tools=["*"]`，均不满足；宿主也没有按派发覆盖工具的参数。
+  派发前后可用 `native_agent.py capability --metadata <metadata.json>` 只读诊断实际权限与
+  G4 资格（`g4.executor`/`precheck_only`/`codes`/`remedy`，并从宿主 `tool_usage` 汇总
+  `host_evidence`：先确认会话存在，再按工具名/`read_only=0` 统计写能力与未分类调用），它
+  不派发、不写状态；`g4.executor` 只是策略预检，不代表 G4 已通过。
+  再用 `native_agent.py review` 生成 `copilot-native-review/v2`；`g4_eligible` 只是结构预检，
   正式资格由 `g4_attest` 读取宿主 DB（`tool_usage`/`part`/`session_entry`）独立核验
   有效权限策略、会话/prompt/工作区、工具调用与原始输出，再由 `test_execution` 与
   `g4_shadow`/候选闭环派生。`commands_run` 必须为空，`files_inspected` 由宿主工具记录合并。
@@ -262,9 +331,10 @@ verify 的结构化质量报告（`copilot-verify-result/v1`）走报告接入�
 复核按需使用，不是流程门禁：
 
 - **普通任务**：ZCode 自检（diff、针对性测试、完成条件核对），不派 Reviewer。
-- **复杂非高风险任务**：自检 + 必要时一个只读子代理，聚焦目标符合性、关键改动、测试结果与
-  真实风险；不要求完整 G4 信封。
-- **高风险任务**：G1–G4 不变，独立上下文、只读约束、宿主记录与最终证据绑定，fail-closed。
+- **复杂非高风险任务**：自检 + 必要时一个内置 `Explore` 做独立只读调查；聚焦目标符合性、
+  关键改动、测试结果与真实风险，不要求完整 G4 信封。
+- **高风险任务**：G1–G4 不变，独立上下文、宿主精确只读约束、宿主记录与最终证据绑定，
+  fail-closed；没有可证明的只读能力载体时如实报告 G4 能力缺口。
 - **正式 REVIEW**：仅用户明确要求时登记（见 `references/review.md`）。
 
 ### 风险准入与停止（v6.8.0）
@@ -351,6 +421,10 @@ severity）→ 集中修复 → 针对性复核（只验证修复、新问题、
   需检查状态而不是当作任务失败。
 - 回填被拒时按错误码定位：计划漂移、摘要不符、证据篡改、宿主记录变化都必须先修正再重试，
   不得绕过校验。
+- 子代理派发失败时先读错误：`UNKNOWN_AGENT_TYPE`（类型未发现）→ 确认工作区、会话启动时机
+  与可用类型，不要原样重试；`profile_tools_not_exact`（权限不满足）→ 该 Profile 含
+  Bash/Write/MCP 或工具集不精确，不能作为 G4 执行者；`review_toolcalls_incomplete` 等宿主
+  记录问题 → 新建复核会话/attempt，不复用旧输出。普通任务在这些失败后由主代理继续。
 - 上下文中断时保留：原始目标与完成条件、当前阶段、已完成工作、未解决问题、证据与验证结果、
   明确的下一步；恢复后从真实现场继续，不把历史计划当作当前事实。
 - 不重复已证无效的做法；同一问题不重复检索；没有新证据时不重复评审。
@@ -365,13 +439,34 @@ severity）→ 集中修复 → 针对性复核（只验证修复、新问题、
 | 阶段机、`drive`/`ingest`、PARTIAL 派生、退出码 | `references/runtime.md` |
 | 正式 REVIEW、缺陷分级、G4 收口细则 | `references/review.md` |
 | 原生 Bridge v2 信封、宿主记录、错误码 | `references/agent-bridge.md` |
+| Agent 调度、内置 Explore/general-purpose 能力与 Profile 发现、G4 能力诊断 | `references/agent-bridge.md` 第 1.1 节；`native_agent.py capability`；`copilot_dispatch.py agent-policy` |
 | 历史 REVIEW 台账与旧审计（只读） | `references/review-ledger.md` |
 | 版本沿革与 SOL 退役记录 | `references/history.md` |
 | 角色与历史 SOL 指令（只作历史） | `references/role.md`、`role-consult.md` / `role-plan.md` / `role-review.md` / `role-map.md` |
 
 ## 版本
 
-当前版本 **v6.8.0（ZCode Autonomous Development Edition）**。v6.8.0 收敛独立复核效率：
+当前版本 **v6.9.0（ZCode Autonomous Development Edition）**。v6.9.0 优化 Agent 调度与原生
+子代理集成：
+
+- **调度策略落地**：主代理直接执行为默认；`Explore` 只做独立只读调查；`general-purpose`
+  只承担边界清晰、可独立交付且并行收益明显的工作。新增五问决策清单与
+  `copilot_dispatch.py agent-policy`（只读建议，不是门禁）；不设调用比例、预算或强制协作。
+- **内置能力基线（ZCode 3.18.2）**：`Explore` 工具集含 `Bash`（`read_only=0`）、
+  `injectAgentsMd=false`；`general-purpose` 为 `tools=["*"]` 并继承 MCP。宿主没有按派发
+  覆盖工具的参数，也没有 OS 级只读沙箱。
+- **G4 不放宽**：仍要求宿主精确 `Read/Grep/Glob` + 禁用 `Write/Edit/Bash`；内置 Explore 与
+  general-purpose 都不合格。新增
+  `native_agent.py capability --metadata ...` 只读诊断实际权限与 G4 资格；无法满足时
+  fail-closed 并如实报告能力缺口，不伪造 PASS。
+- **Profile 根因收敛**：宿主在会话启动时从 user/project 目录加载 Profile 并在会话内缓存；
+  旧 user `reviewer`（含 Bash）或内置 Explore/general-purpose 会产生
+  `profile_tools_not_exact`；未知类型返回 `UNKNOWN_AGENT_TYPE`，不会静默回退。
+- **失败与持续推进**：子代理不可用/返回 PARTIAL 时主代理继续；不原样重复失败派发；普通任务
+  不因 Profile 加载失败而 BLOCKED；G4 能力缺口与业务源码缺陷分开报告。
+- **未放宽**：G1–G4、fail-closed、attempt/宿主记录绑定、证据与 PWW 接受规则不变。
+
+v6.8.0 收敛独立复核效率：
 
 - **风险准入**：新增 `review-admission`；高风险恒需 G4，普通风险默认不派 Reviewer，声明
   `security`/`core-logic`/`data-integrity` 等触发因素才建议复核；纯文档/格式调整不复核。

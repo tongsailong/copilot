@@ -14,6 +14,78 @@ Copilot 不派发 Agent、不调用模型、不写别人的会话。它只校验
 `native_agent.py` 从真实 `metadata.json`、宿主 SQLite（`tool_usage`/`part`/`session_entry`）
 与证据文件生成信封，避免主代理手抄身份。
 
+## 1.1 内置子代理能力与 Profile 发现（ZCode 3.18.2）
+
+以本机安装的 ZCode 3.18.2 为准，宿主内置子代理只有两个（没有 Plan Agent）：
+
+| Agent | 宿主工具集 | AGENTS.md | MCP | 可写 | G4 执行者 |
+|---|---|---|---|---|---|
+| `Explore` | `Bash,Glob,Grep,Read,WebFetch,WebSearch,TodoWrite` | `injectAgentsMd=false` | 不继承（显式工具集不含 `mcp__*`） | 是（Bash） | **否** |
+| `general-purpose` | `["*"]` | `injectAgentsMd=true` | 继承 | 是 | **否** |
+
+依据：
+
+- 宿主源码把 `Explore` 的允许工具固定为上述列表；`Agent` 工具参数只有
+  `description/prompt/subagent_type/run_in_background`，**没有按派发覆盖工具的参数**。
+- 真实 `metadata.json` 的 `profileSnapshot.tools` 与 `tool_usage` 一致；子代理会话中
+  **completed** 的 `Bash` 记录为 `read_only=0, side_effect_scope=system`（失败调用可能
+  为 `NULL`），`Write/Edit/ApplyPatch` 也会记为工作区写入。因此“含 Bash”不是理论风险，
+  而是宿主无法证明只读。宿主 3.18.2 的写工具集合为 `Write/Edit/ApplyPatch/Bash`，
+  执行类 `js*` 与代理类 `Agent/Task` 同样能改文件。
+- `general-purpose` 的 `tools=["*"]` 会继承主会话 MCP；真实子会话中可见
+  `mcp__huashu-chrome__*` 等调用。它不能当作只读复核者。
+- 没有 OS 级只读沙箱：`Read` 没有路径限制；`profileSnapshot` 只是宿主施加的工具白名单。
+  后台派发（`run_in_background`/自动 background）只改变调度与回传方式，**不改变工具集**，
+  因此“后台 Explore”仍含 Bash，不能当作只读模式。
+
+**Profile 发现与加载**（`rCi` 于会话 bootstrap 执行）：
+
+1. 来源：`~/.zcode/agents`（user）→ `<会话工作目录>/.zcode/agents`（project）→
+   `additionalDirectories` 下同名目录（带 namespace）；后加载覆盖前者，project 优先于 user，
+   user/project 同名可覆盖内置。`agents-state.json` 的 `disabledAgentIds` 可禁用 user Profile。
+2. **加载时机是会话/进程启动**；Profile 文件新建、改名或删除不会热更新到已启动会话。
+   Desktop 若通过 `subagentsReadRuntimeConfig` 返回 `kind=built-in-fallback`，本会话只有
+   内置 Agent，不会扫描工作区目录。
+3. 未知 `subagent_type` 返回可恢复错误 `UNKNOWN_AGENT_TYPE` 并列出可用类型，
+   **不会静默回退** general-purpose；只有省略 `subagent_type` 才等同于 general-purpose。
+4. 项目级 Profile 的真实快照通常不含 `permissionMode`（宿主不记录），判定必须允许缺省；
+   `tools`/`disallowedTools`/`path`/`source`/`systemPrompt` 会记录。
+
+**上下文与结果回传**：子代理使用独立上下文；内置 `Explore` 不注入 AGENTS.md，
+`general-purpose` 会注入。前台 `Agent` 调用只返回一段 hand-back 文本（含 `agentId` 与
+usage），**不返回** status/childSessionId/totalToolUseCount；后三者与最终输出必须从
+`metadata.json`、DB `message`/`part`/`tool_usage` 读取。后台派发通过完成通知/`TaskOutput`
+取回，不能假设自动重试；`SendMessage` 可续同一 child session，但复核链路每轮必须新建
+会话（宿主会重置 `totalToolUseCount`）。
+
+**历史症状的根因**（真实宿主记录，非推测）：
+
+- `profile_tools_not_exact` 来自实际派发的 Profile 不满足精确只读：旧 user `reviewer`
+  含 `Bash`（153 次真实快照）、内置 `Explore`（153 次）、`general-purpose`（109 次）。
+  判定只看有效工具策略，与名称/路径无关，所以这是正确拒绝，不是名称匹配 bug。
+- “新会话没发现只读 Profile”通常是：会话工作目录不是仓库根、会话在 Profile 新建/改名之前
+  启动（沿用启动期缓存）、或 Desktop runtime config 回退为 built-in-only。新会话应先确认
+  `metadata.profileId`/`profileSnapshot.source` 与可用类型，再决定是否需要重新派发。
+
+**G4 结论**：内置 `Explore` 与 `general-purpose` 都不满足 G4；不放宽为“实际没调用 Bash
+就当作只读”，因为要求是**不存在** `Write/Edit/Bash` 能力。没有宿主强制只读的能力载体时，
+G4 必须 fail-closed，并如实报告为治理能力缺口，不能伪造 PASS 或把 general-purpose 当
+Reviewer。派发前后可用 `native_agent.py capability --metadata <metadata.json>` 只读诊断
+（输出 `classification`、`g4.executor`/`precheck_only`/`codes`/`remedy`），并只读汇总该
+子会话的 `tool_usage` 为 `host_evidence`：
+
+- 先确认会话存在于宿主 `session` 表；不存在返回 `reason=session_not_found`，只有
+  “会话存在但 0 次调用”才报 `total_calls=0`。
+- 逐调用判定：工具名命中写/执行集合（`Bash/Write/Edit/ApplyPatch/Agent/Task/js*`）或
+  `mcp__*`，或宿主记录 `read_only=0` → `write_capable_calls`；工具名未知且宿主未分类 →
+  `unclassified_calls`。两者任一非零都会追加 `observed_*` 告警。
+- Profile 级“能不能写”用 `KNOWN_READ_ONLY_TOOLS` 反向判定：**任何未知工具都按可能写入
+  处理**，不依赖手工维护的写工具清单。
+
+它不派发、不写状态；`g4.executor` 只是宿主 Profile 策略预检（`precheck_only=true`），
+Profile 文件存在性/正文一致性、会话与 prompt 绑定、工具调用与原始输出仍由 `g4_attest`
+独立核验，`host_evidence` 也不改变权限判定。
+
 ## 2. 信封 v2
 
 ### 2.1 dispatch（`copilot-native-dispatch/v2`）

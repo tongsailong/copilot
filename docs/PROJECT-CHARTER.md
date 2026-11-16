@@ -1,7 +1,7 @@
 # 项目章程：Copilot × ZCode 原生 Agent 协作系统
 
 本文件固定协作职责，不随阶段推进变化；能力与进度见 `ROADMAP.md`、`STATUS.md`。
-现行协作文档基线为 ChatGPT 自定义指令 v5.4.0 与用户级 `AGENTS.md`。
+现行协作文档基线为 ChatGPT 自定义指令 v5.5.1 与用户级 `AGENTS.md`。
 
 ## 角色分工（v6.0.0）
 
@@ -11,16 +11,17 @@
 | **ChatGPT（用户侧）** | 需求理解、产品与业务判断、目标定义、产品层方案规划、任务交接、结果验收 | 不假装拥有本地执行能力；不包办工程技术步骤 |
 | **ZCode 原生 Agent** | **唯一工程执行与技术决策主体**：现场调查、工程规划、方案选择、实施、调试、测试、验证、原生子 Agent 调度；对技术路线与执行结果负责 | 不改变业务目标与规则；不扩大授权；高风险动作须授权 |
 | **Copilot** | 运行于 ZCode 内的轻量协作治理：任务承接、合同与完成条件、状态机、证据桥接、审计、PARTIAL 持续推进、G1–G4 收口 | 不实施工程；不替代 ZCode 的技术决策；不设置无意义的审批门；不调用远程模型 |
-| **原生 Reviewer** | 独立上下文只读复核真实文件、diff、测试日志与原始证据；给出 verdict/findings；承担高风险 G4 | 只读工具集；不改代码、不发布；不得与执行方共用 Agent/上下文 |
+| **G4 只读复核** | 在独立上下文复核真实文件、diff、测试日志与原始证据；给出 verdict/findings；承担高风险 G4 | 只读工具集；不改代码、不发布；不得与执行方共用 Agent/上下文；由宿主精确 `Read/Grep/Glob` 且禁用 `Write/Edit/Bash` 证明，内置 `Explore`/`general-purpose` 不合格 |
 | **DesignWise** | 运行于 ZCode 内的设计方法与设计质量规范 Skill | 不替用户或 ChatGPT 作业务取舍；Copilot 不重复建设其工作流 |
 
 **SOL 已于 v6.0.0 退役。** 历史 v5.x 文档中“SOL 决策通道”的表述只作历史记录，不再构成
 任何角色职责、决策节点或状态门禁。不得用其他远程大模型替代其强制决策职责。
 
 **Executor** 是 ZCode 工程执行体系内的执行分工（主代理或子代理），不是与上述角色并列的
-顶层角色。Executor 与 Reviewer 必须是不同 Agent / Child Session；Provider 与模型可
-`model: inherit` 跟随主代理，但独立性与只读要求不变。绑定规则见
-`references/agent-bridge.md`；G4 细则见 `references/review.md`。
+顶层角色；历史文档中的“Reviewer”只指 G4 只读复核执行方，不是独立角色体系。Executor 与
+G4 只读复核执行方必须是不同 Agent / Child Session；Provider 与模型可 `model: inherit`
+跟随主代理，但独立性与只读要求不变。绑定规则见 `references/agent-bridge.md`；G4 细则见
+`references/review.md`。
 
 **协作闭环**：ChatGPT 定义目标 → ZCode 原生 Agent 承接并自主调查、规划、实施、调试、测试、
 验证 → Copilot 做轻量治理与证据桥接（必要时）→ 结果回传 → 验收。简单任务不强制经过

@@ -246,7 +246,8 @@ class RealDistributionTests(unittest.TestCase):
         manifest = S.source_manifest(ROOT)
         for rel in ("SKILL.md", "scripts/governance.py",
                     "scripts/copilot_dispatch.py", "scripts/copilot_auto.py",
-                    "scripts/native_bridge.py", "scripts/native_agent.py"):
+                    "scripts/agent_policy.py", "scripts/native_bridge.py",
+                    "scripts/native_agent.py"):
             self.assertIn(rel, manifest)
         self.assertFalse([k for k in manifest if k.startswith("legacy/")])
         self.assertFalse([k for k in manifest if k.startswith("tests/")])

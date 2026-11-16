@@ -124,6 +124,17 @@
 以下**不得**作为 BLOCKED 理由：轮次/预算/费用阈值、等待远程模型、重复评审、内部状态流转、
 子 Agent 返回 PARTIAL、首次方案失败、普通测试失败、可自行补齐的证据不足。
 
+### 子代理派发失败与降级（v6.9.0）
+
+- **主代理继续**：子代理不可用、派发失败或返回 PARTIAL 只影响该工作项。主代理分析剩余工作，
+  继续可直接完成的调查、修复、测试与集成；普通任务不因 Agent Profile 加载失败而 BLOCKED。
+- **不原样重派**：`UNKNOWN_AGENT_TYPE` 先确认工作区/会话启动时机/可用类型；`profile_tools_not_exact`
+  说明该 Profile 含 Bash/Write/MCP 或工具集不精确，不能作为 G4 执行者；宿主记录不完整时新建
+  复核会话与 attempt。同一缺口已有 `pending`/`running` 工作项时不再创建相同子代理任务；
+  连续失败派生 `AUTO-REPLAN`，要求换实质不同的路线。
+- **G4 能力缺口**：高风险任务缺少宿主可证明的只读能力载体时，G4 保持 fail-closed；把原因
+  写成治理/宿主能力缺口，不误报为业务源码缺陷，也不伪造 PASS。
+
 ### BLOCKED 下的受控写入
 
 BLOCKED 阻止的是收口和受阻动作，不是事实记录。允许 `record`、`rerun`、`evidence --add`、

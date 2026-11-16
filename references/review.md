@@ -80,13 +80,14 @@ copilot_dispatch.py formal-review --state <state> --verdict pass \
 
 | 任务类型 | 默认做法 |
 |---|---|
-| 普通任务（单文件/小改动、能本地测试） | ZCode 自检：读 diff、跑针对性测试、核对完成条件；不派 Reviewer |
-| 复杂但非高风险（跨模块、行为变化、需要第二意见） | ZCode 自检 + 必要时一个只读子代理，聚焦目标符合性、关键改动、测试结果与真实风险 |
-| 高风险（安全、权限、关键业务链路、全局机制） | G1–G4：独立上下文、只读约束、宿主记录与最终证据绑定 |
+| 普通任务（单文件/小改动、能本地测试） | ZCode 主代理自检：读 diff、跑针对性测试、核对完成条件；不派子代理 |
+| 复杂但非高风险（跨模块、行为变化、需要第二意见） | 主代理自检 + 必要时一个内置 `Explore` 做独立只读调查；聚焦目标符合性、关键改动、测试结果与真实风险，不要求 G4 信封 |
+| 高风险（安全、权限、关键业务链路、全局机制） | G1–G4：独立上下文、宿主精确只读约束、宿主记录与最终证据绑定；内置 Explore 含 Bash，不能充当 G4 执行者 |
 | 用户明确要求正式 REVIEW | 另按第 1 节登记，与风险分级无关 |
 
 不因“改了很多文件”“任务复杂”“有审核模式”机械派 Reviewer，也不要求每个复核都
 生成完整 G4 信封。普通复核的价值是发现 ZCode 自检看不到的问题，不是重复一遍自检。
+是否派发子代理按 `SKILL.md` 的五问清单判断；0–2 个是常见起点，不是配额。
 
 ### 风险准入与停止（v6.8.0）
 
@@ -206,11 +207,15 @@ finding 必须有可达的缺陷机制、实际影响与可核实证据（文件
 
 ### 记录与边界
 
-- 由 ZCode 原生只读子代理执行：工作区通用只读 Profile
-  `.zcode/agents/independent-readonly.md` 只提供宿主权限（`tools=[Read,Grep,Glob]`，
-  禁用 `Write/Edit/Bash`，无 skills/MCP）；G4 按 `reviewer.profile` 记录的有效策略判定，
-  Profile 名称、来源与路径不参与；没有宿主策略时失败关闭。`review-json/v2` 的输出格式
-  由主 Agent 在派发 prompt 中给出，Profile 本身不定义复核流程或输出契约。
+- 由**宿主强制只读**的子代理执行：G4 按 `reviewer.profile` 记录的有效策略判定——`tools`
+  精确等于 `Read/Grep/Glob`、显式禁用 `Write/Edit/Bash`、无 skills/MCP；Profile 名称、来源
+  与路径不参与；没有宿主策略时失败关闭。内置 `Explore` 含 Bash、`general-purpose` 为
+  `tools=["*"]`，**都不是**只读代理；宿主没有按派发覆盖工具的参数。没有可证明的只读能力
+  载体时，G4 保持 fail-closed 并报告能力缺口，不伪造 PASS。派发前后用
+  `native_agent.py capability --metadata <metadata.json>` 只读诊断实际权限与资格。
+  `review-json/v2` 的输出格式由主 Agent 在派发 prompt 中给出，Profile 本身不定义复核流程
+  或输出契约（工作区 `.zcode/agents/independent-readonly.md` 若存在，只是通用只读能力
+  载体，不是 Reviewer 角色，也不是 G4 的必经路径）。
 - 检查真实文件、diff、测试日志与原始证据，给出 verdict 与 findings（含文件位置与证据）。
 - 实际读取由 `native_agent.py` 从宿主 `tool_usage`/`part` 合并，不要求 Reviewer 手工
   复述；`commands_run` 恒为空。结论可用 `native_agent.py review` 生成信封并回填；

@@ -8,38 +8,42 @@
 
 Copilot 是运行于 ZCode 内的**轻量协作治理 Skill**：负责任务承接、合同与完成条件、状态机、
 证据桥接、审计、PARTIAL 持续推进与 G1–G4 收口。ZCode 原生 Agent 是唯一的工程执行与技术
-决策主体；用户侧 ChatGPT 负责需求与产品层目标、交接与验收；原生 Reviewer 承担独立复核与
-高风险 G4。
+决策主体；用户侧 ChatGPT 负责需求与产品层目标、交接与验收；高风险 G4 由宿主可证明只读的
+子代理承担独立复核。
 
 - **v6.0.0 起 SOL 决策通道退役**：活动路径不得调用任何远程模型，不得把其他远程大模型设为
   强制决策节点，也不得设置等待远程返回的状态门禁。历史实现归档在 `legacy/`，历史审计、
   裁决、台账与证据只读保留。
 - 本仓库是**唯一源码**。`~/.zcode/skills/copilot` 是构建产物，只能由
   `scripts-sync/sync_runtime.py` 单向下发，不得直接编辑。旧 Reviewer 全局 Profile
-  已退役；工作区 `.zcode/agents/independent-readonly.md` 是唯一通用只读权限载体
-  （只声明宿主权限，不定义 Reviewer 角色或流程），G4 按 `profileSnapshot` 的有效策略
-  判定（名称/来源/路径不参与），该文件不属于同步分发范围。
+  已退役；工作区 `.zcode/agents/independent-readonly.md` 是通用只读能力载体（只声明
+  宿主权限，不定义 Reviewer 角色或流程）。普通任务不强制使用它；但宿主 3.18.2 没有
+  派发期工具白名单，**需要 G4 时它是本工作区唯一可被宿主验证的只读载体，不得删除**
+  （删除后 G4 只能 fail-closed）。G4 按 `profileSnapshot` 的有效策略判定（名称/来源/
+  路径不参与），该文件不属于同步分发范围。
 - 运行时临时修复必须先回迁本仓库，再同步下发；不使用符号链接替代副本。
 - 源码与运行时的分工见 `docs/DECISIONS.md`。
 
 ## 2. 角色职责
 
 顶层协作角色按 `docs/PROJECT-CHARTER.md`：用户、ChatGPT（用户侧）、Copilot、ZCode 原生
-Agent、原生 Reviewer、DesignWise。Executor / Reviewer 是 ZCode 工程执行体系内的子角色，
+Agent、G4 只读复核、DesignWise。Executor / Reviewer 是 ZCode 工程执行体系内的子角色，
 不是与顶层角色并列的职责。
 
 | 角色 | 职责 | 关键限制 |
 |---|---|---|
-| ZCode 主代理 | 现场调查、工程规划、技术选型、实现、调试、测试、交付；派发子代理；组织必要的独立复核 | 不擅自改变产品目标、业务规则或授权范围 |
-| Executor 子代理 | 按工作项执行具体实现与取证，回报事实 | 有工具但无最终判断权；不得替代 Reviewer |
-| Reviewer 子代理 | 在独立上下文基于真实文件、diff、测试日志与原始证据给出复核结论 | 宿主有效工具策略必须是 `Read/Grep/Glob` 且禁用 `Write/Edit/Bash`、无 skills/MCP（`tools: []` 等于继承父工具，一律拒绝）；这是工具配置层面的约束，不是操作系统沙箱；不得修改代码或代替执行方 |
+| ZCode 主代理 | 默认执行主体：现场调查、工程规划、技术选型、实现、调试、测试、集成与交付；按需派发子代理 | 不擅自改变产品目标、业务规则或授权范围；不为体现协作强制调用子代理 |
+| 内置 `Explore` | 独立只读调查：跨模块/调用链/改动前风险/独立上下文检查 | 工具集含 `Bash`，不是只读代理；不注入 AGENTS.md，主代理必须提供范围与项目背景；不修改工程文件，不能作为 G4 执行者 |
+| 内置 `general-purpose` | 边界清晰、可独立交付、并行收益明显的子任务 | `tools=["*"]` 并继承 MCP；主代理负责拆分、冲突检查、集成与验收；不能当作只读复核者 |
 | Copilot 状态层 | 合同、条件、状态、证据登记、四门、PARTIAL 派生、收口、审计 | 是本地脚本与状态，不是模型；不调用模型、不实施工程、不替代技术决策、门禁不得绕过 |
 | 正式 REVIEW | 用户明确要求时的治理记录 | 不是普通开发前置门禁；不能替代 G4；无授权不得伪造 |
-| G4 复核 | 高风险任务收口所需的技术复核 | 原生独立只读复核 + 宿主记录重核 + 目标摘要绑定；fail-closed |
+| G4 复核 | 高风险任务收口所需的技术复核 | 宿主有效策略必须精确 `Read/Grep/Glob` 且禁用 `Write/Edit/Bash`、无 skills/MCP；内置 Explore/general-purpose 均不合格；fail-closed，无可证明只读能力时报告能力缺口 |
 
 **模型独立 ≠ Agent 独立。** 共享同一 Provider/模型不等于共享上下文、会话或判断。
-Reviewer 与 Executor 必须是不同的 Agent ID / Child Session / 上下文；Reviewer 的
-独立性由独立上下文、只读工具、独立取证与独立报告保证，不由模型名保证。
+复核方与执行方必须是不同的 Agent ID / Child Session / 上下文；独立性由独立上下文、宿主
+只读策略、独立取证与独立报告保证，不由模型名或 Profile 名称保证。工作区
+`.zcode/agents/independent-readonly.md` 只是通用只读能力载体（不作为普通任务的前置条件，
+也不是 G4 的必经路径）。
 
 ## 3. 模型路由规则
 
@@ -79,7 +83,7 @@ Reviewer 与 Executor 必须是不同的 Agent ID / Child Session / 上下文；
    python3 scripts-sync/sync_runtime.py --check   # 缺失 0、不同 0
    ```
 
-   同步同时覆盖 Skill 与 Reviewer；`--prune` 仅在明确要求清理运行时多余文件时使用。
+   同步只覆盖 Skill（Profile 不参与分发）；`--prune` 仅在明确要求清理运行时多余文件时使用。
 6. 真实模型调用、push、发布、部署均需单独授权；本地 commit 仅在任务明确授权时执行。
 
 ## 5. Copilot 闭环规则
@@ -90,6 +94,12 @@ Reviewer 与 Executor 必须是不同的 Agent ID / Child Session / 上下文；
   `AUTO-REPLAN` / `AUTO-NEXT`）并继续推进，直到 PASS 或真实 BLOCKED。禁止因轮次、Token、
   内部费用、等待模型、重复评审、子 Agent PARTIAL、首次方案失败或普通测试失败停止。
 - `execution_backend` 默认 `legacy`，native 为显式 opt-in；既有协议决定不得擅改。
+- **Agent 调度按 `SKILL.md`**：主代理直接执行为默认；`Explore` 只做独立只读调查（不注入
+  AGENTS.md，必须提供范围与背景）；`general-purpose` 只承担边界清晰的独立交付物。
+  不设调用比例或预算；子代理不可用/PARTIAL 时主代理继续，不原样重复失败派发。
+- **内置子代理不是 G4 执行者**：`Explore` 含 Bash、`general-purpose` 为 `tools=["*"]`，
+  均不满足精确只读要求。G4 仍要求宿主 `Read/Grep/Glob` + 禁用 `Write/Edit/Bash`；
+  无可证明只读能力时 fail-closed 并报告能力缺口，不伪造 PASS、不新建自定义只读子代理补位。
 - G1–G4 保持 fail-closed：证据不足、绑定不符、门禁未过时必须失败关闭，不得用
   “看起来合理”替代验证；普通 Reviewer PASS **不等于** G4，`g4_eligible` 由宿主记录计算。
 - 执行/复核必须绑定 task / contract / plan / dispatch / work_item /

@@ -32,9 +32,10 @@ if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
 import governance as G  # noqa: E402
+import agent_policy as AP  # noqa: E402
 import review_policy as RP  # noqa: E402
 
-__version__ = "6.8.0"
+__version__ = "6.9.0"
 
 
 class CLIError(Exception):
@@ -525,6 +526,36 @@ def cmd_review_admission(args) -> int:
         if not decision.get("code_scope_checked"):
             print("提示：未提供 --workspace，未比较当前代码范围；"
                   "same-snapshot/docs-only 判断不可用。")
+    return 0
+
+
+def cmd_agent_policy(args) -> int:
+    """只读调度建议：主代理默认执行，Explore/general-purpose 按需。
+
+    这是决策支持，不是调度器：不创建任务、不派发子代理、不设调用配额。
+    """
+    decision = AP.dispatch_advice(
+        needs_independent_context=bool(args.needs_independent_context),
+        parallelizable=bool(args.parallel),
+        independent_deliverable=bool(args.independent_deliverable),
+        write_conflict=bool(args.write_conflict),
+        saves_time=bool(args.saves_time),
+        research_only=bool(args.research_only),
+        subagent_unavailable=bool(args.subagent_unavailable),
+    )
+    decision["schema"] = "copilot-agent-dispatch-advice/v1"
+    decision["note"] = (
+        "建议而非门禁；主代理可按现场证据否决，但不得为“体现协作”强制调用子代理。"
+        "内置 Explore 不注入 AGENTS.md，派发时必须提供项目背景与范围；"
+        "general-purpose 拥有完整工具与 MCP，不能当作只读复核者。")
+    if args.json:
+        _print(decision)
+    else:
+        print(f"建议执行方：{decision['executor']}")
+        print(f"理由：{decision['reason']}")
+        for item in decision.get("prompt_requirements") or []:
+            print(f"- {item}")
+        print("说明：" + decision["note"])
     return 0
 
 
@@ -1044,6 +1075,25 @@ def build_parser() -> argparse.ArgumentParser:
                    help="把本次准入判断写入 review_admissions（普通风险也留痕）")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_review_admission)
+
+    p = sub.add_parser("agent-policy",
+                       help="只读调度建议：主代理默认，Explore/general-purpose 按需")
+    p.add_argument("--needs-independent-context", action="store_true",
+                   help="调查需要独立上下文（跨模块/调用链/独立复核）")
+    p.add_argument("--parallel", action="store_true",
+                   help="存在可真正并行的独立工作")
+    p.add_argument("--independent-deliverable", action="store_true",
+                   help="有边界清晰、可独立验收的交付物")
+    p.add_argument("--write-conflict", action="store_true",
+                   help="工作范围与主代理正在修改的文件冲突；冲突时建议主代理")
+    p.add_argument("--saves-time", action="store_true",
+                   help="并行收益明显高于上下文与集成成本（覆盖第 4、5 问）")
+    p.add_argument("--research-only", action="store_true",
+                   help="只读调查，不修改工程文件；只建议 Explore，不交给全工具代理")
+    p.add_argument("--subagent-unavailable", action="store_true",
+                   help="Profile/类型不可用或权限不满足；建议主代理继续")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_agent_policy)
 
     p = sub.add_parser("finding",
                        help="查看/更新 Finding 台账（修复与定向验证，不触发复核）")
