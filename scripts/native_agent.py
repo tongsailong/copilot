@@ -66,6 +66,7 @@ import governance as G
 import host_records
 import review_output  # noqa: E402
 import native_bridge as NB  # noqa: E402
+import review_policy as RP  # noqa: E402
 
 EXIT_OK, EXIT_USAGE = 0, 2
 MAX_JSON_BYTES = 4 << 20
@@ -368,6 +369,33 @@ def bind_execution(args) -> dict:
     }
 
 
+def _check_output_path(value: str, workspace: str, state_path: str) -> None:
+    """--output 在执行/复核快照之后写出，不能落在未被快照排除的工作区路径。"""
+    text = str(value or "").strip()
+    if not text:
+        return
+    workspace_root = G.CS.git_root(workspace) or os.path.abspath(workspace)
+    absolute = os.path.abspath(os.path.expanduser(text))
+    try:
+        inside = os.path.commonpath([workspace_root, absolute]) == workspace_root
+    except ValueError:
+        inside = False
+    if not inside:
+        return
+    task_dir = os.path.dirname(os.path.abspath(state_path))
+    rel_task = os.path.relpath(task_dir, workspace_root)
+    task_excluded = rel_task != "." and (
+        rel_task == ".copilot-tasks" or rel_task.startswith(".copilot-tasks" + os.sep)
+        or rel_task == ".audit" or rel_task.startswith(".audit" + os.sep))
+    if task_excluded and (absolute == task_dir
+                          or absolute.startswith(task_dir + os.sep)):
+        return
+    raise AgentRecordError(
+        "--output 不能写在工作区内：执行/复核快照生成时该文件尚不存在，之后会出现"
+        "代码范围不一致。请写到工作区外，或把状态放在 `.copilot-tasks/` / `.audit/`"
+        "任务目录下。")
+
+
 def build_execution(args) -> dict:
     state = G.load_state(os.path.abspath(args.state))
     dispatch_env, native = _dispatch_for_state(state, args.dispatch)
@@ -466,13 +494,14 @@ def build_execution(args) -> dict:
                 "本次执行登记的文件证据。")
     workspace = str(getattr(args, "workspace", "") or "").strip() \
         or os.getcwd()
-    excluded = list(G._evidence_paths(state)) + list(G.governance_paths(args.state))
+    _check_output_path(getattr(args, "output", ""), workspace, args.state)
+    evidence_files = list(G._evidence_paths(state))
     for item in env["evidence"]:
         if isinstance(item, dict) and item.get("file"):
-            excluded.append(str(item["file"]))
-    for extra in (getattr(args, "output", ""), getattr(args, "result_file", "")):
-        if str(extra or "").strip():
-            excluded.append(os.path.abspath(os.path.expanduser(str(extra))))
+            evidence_files.append(str(item["file"]))
+    excluded = G.CS.safe_path_excludes(
+        evidence_files, workspace, str(getattr(args, "base", "") or "")) \
+        + list(G.governance_paths(args.state))
     snapshot = G.capture_code_snapshot(
         workspace, exclude_paths=excluded,
         base=str(getattr(args, "base", "") or ""))
@@ -481,6 +510,7 @@ def build_execution(args) -> dict:
     env["execution_binding"] = binding_env
     env["code_scope_sha256"] = str(snapshot.get("digest") or "") \
         if snapshot.get("available") else ""
+    env["code_scope_excluded_paths"] = sorted(set(excluded))
     env["result_sha256"] = NB.envelope_sha256(env)
     try:
         NB.validate_execution_result(env, native, state)
@@ -1070,9 +1100,10 @@ def build_review_context(args) -> dict:
             "execution 尚未入账；请先用 auto ingest 回填 execution，再生成上下文。")
     workspace = str(getattr(args, "workspace", "") or "").strip() or os.getcwd()
     code_base = str(getattr(args, "base", "") or "").strip()
-    code_snapshot = G.capture_code_snapshot(
-        workspace, exclude_paths=G._evidence_paths(state)
-        + G.governance_paths(args.state), base=code_base)
+    code_snapshot = G._review_code_snapshot_for_execution(
+        workspace, state, args.state, code_base,
+        str(execution.get("code_scope_sha256") or ""),
+        execution.get("code_scope_excluded_paths"))
 
     coverage = NB.review_coverage(state)
     evidence = []
@@ -1182,6 +1213,34 @@ def build_review_context(args) -> dict:
             + ", ".join(f"{item['id']}({item['problem']})" for item in drift)
             + "；先修正证据或重新回填执行结果再复核。")
     current_target = G.final_evidence_digest(state)
+    triggers = [str(item).strip() for item in getattr(args, "trigger", []) or []
+                if str(item).strip()]
+    admission_reason = str(getattr(args, "reason", "") or "")
+    ledger = RP.ledger_summary(state)
+    try:
+        admission = G.review_admission(
+            state, triggers=triggers, reason=admission_reason,
+            target_sha256=current_target,
+            code_scope_sha256=str(code_snapshot.get("digest") or ""),
+            files=[item for item in code_snapshot.get("files") or []
+                   if isinstance(item, dict)],
+            scope=scope)
+    except RP.ReviewPolicyError as exc:
+        raise AgentRecordError(f"[review_admission_invalid] {exc}") from None
+    if ledger.get("blocking"):
+        warnings.append(
+            "Finding 台账仍有未闭合 blocking/major："
+            + ", ".join(ledger["blocking"])
+            + "；先修复并用定向测试/证据验证（finding --status fixed/verified），"
+              "不要直接重跑完整复核。")
+    if not admission.get("reentry", {}).get("allowed"):
+        warnings.append(
+            "复核准入拒绝：" + str(admission["reentry"].get("detail") or "")
+            + "（如需重入，显式给出 --trigger 与 --reason）。")
+    if admission.get("decision") == "not_required":
+        warnings.append(
+            "普通风险且未声明实质触发因素：默认不派发 Reviewer；"
+            "自检、diff 与确定性测试足以覆盖时直接停止。")
     if previous and not previous.get("trust_problems") and \
             previous.get("g4_eligible") and previous_target and \
             previous_target != current_target:
@@ -1220,6 +1279,8 @@ def build_review_context(args) -> dict:
             review_scope=scope,
             based_on_review_sha256=based_on,
             evidence_manifest=manifest,
+            triggers=triggers,
+            reason=admission_reason,
             workspace=workspace, base=code_base,
         )
     return {
@@ -1241,6 +1302,8 @@ def build_review_context(args) -> dict:
         "based_on_review_sha256": based_on,
         "evidence_manifest": manifest,
         "scope_reason": reason,
+        "review_admission": admission,
+        "finding_ledger": ledger,
         "evidence": evidence,
         "criteria": criteria,
         "warnings": warnings,
@@ -1369,10 +1432,26 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--base", default="",
                    help="可选：任务开始时的 git commit；用于把已提交的任务代码纳入"
                         "代码快照（默认只比较工作区与 HEAD）")
+    p.add_argument("--trigger", action="append", default=[],
+                   help="重新完整复核的实质触发因素（blocking-fix/major-fix/"
+                        "code-changed/scope-expanded/evidence-changed/risk-changed 等）；"
+                        "已有 PASS 覆盖当前快照时拒绝重复派发")
+    p.add_argument("--reason", default="",
+                   help="复核准入/重入原因，写入 admission 记录")
     p.add_argument("--output", default="")
 
     args = ap.parse_args(argv)
     try:
+        if args.cmd in ("review", "review-context") and getattr(
+                args, "output", ""):
+            workspace = str(getattr(args, "workspace", "") or "")
+            if not workspace:
+                state = G.load_state(os.path.abspath(args.state))
+                attempt = G.find_review_attempt(
+                    state, str(getattr(args, "attempt", "") or ""))
+                workspace = str(((attempt or {}).get("code_snapshot") or {}).get(
+                    "workspace") or "") or G.task_workspace(state, args.state)
+            _check_output_path(args.output, workspace or os.getcwd(), args.state)
         if args.cmd == "bind-execution":
             payload = bind_execution(args)
             return _emit(payload, args.output)

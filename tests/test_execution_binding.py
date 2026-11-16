@@ -6,6 +6,7 @@ import json
 import os
 import shutil
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -152,6 +153,85 @@ class ExecutionBindingFlowTests(F.BridgeBase):
         self.assertTrue(record["layers"]["expected_test_verified"])
         self.assertEqual(record["execution_binding_id"],
                          binding["binding_id"])
+
+    def test_tracked_evidence_is_not_excluded_from_execution_scope(self):
+        subprocess.run(["git", "-C", self.dir, "add", "evidence.txt"],
+                       check=True)
+        subprocess.run(["git", "-C", self.dir, "commit", "-qm", "evidence"],
+                       check=True)
+        binding = self._binding()
+        meta, rollout = self._metadata(binding["nonce"])
+        args = SimpleNamespace(
+            state=self.state_path,
+            dispatch=write_json(os.path.join(self.out, "dispatch.json"),
+                                self.dispatch),
+            work_item="A1", metadata=meta, model_rollout=rollout,
+            result_file="", result_text="实际结果", summary="完成",
+            status="done", evidence=[f"E1={self.evidence}"],
+            test_command=[COMMAND], test_artifact=["E1"],
+            workspace=self.dir, base="", output="",
+            binding=binding["binding_id"])
+        env = NA.build_execution(args)
+        path = write_json(os.path.join(self.out, "execution.json"), env)
+        proc = F.run_cli("copilot_auto.py", "ingest", "--state",
+                         self.state_path, "--result-file", path)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        attempt = G.create_review_attempt(
+            self.state_path, work_item_id="A1",
+            execution_result_sha256=env["result_sha256"],
+            workspace=self.dir)
+        self.assertEqual(env["code_scope_sha256"],
+                         attempt["code_scope_sha256"])
+
+    def test_late_registered_artifact_keeps_execution_scope(self):
+        artifact = os.path.join(self.dir, "run.log")
+        with open(artifact, "w", encoding="utf-8") as fh:
+            fh.write("log\n")
+        binding = self._binding()
+        meta, rollout = self._metadata(binding["nonce"])
+        args = SimpleNamespace(
+            state=self.state_path,
+            dispatch=write_json(os.path.join(self.out, "dispatch.json"),
+                                self.dispatch),
+            work_item="A1", metadata=meta, model_rollout=rollout,
+            result_file="", result_text="实际结果", summary="完成",
+            status="done", evidence=[f"E1={self.evidence}"],
+            test_command=[COMMAND], test_artifact=["E1"],
+            workspace=self.dir, base="", output="",
+            binding=binding["binding_id"])
+        env = NA.build_execution(args)
+        path = write_json(os.path.join(self.out, "execution.json"), env)
+        proc = F.run_cli("copilot_auto.py", "ingest", "--state",
+                         self.state_path, "--result-file", path)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        state = G.load_state(self.state_path)
+        G.register_evidence(state, "E2", file_path=artifact)
+        G.save_state(self.state_path, state)
+        attempt = G.create_review_attempt(
+            self.state_path, work_item_id="A1",
+            execution_result_sha256=env["result_sha256"],
+            workspace=self.dir)
+        self.assertEqual(env["code_scope_sha256"],
+                         attempt["code_scope_sha256"])
+        self.assertEqual(G.CS.code_scope_problems(
+            attempt, G.load_state(self.state_path)), [])
+
+    def test_output_inside_workspace_is_rejected(self):
+        binding = self._binding()
+        meta, rollout = self._metadata(binding["nonce"])
+        args = SimpleNamespace(
+            state=self.state_path,
+            dispatch=write_json(os.path.join(self.out, "dispatch.json"),
+                                self.dispatch),
+            work_item="A1", metadata=meta, model_rollout=rollout,
+            result_file="", result_text="实际结果", summary="完成",
+            status="done", evidence=[f"E1={self.evidence}"],
+            test_command=[COMMAND], test_artifact=["E1"],
+            workspace=self.dir, base="",
+            output=os.path.join(self.dir, "execution.json"),
+            binding=binding["binding_id"])
+        with self.assertRaisesRegex(NA.AgentRecordError, "output"):
+            NA.build_execution(args)
 
     def test_consumed_binding_cannot_be_reused(self):
         binding = self._binding()

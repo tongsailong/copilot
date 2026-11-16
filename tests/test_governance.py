@@ -388,6 +388,35 @@ class HighRiskGateTests(unittest.TestCase):
                  G.closure_check(G.load_state(self.state))["reasons"]}
         self.assertIn("native_review_unverified", codes)
 
+    def test_ledger_open_major_blocks_g4_despite_clean_pass(self):
+        self._review()
+        state = G.load_state(self.state)
+        state["finding_ledger"] = {
+            "schema": "copilot-finding-ledger/v1", "next_id": 2,
+            "items": [{
+                "finding_id": "F1", "severity": "major", "status": "open",
+                "file": "src/a.py", "line": 7, "summary": "旧问题仍未修复",
+                "occurrences": 1,
+            }],
+        }
+        G.save_state(self.state, state)
+        codes = {r["code"] for r in
+                 G.closure_check(G.load_state(self.state))["reasons"]}
+        self.assertIn("native_review_finding_open", codes)
+
+        G.record_finding_status(self.state, "F1", "fixed",
+                                evidence_ids=["E1"])
+        codes = {r["code"] for r in
+                 G.closure_check(G.load_state(self.state))["reasons"]}
+        self.assertIn("native_review_finding_unverified", codes)
+
+        G.record_finding_status(self.state, "F1", "verified",
+                                evidence_ids=["E1"])
+        codes = {r["code"] for r in
+                 G.closure_check(G.load_state(self.state))["reasons"]}
+        self.assertNotIn("native_review_finding_open", codes)
+        self.assertNotIn("native_review_finding_unverified", codes)
+
     def test_g4_review_action_does_not_invalidate_its_own_target(self):
         state = G.load_state(self.state)
         before = G.final_evidence_digest(state)

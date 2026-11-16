@@ -88,6 +88,56 @@ copilot_dispatch.py formal-review --state <state> --verdict pass \
 不因“改了很多文件”“任务复杂”“有审核模式”机械派 Reviewer，也不要求每个复核都
 生成完整 G4 信封。普通复核的价值是发现 ZCode 自检看不到的问题，不是重复一遍自检。
 
+### 风险准入与停止（v6.8.0）
+
+派发前先做一次本地准入判断：
+
+```bash
+copilot_dispatch.py review-admission --state <state> [--trigger security \
+  --trigger core-logic] --reason "为什么需要独立复核"
+```
+
+- `risk=high` 恒为 `required`（G4）；普通风险默认 `not_required`，只有声明
+  `security` / `permissions` / `core-logic` / `data-integrity` / `architecture` /
+  `global-execution` / `production` / `release` 之一才建议派发。
+- 文案、格式、纯文档、注释与已被确定性测试覆盖的局部修改不派 Reviewer。高风险 G4 的
+  代码范围包含 tracked 文档：G4 PASS 之后文档变化同样使旧快照失效，需要重新完整复核；
+  这是代码范围绑定，不表示低风险文案任务也必须复核。
+- `--trigger` 可以使用准入词汇（`security`/`core-logic`…）或重入词汇
+  （`blocking-fix`/`major-fix`/`code-changed`…），两者都会进入同一准入记录。
+- PASS 回填时写入 `review_stops`。同一目标摘要与代码范围再次创建 attempt 会被拒绝
+  （`review_not_needed`）；上轮 PASS 后只有文档/格式文件变化时返回
+  `review_not_needed_docs_only`。这两条是停止条件，不是“不允许复核”——确有实质风险时
+  用 `--trigger` 显式重入。
+- 代码/目标/证据变化后重入：`--trigger blocking-fix|major-fix|code-changed|
+  scope-expanded|evidence-changed|risk-changed|security-fix|concurrency-fix`
+  并给出 `--reason`；准入记录写入 `review_admissions`，可审计。
+- 同一工作项、执行结果、目标、代码范围、scope 与证据清单的未消费 attempt 直接复用；
+  重复运行 `review-context --create-attempt` 不会产生第二个派发快照。
+
+### Finding 台账与定向复验
+
+复核回填的 findings 会合并进 `finding_ledger`：
+
+- 稳定 ID 为 `F1..Fn`；显式 `id`、`root_cause` 归一化或“同文件 + 摘要相似”都映射到
+  同一问题。Reviewer 换一种说法、换一个编号不会产生重复条目。
+- 生命周期 `open → fixed → verified → closed`；`fixed` 只是已改，`verified` 才表示修复
+  已被定向验证。`fixed`/`verified` 必须带证据，`closed` 只能从 `verified` 进入。
+- 已 `verified`/`closed` 的问题，没有新证据时再次出现只记为重复报告
+  （`rereported`），不会重开或重复登记；有新证据时标记 `regressed`。
+- 未闭合 blocking/major 阻断高风险 G4 与普通风险 G2；minor/info 不阻断，也不派生复核。
+- 已修复未验证的 finding 派生 `AUTO-VERIFY-<F>`：只运行对应定向测试/检查、登记证据并
+  标记 `verified`，不需要重新派发完整 Reviewer。未闭合的 blocking/major 派生
+  `AUTO-FIX-<F>`，修复与定向验证完成前不进入 G4 重跑。
+
+```bash
+copilot_dispatch.py finding --state <state> --list
+copilot_dispatch.py finding --state <state> --id F1 --status fixed \
+  --evidence E3 --note "修复提交与 diff"
+copilot_dispatch.py finding --state <state> --id F1 --status verified \
+  --evidence E4 --note "定向回归测试通过"
+```
+
 ### 复核收敛流程
 
 1. **ZCode 充分自检**：先自己完成针对性测试、diff 检查与目标核对，把能本地发现
@@ -129,15 +179,18 @@ finding 必须有可达的缺陷机制、实际影响与可核实证据（文件
 ### 后续轮次与停止
 
 - **复用 ID 与状态**：`resolved` 仅表示当前快照已验证修复，`open` 表示仍复现，
-  `regressed` 仅在有新证据表明已修复问题再次出现时使用。
-- **不重报已关闭问题**：没有新证据的同一观察是噪声，不是 finding。
+  `regressed` 仅在有新证据表明已修复问题再次出现时使用。回填后统一进入 Finding 台账；
+  已关闭问题没有新证据不得重报。
+- **不重报已关闭问题**：没有新证据的同一观察是噪声，不是 finding。台账按根因归并，
+  同一问题换一种表述仍使用原 ID。
 - **只在输入变化时重跑**：文件内容、证据、合同或测试命令变了才重新执行；仍有效的
-  结果直接复用并说明复用了哪些证据。
+  结果直接复用并说明复用了哪些证据。局部修复优先用定向测试与 `finding` 台账验证。
 - **PASS 即停止**：合同与完成条件满足、无 blocking、`unverified` 为空即返回 `pass`；
   不为 `minor`/`info` 或可选改进重开。把 `minor` 记录为 findings、把已核实非缺陷风险记录
   为 `residual_risks`，不要为了让 finding 归零而修改已通过的证据再重开完整复核。
 - **PASS 绑定快照**：如果 PASS 之后出现实质代码、证据、合同或风险变化，原 PASS 不再覆盖
   新快照；按新范围重新完整或增量复核。不得用“及时停止”作为旧结论覆盖新代码的理由。
+  重入前用 `review-admission` 判断；没有实质触发因素时先做定向验证，不默认重跑完整复核。
 - **每轮新会话**：不要续跑同一 Reviewer 会话；宿主按 child session 统计 `tool_usage`，
   续跑会重置 `totalToolUseCount` 并使信封因 `review_toolcalls_incomplete` 被拒。
 
@@ -281,7 +334,7 @@ python3 -B scripts/native_agent.py review ... --work-item A1 --attempt RA...
 - attempt 在派发前由宿主创建，冻结 task / contract / plan / dispatch / work item /
   execution result、`target_sha256`、条件摘要、文件证据内容摘要，以及 git 工作区的
   代码范围（tracked/untracked/新增/删除/重命名，逐文件 SHA-256）；创建后不可修改。
-  已登记证据由证据快照单独绑定，代码快照不重复纳入。
+  G4 代码快照只排除未跟踪证据产物；已跟踪源文件即使登记为证据也进入快照。
 - `review --attempt` 要求：attempt 属于本任务、未被消费、所有绑定与当前执行一致、
   attempt 的目标仍是当前 `final_evidence_digest`；宿主 metadata 的 `createdAt` 不早于
   attempt 创建时间、prompt 携带 attempt id、`workspaceRoot` 等于 attempt 代码根，

@@ -34,6 +34,7 @@ import host_records as HR  # noqa: E402
 import governance as G  # noqa: E402
 import native_bridge as NB  # noqa: E402
 import review_output  # noqa: E402
+import review_policy as RP  # noqa: E402
 
 EXIT_DONE = 0
 EXIT_EXECUTE = 10
@@ -158,8 +159,13 @@ def drive(args) -> int:
             return EXIT_WAIT
         if phase == "PASS":
             closure = G.close_task(path)
-            print(f"四门通过，任务已收口：iteration={closure['iteration_id']} "
-                  f"by={closure['closed_by']}")
+            print(f"四门通过，任务已收口：verdict={closure.get('verdict')} "
+                  f"iteration={closure['iteration_id']} by={closure['closed_by']}")
+            quality = closure.get("quality") or {}
+            if quality.get("verdict") == "pass_with_warnings":
+                print("质量结论："
+                      f"{str(quality.get('raw_verdict') or 'PASS_WITH_WARNINGS').upper()}"
+                      "（原始结论保留，不改写为 PASS）")
             return EXIT_DONE
         if phase == "RUNNING":
             ready = G.ready_actions(state)
@@ -281,6 +287,8 @@ def _ingest_execution(path: str, envelope: dict) -> int:
         "test_commands": normalized.get("test_commands") or [],
         "test_artifacts": normalized.get("test_artifacts") or [],
         "code_scope_sha256": normalized.get("code_scope_sha256") or "",
+        "code_scope_excluded_paths": normalized.get(
+            "code_scope_excluded_paths") or [],
         "execution_binding": binding,
         "received": G.now_iso(),
     })
@@ -498,6 +506,20 @@ def _ingest_review(path: str, envelope: dict) -> int:
                 "G4 复核引用的 review attempt 已被消费；不能用同一 attempt "
                 "重放另一份结果，请新建 attempt。")
     state = G.load_state(path)
+    # 候选 G4 评估先于 attempt 消费：评估本身抛异常时不能留下“复核已入账、
+    # attempt 已消费、candidate 永远失败”的半成品；此时直接拒绝，状态不变，
+    # 修正后可重试同一 attempt。
+    candidate = {"eligible": False, "reasons": ["candidate_not_evaluated"]}
+    try:
+        candidate = _finalize_candidate(
+            path, state, normalized, envelope, shadow_record, execution, sha)
+    except Exception as exc:
+        _record_attempt(path, "review", envelope, "candidate_internal_error",
+                        f"{type(exc).__name__}: {exc}")
+        raise AutoError(
+            f"G4 候选评估内部错误（{type(exc).__name__}）：{exc}；"
+            "本次复核未入账、attempt 未消费，修正后可重试。") from None
+    authoritative = bool(normalized["g4_eligible"] and candidate.get("eligible"))
     if normalized["g4_eligible"]:
         # 校验后重新加载，确保消费与复核登记基于同一份状态；任何一边变化都
         # 失败关闭，而不是把“校验通过”当成可写入。
@@ -525,15 +547,23 @@ def _ingest_review(path: str, envelope: dict) -> int:
                 (normalized.get("reviewer") or {}).get("profile_id") or ""),
             "bound_at": G.now_iso(),
         }
-    candidate = {"eligible": False, "reasons": ["candidate_not_evaluated"]}
-    try:
-        candidate = _finalize_candidate(
-            path, state, normalized, envelope, shadow_record, execution, sha)
-    except Exception as exc:  # 候选异常不得改变正式结果，但必须如实记录
-        candidate = {"eligible": False,
-                     "reasons": [f"candidate_internal_error:{type(exc).__name__}"],
-                     "decided_at": G.now_iso()}
-        shadow_record["candidate"] = candidate
+    # Finding 台账在正式记录写入前合并：稳定 ID、跨轮去重、生命周期状态都从
+    # 正式 G4（且候选可用）重算；普通/参考性复核只能新增或重复报告，不能把
+    # 已有 blocking/major 改成 verified，避免 g4_eligible=false 清掉台账门禁。
+    ledger = RP.merge_review(state, normalized, authoritative=authoritative)
+    normalized["finding_refs"] = ledger["refs"]
+    stop_attempt = G.find_review_attempt(
+        state, str(normalized.get("review_attempt_id") or ""))
+    stop = None
+    if str(normalized.get("verdict") or "").lower() == "pass" and \
+            (authoritative or not risk_high):
+        stop = RP.record_stop(
+            state, normalized,
+            code_scope_sha256=str(
+                (stop_attempt or {}).get("code_scope_sha256") or ""),
+            authoritative=authoritative)
+    if stop is not None:
+        normalized["review_stop_id"] = stop["stop_id"]
     state.setdefault("native_reviews", []).append({
         **normalized,
         "candidate_g4": candidate,
@@ -565,6 +595,10 @@ def _ingest_review(path: str, envelope: dict) -> int:
         "finding_count": len(findings),
         "blocking_count": sum(1 for f in findings
                               if str(f.get("severity") or "") == "blocking"),
+        "finding_refs": normalized.get("finding_refs") or [],
+        "finding_rereported": ledger.get("rereported") or [],
+        "finding_regressed": ledger.get("regressed") or [],
+        "review_stop_id": str(normalized.get("review_stop_id") or ""),
         "execution_evidence_unbound": normalized.get(
             "execution_evidence_unbound") or [],
         "review_attempt_id": normalized.get("review_attempt_id") or "",

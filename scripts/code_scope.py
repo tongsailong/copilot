@@ -67,6 +67,11 @@ def _path_allowed(rel: str) -> bool:
 def _git(root: str, *args: str) -> subprocess.CompletedProcess:
     env = dict(os.environ)
     env.setdefault("GIT_OPTIONAL_LOCKS", "0")
+    # 不让调用方环境把 git 重定向到另一个仓库/索引/对象库。
+    for key in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE",
+                "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+                "GIT_COMMON_DIR", "GIT_NAMESPACE"):
+        env.pop(key, None)
     return subprocess.run(["git", "-C", root, *args], capture_output=True,
                           text=True, encoding="utf-8", errors="replace",
                           env=env, check=False)
@@ -76,7 +81,8 @@ def governance_paths(state_path: str) -> list[str]:
     """任务治理文件/目录：不能因为它们被更新而让代码快照自失效。"""
     path = os.path.abspath(state_path)
     task_dir = os.path.dirname(path)
-    return [path, path + ".lock",
+    return [path, os.path.join(task_dir,
+                               "." + os.path.basename(path) + ".lock"),
             os.path.join(task_dir, "review-attempts.jsonl"),
             os.path.join(task_dir, "evidence"),
             os.path.join(task_dir, "review-outputs")]
@@ -104,6 +110,53 @@ def evidence_paths(state: dict) -> list[str]:
         if hint and hint != "<inline>" and os.path.isabs(hint):
             paths.append(os.path.abspath(hint))
     return sorted(set(paths))
+
+
+def _is_tracked(root: str, path: str) -> bool:
+    rel = os.path.relpath(path, root).replace("\\", "/")
+    if rel == ".." or rel.startswith("../"):
+        return False
+    result = _git(root, "ls-files", "--error-unmatch", "--", ":(literal)" + rel)
+    if result.returncode == 0:
+        return True
+    # 索引被 git rm --cached 后仍可能在 HEAD 中；tracked 源文件不能因此被排除。
+    head = _git(root, "ls-tree", "-r", "--name-only", "HEAD", "--",
+                ":(literal)" + rel)
+    return head.returncode == 0 and rel in head.stdout.splitlines()
+
+
+def safe_path_excludes(paths: list[str], workspace: str,
+                       base: str = "") -> list[str]:
+    """给定路径中可排除的部分：仅未跟踪产物；跟踪文件一律不排除。"""
+    root = git_root(workspace)
+    if not root:
+        return []
+    out: list[str] = []
+    for path in paths:
+        if not str(path or "").strip():
+            continue
+        absolute = os.path.abspath(os.path.expanduser(str(path)))
+        path_root = git_root(absolute) or root
+        try:
+            inside = os.path.commonpath([path_root, absolute]) == path_root
+        except ValueError:
+            inside = False
+        tracked = _is_tracked(path_root, absolute)
+        if not tracked and path_root != root:
+            tracked = _is_tracked(root, absolute)
+        if not inside or not tracked:
+            out.append(absolute)
+    return sorted(set(out))
+
+
+def safe_evidence_excludes(state: dict, workspace: str,
+                           base: str = "") -> list[str]:
+    """G4 代码快照可排除的 evidence：仅限未被 git 跟踪的证据产物。
+
+    被 git 跟踪的源文件即使登记为 evidence，也不能从代码快照消失；未跟踪的
+    证据文件（日志/截图/输出）仍排除，避免新增证据被误判为源码变化。
+    """
+    return safe_path_excludes(evidence_paths(state), workspace, base)
 
 
 _SUBMODULE_LINE = re.compile(
@@ -352,8 +405,9 @@ def capture_code_snapshot(workspace: str = "",
     """读取工作区 git 变更并计算每个文件的 SHA-256。
 
     覆盖 tracked 修改、untracked、删除、重命名；`.gitignore` 排除构建输出，
-    治理临时目录与常见缓存目录另行排除。已登记证据由证据快照单独绑定，这里
-    默认排除，避免“新增证据文件”被误判为源码变化。
+    治理临时目录与常见缓存目录另行排除。证据文件是否排除由调用方决定：质量报告
+    不排除已登记证据；G4 只排除未被 git 跟踪的证据产物，已跟踪源文件即使登记为
+    证据也必须进入快照。证据内容由独立证据快照绑定。
     """
     workspace = os.path.abspath(os.path.expanduser(workspace or os.getcwd()))
     excluded = {os.path.abspath(os.path.expanduser(p))
@@ -507,6 +561,22 @@ def capture_code_snapshot(workspace: str = "",
     return snapshot
 
 
+def _snapshot_known_paths(items: object) -> set[str]:
+    """收集快照中顶层/子模块/嵌套仓库的文件相对路径（path 均为仓库根相对）。"""
+    out: set[str] = set()
+    if not isinstance(items, list):
+        return out
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        base = str(item.get("path") or "").strip("/")
+        for entry in item.get("files") or []:
+            if isinstance(entry, dict) and entry.get("path"):
+                out.add((base + "/" + str(entry["path"])).strip("/"))
+        out |= _snapshot_known_paths(item.get("nested") or [])
+    return out
+
+
 def code_scope_problems(attempt: dict, state: dict | None = None, *,
                         check_current: bool = True) -> list[str]:
     """attempt 冻结的代码范围必须存在，且当前工作区未发生漂移。"""
@@ -521,7 +591,29 @@ def code_scope_problems(attempt: dict, state: dict | None = None, *,
         return []
     excluded = set(str(p) for p in snapshot.get("excluded_paths") or [])
     if state is not None:
-        excluded.update(evidence_paths(state))
+        # 只动态排除“attempt 之后新增的未跟踪证据”；attempt 时已存在并进入
+        # 快照的未跟踪产物不能排除，否则执行后才登记的证据会让执行/复核摘要
+        # 再次不一致。新证据本身由 final_evidence_digest / 增量 manifest 处理。
+        root = str(snapshot.get("git_root") or snapshot.get("workspace") or "")
+        known = {str(item.get("path") or "")
+                 for item in snapshot.get("files") or []
+                 if isinstance(item, dict)}
+        known |= _snapshot_known_paths(snapshot.get("submodule_worktrees"))
+        known |= _snapshot_known_paths(snapshot.get("nested_repos"))
+        for path in evidence_paths(state):
+            absolute = os.path.abspath(path)
+            try:
+                inside = bool(root) and os.path.commonpath(
+                    [root, absolute]) == root
+            except ValueError:
+                inside = False
+            if inside and os.path.relpath(absolute, root).replace(
+                    "\\", "/") in known:
+                continue
+            if not inside or safe_path_excludes(
+                    [absolute], str(snapshot.get("workspace") or ""),
+                    str(snapshot.get("git_base") or "")):
+                excluded.add(absolute)
     current = capture_code_snapshot(
         str(snapshot.get("workspace") or ""), exclude_paths=sorted(excluded),
         base=str(snapshot.get("git_base") or ""))

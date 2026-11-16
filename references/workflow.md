@@ -8,7 +8,7 @@
 
 - 默认路径由调用方指定（`--state`）；建议放在任务目录，例如 `<task>/state.json`。
 - 同名辅助文件：`<state-basename>.dispatch.json`（原生派发）、`evidence/`（命令采集输出）、
-  `state.json.lock`（并发锁，短生命周期）。
+  `.state.json.lock`（并发锁，短生命周期，文件名随状态文件名）。
 - 单文件 JSON，`schema=copilot-governance/v1`、`version=1`；写入为
   “临时文件 + fsync + `os.replace`”，并用单调 `save_seq` 做 CAS 并发校验。
 - 状态已存在时 `start` 会拒绝，避免覆盖进行中的任务；续跑直接使用同一文件。
@@ -21,7 +21,7 @@ python3 -B scripts/copilot_dispatch.py <子命令> --state <state.json> [参数]
 
 | 子命令 | 用途 | 关键参数 |
 |---|---|---|
-| `start` | 创建任务合同 | `--goal`、`--contract-file`、`--criteria-file`、`--test-policy`/`--test-policy-file`（JSON：`required`/`commands`/`report`/`artifacts`/`require_*`）、`--risk normal\|high`、`--backend legacy\|native`、`--task-id`、`--mode`、`--note`；`--risk high` 必须配 `--backend native` |
+| `start` | 创建任务合同 | `--goal`、`--contract-file`、`--criteria-file`、`--test-policy`/`--test-policy-file`（JSON：`required`/`commands`/`report`/`artifacts`/`require_*`）、`--risk normal\|high`、`--backend legacy\|native`、`--task-id`、`--mode`、`--note`、`--workspace`（省略取状态文件所在目录的 git 根）；`--risk high` 必须配 `--backend native` |
 | `plan` | 登记 ZCode 本地计划 | `--plan <plan.json>`（或 stdin）、`--source` |
 | `status` / `next` | 查看阶段、工作项、四门、下一步 | `--json` |
 | `record` | 回填工作项结果 | `--id`、`--status`、`--result`、`--evidence E1`（可重复） |
@@ -29,11 +29,15 @@ python3 -B scripts/copilot_dispatch.py <子命令> --state <state.json> [参数]
 | `criterion` | 核销完成条件 | `--id C1`、`--status pending\|met\|not_met`、`--evidence`（`met` 必填） |
 | `judgment` | 记录自我判断（仅审计） | `--status pass\|partial\|blocked`、`--summary`、`--evidence` |
 | `evidence` | 登记 / 归档 / 列出证据 | `--add`、`--file`、`--text`、`--capture-cmd`、`--drop --id`、`--list`、`--next-id` |
-| `report` | 登记执行报告 | `--summary`、`--blocked`、`--reason` |
-| `decide` | 记录用户/任务决策 | `--text`、`--source` |
+| `report` | 登记执行报告，或接入 verify 结构化质量报告 | `--summary`（可与下一项同用）、`--verify-report <报告文件>`、`--blocked`、`--reason`；PWW 自动登记用户接受条件 |
+| `accept` | 登记用户对 PWW 的明确接受 | `--report <report_id>`（仅一份可省）、`--accept W1,R1`、`--by user`（必填）、`--quote "<用户原话>"`（必填）、`--note`；部分接受保持 pending |
+| `quality` | 查看质量结论与接受状态 | `--json` |
+| `decide` | 记录用户/任务决策 | `--text`、`--source`；**不能替代 PWW 接受** |
 | `block` / `unblock` | 记录/解除真实阻塞 | `block --reason ... --needs ...`；`unblock --reason ... [--block-id B...]`（多条未解除时必须指定） |
 | `closure-check` | 只读检查 G1–G4 | `--json` |
-| `review-metrics` | 统计真实复核效率：轮次、首轮 finding、重复 finding、无效信封、重复命令/文件、证据包字符数、首轮到 PASS 耗时 | `--state`；正式 REVIEW/G4/原生复核分别计数 |
+| `review-admission` | 复核风险准入与停止/重入判断（只读） | `--trigger security`（可重复）、`--reason`、`--scope full\|incremental`、`--json` |
+| `finding` | 查看 / 更新 Finding 台账（不触发复核） | `--list`；`--id F1 --status open\|fixed\|verified\|closed\|regressed\|dropped --evidence E1 --note`；`fixed`/`verified` 必须有证据 |
+| `review-metrics` | 统计真实复核效率：完整/增量轮次、准入与停止次数、Finding 台账、重复 finding、无效信封、重复命令/文件、证据包字符数、首次完整复核与总耗时 | `--state`；正式 REVIEW/G4/原生复核分别计数 |
 | `closure` | 收口（必须四门通过） | `--close`、`--by` |
 | `reopen` | 用户授权后重开 | `--reason`、`--authorized-by user`（必填） |
 | `handoff` | 只读列出生效交付清单：分支/HEAD/上游、已暂存、未暂存、未跟踪分类 | `--state`（可选）、`--cwd`、`--limit`、`--json`；不提交、不删除、不改 `.gitignore` |
@@ -94,6 +98,67 @@ python3 -B scripts/copilot_dispatch.py handoff --state ... --json
 - **只读边界**：命令只运行 `git --no-optional-locks` 查询，不 `add`、不 `commit`、
   不删除、不改写 `.gitignore`，也不处理忽略项。清单不构成提交授权。
 
+### PWW 质量报告接入与用户接受
+
+verify 报告末尾的 `<!-- copilot-verify-result/v1 -->` JSON 块是唯一机器可读入口；正文里的
+`PASS_WITH_WARNINGS` 文本不触发治理。
+
+```bash
+python3 -B scripts/copilot_dispatch.py report --state S --verify-report report.md \
+  [--workspace <repo>]
+python3 -B scripts/copilot_dispatch.py quality --state S
+python3 -B scripts/copilot_dispatch.py accept --state S --report VR-... \
+  --accept W1,W2,R1 --by user --quote "用户接受的原话"
+```
+
+- 接入时校验 schema、verdict、W/R id、`checks`、`unverified`、`subject`、替代字段与
+  `acceptance_status`；缺字段、未知字段、PWW 带未验证项/blocking、报告自报已接受、合同
+  条件未核销都失败关闭。
+- 存在生效报告时，新报告必须用 `supersedes_report_id` 指向它，且被替代目标必须是当前
+  生效报告；`pww_supersede_missing` / `pww_supersede_invalid_target` 拒绝。
+- 旧报告的每个未解决 W/R 必须：仍出现在新报告（继承，PWW 重新接受），或在
+  `resolved_warning_ids` / `resolved_residual_risk_ids` 声明解决。解决声明只在
+  `subject_digest` 与警告来源报告一致时生效；PASS 不能继承未解决项；部分覆盖拒绝
+  （`pww_supersede_coverage_incomplete` / `pww_supersede_subject_mismatch`）。旧接受记录
+  保留但不继承，新 PWW 重新 pending；旧报告已由用户接受的 W/R 视为已解决，不要求新报告
+  继承（新报告出现的新 W/R 仍需重新接受）。
+- PWW 自动创建**一个**用户接受完成条件（`C<n>`，`acceptance` 元数据），绑定
+  `report_sha256`、W/R 集合、目标摘要、代码快照、合同/条件摘要与报告内容摘要。同一报告
+  重复接入幂等；重复接入已替代的旧报告会被拒绝。重新验收必须使用新的 `report_id` 与
+  `generated_at`。FAIL/PARTIAL/BLOCKED 报告不创建接受条件；其未解决项仍沿替代链保留。
+- **代码类报告**：声明 `commit`/`files`/`diff_sha256`/`code_scope_sha256` 时，verify 必须先运行
+  `code_scope_capture.py --workspace <repo> --state S --exclude <报告文件>`，把 `commit`、
+  `code_scope_sha256` 与 `files_paths`（字符串路径数组，重命名含新旧路径）写入
+  `subject.files`；`dirty` 可选，给出时必须一致。工作区有变更时 `files` 必须覆盖全部
+  变更路径，干净时可省略。若给出 `diff_sha256`，必须与 `code_scope_sha256` 相同（同一
+  快照别名）。报告文件必须放在任务目录或工作区外；放在工作区其他位置会被拒绝。`subject.code_scope_sha256` 是报告生成时声明的摘要并进入
+  `report_sha256`；接入时用 `--workspace` 重算，生成后/接入前代码变化即摘要不一致拒绝。
+  Copilot 保存的 `code_scope` 标注 `capture_source=copilot-ingest-recompute`，只是接入时
+  重算快照，不冒充报告生成时刻。G2 收口前再重算，漂移报 `quality_code_scope_drift`。
+- **工作区身份**：`start --workspace` 绑定任务工作区；未显式绑定时由 native execution
+  binding、合同来源、任务证据所属仓库、任务目录唯一派生。`report --workspace` 必须与
+  绑定一致（realpath/git root 归一），
+  无法确认或指向其他仓库时 `quality_code_scope_workspace_unbound` / `_mismatch` 失败关闭。
+  已登记证据文件不从快照排除——证据位于工作区内且发生变更时同样必须声明。纯文档报告
+  不要求工作区或快照。
+- G2 独立检查最新生效报告：未接受 → `pww_acceptance_pending`；部分接受 →
+  `pww_acceptance_partial`；目标/合同/条件/工作区变化 → `pww_acceptance_stale`；
+  PASS 的目标/合同/条件/工作区绑定变化 → `quality_binding_stale`；代码漂移 →
+  `quality_code_scope_drift`；替代链不合法/未解决项残留 → `pww_supersede_*` /
+  `pww_superseded_unresolved`；PARTIAL/BLOCKED/FAIL → `quality_verdict_not_pass`。
+  合同修订删掉条件也不能绕过。
+- `accept` 只接受 `--by user`，必须带用户原话；执行方、子代理、verify 与 Copilot 不得代为
+  接受，`criterion --status met` 不能核销接受条件。接受事件与每次部分接受的原话记录在
+  `acceptance_history`，完整接受后以 inline 证据绑定到条件（含 code_scope_sha256）；G2 会
+  核对接受记录、历史、证据与条件状态一致，缺少任一环即拒绝。`accept` 记录的是
+  user-declared 接受，CLI 不能证明用户来源（见 DECISIONS 49）。
+- 任务 `reopen` 后旧 PWW 接受立即失效（`pww_reverify_required`），必须重新验收并再次取得
+  用户明确接受；不能拿旧接受直接再收口。
+- 收口保留原始结论：`closure.verdict=pass_with_warnings`、`closure.quality` 记录
+  `raw_verdict`/`report_id`/接受状态/已接受 id；未接入质量报告的历史任务显示
+  `quality.verdict=unrecorded`，**不伪造**已接受。
+- 高风险任务：接受会改变条件状态与最终证据摘要，应在最终 G4 之前完成接受登记。
+
 ## 3. `copilot_auto.py`：驱动与回填
 
 ```bash
@@ -130,7 +195,8 @@ python3 -B scripts/copilot_auto.py ingest --state <state.json> [--result-file f]
 ```bash
 # 1. 建立合同
 python3 -B scripts/copilot_dispatch.py start --state T/state.json \
-  --goal "目标" --contract-file contract.md --risk normal
+  --goal "目标" --contract-file contract.md --risk normal \
+  --workspace /path/to/task-repo
 
 # 2. 登记 ZCode 计划
 python3 -B scripts/copilot_dispatch.py plan --state T/state.json --plan plan.json
@@ -193,7 +259,8 @@ python3 -B scripts/copilot_dispatch.py formal-review --state T/state.json \
 python3 -B scripts/native_agent.py review-context --state T/state.json \
   --dispatch T/state.dispatch.json --execution A1.execution.json \
   --work-item A1 --create-attempt --workspace "$(git rev-parse --show-toplevel)" \
-  [--base <任务开始 commit>] --output A1.context.json
+  [--base <任务开始 commit>] [--trigger major-fix --reason "修复后重验"] \
+  --output A1.context.json
 
 # 把 A1.context.json 的 review_attempt_id 写入 Reviewer prompt，再派发只读子代理；
 # 生成信封时必须带同一个 attempt
@@ -212,6 +279,15 @@ attempt 在派发前冻结目标摘要、文件证据内容与 git 工作区代�
 新建 attempt 重新复核。`--workspace` 应指向任务实际仓库根，且必须与任务证据所属仓库
 一致；高风险任务在非 git 工作区会拒绝创建 attempt。默认快照覆盖工作区相对 HEAD 的变更，
 任务代码已提交时用 `--base <任务开始 commit>` 纳入已提交范围。
+
+同一目标/代码范围/执行结果的未消费 attempt 会直接复用，重复调用不会生成第二个派发
+快照。PASS 之后已有 `review_stops`：同一快照再次创建 attempt 返回 `review_not_needed`，
+只有文档/格式变化返回 `review_not_needed_docs_only`；代码/目标/证据实质变化时必须用
+`--trigger`（`blocking-fix`/`major-fix`/`code-changed`/`scope-expanded`/
+`evidence-changed`/`risk-changed`/`security-fix`/`concurrency-fix`）与 `--reason`
+说明重入原因。Reviewer 报出的 findings 进入 Finding 台账；修复后用
+`copilot_dispatch.py finding --id F1 --status fixed --evidence E3` 登记，运行定向测试后
+再标 `verified`，不需要重新派发完整复核。
 
 ## 6. 历史只读
 

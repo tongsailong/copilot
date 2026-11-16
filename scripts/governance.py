@@ -28,6 +28,7 @@ import tempfile
 from datetime import datetime
 
 import code_scope as CS
+import review_policy as RP
 
 SCHEMA = "copilot-governance/v1"
 VERSION = 1
@@ -42,6 +43,24 @@ STATUSES = ("pending", "running", "done", "failed", "blocked", "dropped")
 TERMINAL = {"done", "dropped"}
 CRITERION_STATUSES = ("pending", "met", "not_met")
 VERDICTS = ("pass", "partial", "blocked")
+# verify 的结构化质量结论：原始 verdict 只允许这五种，大小写由解析层归一。
+QUALITY_SCHEMA = "copilot-verify-result/v1"
+QUALITY_INGEST_VERSION = "6.7.1"
+QUALITY_VERDICTS = ("pass", "pass_with_warnings", "partial", "blocked", "fail")
+PWW = "pass_with_warnings"
+QUALITY_REPORT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+QUALITY_WARNING_RE = re.compile(r"^W[1-9][0-9]{0,2}$")
+QUALITY_RISK_RE = re.compile(r"^R[1-9][0-9]{0,2}$")
+QUALITY_COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
+QUALITY_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+QUALITY_FIELDS = frozenset({
+    "schema", "report_id", "generated_at", "verdict", "warnings",
+    "residual_risks", "unverified", "acceptance_required",
+    "acceptance_status", "checks", "subject", "supersedes_report_id",
+    "resolved_warning_ids", "resolved_residual_risk_ids",
+})
+QUALITY_ACCEPTANCE_STATUSES = ("pending", "partial", "accepted",
+                               "superseded", "stale")
 CRITERION_ID_RE = re.compile(r"^C[1-9][0-9]{0,2}$")
 EVIDENCE_ID_RE = re.compile(r"^E[1-9][0-9]{0,3}$")
 TASK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
@@ -175,6 +194,7 @@ def _default_closure() -> dict:
         "iteration_id": None,
         "closed_at": None,
         "gate": {"passed": None, "iteration_id": None, "reasons": []},
+        "quality": None,
         "reopen_history": [],
     }
 
@@ -191,6 +211,8 @@ def _default_state() -> dict:
         "note": "",
         "risk": "normal",
         "execution_backend": "legacy",
+        "workspace": "",
+        "workspace_source": "",
         "created": now_iso(),
         "updated": now_iso(),
         "save_seq": 0,
@@ -203,11 +225,19 @@ def _default_state() -> dict:
         "evidence": [],
         "reports": [],
         "decisions": [],
+        "quality_reports": [],
         "contract": _default_contract(),
         "native_dispatch": None,
         "native_results": [],
         "native_reviews": [],
         "review_attempts": [],
+        "review_admissions": [],
+        "review_stops": [],
+        "finding_ledger": {
+            "schema": RP.LEDGER_SCHEMA,
+            "next_id": 1,
+            "items": [],
+        },
         "g4_attestations": [],
         "execution_bindings": [],
         "formal_reviews": [],
@@ -534,10 +564,87 @@ def contract_source_warnings(state: dict) -> list[str]:
     return []
 
 
+def _canonical_workspace(path: str) -> str:
+    """工作区规范路径：展开、realpath，并尽量归一到 git 根。"""
+    value = str(path or "").strip()
+    if not value:
+        return ""
+    absolute = os.path.realpath(os.path.abspath(os.path.expanduser(value)))
+    root = CS.git_root(absolute)
+    return os.path.realpath(root) if root else absolute
+
+
+def _git_workspace(path: str) -> str:
+    value = str(path or "").strip()
+    if not value:
+        return ""
+    root = CS.git_root(os.path.abspath(os.path.expanduser(value)))
+    return os.path.realpath(root) if root else ""
+
+
+def _task_workspace_info(state: dict, state_path: str = "") -> tuple[str, list[str]]:
+    """任务工作区与候选来源；显式绑定优先，否则要求候选唯一。"""
+    explicit = _canonical_workspace(state.get("workspace") or "")
+    if explicit:
+        return explicit, [explicit]
+    candidates: set[str] = set()
+    for binding in state.get("execution_bindings") or []:
+        if isinstance(binding, dict) and binding.get("workspace"):
+            root = _git_workspace(str(binding.get("workspace") or ""))
+            if root:
+                candidates.add(root)
+    source = (state.get("contract") or {}).get("source") or {}
+    if isinstance(source, dict) and source.get("path"):
+        root = _git_workspace(str(source.get("path") or ""))
+        if root:
+            candidates.add(root)
+    for root in CS.evidence_roots(state):
+        value = _git_workspace(root)
+        if value:
+            candidates.add(value)
+    if state_path:
+        root = _git_workspace(os.path.dirname(os.path.abspath(state_path)))
+        if root:
+            candidates.add(root)
+    ordered = sorted(candidates)
+    return (ordered[0] if len(ordered) == 1 else ""), ordered
+
+
+def task_workspace(state: dict, state_path: str = "") -> str:
+    return _task_workspace_info(state, state_path)[0]
+
+
+def set_task_workspace(path: str, workspace: str, *, source: str = "zcode") -> dict:
+    """首次绑定任务工作区；已绑定或与证据仓库冲突时拒绝。"""
+    state = load_state(path)
+    value = _canonical_workspace(workspace)
+    if not value:
+        raise GovernanceError("工作区为空；必须给出实际 git 仓库路径。")
+    if not os.path.isdir(value):
+        raise GovernanceError(f"工作区不存在：{value}")
+    existing, candidates = _task_workspace_info(state, path)
+    if existing and existing != value:
+        raise GovernanceError(
+            "[quality_code_scope_workspace_mismatch] 任务已绑定工作区 "
+            f"{existing!r}，不能再改为 {value!r}。")
+    if not existing and candidates and value not in candidates:
+        raise GovernanceError(
+            "[quality_code_scope_workspace_mismatch] 工作区 "
+            f"{value!r} 与任务证据/派发上下文不一致：{candidates!r}。")
+    if str(state.get("workspace") or "") == value:
+        return state
+    state["workspace"] = value
+    state["workspace_source"] = str(source or "zcode")[:80]
+    _history(state, "task_workspace_bound",
+             {"workspace": value, "source": state["workspace_source"]})
+    save_state(path, state)
+    return state
+
+
 def start_state(path: str, goal: str, *, contract: str = "", criteria: object = None,
                 risk: str = "normal", execution_backend: str = "legacy",
                 task_id: str = "", mode: str = "", note: str = "",
-                contract_source: str = "",
+                contract_source: str = "", workspace: str = "",
                 test_policy: dict | None = None) -> dict:
     if os.path.exists(path):
         raise GovernanceError(f"任务状态已存在：{path}；续跑请直接使用，勿重建。")
@@ -576,6 +683,9 @@ def start_state(path: str, goal: str, *, contract: str = "", criteria: object = 
         raise GovernanceError(
             "完成条件为空：v6 的 PASS 必须逐条核销，请用 --criteria-file 或合同"
             "「## 完成条件」列表给出至少一条条件。")
+    workspace_value = _canonical_workspace(workspace)
+    if str(workspace or "").strip() and not os.path.isdir(workspace_value):
+        raise GovernanceError(f"任务工作区不存在：{workspace_value}")
     state = _default_state()
     state.update({
         "task_id": task_id,
@@ -585,6 +695,8 @@ def start_state(path: str, goal: str, *, contract: str = "", criteria: object = 
         "note": (note or "").strip(),
         "risk": risk,
         "execution_backend": backend,
+        "workspace": workspace_value,
+        "workspace_source": "start" if workspace_value else "",
         "contract_sha256": _contract_fingerprint(goal, contract, items, policy),
     })
     state["contract"].update({
@@ -644,12 +756,49 @@ def amend_contract(path: str, *, contract: str = "",
             item["updated_at"] = previous.get("updated_at")
             item["updated_iteration"] = previous.get("updated_iteration")
             item["history"] = previous.get("history") or []
-    sha = criteria_digest(items)
     policy = (_normalize_test_policy(test_policy) if test_policy is not None
               else (current.get("test_policy") or _default_test_policy()))
     if str(state.get("risk") or "").lower() == "high" and not policy.get("captured"):
         raise GovernanceError(
             "risk=high 修订合同时不能移除 test_policy；测试要求必须保留在合同中。")
+    base_items = [c for c in current.get("criteria") or []
+                  if not isinstance(c.get("acceptance"), dict)]
+    contract_unchanged = (
+        body == str(current.get("done_criteria_text") or "").strip()
+        and criteria_digest(items) == criteria_digest(base_items)
+        and policy == (current.get("test_policy") or _default_test_policy()))
+    # PWW 接受条件是系统登记的收口前置条件，不因合同修订静默消失；内容不变的
+    # 空操作修订保留原接受记录，内容变化时保留为 pending 并让旧接受绑定失效。
+    acceptance_previous = [c for c in current.get("criteria") or []
+                           if isinstance(c.get("acceptance"), dict)]
+    if acceptance_previous:
+        used = set()
+        for item in items:
+            match = CRITERION_ID_RE.match(str(item.get("criterion_id") or ""))
+            if match:
+                used.add(int(match.group(0)[1:]))
+        for previous in acceptance_previous:
+            if any(isinstance(item.get("acceptance"), dict) for item in items):
+                break
+            if contract_unchanged:
+                items.append(json.loads(json.dumps(previous)))
+                continue
+            number = 1
+            while number in used:
+                number += 1
+            used.add(number)
+            carried = json.loads(json.dumps(previous))
+            carried["criterion_id"] = f"C{number}"
+            carried["status"] = "pending"
+            carried["evidence_refs"] = []
+            carried["updated_at"] = now_iso()
+            carried["updated_iteration"] = _current_iteration_id(state)
+            carried.setdefault("acceptance", {}).update({
+                "status": "pending", "accepted_ids": [], "accepted_by": "",
+                "accepted_at": "", "quote": "", "binding_sha256": "",
+            })
+            items.append(carried)
+    sha = criteria_digest(items)
     state["contract"].update({
         "done_criteria_text": body,
         "boundaries": _section_text(body, "边界") or current.get("boundaries") or "",
@@ -1118,6 +1267,10 @@ def record_criterion(path: str, cid: str, status: str, *,
         raise GovernanceError(
             f"criterion status={status!r} 非法；只能是 {' / '.join(CRITERION_STATUSES)}。")
     criterion = _criterion(state, cid)
+    if isinstance(criterion.get("acceptance"), dict):
+        raise GovernanceError(
+            f"{cid} 是 PWW 用户接受条件：只能由用户明确表达后经 accept 命令登记；"
+            "criterion 命令不得直接核销或改写该条件。")
     refs = _validate_evidence_refs(state, evidence_ids or [])
     if status == "met" and not refs:
         raise GovernanceError(f"{cid} 判定 met 时必须引用至少一条已登记证据。")
@@ -1262,6 +1415,1580 @@ def add_report(path: str, summary: str, *, blocked: bool = False,
                                         "blocked": bool(blocked)})
     save_state(path, state)
     return entry
+
+
+# ── 质量结论（verify 结构化报告） ──────────────────────────────────────────
+# verify 产出的机器可读结论走固定结构（`copilot-verify-result/v1`）。Copilot 在
+# 报告接入路径解析它：PWW 自动登记用户接受条件并绑定报告/警告/目标摘要；解析或
+# 校验失败一律 fail-closed，不按普通 PASS 处理。
+_QUALITY_CHECKS = ("required_tests_executed", "required_evidence_present",
+                   "completion_criteria_met", "delivery_verifiable")
+_QUALITY_MARKER = "<!-- copilot-verify-result/v1 -->"
+
+
+def _quality_verdict(raw: object) -> str:
+    text = str(raw or "").strip().replace("-", "_").lower()
+    if text not in QUALITY_VERDICTS:
+        raise GovernanceError(
+            f"[verify_report_invalid] verdict={raw!r} 非法；只能是 "
+            f"{' / '.join(v.upper() for v in QUALITY_VERDICTS)}。")
+    return text
+
+
+def _quality_items(raw: object, name: str) -> list[dict]:
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise GovernanceError(f"[verify_report_invalid] {name} 必须是数组。")
+    pattern = QUALITY_WARNING_RE if name == "warnings" else QUALITY_RISK_RE
+    out: list[dict] = []
+    seen: set[str] = set()
+    for idx, item in enumerate(raw, 1):
+        if not isinstance(item, dict):
+            raise GovernanceError(
+                f"[verify_report_invalid] {name} 第 {idx} 项必须是对象。")
+        rid = str(item.get("id") or "").strip()
+        text = str(item.get("text") or "").strip()
+        if not pattern.match(rid):
+            raise GovernanceError(
+                f"[verify_report_invalid] {name} id={rid!r} 非法（应形如 "
+                f"{'W1' if name == 'warnings' else 'R1'}）。")
+        if rid in seen:
+            raise GovernanceError(f"[verify_report_invalid] {name} id {rid} 重复。")
+        if not text:
+            raise GovernanceError(
+                f"[verify_report_invalid] {name} {rid} 缺少 text。")
+        allowed_keys = {"id", "text", "severity"}
+        unknown_keys = sorted(set(item) - allowed_keys)
+        if unknown_keys:
+            raise GovernanceError(
+                f"[verify_report_invalid] {name} {rid} 含未知字段："
+                + "、".join(unknown_keys)
+                + "；质量报告不允许静默丢弃字段。")
+        seen.add(rid)
+        entry = {"id": rid, "text": text[:2000]}
+        severity = str(item.get("severity") or "").strip().lower()
+        if severity:
+            if severity not in ("info", "minor", "major", "blocking"):
+                raise GovernanceError(
+                    f"[verify_report_invalid] {name} {rid} severity={severity!r} "
+                    "非法；只能是 info / minor / major / blocking。")
+            entry["severity"] = severity
+        out.append(entry)
+    return sorted(out, key=lambda item: int(re.sub(r"\D", "", item["id"])))
+
+
+def _quality_unverified(raw: object) -> list[str]:
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise GovernanceError("[verify_report_invalid] unverified 必须是数组。")
+    out = []
+    for item in raw:
+        text = str(item or "").strip()
+        if not text:
+            raise GovernanceError(
+                "[verify_report_invalid] unverified 条目不能为空字符串。")
+        out.append(text[:2000])
+    return out
+
+
+def _quality_checks(raw: object, *, required: bool) -> dict:
+    if raw is None:
+        if required:
+            raise GovernanceError(
+                "[verify_report_invalid] PASS/PASS_WITH_WARNINGS 必须提供 checks，"
+                f"且 {'/'.join(_QUALITY_CHECKS)} 全为 true。")
+        return {}
+    if not isinstance(raw, dict):
+        raise GovernanceError("[verify_report_invalid] checks 必须是对象。")
+    out = {}
+    for key, value in raw.items():
+        if key not in _QUALITY_CHECKS:
+            raise GovernanceError(f"[verify_report_invalid] checks.{key} 不是已知检查项。")
+        if not isinstance(value, bool):
+            raise GovernanceError(
+                f"[verify_report_invalid] checks.{key} 必须是布尔值。")
+        out[key] = value
+    if required:
+        missing = [key for key in _QUALITY_CHECKS if key not in out]
+        failed = [key for key in _QUALITY_CHECKS if out.get(key) is not True]
+        if missing or failed:
+            raise GovernanceError(
+                "[verify_pww_precondition_failed] PASS/PASS_WITH_WARNINGS 要求 "
+                + "、".join(_QUALITY_CHECKS) + " 全部为 true；"
+                + (f"缺少 {', '.join(missing)}；" if missing else "")
+                + (f"未通过 {', '.join(failed)}。" if failed else ""))
+    return out
+
+
+def _quality_subject(raw: object) -> tuple[dict, str]:
+    if not isinstance(raw, dict) or not raw:
+        raise GovernanceError(
+            "[verify_report_invalid] subject 必须是非空对象，记录本次验收覆盖的"
+            "代码/产物范围（至少含 scope/commit/diff_sha256/files 之一）。")
+    allowed = ("scope", "commit", "diff_sha256", "files", "summary")
+    if not any(raw.get(key) for key in allowed):
+        raise GovernanceError(
+            "[verify_report_invalid] subject 缺少可核对的目标摘要；至少给出 "
+            "scope/commit/diff_sha256/files/summary 之一。")
+    if "commit" in raw and raw.get("commit") not in (None, ""):
+        if not QUALITY_COMMIT_RE.match(str(raw.get("commit") or "")):
+            raise GovernanceError(
+                "[verify_report_invalid] subject.commit 必须是 40 位小写 Git SHA。")
+    if "code_scope_sha256" in raw:
+        value = str(raw.get("code_scope_sha256") or "")
+        if not QUALITY_SHA256_RE.match(value):
+            raise GovernanceError(
+                "[verify_report_invalid] subject.code_scope_sha256 必须是 64 位小写 SHA-256。")
+    if "dirty" in raw and not isinstance(raw.get("dirty"), bool):
+        raise GovernanceError(
+            "[verify_report_invalid] subject.dirty 必须是布尔值。")
+    files = raw.get("files")
+    if files is not None:
+        if not isinstance(files, list):
+            raise GovernanceError(
+                "[verify_report_invalid] subject.files 必须是数组（干净工作区可用空数组）。")
+        for item in files:
+            if not isinstance(item, str):
+                raise GovernanceError(
+                    "[verify_report_invalid] subject.files 的每一项都必须是字符串路径；"
+                    "code_scope_capture.py 的 files_paths 字段可直接使用。")
+            path = item.strip()
+            if not path or os.path.isabs(path) or ".." in path.replace("\\", "/").split("/"):
+                raise GovernanceError(
+                    "[verify_report_invalid] subject.files 必须是工作区内的相对路径。")
+    return raw, _sha256_text(canonical_json(raw))
+
+
+def _quality_resolved_ids(raw: object, name: str) -> list[str]:
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise GovernanceError(f"[verify_report_invalid] {name} 必须是数组。")
+    pattern = QUALITY_WARNING_RE if name == "resolved_warning_ids" else QUALITY_RISK_RE
+    out = []
+    for item in raw:
+        value = str(item or "").strip()
+        if not pattern.match(value):
+            raise GovernanceError(
+                f"[verify_report_invalid] {name} 含非法 id {value!r}。")
+        out.append(value)
+    if len(set(out)) != len(out):
+        raise GovernanceError(f"[verify_report_invalid] {name} 存在重复 id。")
+    return out
+
+
+def _quality_payload(block: dict, *, legacy: bool = False) -> dict:
+    """进入报告摘要的规范载荷；report_id 不参与，重新运行由 generated_at 区分。
+
+    v6.7.0 历史报告没有 supersede/resolved 字段，重算摘要时必须沿用旧载荷，
+    否则历史报告会被误判为篡改。
+    """
+    payload = {
+        "schema": QUALITY_SCHEMA,
+        "verdict": block.get("verdict"),
+        "warnings": block.get("warnings") or [],
+        "residual_risks": block.get("residual_risks") or [],
+        "unverified": block.get("unverified") or [],
+        "acceptance_required": block.get("acceptance_required"),
+        "checks": block.get("checks") or {},
+        "subject": block.get("subject") or {},
+    }
+    generated_at = str(block.get("generated_at") or "")
+    if generated_at or not legacy:
+        # v6.7.0 当时没有 generated_at 字段时不写入空串；v6.7.1 报告必填。
+        payload["generated_at"] = generated_at
+    if not legacy:
+        payload.update({
+            "supersedes_report_id": block.get("supersedes_report_id") or "",
+            "resolved_warning_ids": block.get("resolved_warning_ids") or [],
+            "resolved_residual_risk_ids":
+                block.get("resolved_residual_risk_ids") or [],
+        })
+    return payload
+
+
+def _quality_report_payload(report: dict) -> dict:
+    return _quality_payload(
+        report, legacy=report.get("ingest_version") != QUALITY_INGEST_VERSION)
+
+
+def _extract_quality_json(text: str) -> object:
+    raw = (text or "").strip()
+    if not raw:
+        raise GovernanceError("[verify_report_missing] 质量报告为空。")
+    lines = raw.splitlines()
+    marker = next((i for i, line in enumerate(lines)
+                   if line.strip() == _QUALITY_MARKER), None)
+    if marker is None:
+        raise GovernanceError(
+            f"[verify_report_marker_missing] 未找到 {_QUALITY_MARKER}；"
+            "不能只凭正文里的 PASS_WITH_WARNINGS 文本触发治理。")
+    candidate = ""
+    in_fence = False
+    for line in lines[marker + 1:]:
+        if not in_fence:
+            if line.strip().startswith("```"):
+                in_fence = True
+            continue
+        if line.strip().startswith("```"):
+            break
+        candidate += line + "\n"
+    if not candidate.strip():
+        raise GovernanceError(
+            "[verify_report_marker_missing] 标记后没有 JSON 代码块。")
+    try:
+        return json.loads(candidate)
+    except ValueError as exc:
+        raise GovernanceError(f"[verify_report_invalid] JSON 解析失败：{exc}") from None
+
+
+def parse_quality_report(text: str) -> dict:
+    """解析并校验 verify 结构化结论；任何缺字段/自相矛盾都失败关闭。"""
+    value = _extract_quality_json(text)
+    if not isinstance(value, dict):
+        raise GovernanceError("[verify_report_invalid] 质量结论必须是 JSON 对象。")
+    unknown = sorted(set(value) - QUALITY_FIELDS)
+    if unknown:
+        raise GovernanceError(
+            "[verify_report_unknown_field] 质量结论包含未知字段："
+            + "、".join(unknown)
+            + "；替代/解决关系必须使用契约字段，不能静默丢弃。")
+    if str(value.get("schema") or "").strip() != QUALITY_SCHEMA:
+        raise GovernanceError(
+            f"[verify_report_invalid] schema 必须是 {QUALITY_SCHEMA}。")
+    raw_verdict = str(value.get("verdict") or "").strip()
+    verdict = _quality_verdict(raw_verdict)
+    report_id = str(value.get("report_id") or "").strip()
+    if not QUALITY_REPORT_ID_RE.match(report_id):
+        raise GovernanceError(
+            "[verify_report_invalid] report_id 缺失或非法（字母数字与 ._-，≤64）。")
+    warnings = _quality_items(value.get("warnings"), "warnings")
+    residual = _quality_items(value.get("residual_risks"), "residual_risks")
+    unverified = _quality_unverified(value.get("unverified"))
+    required = value.get("acceptance_required")
+    if not isinstance(required, bool):
+        raise GovernanceError(
+            "[verify_report_invalid] acceptance_required 必须是布尔值。")
+    status = str(value.get("acceptance_status") or "").strip().lower()
+    subject, subject_digest = _quality_subject(value.get("subject"))
+    supersedes = str(value.get("supersedes_report_id") or "").strip()
+    if supersedes and not QUALITY_REPORT_ID_RE.match(supersedes):
+        raise GovernanceError(
+            "[verify_report_invalid] supersedes_report_id 非法（字母数字与 ._-，≤64）。")
+    resolved_warnings = _quality_resolved_ids(
+        value.get("resolved_warning_ids"), "resolved_warning_ids")
+    resolved_risks = _quality_resolved_ids(
+        value.get("resolved_residual_risk_ids"), "resolved_residual_risk_ids")
+    generated_at = str(value.get("generated_at") or "").strip()
+    if not generated_at:
+        raise GovernanceError(
+            "[verify_report_invalid] generated_at 缺失；每次验收必须记录生成时间，"
+            "用于区分重新验收与重复接入。")
+
+    if verdict == PWW:
+        if not required:
+            raise GovernanceError(
+                "[verify_report_invalid] PASS_WITH_WARNINGS 必须 acceptance_required=true。")
+        if status and status != "pending":
+            raise GovernanceError(
+                "[verify_acceptance_forbidden] verify 只能写 acceptance_status=pending；"
+                "用户接受必须由 Copilot 的 accept 命令登记。")
+        if not status:
+            raise GovernanceError(
+                "[verify_report_invalid] PASS_WITH_WARNINGS 必须显式声明 "
+                "acceptance_status=pending。")
+        if not warnings and not residual:
+            raise GovernanceError(
+                "[verify_report_invalid] PASS_WITH_WARNINGS 必须列出 warnings 或 "
+                "residual_risks，供用户逐条接受。")
+        if unverified:
+            raise GovernanceError(
+                "[verify_pww_has_unverified] 仍有未验证项，不得使用 PASS_WITH_WARNINGS；"
+                "按 verify 语义改判 PARTIAL/BLOCKED。")
+        severe = [item["id"] for item in warnings + residual
+                  if item.get("severity") in ("blocking", "major")]
+        if severe:
+            raise GovernanceError(
+                "[verify_pww_blocking_finding] "
+                f"{', '.join(severe)} 标记为 blocking/major，不得使用 PASS_WITH_WARNINGS。")
+        checks = _quality_checks(value.get("checks"), required=True)
+        status = "pending"
+    else:
+        if required:
+            raise GovernanceError(
+                "[verify_report_invalid] 非 PASS_WITH_WARNINGS 不能要求用户接受。")
+        if status not in ("", "not_required"):
+            raise GovernanceError(
+                "[verify_report_invalid] 非 PASS_WITH_WARNINGS 的 acceptance_status "
+                "只能是 not_required。")
+        if verdict == "pass":
+            if warnings or residual or unverified:
+                raise GovernanceError(
+                    "[verify_report_invalid] PASS 不得携带 warnings/residual_risks/"
+                    "unverified；有残余风险请用 PASS_WITH_WARNINGS。")
+            checks = _quality_checks(value.get("checks"), required=True)
+        else:
+            checks = _quality_checks(value.get("checks"), required=False)
+        status = "not_required"
+    block = {
+        "schema": QUALITY_SCHEMA,
+        "report_id": report_id,
+        "raw_verdict": raw_verdict,
+        "verdict": verdict,
+        "warnings": warnings,
+        "residual_risks": residual,
+        "unverified": unverified,
+        "acceptance_required": required,
+        "acceptance_status": status,
+        "checks": checks,
+        "subject": subject,
+        "subject_digest": subject_digest,
+        "generated_at": generated_at[:64],
+        "supersedes_report_id": supersedes,
+        "resolved_warning_ids": resolved_warnings,
+        "resolved_residual_risk_ids": resolved_risks,
+    }
+    block["report_sha256"] = _sha256_text(canonical_json(_quality_payload(block)))
+    return block
+
+
+def parse_quality_report_file(path: str) -> dict:
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            text = fh.read()
+    except OSError as exc:
+        raise GovernanceError(f"[verify_report_missing] 无法读取 {path}：{exc}") from None
+    block = parse_quality_report(text)
+    block["file_sha256"] = _sha256_file(path)
+    block["source_path"] = os.path.abspath(path)
+    return block
+
+
+def _quality_required_ids(report: dict) -> list[str]:
+    ids = [str(item.get("id") or "") for item in report.get("warnings") or []]
+    ids += [str(item.get("id") or "") for item in report.get("residual_risks") or []]
+    order = {item["id"]: idx for idx, item in enumerate(
+        (report.get("warnings") or []) + (report.get("residual_risks") or []))}
+    return sorted([i for i in ids if i], key=lambda i: order[i])
+
+
+def _quality_report_structurally_valid(report: dict) -> bool:
+    """state 可能被手工改写：进入摘要/绑定/门禁前先做结构校验。"""
+    if not isinstance(report, dict):
+        return False
+    if not isinstance(report.get("subject"), dict):
+        return False
+    if "checks" in report and not isinstance(report.get("checks"), dict):
+        return False
+    if report.get("acceptance") is not None and \
+            not isinstance(report.get("acceptance"), dict):
+        return False
+    for key in ("warnings", "residual_risks"):
+        value = report.get(key, [])
+        if not isinstance(value, list):
+            return False
+        for item in value:
+            if not isinstance(item, dict):
+                return False
+            if not isinstance(item.get("id"), str) or \
+                    not isinstance(item.get("text"), str):
+                return False
+            if "severity" in item and not isinstance(item.get("severity"), str):
+                return False
+    unverified = report.get("unverified", [])
+    if not isinstance(unverified, list) or not all(
+            isinstance(item, str) for item in unverified):
+        return False
+    unresolved = report.get("unresolved")
+    if unresolved is not None and not isinstance(unresolved, list):
+        return False
+    return True
+
+
+def _unresolved_entry(kind: str, item: dict, report_id: str,
+                      subject_digest: str) -> dict:
+    return {
+        "kind": kind,
+        "id": str(item.get("id") or ""),
+        "text": str(item.get("text") or "")[:2000],
+        "origin_report_id": report_id,
+        "origin_subject_digest": subject_digest,
+    }
+
+
+def _report_unresolved(report: dict) -> list[dict]:
+    """报告继承的未解决 W/R；已接受 id 不再算未解决。"""
+    if not _quality_report_structurally_valid(report):
+        return []
+    acceptance = report.get("acceptance")
+    if not isinstance(acceptance, dict):
+        acceptance = {}
+    accepted = {str(value) for value in acceptance.get("accepted_ids") or []}
+    stored = report.get("unresolved")
+    if isinstance(stored, list):
+        out = []
+        for item in stored:
+            if not isinstance(item, dict):
+                continue
+            kind = str(item.get("kind") or "")
+            rid = str(item.get("id") or "")
+            if kind not in ("warning", "residual_risk") or not rid or rid in accepted:
+                continue
+            out.append({
+                "kind": kind, "id": rid,
+                "text": str(item.get("text") or "")[:2000],
+                "origin_report_id": str(item.get("origin_report_id") or ""),
+                "origin_subject_digest": str(
+                    item.get("origin_subject_digest") or ""),
+            })
+        return out
+    if str(report.get("verdict") or "") != PWW:
+        return []
+    report_id = str(report.get("report_id") or "")
+    subject_digest = str(report.get("subject_digest") or "")
+    out = []
+    for kind, key in (("warning", "warnings"), ("residual_risk", "residual_risks")):
+        for item in report.get(key) or []:
+            rid = str(item.get("id") or "")
+            if rid and rid not in accepted:
+                out.append(_unresolved_entry(kind, item, report_id, subject_digest))
+    return out
+
+
+def _quality_code_declared(subject: dict) -> bool:
+    return any(subject.get(key) not in (None, "", [], {}) for key in
+               ("commit", "diff_sha256", "files", "code_scope_sha256"))
+
+
+def _snapshot_dirty(snapshot: dict) -> bool:
+    if snapshot.get("files"):
+        return True
+
+    def any_dirty(items: object) -> bool:
+        if not isinstance(items, list):
+            return False
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            if item.get("dirty"):
+                return True
+            if any_dirty(item.get("nested") or []):
+                return True
+        return False
+
+    return any_dirty(snapshot.get("submodule_worktrees")) or \
+        any_dirty(snapshot.get("nested_repos"))
+
+
+def _path_covered(path: str, declared: list[str]) -> bool:
+    value = str(path or "").replace("\\", "/")
+    for item in declared:
+        rel = str(item or "").replace("\\", "/").strip("/")
+        if not rel:
+            continue
+        if value == rel or value.startswith(rel + "/"):
+            return True
+    return False
+
+
+def _capture_quality_code_scope(state: dict, state_path: str,
+                                report_file: str, block: dict,
+                                workspace: str) -> dict | None:
+    """把报告声明的代码范围与 ingest 时工作区快照核对并持久化。"""
+    subject = block.get("subject") or {}
+    if not _quality_code_declared(subject):
+        return None
+    commit = str(subject.get("commit") or "")
+    declared_sha = str(subject.get("code_scope_sha256") or "")
+    files = subject.get("files")
+    if not QUALITY_COMMIT_RE.match(commit):
+        raise GovernanceError(
+            "[verify_code_scope_missing] 代码类报告必须在 subject.commit 给出 40 位 Git SHA。")
+    if not QUALITY_SHA256_RE.match(declared_sha):
+        raise GovernanceError(
+            "[verify_code_scope_missing] 代码类报告必须给出 subject.code_scope_sha256"
+            "（由 code_scope_capture.py 在 verify 时生成）。")
+    if files is not None and not isinstance(files, list):
+        raise GovernanceError(
+            "[verify_code_scope_missing] subject.files 必须是数组。")
+    workspace = str(workspace or "").strip()
+    if not workspace:
+        raise GovernanceError(
+            "[verify_code_scope_workspace_required] 代码类报告接入必须用 --workspace "
+            "指定实际工作区，不能由 Copilot 猜测。")
+    requested = _canonical_workspace(workspace)
+    if not os.path.isdir(requested):
+        raise GovernanceError(
+            f"[verify_code_scope_unavailable] 工作区不存在：{requested}")
+    task_ws, candidates = _task_workspace_info(state, state_path)
+    if not task_ws:
+        raise GovernanceError(
+            "[quality_code_scope_workspace_unbound] 任务没有唯一工作区绑定；"
+            f"候选={candidates or '无'}。请用 start --workspace 创建任务，"
+            "或在任务仓库内登记证据后再接入代码报告。")
+    if requested != task_ws:
+        raise GovernanceError(
+            "[quality_code_scope_workspace_mismatch] 报告工作区 "
+            f"{requested!r} 与任务绑定工作区 {task_ws!r} 不一致；"
+            "不能用另一个仓库的代码快照冒充任务代码范围。")
+    if not str(state.get("workspace") or ""):
+        state["workspace"] = task_ws
+        state["workspace_source"] = "derived"
+        _history(state, "task_workspace_bound",
+                 {"workspace": task_ws, "source": "derived"})
+    workspace = task_ws
+    report_abs = os.path.realpath(os.path.abspath(report_file))
+    task_dir = os.path.realpath(os.path.dirname(os.path.abspath(state_path)))
+    if (report_abs == workspace or report_abs.startswith(workspace + os.sep)) \
+            and not (report_abs == task_dir
+                     or report_abs.startswith(task_dir + os.sep)):
+        raise GovernanceError(
+            "[verify_code_scope_report_in_workspace] verify 报告文件必须放在任务"
+            "目录或工作区外；放在代码工作区内会使报告自身变更无法与代码范围"
+            "区分。")
+    # 只排除治理文件与报告文件本身；不排除已登记证据文件——证据如果位于
+    # 工作区内且发生变更，同样属于代码范围，不能借“已登记为证据”从快照消失。
+    excludes = CS.governance_paths(state_path)
+    excludes.append(report_abs)
+    snapshot = CS.capture_code_snapshot(workspace, exclude_paths=sorted(set(excludes)))
+    if not snapshot.get("available"):
+        raise GovernanceError(
+            "[verify_code_scope_unavailable] 无法读取工作区代码快照："
+            f"{snapshot.get('reason') or 'unknown'}")
+    if str(snapshot.get("git_head") or "") != commit:
+        raise GovernanceError(
+            "[quality_code_scope_commit_mismatch] 报告 commit="
+            f"{commit or '-'} 与工作区 HEAD={snapshot.get('git_head') or '-'} 不一致。")
+    if str(snapshot.get("digest") or "") != declared_sha:
+        raise GovernanceError(
+            "[quality_code_scope_mismatch] 报告 code_scope_sha256 与当前工作区快照"
+            "不一致；报告不是针对当前代码生成的。")
+    diff_sha = str(subject.get("diff_sha256") or "")
+    if diff_sha and diff_sha != declared_sha:
+        raise GovernanceError(
+            "[quality_code_scope_mismatch] subject.diff_sha256 与 code_scope_sha256 "
+            "不一致；一个报告只能绑定一个代码快照。")
+    dirty = _snapshot_dirty(snapshot)
+    if "dirty" in subject and bool(subject.get("dirty")) != dirty:
+        raise GovernanceError(
+            "[quality_code_scope_dirty_mismatch] subject.dirty 与工作区实际状态不一致。")
+    root = str(snapshot.get("git_root") or "")
+    declared = [str(item) for item in (files or [])]
+    if snapshot.get("files") and not declared:
+        raise GovernanceError(
+            "[verify_code_scope_missing] 工作区有变更时，subject.files 必须列出"
+            "覆盖范围。")
+    for entry in snapshot.get("files") or []:
+        for key in ("path", "old_path"):
+            value = str(entry.get(key) or "")
+            if value and not _path_covered(value, declared):
+                raise GovernanceError(
+                    "[quality_code_scope_files_incomplete] 工作区变更 "
+                    f"{value} 不在报告声明的 files 范围内。")
+    changed = set()
+    for entry in snapshot.get("files") or []:
+        for key in ("path", "old_path"):
+            if entry.get(key):
+                changed.add(str(entry[key]).replace("\\", "/"))
+    for item in declared:
+        rel = str(item).replace("\\", "/").strip("/")
+        if rel in changed:
+            continue
+        target = os.path.abspath(os.path.join(root, rel))
+        if os.path.commonpath([root, target]) != root or not os.path.exists(target):
+            raise GovernanceError(
+                "[quality_code_scope_files_unknown] 报告声明的路径不存在且不在变更集："
+                f"{item}")
+    snapshot["dirty"] = dirty
+    # 这是 Copilot ingest 时的重算快照，不是“报告生成时刻”的证明。报告声明
+    # 的 generation-time 摘要保存在 subject.code_scope_sha256，并已进入
+    # report_sha256；此处显式标注来源，避免把 ingest 重算冒充生成时快照。
+    snapshot.update({
+        "workspace": task_ws,
+        "workspace_source": str(state.get("workspace_source") or "derived"),
+        "capture_source": "copilot-ingest-recompute",
+        "captured_at": now_iso(),
+        "report_id": str(block.get("report_id") or ""),
+        "report_sha256": str(block.get("report_sha256") or ""),
+        "report_file_sha256": str(block.get("file_sha256") or ""),
+        "report_generated_at": str(block.get("generated_at") or ""),
+        "declared_sha256": declared_sha,
+        "task_id": str(state.get("task_id") or ""),
+    })
+    return snapshot
+
+
+def _code_scope_status(report: dict, state: dict | None = None) -> dict:
+    """当前工作区是否仍等于报告绑定的代码快照。"""
+    subject = report.get("subject") or {}
+    snapshot = report.get("code_scope")
+    if not isinstance(snapshot, dict) or not snapshot:
+        if _quality_code_declared(subject) and \
+                report.get("ingest_version") == QUALITY_INGEST_VERSION:
+            return {"status": "missing", "reasons": ["quality_code_scope_missing"]}
+        return {"status": "legacy" if _quality_code_declared(subject)
+                else "not_required", "reasons": []}
+    if not snapshot.get("available") or not snapshot.get("digest"):
+        return {"status": "unavailable",
+                "reasons": ["quality_code_scope_unavailable"]}
+    stored_sha = str(report.get("code_scope_sha256") or "")
+    snapshot_ws = _canonical_workspace(snapshot.get("workspace") or "")
+    if state is not None:
+        task_ws, candidates = _task_workspace_info(state)
+        if not task_ws:
+            return {"status": "unbound",
+                    "reasons": ["quality_code_scope_workspace_unbound"]}
+        if snapshot_ws != task_ws:
+            return {"status": "workspace_mismatch",
+                    "reasons": ["quality_code_scope_workspace_mismatch"]}
+        if str(snapshot.get("task_id") or "") != str(
+                state.get("task_id") or ""):
+            return {"status": "inconsistent",
+                    "reasons": ["quality_code_scope_inconsistent"]}
+    if str(snapshot.get("report_id") or "") != str(
+            report.get("report_id") or "") or \
+            str(snapshot.get("report_sha256") or "") != str(
+            report.get("report_sha256") or "") or \
+            str(snapshot.get("declared_sha256") or "") != stored_sha or \
+            stored_sha != str(snapshot.get("digest") or "") or \
+            str(subject.get("code_scope_sha256") or "") != stored_sha or \
+            str(subject.get("commit") or "") != str(snapshot.get("git_head") or ""):
+        return {"status": "inconsistent",
+                "reasons": ["quality_code_scope_inconsistent"]}
+    current = CS.capture_code_snapshot(
+        snapshot_ws,
+        exclude_paths=sorted(set(snapshot.get("excluded_paths") or [])),
+        base=str(snapshot.get("git_base") or ""))
+    if not current.get("available"):
+        return {"status": "unavailable",
+                "reasons": ["quality_code_scope_unavailable"]}
+    if str(current.get("digest") or "") != stored_sha:
+        return {"status": "drift", "reasons": ["quality_code_scope_drift"]}
+    return {"status": "current", "reasons": [], "digest": stored_sha,
+            "git_head": current.get("git_head") or "",
+            "workspace": snapshot_ws,
+            "capture_source": snapshot.get("capture_source") or "",
+            "captured_at": snapshot.get("captured_at") or ""}
+
+
+def _supersede_plan(old: dict, block: dict) -> dict:
+    """按“旧未解决 W/R + 新报告 + 明确解决声明”计算继承与解决关系。"""
+    old_unresolved = _report_unresolved(old)
+    old_map = {(entry["kind"], entry["id"]): entry for entry in old_unresolved}
+    resolved_w = [str(value) for value in block.get("resolved_warning_ids") or []]
+    resolved_r = [str(value) for value in
+                  block.get("resolved_residual_risk_ids") or []]
+    resolved_keys = {("warning", value) for value in resolved_w} | \
+        {("residual_risk", value) for value in resolved_r}
+    unknown = sorted(key for key in resolved_keys if key not in old_map)
+    if unknown:
+        raise GovernanceError(
+            "[pww_supersede_coverage_incomplete] 解决声明包含不属于旧报告的 id："
+            + "、".join(value for _kind, value in unknown))
+    own = {}
+    for kind, key in (("warning", "warnings"), ("residual_risk", "residual_risks")):
+        for item in block.get(key) or []:
+            rid = str(item.get("id") or "")
+            if rid:
+                own[(kind, rid)] = _unresolved_entry(
+                    kind, item, str(block.get("report_id") or ""),
+                    str(block.get("subject_digest") or ""))
+    contradiction = sorted(key for key in resolved_keys if key in own)
+    if contradiction:
+        raise GovernanceError(
+            "[pww_supersede_coverage_incomplete] 同一 id 既声明已解决又列入新报告："
+            + "、".join(value for _kind, value in contradiction))
+    carried: list[dict] = []
+    resolved: list[dict] = []
+    verdict = str(block.get("verdict") or "")
+    for key, entry in old_map.items():
+        if key in own:
+            carried.append(entry)
+        elif key in resolved_keys:
+            if str(block.get("subject_digest") or "") != \
+                    str(entry.get("origin_subject_digest") or ""):
+                raise GovernanceError(
+                    "[pww_supersede_subject_mismatch] 报告声称解决 "
+                    f"{entry['id']}，但 subject 与警告来源报告不一致；"
+                    "不能自动证明该范围已重新验证。")
+            resolved.append(entry)
+        elif verdict not in ("pass", PWW):
+            # 非 PASS/PWW 报告不能收口；旧未解决项继续留在链上，防止借
+            # FAIL/PARTIAL 中转后由后续 PASS 洗掉。
+            carried.append(entry)
+        else:
+            raise GovernanceError(
+                "[pww_supersede_coverage_incomplete] 旧报告未解决的 "
+                f"{entry['id']} 既未继承到新报告，也未声明解决。")
+    new_entries = carried + [entry for key, entry in own.items()
+                             if key not in {(e["kind"], e["id"]) for e in carried}]
+    if str(block.get("verdict") or "") == "pass" and new_entries:
+        raise GovernanceError(
+            "[pww_superseded_unresolved] PASS 报告仍继承未解决警告，不能作为通过结论。")
+    return {
+        "old_unresolved": old_unresolved,
+        "new_unresolved": new_entries,
+        "carried": [entry["id"] for entry in carried],
+        "resolved": [entry["id"] for entry in resolved],
+        "resolved_warning_ids": resolved_w,
+        "resolved_residual_risk_ids": resolved_r,
+    }
+
+
+def _validate_supersede_chain(state: dict, active: dict) -> list[str]:
+    """G2 复核 active 报告的替代关系与 unresolved 是否自洽。"""
+    if active.get("ingest_version") != QUALITY_INGEST_VERSION:
+        # v6.7.0 状态没有显式替代关系，按历史兼容保留，不伪造新规则。
+        return []
+    reports = [item for item in state.get("quality_reports") or []
+               if isinstance(item, dict)]
+    by_id = {str(item.get("report_id") or ""): item for item in reports}
+    target_id = str(active.get("supersedes_report_id") or "")
+    older = [item for item in reports
+             if str(item.get("report_id") or "") !=
+             str(active.get("report_id") or "")]
+    if not target_id:
+        if older:
+            return ["pww_supersede_missing"]
+        return []
+    target = by_id.get(target_id)
+    if target is None or str(target.get("superseded_by") or "") != \
+            str(active.get("report_id") or "") or target.get("superseded_at") is None:
+        return ["pww_supersede_invalid_target"]
+    if not _quality_report_structurally_valid(target):
+        return ["pww_supersede_target_tampered"]
+    try:
+        target_sha = _sha256_text(canonical_json(_quality_report_payload(target)))
+    except (TypeError, ValueError, KeyError):
+        return ["pww_supersede_target_tampered"]
+    if target_sha != str(target.get("report_sha256") or ""):
+        return ["pww_supersede_target_tampered"]
+    block = {
+        "report_id": active.get("report_id"),
+        "verdict": active.get("verdict"),
+        "warnings": active.get("warnings") or [],
+        "residual_risks": active.get("residual_risks") or [],
+        "subject_digest": active.get("subject_digest"),
+        "resolved_warning_ids": active.get("resolved_warning_ids") or [],
+        "resolved_residual_risk_ids": active.get("resolved_residual_risk_ids") or [],
+    }
+    try:
+        plan = _supersede_plan(target, block)
+    except GovernanceError as exc:
+        match = re.match(r"^\[([a-z0-9_]+)\]", str(exc))
+        return [match.group(1) if match else "pww_supersede_coverage_incomplete"]
+    expected = {(entry["kind"], entry["id"], entry["origin_report_id"],
+                 entry["origin_subject_digest"])
+                for entry in plan["new_unresolved"]}
+    stored_entries = active.get("unresolved")
+    if not isinstance(stored_entries, list):
+        stored_entries = _report_unresolved(active)
+    stored = {(str(entry.get("kind") or ""), str(entry.get("id") or ""),
+               str(entry.get("origin_report_id") or ""),
+               str(entry.get("origin_subject_digest") or ""))
+              for entry in stored_entries if isinstance(entry, dict)}
+    if expected != stored:
+        return ["pww_supersede_inconsistent"]
+    return []
+
+
+def _acceptance_criterion(state: dict) -> dict | None:
+    for criterion in (state.get("contract") or {}).get("criteria") or []:
+        if isinstance(criterion.get("acceptance"), dict):
+            return criterion
+    return None
+
+
+def _next_criterion_id(state: dict) -> str:
+    used = set()
+    for criterion in (state.get("contract") or {}).get("criteria") or []:
+        match = CRITERION_ID_RE.match(str(criterion.get("criterion_id") or ""))
+        if match:
+            used.add(int(match.group(0)[1:]))
+    number = 1
+    while number in used:
+        number += 1
+    if number > 999:
+        raise GovernanceError("完成条件 id 已用尽（C1–C999）。")
+    return f"C{number}"
+
+
+def _refresh_contract_digests(state: dict) -> None:
+    """合同条件集合变化后同步 fingerprint，保证 G2 与复核绑定口径一致。"""
+    contract = state.setdefault("contract", {})
+    criteria = contract.get("criteria") or []
+    contract["criteria_sha256"] = criteria_digest(criteria)
+    contract["criteria_state"] = "confirmed"
+    state["contract_sha256"] = _contract_fingerprint(
+        state.get("goal") or "", contract.get("done_criteria_text") or "",
+        criteria, contract.get("test_policy") or {})
+
+
+def _ensure_acceptance_criterion(state: dict, report: dict,
+                                 ids: list[str] | None = None) -> dict:
+    required = list(ids) if ids is not None else _quality_required_ids(report)
+    summary = "、".join(required)
+    description = (f"用户明确接受质量报告 {report['report_id']} 的未解决警告与"
+                   f"残余风险（{summary}）；Copilot 只登记用户明确表达，"
+                   "执行方不得代替用户接受。")
+    criterion = _acceptance_criterion(state)
+    at = now_iso()
+    if criterion is None:
+        criterion = {
+            "criterion_id": _next_criterion_id(state),
+            "description": description,
+            "status": "pending",
+            "evidence_refs": [],
+            "updated_at": at,
+            "updated_iteration": _current_iteration_id(state),
+            "history": [],
+        }
+        (state.setdefault("contract", {}).setdefault("criteria", [])
+         ).append(criterion)
+        _history(state, "pww_acceptance_condition_created",
+                 {"criterion_id": criterion["criterion_id"],
+                  "report_id": report["report_id"],
+                  "required_ids": required})
+    else:
+        previous = (criterion.get("acceptance") or {}).get("report_id")
+        criterion["description"] = description
+        criterion["status"] = "pending"
+        criterion["evidence_refs"] = []
+        criterion["updated_at"] = at
+        _history(state, "pww_acceptance_condition_updated",
+                 {"criterion_id": criterion["criterion_id"],
+                  "previous_report_id": previous,
+                  "report_id": report["report_id"],
+                  "required_ids": required})
+    criterion["acceptance"] = {
+        "report_id": report["report_id"],
+        "report_sha256": report["report_sha256"],
+        "required_ids": required,
+        "accepted_ids": [],
+        "status": "pending",
+        "accepted_by": "",
+        "accepted_at": "",
+        "quote": "",
+        "binding_sha256": "",
+    }
+    _refresh_contract_digests(state)
+    return criterion
+
+
+def _retire_acceptance_criterion(state: dict) -> None:
+    criterion = _acceptance_criterion(state)
+    if criterion is None:
+        return
+    criteria = state.setdefault("contract", {}).setdefault("criteria", [])
+    criteria[:] = [c for c in criteria if c is not criterion]
+    _refresh_contract_digests(state)
+    _history(state, "pww_acceptance_condition_retired",
+             {"criterion_id": criterion.get("criterion_id"),
+              "report_id": (criterion.get("acceptance") or {}).get("report_id")})
+
+
+def _quality_binding_payload(state: dict, report: dict, *,
+                             include_subject: bool,
+                             include_code_scope: bool = True,
+                             include_identity: bool = False) -> dict:
+    payload = {
+        "task_id": state.get("task_id"),
+        "goal_sha256": state.get("goal_sha256"),
+        "contract_sha256": state.get("contract_sha256"),
+        "criteria_sha256": (state.get("contract") or {}).get("criteria_sha256"),
+        "report_sha256": report.get("report_sha256"),
+        "warnings": [item.get("id") for item in report.get("warnings") or []],
+        "residual_risks": [item.get("id") for item in report.get("residual_risks") or []],
+    }
+    if include_identity:
+        payload["report_id"] = report.get("report_id")
+        payload["workspace"] = report.get("workspace") or ""
+    if include_subject:
+        payload["subject_digest"] = report.get("subject_digest")
+        if include_code_scope:
+            payload["code_scope_sha256"] = report.get("code_scope_sha256") or ""
+    return payload
+
+
+def _quality_binding_candidates(state: dict, report: dict) -> set[str]:
+    """当前可接受的绑定摘要。
+
+    v6.7.1 报告绑定 subject、代码范围、report_id 与 workspace；无
+    `ingest_version` 的 v6.7.0 历史报告没有这些字段，同时兼容“旧绑定已含
+    subject_digest”的两种过渡口径，避免历史 PWW 因升级被误判为 stale。
+    """
+    if report.get("ingest_version") == QUALITY_INGEST_VERSION:
+        return {_sha256_text(canonical_json(_quality_binding_payload(
+            state, report, include_subject=True, include_identity=True)))}
+    legacy = {_sha256_text(canonical_json(_quality_binding_payload(
+        state, report, include_subject=False)))}
+    if str(report.get("subject_digest") or ""):
+        legacy.add(_sha256_text(canonical_json(_quality_binding_payload(
+            state, report, include_subject=True, include_code_scope=False))))
+        legacy.add(_sha256_text(canonical_json(_quality_binding_payload(
+            state, report, include_subject=True))))
+    return legacy
+
+
+def _quality_binding(state: dict, report: dict) -> str:
+    """接受记录与任务当前目标/合同/条件/报告/警告/代码范围的绑定摘要。"""
+    candidates = _quality_binding_candidates(state, report)
+    versioned = report.get("ingest_version") == QUALITY_INGEST_VERSION
+    current = _sha256_text(canonical_json(_quality_binding_payload(
+        state, report, include_subject=versioned,
+        include_identity=versioned)))
+    # 优先返回当前规范摘要；旧报告若只匹配过渡摘要，返回该过渡值。
+    return current if current in candidates else sorted(candidates)[0]
+
+
+def _quality_binding_current(state: dict, report: dict) -> bool:
+    if not _quality_report_structurally_valid(report):
+        return False
+    stored = str(report.get("binding_sha256") or "")
+    return bool(stored) and stored in _quality_binding_candidates(state, report)
+
+
+def active_quality_reports(state: dict) -> list[dict]:
+    return [report for report in state.get("quality_reports") or []
+            if isinstance(report, dict) and not report.get("superseded_by")]
+
+
+def latest_quality_report(state: dict) -> dict | None:
+    reports = active_quality_reports(state)
+    return reports[-1] if reports else None
+
+
+def quality_summary(state: dict) -> dict:
+    report = latest_quality_report(state)
+    if report is None:
+        closure = state.get("closure") or {}
+        return {
+            "verdict": "unrecorded",
+            "report_id": "",
+            "acceptance_status": "not_required",
+            "accepted_ids": [],
+            "binding_current": True,
+            "closed_verdict": closure.get("verdict"),
+            "note": "本任务没有接入 verify 结构化质量报告；不据此推断任何接受状态。",
+        }
+    if not _quality_report_structurally_valid(report):
+        return {
+            "verdict": report.get("verdict"),
+            "raw_verdict": report.get("raw_verdict"),
+            "report_id": report.get("report_id"),
+            "acceptance_status": "invalid",
+            "accepted_ids": [],
+            "accepted_by": "",
+            "accepted_at": "",
+            "warnings": [],
+            "residual_risks": [],
+            "unresolved_ids": [],
+            "supersedes_report_id": report.get("supersedes_report_id") or "",
+            "code_scope_sha256": report.get("code_scope_sha256") or "",
+            "code_scope_declared": False,
+            "workspace": report.get("workspace") or state.get("workspace") or "",
+            "workspace_source": state.get("workspace_source") or "",
+            "code_scope_status": "invalid",
+            "binding_current": False,
+            "note": "质量报告结构被改写，按 fail-closed 拒绝收口。",
+        }
+    try:
+        digest_ok = _sha256_text(canonical_json(
+            _quality_report_payload(report))) == str(
+            report.get("report_sha256") or "")
+    except (TypeError, ValueError, KeyError, AttributeError):
+        digest_ok = False
+    binding_current = digest_ok and _quality_binding_current(state, report)
+    scope = _code_scope_status(report, state)
+    acceptance = report.get("acceptance")
+    if not isinstance(acceptance, dict):
+        acceptance = {}
+    status = str(report.get("acceptance_status") or "")
+    if report.get("verdict") == PWW and not binding_current:
+        status = "stale"
+    return {
+        "verdict": report.get("verdict"),
+        "raw_verdict": report.get("raw_verdict"),
+        "report_id": report.get("report_id"),
+        "acceptance_status": status,
+        "accepted_ids": list(acceptance.get("accepted_ids") or []),
+        "accepted_by": acceptance.get("accepted_by") or "",
+        "accepted_at": acceptance.get("accepted_at") or "",
+        "warnings": report.get("warnings") or [],
+        "residual_risks": report.get("residual_risks") or [],
+        "unresolved_ids": [entry["id"] for entry in _report_unresolved(report)],
+        "supersedes_report_id": report.get("supersedes_report_id") or "",
+        "code_scope_sha256": report.get("code_scope_sha256") or "",
+        "code_scope_declared": _quality_code_declared(report.get("subject") or {}),
+        "code_scope_status": scope["status"],
+        "code_scope_capture_source": (report.get("code_scope") or {}).get(
+            "capture_source") or "",
+        "code_scope_captured_at": (report.get("code_scope") or {}).get(
+            "captured_at") or "",
+        "workspace": report.get("workspace") or state.get("workspace") or "",
+        "workspace_source": state.get("workspace_source") or "",
+        "binding_current": binding_current,
+    }
+
+
+def ingest_quality_report(path: str, report_file: str, *,
+                          note: str = "", summary: str = "",
+                          workspace: str = "") -> dict:
+    """接入 verify 报告：PWW 自动登记用户接受条件；重复接入幂等。"""
+    state = load_state(path)
+    _assert_open(state, "接入质量报告", allow_blocked=True)
+    block = parse_quality_report_file(report_file)
+    if str(workspace or "").strip() and \
+            not _quality_code_declared(block.get("subject") or {}):
+        raise GovernanceError(
+            "[verify_code_scope_missing] 已提供 --workspace，但 subject 未声明 "
+            "commit/files/diff_sha256/code_scope_sha256；代码任务必须绑定代码快照。"
+            "纯文档报告请省略 --workspace。")
+    state_reports = state.setdefault("quality_reports", [])
+    reports = [item for item in state_reports if isinstance(item, dict)]
+    existing = next((report for report in reports
+                     if report.get("report_sha256") == block["report_sha256"]), None)
+    if existing is not None:
+        if existing.get("superseded_by"):
+            raise GovernanceError(
+                "[verify_report_superseded] 该报告已被 "
+                f"{existing.get('superseded_by')} 替代，不能重新接入旧结论；"
+                "请对当前目标重新验收并使用新的 report_id。")
+        if (summary or "").strip():
+            # 同一保存轮次里补齐执行说明；仍不改动既有质量报告与接受记录。
+            state.setdefault("reports", []).append({
+                "kind": "note",
+                "summary": summary.strip()[:MAX_REPORT_CHARS],
+                "report_sha256": _sha256_text(summary.strip()),
+                "blocked": False, "reason": "",
+                "iteration_id": _current_iteration_id(state),
+                "created": now_iso(),
+            })
+            _history(state, "report_recorded",
+                     {"sha256": _sha256_text(summary.strip()), "blocked": False})
+            save_state(path, state)
+        return {"idempotent": True, "report": existing,
+                "criterion": _acceptance_criterion(state), "state": state}
+    conflict = next((report for report in reports
+                     if report.get("report_id") == block["report_id"]), None)
+    if conflict is not None:
+        raise GovernanceError(
+            f"[verify_report_id_reused] report_id={block['report_id']} 已用于另一份"
+            "质量结论；新结论必须使用新的 report_id，不能复用旧 ID 覆盖历史。")
+    active = active_quality_reports(state)
+    if len(active) > 1:
+        raise GovernanceError(
+            "[quality_report_state_inconsistent] 同时存在多份未替代的质量报告；"
+            "先修复状态再接入新报告。")
+    target = active[-1] if active else None
+    supersedes = str(block.get("supersedes_report_id") or "")
+    if target is None:
+        if supersedes:
+            raise GovernanceError(
+                f"[pww_supersede_invalid_target] 当前没有生效报告可被 {supersedes} 替代。")
+        plan = _supersede_plan({"verdict": "pass", "warnings": [],
+                                "residual_risks": [], "acceptance": {}}, block)
+    else:
+        if not supersedes:
+            raise GovernanceError(
+                "[pww_supersede_missing] 已存在生效报告 "
+                f"{target.get('report_id')}；新报告必须用 supersedes_report_id "
+                "明确替代目标。")
+        if supersedes != str(target.get("report_id") or ""):
+            raise GovernanceError(
+                f"[pww_supersede_invalid_target] supersedes_report_id={supersedes} "
+                f"不是当前生效报告 {target.get('report_id')}。")
+        plan = _supersede_plan(target, block)
+    if block["verdict"] == PWW:
+        unmet = [str(c.get("criterion_id") or "")
+                 for c in (state.get("contract") or {}).get("criteria") or []
+                 if str(c.get("status") or "pending") != "met"
+                 and not isinstance(c.get("acceptance"), dict)]
+        if unmet:
+            raise GovernanceError(
+                "[verify_pww_criteria_unmet] Copilot 合同完成条件尚未核销："
+                + "、".join(unmet)
+                + "；必需完成条件未核销时不得使用 PASS_WITH_WARNINGS。")
+    code_scope = _capture_quality_code_scope(
+        state, path, report_file, block, workspace)
+    at = now_iso()
+    report = {
+        "report_id": block["report_id"],
+        "schema": QUALITY_SCHEMA,
+        "ingest_version": QUALITY_INGEST_VERSION,
+        "raw_verdict": block["raw_verdict"],
+        "verdict": block["verdict"],
+        "warnings": block["warnings"],
+        "residual_risks": block["residual_risks"],
+        "unverified": block["unverified"],
+        "acceptance_required": block["acceptance_required"],
+        "acceptance_status": block["acceptance_status"],
+        "checks": block["checks"],
+        "subject": block["subject"],
+        "subject_digest": block["subject_digest"],
+        "generated_at": block["generated_at"],
+        "report_sha256": block["report_sha256"],
+        "file_sha256": block["file_sha256"],
+        "source_path": block["source_path"],
+        "note": (note or "").strip()[:2000],
+        "task_id": state.get("task_id"),
+        "goal_sha256": state.get("goal_sha256"),
+        "contract_sha256": state.get("contract_sha256"),
+        "criteria_sha256": (state.get("contract") or {}).get("criteria_sha256"),
+        "iteration_id": _current_iteration_id(state),
+        "ingested_at": at,
+        "superseded_by": None,
+        "superseded_at": None,
+        "supersedes_report_id": supersedes,
+        "resolved_warning_ids": plan["resolved_warning_ids"],
+        "resolved_residual_risk_ids": plan["resolved_residual_risk_ids"],
+        "unresolved": plan["new_unresolved"],
+        "supersede": ({
+            "target_report_id": target.get("report_id"),
+            "target_subject_digest": target.get("subject_digest"),
+            "subject_match": str(target.get("subject_digest") or "") ==
+                             str(block.get("subject_digest") or ""),
+            "carried_ids": plan["carried"],
+            "resolved_ids": plan["resolved"],
+            "at": at,
+        } if target is not None else None),
+        "workspace": (code_scope or {}).get("workspace") or "",
+        "workspace_source": str(state.get("workspace_source") or ""),
+        "code_scope": code_scope,
+        "code_scope_sha256": (code_scope or {}).get("digest") or "",
+        "criterion_id": "",
+        "binding_sha256": "",
+        "acceptance": {
+            "status": block["acceptance_status"],
+            "accepted_ids": [],
+            "accepted_by": "",
+            "accepted_at": "",
+            "quote": "",
+            "binding_sha256": "",
+            "code_scope_sha256": (code_scope or {}).get("digest") or "",
+        },
+        "acceptance_evidence_id": "",
+    }
+    if target is not None:
+        target["superseded_by"] = report["report_id"]
+        target["superseded_at"] = at
+        if target.get("acceptance_status") in ("pending", "partial", "accepted",
+                                               "stale"):
+            target["acceptance_status"] = "superseded"
+        if isinstance(target.get("acceptance"), dict):
+            target["acceptance"]["status"] = "superseded"
+    state_reports.append(report)
+    unresolved = plan["new_unresolved"]
+    unresolved_ids = [entry["id"] for entry in unresolved]
+    if block["verdict"] == PWW and set(unresolved_ids) != \
+            set(_quality_required_ids(report)):
+        raise GovernanceError(
+            "[pww_supersede_inconsistent] PWW 的未解决集合与自身 W/R 不一致；"
+            "请检查替代覆盖声明。")
+    # 只有 PWW 才产生用户接受条件；FAIL/PARTIAL/BLOCKED 带警告时仍记录
+    # unresolved 以维持替代链，但不能生成无法执行的“接受”工作。
+    if block["verdict"] == PWW and unresolved:
+        criterion = _ensure_acceptance_criterion(state, report, unresolved_ids)
+        report["criterion_id"] = criterion["criterion_id"]
+    else:
+        _retire_acceptance_criterion(state)
+        criterion = None
+    report["goal_sha256"] = state.get("goal_sha256")
+    report["contract_sha256"] = state.get("contract_sha256")
+    report["criteria_sha256"] = (state.get("contract") or {}).get("criteria_sha256")
+    report["binding_sha256"] = _quality_binding(state, report)
+    if criterion is not None:
+        criterion["acceptance"]["binding_sha256"] = report["binding_sha256"]
+    state.setdefault("reports", []).append({
+        "kind": "quality",
+        "summary": (f"质量报告 {report['report_id']}：{block['raw_verdict']}"
+                    + (f"；待接受 {'、'.join(unresolved_ids)}"
+                       if unresolved_ids else "")),
+        "report_sha256": report["report_sha256"],
+        "blocked": False,
+        "reason": "",
+        "iteration_id": report["iteration_id"],
+        "created": at,
+    })
+    if (summary or "").strip():
+        state.setdefault("reports", []).append({
+            "kind": "execution",
+            "summary": summary.strip()[:MAX_REPORT_CHARS],
+            "report_sha256": _sha256_text(summary.strip()),
+            "blocked": False, "reason": "",
+            "iteration_id": report["iteration_id"],
+            "created": at,
+        })
+    _history(state, "quality_report_ingested", {
+        "report_id": report["report_id"],
+        "verdict": report["verdict"],
+        "acceptance_required": block["acceptance_required"],
+        "required_ids": unresolved_ids,
+        "subject_digest": report["subject_digest"],
+        "supersedes_report_id": supersedes,
+        "carried_ids": plan["carried"],
+        "resolved_ids": plan["resolved"],
+        "code_scope_sha256": report["code_scope_sha256"],
+        "binding_sha256": report["binding_sha256"],
+    })
+    save_state(path, state)
+    return {"idempotent": False, "report": report, "criterion": criterion,
+            "state": state}
+
+
+def _id_order(ids: list[str]) -> list[str]:
+    def key(value: str):
+        prefix = 0 if str(value).startswith("W") else 1
+        return (prefix, int(re.sub(r"\D", "", str(value)) or 0))
+    return sorted(set(ids), key=key)
+
+
+def _acceptance_evidence(state: dict, report: dict, accepted: list[str],
+                         accepted_at: str, quote: str) -> tuple[str, dict]:
+    payload = {
+        "schema": QUALITY_SCHEMA,
+        "report_id": report.get("report_id"),
+        "report_sha256": report.get("report_sha256"),
+        "verdict": report.get("verdict"),
+        "warnings": report.get("warnings") or [],
+        "residual_risks": report.get("residual_risks") or [],
+        "accepted_ids": _id_order(accepted),
+        "accepted_by": "user",
+        "accepted_at": accepted_at,
+        "quote": quote[:2000],
+        "binding_sha256": report.get("binding_sha256"),
+        "code_scope_sha256": report.get("code_scope_sha256") or "",
+        "supersedes_report_id": report.get("supersedes_report_id") or "",
+        "unresolved_ids": [entry["id"] for entry in _report_unresolved(report)],
+    }
+    text = canonical_json(payload)
+    eid = next_evidence_id(state)
+    entry = register_evidence(state, eid, kind="verify-report", text=text,
+                              note=f"PWW 用户接受：{report.get('report_id')}")
+    return eid, entry
+
+
+def accept_pww(path: str, *, report_id: str = "", ids: list[str] | None = None,
+               accepted_by: str = "", quote: str = "", note: str = "") -> dict:
+    """登记用户对 PWW 的明确接受；执行方/子代理/verify 不得代为接受。"""
+    state = load_state(path)
+    _assert_open(state, "登记用户接受", allow_blocked=True)
+    if str(accepted_by or "").strip().lower() != "user":
+        raise GovernanceError(
+            "[acceptance_requires_user] 只有用户明确接受才能登记；"
+            "--by 必须是 user，执行方/子代理/verify/Copilot 不得代替用户接受。")
+    quote = (quote or "").strip()
+    if not quote:
+        raise GovernanceError(
+            "[acceptance_quote_required] 必须记录用户接受的原话（--quote），"
+            "不能只写调用方结论。")
+    active = active_quality_reports(state)
+    target_id = str(report_id or "").strip()
+    if target_id:
+        report = next((item for item in active
+                       if str(item.get("report_id") or "") == target_id), None)
+        if report is None:
+            raise GovernanceError(
+                f"[pww_report_not_found] 没有生效中的质量报告 {target_id}；"
+                "旧报告被新报告替代后不能继续接受。")
+    else:
+        if len(active) != 1:
+            raise GovernanceError(
+                "[pww_report_required] 存在多份生效质量报告时必须用 --report 指定。")
+        report = active[0]
+    if report.get("verdict") != PWW:
+        raise GovernanceError(
+            f"[pww_not_applicable] 报告 {report.get('report_id')} 的 verdict="
+            f"{report.get('verdict')}，不接受 PWW 用户接受登记。")
+    if not _quality_report_structurally_valid(report):
+        raise GovernanceError(
+            f"[quality_report_state_invalid] 报告 {report.get('report_id')} 结构被"
+            "改写；质量结论不可信，必须重新验收。")
+    if _sha256_text(canonical_json(_quality_report_payload(report))) != \
+            str(report.get("report_sha256") or ""):
+        raise GovernanceError(
+            f"[quality_report_tampered] 报告 {report.get('report_id')} 内容摘要与登记"
+            "不一致；质量结论不可信，必须重新验收后再接受。")
+    current = _quality_binding(state, report)
+    stored_binding = str(report.get("binding_sha256") or "")
+    if stored_binding in _quality_binding_candidates(state, report):
+        # legacy 过渡口径：保留已登记的绑定值，避免幂等/部分接受合并失效。
+        current = stored_binding
+    if not _quality_binding_current(state, report):
+        # 不落盘：校验失败时状态必须保持不变；stale 由查询/门禁按当前绑定派生。
+        raise GovernanceError(
+            "[pww_acceptance_stale] 目标、合同、条件或报告已变化，原接受绑定失效；"
+            "请重新验收并接入新的质量报告后再接受。")
+    if str(report.get("acceptance_status") or "") == "stale":
+        raise GovernanceError(
+            "[pww_reverify_required] 任务重开后旧接受已失效；必须重新验收并接入新的"
+            "质量报告，再取得用户明确接受。")
+    scope = _code_scope_status(report, state)
+    if scope["reasons"]:
+        raise GovernanceError(
+            f"[{scope['reasons'][0]}] 报告绑定的代码范围不可用或已变化；"
+            "必须重新验收并生成绑定当前代码的新报告后再接受。")
+    criterion = _acceptance_criterion(state)
+    if criterion is None:
+        raise GovernanceError(
+            "[pww_acceptance_condition_missing] 任务没有 PWW 接受条件；"
+            "请先用 report --verify-report 重新接入当前质量报告。")
+    required = _quality_required_ids(report)
+    given = _id_order([str(value).strip() for value in (ids or [])
+                       if str(value).strip()])
+    if not given:
+        raise GovernanceError(
+            "[acceptance_ids_required] 必须用 --accept 列出用户接受的警告/残余风险 id。")
+    unknown = [value for value in given if value not in required]
+    if unknown:
+        raise GovernanceError(
+            f"[acceptance_ids_unknown] 报告 {report.get('report_id')} 没有这些 id："
+            + "、".join(unknown))
+    previous = report.get("acceptance")
+    if not isinstance(previous, dict):
+        previous = {}
+    previous_status = str(previous.get("status") or "")
+    if previous_status in ("partial", "accepted") and \
+            str(previous.get("binding_sha256") or "") == current and \
+            set(given) <= set(previous.get("accepted_ids") or []):
+        # 幂等：同一报告、同一绑定、范围未扩大时不重复追加证据与接受事件。
+        accepted_previous = set(previous.get("accepted_ids") or [])
+        return {"report": report, "criterion": criterion,
+                "status": previous_status, "required_ids": required,
+                "pending_ids": [value for value in required
+                                if value not in accepted_previous],
+                "idempotent": True}
+    accepted = set(given)
+    if previous.get("status") in ("partial", "accepted") and \
+            str(previous.get("binding_sha256") or "") == current:
+        accepted |= set(previous.get("accepted_ids") or [])
+    status = "accepted" if accepted == set(required) else "partial"
+    at = now_iso()
+    record = {
+        "status": status,
+        "accepted_ids": _id_order(list(accepted)),
+        "accepted_by": "user",
+        "origin": "user-declared",
+        "accepted_at": at,
+        "quote": quote[:2000],
+        "report_id": report.get("report_id"),
+        "binding_sha256": current,
+        "code_scope_sha256": report.get("code_scope_sha256") or "",
+        "note": (note or "").strip()[:2000],
+    }
+    report["acceptance"] = record
+    history = report.setdefault("acceptance_history", [])
+    history.append(json.loads(json.dumps(record)))
+    report["acceptance_status"] = status
+    criterion["acceptance"].update({
+        "status": status,
+        "accepted_ids": record["accepted_ids"],
+        "accepted_by": "user",
+        "accepted_at": at,
+        "quote": quote[:2000],
+        "binding_sha256": current,
+        "code_scope_sha256": report.get("code_scope_sha256") or "",
+    })
+    report["criterion_id"] = criterion.get("criterion_id") or ""
+    if status == "accepted":
+        eid, entry = _acceptance_evidence(state, report, record["accepted_ids"],
+                                          at, quote)
+        report["acceptance_evidence_id"] = eid
+        criterion["status"] = "met"
+        criterion["evidence_refs"] = [{"id": eid, "sha256": entry["sha256"]}]
+        criterion["updated_at"] = at
+        criterion["updated_iteration"] = _current_iteration_id(state)
+        criterion.setdefault("history", []).append({
+            "status": "met", "at": at,
+            "evidence_refs": criterion["evidence_refs"], "source": "accept",
+        })
+    else:
+        criterion["status"] = "pending"
+        criterion["evidence_refs"] = []
+        criterion["updated_at"] = at
+    state.setdefault("decisions", []).append({
+        "text": (f"用户接受 {report.get('report_id')} 的 "
+                 + "、".join(record["accepted_ids"]) + f"：{quote}")[:MAX_REPORT_CHARS],
+        "source": "user",
+        "kind": "pww-acceptance",
+        "at": at,
+    })
+    _history(state, "pww_acceptance_recorded", {
+        "report_id": report.get("report_id"),
+        "status": status,
+        "accepted_ids": record["accepted_ids"],
+        "pending_ids": [value for value in required
+                        if value not in set(record["accepted_ids"])],
+        "criterion_id": criterion.get("criterion_id"),
+    })
+    save_state(path, state)
+    return {"report": report, "criterion": criterion, "status": status,
+            "required_ids": required,
+            "pending_ids": [value for value in required
+                            if value not in set(record["accepted_ids"])]}
+
+
+def _gate_quality(state: dict) -> dict:
+    """G2 的 PWW 接受检查：与条件列表独立，合同修订删条件也不能绕过。"""
+    reports = [item for item in state.get("quality_reports") or []
+               if isinstance(item, dict)]
+    active = active_quality_reports(state)
+    report = active[-1] if active else None
+    if report is None:
+        ingested_events = [event for event in state.get("history") or []
+                           if isinstance(event, dict)
+                           and event.get("event") == "quality_report_ingested"]
+        if reports or ingested_events:
+            return {"passed": False, "quality": quality_summary(state), "reasons": [{
+                "code": "quality_report_state_inconsistent",
+                "detail": "历史记录了质量报告接入，但当前没有生效报告；"
+                          "状态被删除或写入不完整，按 fail-closed 拒绝收口。"}]}
+        return {"passed": True, "reasons": [], "quality": quality_summary(state)}
+    reasons: list[dict] = []
+    if len(active) > 1:
+        reasons.append({
+            "code": "quality_report_state_inconsistent",
+            "detail": "同时存在多份未替代的质量报告；状态被手工改写或写入不完整，"
+                      "按 fail-closed 拒绝收口。"})
+    try:
+        recomputed = _sha256_text(canonical_json(_quality_report_payload(report)))
+    except (TypeError, ValueError, KeyError, AttributeError):
+        recomputed = ""
+        reasons.append({
+            "code": "quality_report_state_invalid",
+            "detail": f"报告 {report.get('report_id')} 结构不完整，无法重算摘要；"
+                      "按 fail-closed 拒绝收口。"})
+    if not _quality_report_structurally_valid(report):
+        return {"passed": False, "reasons": reasons + [{
+            "code": "quality_report_state_invalid",
+            "detail": f"报告 {report.get('report_id')} 的 warnings/residual_risks/"
+                      "unverified/unresolved 结构被改写；按 fail-closed 拒绝收口。"}],
+            "quality": quality_summary(state)}
+    if recomputed and recomputed != str(report.get("report_sha256") or ""):
+        reasons.append({
+            "code": "quality_report_tampered",
+            "detail": f"报告 {report.get('report_id')} 内容摘要与登记不一致；"
+                      "质量结论不可信，必须重新验收。"})
+    for code in _validate_supersede_chain(state, report):
+        reasons.append({
+            "code": code,
+            "detail": (f"报告 {report.get('report_id')} 的替代关系不合法或覆盖不完整；"
+                       "不能据此解除旧 PWW 的接受要求。")})
+    scope = _code_scope_status(report, state)
+    for code in scope["reasons"]:
+        reasons.append({
+            "code": code,
+            "detail": (f"报告 {report.get('report_id')} 的代码范围不可读、与登记不一致"
+                       "或当前工作区已漂移；必须重新验收。")})
+    unresolved_ids = {entry["id"] for entry in _report_unresolved(report)}
+    verdict = str(report.get("verdict") or "")
+    if verdict == "pass":
+        if not _quality_binding_current(state, report):
+            reasons.append({
+                "code": "quality_binding_stale",
+                "detail": (f"PASS 报告 {report.get('report_id')} 的目标/合同/条件/"
+                           "工作区绑定已变化；该结论不覆盖当前任务，必须重新验收。")})
+        checks = report.get("checks")
+        if not isinstance(checks, dict) or any(
+                checks.get(key) is not True for key in _QUALITY_CHECKS):
+            reasons.append({
+                "code": "quality_precondition_failed",
+                "detail": "PASS 报告的四项 checks 不全是 true；不得按通过收口。"})
+        if unresolved_ids:
+            reasons.append({
+                "code": "pww_superseded_unresolved",
+                "detail": ("PASS 报告仍继承未解决警告/残余风险："
+                           + "、".join(sorted(unresolved_ids))
+                           + "；不能按通过收口。")})
+        return {"passed": not reasons, "reasons": reasons,
+                "quality": quality_summary(state)}
+    if verdict != PWW:
+        reasons.append({
+            "code": "quality_verdict_not_pass",
+            "detail": (f"最新质量报告 {report.get('report_id')} 的原始结论是 "
+                       f"{str(report.get('raw_verdict') or verdict).upper()}；"
+                       "先修复并重新验收，不能按收口处理。")})
+        return {"passed": not reasons, "reasons": reasons,
+                "quality": quality_summary(state)}
+    current = _quality_binding(state, report)
+    if not _quality_binding_current(state, report):
+        reasons.append({
+            "code": "pww_acceptance_stale",
+            "detail": (f"报告 {report.get('report_id')} 的目标/合同/条件/代码范围已变化，"
+                       "原接受不继承；请重新验收并接入新报告。")})
+    acceptance = report.get("acceptance")
+    if not isinstance(acceptance, dict):
+        acceptance = {}
+    required = set(_quality_required_ids(report))
+    accepted = set(acceptance.get("accepted_ids") or [])
+    status = str(report.get("acceptance_status") or "")
+    if unresolved_ids != (required - accepted):
+        reasons.append({
+            "code": "pww_supersede_inconsistent",
+            "detail": "报告的未解决集合与“全部 W/R - 已接受”不一致；"
+                      "替代关系或接受记录被改写。"})
+    if status == "superseded":
+        reasons.append({"code": "pww_report_superseded",
+                        "detail": "生效报告已被替代；不能使用旧接受记录。"})
+    elif status == "stale":
+        reasons.append({"code": "pww_reverify_required",
+                        "detail": ("任务重开或目标变化后旧接受已失效；"
+                                   "必须重新验收并取得用户再次接受。")})
+    elif not required:
+        reasons.append({"code": "pww_warning_set_missing",
+                        "detail": "PWW 报告没有可接受的警告/残余风险 id。"})
+    elif accepted != required or status != "accepted":
+        missing = [value for value in _quality_required_ids(report)
+                   if value not in accepted]
+        if missing and accepted:
+            reasons.append({
+                "code": "pww_acceptance_partial",
+                "detail": ("用户只接受了部分警告，仍未接受：" + "、".join(missing)
+                           + "；任务保持未完成。")})
+        else:
+            reasons.append({
+                "code": "pww_acceptance_pending",
+                "detail": ("PWW 需要用户明确接受全部警告与残余风险："
+                           + "、".join(_quality_required_ids(report))
+                           + "；未接受前 G2 拒绝收口。")})
+    if (accepted or status in ("partial", "accepted")) and (
+            str(acceptance.get("accepted_by") or "") != "user"
+            or not str(acceptance.get("accepted_at") or "")):
+        reasons.append({
+            "code": "pww_acceptance_not_user",
+            "detail": "接受记录缺少用户明确表达（accepted_by=user 与接受时间）。"})
+    # 接受记录必须与条件、证据和接受历史一致：防止只改一处字段伪造“已接受”。
+    if status in ("partial", "accepted"):
+        history = report.get("acceptance_history")
+        legacy_missing_history = (
+            report.get("ingest_version") != QUALITY_INGEST_VERSION
+            and not (isinstance(history, list) and history))
+        if not legacy_missing_history:
+            last = history[-1] if isinstance(history, list) and history else None
+            if not isinstance(last, dict) or \
+                    str(last.get("status") or "") != status or \
+                    set(last.get("accepted_ids") or []) != accepted:
+                reasons.append({
+                    "code": "pww_acceptance_record_inconsistent",
+                    "detail": "接受状态与 acceptance_history 不一致；接受记录不可信。"})
+    if status == "accepted":
+        evidence_id = str(report.get("acceptance_evidence_id") or "")
+        entry = _evidence_entry(state, evidence_id)
+        criterion = _acceptance_criterion(state)
+        refs = {str(ref.get("id") or "") for ref in
+                (criterion or {}).get("evidence_refs") or []}
+        meta = (criterion or {}).get("acceptance")
+        if entry is None or entry.get("dropped") or not isinstance(meta, dict) \
+                or str(meta.get("report_id") or "") != str(report.get("report_id") or "") \
+                or str(criterion.get("status") or "") != "met" \
+                or evidence_id not in refs:
+            reasons.append({
+                "code": "pww_acceptance_record_inconsistent",
+                "detail": "完整接受缺少绑定的接受证据/条件核销；接受记录不可信。"})
+    return {"passed": not reasons, "reasons": reasons,
+            "quality": quality_summary(state)}
 
 
 # ── 证据 ───────────────────────────────────────────────────────────────────
@@ -1638,18 +3365,284 @@ def _review_evidence_snapshot(state: dict) -> list[dict]:
     return snapshot
 
 
+def _review_code_snapshot_for_execution(workspace: str, state: dict,
+                                        state_path: str, base: str,
+                                        execution_sha256: str,
+                                        excluded_paths: object = None) -> dict:
+    """复核快照必须与执行信封绑定的代码范围一致。
+
+    新版执行信封固化 `code_scope_excluded_paths`，复核直接复用同一排除集；旧信封
+    没有该字段时，先按“只排除未跟踪证据”计算，再按“不排除证据”计算，任一与执行
+    摘要一致即可，否则 fail-closed。
+    """
+    execution_sha = str(execution_sha256 or "").strip().lower()
+    if isinstance(excluded_paths, list) and excluded_paths:
+        governance = {os.path.abspath(item)
+                      for item in governance_paths(state_path)}
+        evidence = {os.path.abspath(item) for item in CS.evidence_paths(state)}
+        requested = {os.path.abspath(os.path.expanduser(str(item)))
+                     for item in excluded_paths if str(item or "").strip()}
+        # 不信任信封自报的排除集：只保留治理路径与“已登记且未跟踪的证据”。
+        # 任意未跟踪目录、工作区外路径或尚不存在的路径都不能被排除，避免手工
+        # 信封借排除集隐藏后续新增文件。
+        allowed = set()
+        for item in sorted(requested):
+            if item in governance or any(
+                    item == g or item.startswith(g + os.sep)
+                    for g in governance):
+                allowed.add(item)
+                continue
+            if item in evidence and os.path.exists(item) and \
+                    CS.safe_path_excludes([item], workspace, base):
+                allowed.add(item)
+        snapshot = capture_code_snapshot(
+            workspace, exclude_paths=sorted(allowed), base=base)
+        if not execution_sha or str(snapshot.get("digest") or "") == execution_sha:
+            return snapshot
+        raise GovernanceError(
+            "[native_review_code_scope_mismatch] 当前工作区代码范围与执行结果绑定的"
+            "快照不一致；执行后新增/修改的文件改变了范围。请重新执行后再复核。")
+    governance = governance_paths(state_path)
+    safe = capture_code_snapshot(
+        workspace,
+        exclude_paths=CS.safe_evidence_excludes(state, workspace, base)
+        + governance,
+        base=base)
+    if not execution_sha or str(safe.get("digest") or "") == execution_sha:
+        return safe
+    plain = capture_code_snapshot(
+        workspace, exclude_paths=governance, base=base)
+    if str(plain.get("digest") or "") == execution_sha:
+        return plain
+    raise GovernanceError(
+        "[native_review_code_scope_mismatch] 当前工作区代码范围与执行结果绑定的"
+        "快照不一致；执行后新增/修改的文件（包括后登记证据或工作区内输出）改变了"
+        "范围。请重新执行，或把输出/证据放到工作区外后再复核。")
+
+
+def _stop_review(state: dict, stop: dict) -> dict | None:
+    target = str(stop.get("review_sha256") or "")
+    if not target:
+        return None
+    for review in state.get("native_reviews") or []:
+        if isinstance(review, dict) and \
+                str(review.get("result_sha256") or "") == target:
+            return review
+    return None
+
+
+def _valid_stop(state: dict, stop: dict | None) -> bool:
+    """停止标记对应的复核必须仍然可用；失效的 PASS 不能继续阻止重入。
+
+    这里只检查复核本身（存在、PASS、无 blocking/unverified、高风险
+    g4_eligible/candidate 可用），不比较目标摘要：目标变化时 stop 仍应作为
+    “曾有 PASS”的信号保留，让重入必须声明 trigger，而不是退回“首次复核”。
+    """
+    if not isinstance(stop, dict):
+        return False
+    review = _stop_review(state, stop)
+    if review is None:
+        return False
+    if str(review.get("verdict") or "").strip().lower() != "pass":
+        return False
+    if review.get("unverified"):
+        return False
+    if any(isinstance(item, dict)
+           and str(item.get("severity") or "") == "blocking"
+           for item in review.get("findings") or []):
+        return False
+    if str(state.get("risk") or "").lower() == "high":
+        if review.get("g4_eligible") is not True:
+            return False
+        candidate = review.get("candidate_g4")
+        if isinstance(candidate, dict) and candidate.get("eligible") is not True:
+            return False
+    return True
+
+
+def _effective_reentry_state(state: dict, target: str) -> tuple[dict, dict | None, bool]:
+    stop = RP.last_stop(
+        state, g4_only=str(state.get("risk") or "").lower() == "high")
+    if stop is None:
+        return state, None, False
+    same_target = str(stop.get("target_sha256") or "") == str(target or "")
+    if same_target:
+        if _valid_stop(state, stop):
+            return state, stop, True
+        # 目标没变但复核已失效（证据文件漂移、candidate 不可用等）：旧 PASS
+        # 不能继续挡住重做，按“没有可用 stop”处理。
+        filtered = [item for item in state.get("review_stops") or []
+                    if item is not stop]
+        return {**state, "review_stops": filtered}, None, False
+    # 目标已变化：保留 stop 作为“曾有 PASS”的信号，让重入仍要求 trigger。
+    return state, stop, False
+
+
+def review_admission(state: dict, *, triggers: list[str] | None = None,
+                     reason: str = "", target_sha256: str = "",
+                     code_scope_sha256: str = "",
+                     files: list[dict] | None = None,
+                     scope: str = "full") -> dict:
+    """复核风险准入与停止/重入判断（只读，不写状态）。
+
+    高风险仍然需要 G4；普通风险默认 `not_required`，只有声明实质触发因素
+    才建议派发。已有 PASS 覆盖当前目标与代码范围时返回 `review_not_needed`，
+    不因 Reviewer“还能提建议”而重新打开完整复核。
+    """
+    risk = str(state.get("risk") or "normal")
+    base = RP.admission(risk=risk, triggers=triggers, reason=reason)
+    target = str(target_sha256 or final_evidence_digest(state))
+    reentry_state, _stop, _stop_valid = _effective_reentry_state(state, target)
+    reentry = RP.reentry_decision(
+        reentry_state, target=target, code_scope_sha256=code_scope_sha256,
+        scope=scope, triggers=triggers, reason=reason, files=files)
+    decision = base.get("decision")
+    if not reentry.get("allowed") and decision == "required" and \
+            risk.strip().lower() != "high":
+        decision = "not_needed"
+    return {
+        **base,
+        "decision": decision,
+        "target_sha256": target,
+        "reentry": reentry,
+        "ledger": RP.ledger_summary(state),
+        "code_scope_checked": bool(code_scope_sha256 or files),
+    }
+
+
+def list_findings(state: dict) -> dict:
+    """只读返回 Finding 台账摘要与条目。"""
+    return RP.ledger_summary(state)
+
+
+def record_review_admission(path: str, *, decision: dict, work_item_id: str = "",
+                            target_sha256: str = "",
+                            code_scope_sha256: str = "",
+                            scope: str = "full", base: str = "") -> dict:
+    """登记一次准入判断（普通风险的自愿复核也应有可审计依据）。"""
+    state = load_state(path)
+    _assert_open(state, "记录复核准入", allow_blocked=True)
+    record = {
+        "schema": RP.ADMISSION_SCHEMA,
+        "admission_id": "RVA" + secrets.token_hex(12),
+        "task_id": str(state.get("task_id") or ""),
+        "work_item_id": str(work_item_id or ""),
+        "execution_result_sha256": "",
+        "target_sha256": str(target_sha256 or final_evidence_digest(state)),
+        "code_scope_sha256": str(code_scope_sha256 or ""),
+        "review_scope": str(scope or "full"),
+        "base": str(base or ""),
+        "decision": str(decision.get("decision") or "unknown"),
+        "risk": str(decision.get("risk") or state.get("risk") or ""),
+        "triggers": list(decision.get("triggers") or []),
+        "reason": str(decision.get("reason") or "")[:1000],
+        "reentry_stop_id": str((decision.get("reentry") or {}).get("stop_id") or ""),
+        "reentry_allowed": bool((decision.get("reentry") or {}).get("allowed")),
+        "reentry_code": str((decision.get("reentry") or {}).get("code") or ""),
+        "reentry_changed_paths": list(
+            (decision.get("reentry") or {}).get("changed_paths") or [])[:50],
+        "created_at": now_iso(),
+        "created_by": "zcode-native",
+    }
+    state.setdefault("review_admissions", []).append(record)
+    _history(state, "review_admission_recorded", {
+        "admission_id": record["admission_id"],
+        "work_item_id": record["work_item_id"],
+        "decision": record["decision"],
+        "review_scope": record["review_scope"],
+        "triggers": record["triggers"],
+        "target_sha256": record["target_sha256"],
+    })
+    save_state(path, state)
+    return record
+
+
+def record_finding_status(path: str, finding_id: str, status: str, *,
+                          evidence_ids: list[str] | None = None,
+                          note: str = "") -> dict:
+    """推进 Finding 生命周期（本地、可审计、不触发复核）。
+
+    `fixed`/`verified` 必须有证据；`closed` 只能从 verified 进入。定向测试
+    结果登记为证据即可验证局部修复，不需要重新派发完整 Reviewer。
+    """
+    state = load_state(path)
+    _assert_open(state, "更新 finding 台账", allow_blocked=True)
+    if evidence_ids:
+        # 与 record/criterion 同一口径：文件型证据重新读取并核对摘要，
+        # 不允许用已改写/删除的文件充当“定向验证证据”。
+        _validate_evidence_refs(state, list(evidence_ids))
+    try:
+        item = RP.transition(state, finding_id, status,
+                             evidence_ids=evidence_ids, note=note)
+    except RP.ReviewPolicyError as exc:
+        raise GovernanceError(str(exc)) from None
+    _history(state, "finding_status_changed", {
+        "finding_id": str(item.get("finding_id") or ""),
+        "status": str(item.get("status") or ""),
+        "severity": str(item.get("severity") or ""),
+        "evidence_ids": [str(item) for item in (evidence_ids or [])],
+        "note": str(note or "")[:500],
+    })
+    save_state(path, state)
+    return item
+
+
+def _record_admission(state: dict, *, decision: dict, reentry: dict,
+                      work_item_id: str, execution_sha256: str,
+                      target_sha256: str, code_scope_sha256: str,
+                      scope: str, base: str = "") -> dict:
+    now = now_iso()
+    record = {
+        "schema": RP.ADMISSION_SCHEMA,
+        "admission_id": "RVA" + secrets.token_hex(12),
+        "task_id": str(state.get("task_id") or ""),
+        "work_item_id": str(work_item_id or ""),
+        "execution_result_sha256": str(execution_sha256 or ""),
+        "target_sha256": str(target_sha256 or ""),
+        "code_scope_sha256": str(code_scope_sha256 or ""),
+        "review_scope": str(scope or "full"),
+        "base": str(base or ""),
+        "decision": "admitted",
+        "risk": str(decision.get("risk") or ""),
+        "triggers": list(decision.get("triggers") or []),
+        "reason": str(decision.get("reason") or "")[:1000],
+        "reentry_stop_id": str((reentry or {}).get("stop_id") or ""),
+        "reentry_allowed": bool((reentry or {}).get("allowed")),
+        "reentry_code": str((reentry or {}).get("code") or ""),
+        "reentry_changed_paths": list(
+            (reentry or {}).get("changed_paths") or [])[:50],
+        "created_at": now,
+        "created_by": "zcode-native",
+    }
+    state.setdefault("review_admissions", []).append(record)
+    _history(state, "review_admission_recorded", {
+        "admission_id": record["admission_id"],
+        "work_item_id": record["work_item_id"],
+        "review_scope": record["review_scope"],
+        "triggers": record["triggers"],
+        "target_sha256": record["target_sha256"],
+    })
+    return record
+
+
 def create_review_attempt(path: str, *, work_item_id: str,
                           execution_result_sha256: str,
                           dispatch_id: str = "", plan_id: str = "",
                           plan_sha256: str = "", review_scope: str = "full",
                           based_on_review_sha256: str = "",
                           evidence_manifest: list[str] | None = None,
+                          triggers: list[str] | None = None,
+                          reason: str = "",
                           workspace: str = "", base: str = "") -> dict:
     """在派发 Reviewer 前固化一次不可变的复核 attempt 快照。
 
     快照由宿主（本函数）按当前状态生成：target 是 `final_evidence_digest`，
     并绑定 task/contract/plan/dispatch/work item/execution result。Reviewer
     会话和信封只能声明该 attempt；旧 session 或旧输出不能创建新的快照。
+
+    创建前先做幂等复用与风险准入：同一快照的未消费 attempt 直接复用；已有
+    PASS 覆盖当前目标/代码范围时拒绝重新派发；普通风险任务默认不派发，声明
+    `triggers` 时按实质风险记录准入。
     """
     state = load_state(path)
     _assert_open(state, "创建复核 attempt")
@@ -1699,9 +3692,10 @@ def create_review_attempt(path: str, *, work_item_id: str,
         raise GovernanceError("incremental 复核 attempt 必须绑定基线复核。")
     manifest = [str(eid).strip() for eid in (evidence_manifest or [])
                 if str(eid).strip()]
-    code_snapshot = capture_code_snapshot(
-        workspace, exclude_paths=_evidence_paths(state) + governance_paths(path),
-        base=base)
+    code_snapshot = _review_code_snapshot_for_execution(
+        workspace, state, path, base,
+        str(execution.get("code_scope_sha256") or ""),
+        execution.get("code_scope_excluded_paths"))
     evidence_roots = CS.evidence_roots(state)
     if evidence_roots and code_snapshot.get("git_root") and \
             code_snapshot.get("git_root") not in evidence_roots:
@@ -1717,6 +3711,57 @@ def create_review_attempt(path: str, *, work_item_id: str,
             f"{code_snapshot.get('reason') or 'unknown'}。请在任务仓库内运行，"
             "或用 review-context --workspace 指定仓库根。")
     target = final_evidence_digest(state)
+    code_digest = str(code_snapshot.get("digest") or "")
+    reentry_state, stop, stop_valid = _effective_reentry_state(state, target)
+    stop_covers = bool(stop_valid and stop is not None
+                       and str(stop.get("target_sha256") or "") == target
+                       and str(stop.get("code_scope_sha256") or "") == code_digest)
+    # 幂等：同一工作项、同一执行结果、同一目标/代码范围/scope 的未消费 attempt
+    # 直接复用。重复调用 review-context 不应生成第二个派发快照，否则同一个复核
+    # 目标会出现多条 attempt，既浪费派发也污染审计。已有 PASS 覆盖当前快照时
+    # 不复用，交给下面的停止判断直接拒绝。
+    for existing in ([] if stop_covers else
+                     reversed(state.get("review_attempts") or [])):
+        if not isinstance(existing, dict) or existing.get("consumed"):
+            continue
+        if (str(existing.get("task_id") or "") == str(state.get("task_id") or "")
+                and str(existing.get("contract_sha256") or "")
+                == str(state.get("contract_sha256") or "")
+                and str(existing.get("work_item_id") or "") == wid
+                and str(existing.get("execution_result_sha256") or "") == exec_sha
+                and str(existing.get("target_sha256") or "") == target
+                and str(existing.get("code_scope_sha256") or "") == code_digest
+                and str(existing.get("review_scope") or "") == scope
+                and str(existing.get("based_on_review_sha256") or "") == based_on
+                and sorted(str(x) for x in existing.get("evidence_manifest") or [])
+                == sorted(manifest)):
+            _history(state, "review_attempt_reused", {
+                "review_attempt_id": existing.get("review_attempt_id") or "",
+                "work_item_id": wid,
+                "target_sha256": target,
+                "review_scope": scope,
+            })
+            save_state(path, state)
+            return existing
+    # 风险准入 + 停止/重入判断：普通风险默认不派发，但 ZCode 对复杂非高风险
+    # 任务仍可自主选择一次只读复核；高风险必须有 admissions 记录。已有 PASS
+    # 覆盖当前快照时直接拒绝，避免重复派发。
+    decision = RP.admission(
+        risk=str(state.get("risk") or "normal"),
+        triggers=triggers, reason=reason)
+    reentry = RP.reentry_decision(
+        reentry_state, target=target, code_scope_sha256=code_digest, scope=scope,
+        triggers=triggers, reason=reason,
+        files=[item for item in code_snapshot.get("files") or []
+               if isinstance(item, dict)])
+    if not reentry.get("allowed"):
+        raise GovernanceError(
+            f"[{reentry.get('code') or 'review_reentry_blocked'}] "
+            f"{reentry.get('detail') or ''}")
+    admission = _record_admission(
+        state, decision=decision, reentry=reentry, work_item_id=wid,
+        execution_sha256=exec_sha, target_sha256=target,
+        code_scope_sha256=code_digest, scope=scope, base=base)
     attempt = {
         "review_attempt_id": "RA" + secrets.token_hex(12),
         "task_id": str(state.get("task_id") or ""),
@@ -1729,11 +3774,20 @@ def create_review_attempt(path: str, *, work_item_id: str,
         "target_sha256": target,
         "criteria_sha256": _review_criteria_state_digest(state),
         "code_snapshot": code_snapshot,
-        "code_scope_sha256": code_snapshot.get("digest") or "",
+        "code_scope_sha256": code_digest,
         "evidence_snapshot": _review_evidence_snapshot(state),
         "review_scope": scope,
         "based_on_review_sha256": based_on,
         "evidence_manifest": manifest,
+        "review_admission_id": admission["admission_id"],
+        "review_admission": {
+            "risk": decision.get("risk"),
+            "triggers": list(decision.get("triggers") or []),
+            "reason": str(decision.get("reason") or "")[:1000],
+            "reentry_stop_id": reentry.get("stop_id") or "",
+            "reentry_changed_paths": list(
+                reentry.get("changed_paths") or [])[:50],
+        },
         "created_at": now_iso(),
         "created_by": "zcode-native",
         "consumed": False,
@@ -2326,8 +4380,45 @@ def _gate_review(state: dict) -> dict:
                         "detail": _review_reason_detail(review, state, code),
                         "required_target": target})
     if best is not None:
+        # 一条“本次没有 blocking”的 PASS 不能掩盖台账里仍未解决的 blocking/major：
+        # 旧问题被遗漏、只修未验证或已复现时，G4 继续失败关闭。
+        unresolved = RP.blocking_findings(state)
+        if unresolved:
+            reasons = []
+            for item in unresolved[:10]:
+                status = str(item.get("status") or "open")
+                code = ("native_review_finding_unverified"
+                        if status == "fixed" else
+                        "native_review_finding_regressed"
+                        if status == "regressed" else
+                        "native_review_finding_open")
+                reasons.append({
+                    "code": code,
+                    "detail": _finding_reason_detail(item),
+                    "finding_id": str(item.get("finding_id") or ""),
+                    "required_target": target,
+                })
+            return {"passed": False, "reasons": reasons}
         return {"passed": True, "reasons": [], "review": best}
     return {"passed": False, "reasons": reasons}
+
+
+def _finding_reason_detail(item: dict) -> str:
+    fid = str(item.get("finding_id") or "-")
+    severity = str(item.get("severity") or "")
+    status = str(item.get("status") or "open")
+    where = str(item.get("file") or "")
+    if item.get("line") is not None:
+        where += f":{item.get('line')}"
+    summary = str(item.get("summary") or "")[:160]
+    action = {
+        "open": "先修复并用定向测试/证据验证，不要直接重跑完整复核",
+        "regressed": "已修复问题再次出现：先修复并给出复现证据",
+        "fixed": "已修复但尚未定向验证：运行对应测试并登记证据后标记 verified",
+    }.get(status, "先闭合该 finding")
+    return (f"Finding {fid}（{severity}，{status}）仍未闭合"
+            + (f"：{where} " if where else "：")
+            + f"{summary}；{action}。")
 
 
 _TEMP_EVIDENCE_PREFIXES = ("/tmp/", "/var/tmp/", "/dev/shm/")
@@ -2467,14 +4558,27 @@ def review_metrics(state: dict, *, task_dir: str = "") -> dict:
     rounds_with_blocking = 0
     scope_counts: dict[str, int] = {}
     g4_reviews = 0
+    g4_candidate_reviews = 0
     package_chars: list[int] = []
     command_rounds: dict[str, int] = {}
     file_rounds: dict[str, int] = {}
+    incremental_new = {"blocking": 0, "major": 0}
+    no_information = 0
+    attempt_durations: list[float] = []
+    first_full_durations: list[float] = []
+    attempt_by_id = {str(item.get("review_attempt_id") or ""): item
+                     for item in state.get("review_attempts") or []
+                     if isinstance(item, dict)}
+    reviews_by_sha = {str(item.get("result_sha256") or ""): item
+                      for item in reviews}
+    first_full_seen: set[str] = set()
     for review in reviews:
         scope = str(review.get("review_scope") or "full")
         scope_counts[scope] = scope_counts.get(scope, 0) + 1
         if review.get("g4_eligible") is True:
             g4_reviews += 1
+            if (review.get("candidate_g4") or {}).get("eligible") is True:
+                g4_candidate_reviews += 1
         findings = [f for f in review.get("findings") or [] if isinstance(f, dict)]
         total_findings += len(findings)
         blocking = sum(1 for f in findings
@@ -2484,6 +4588,34 @@ def review_metrics(state: dict, *, task_dir: str = "") -> dict:
             rounds_with_blocking += 1
         for key in _finding_keys(review):
             finding_counts[key] = finding_counts.get(key, 0) + 1
+        if scope == "incremental":
+            base = reviews_by_sha.get(
+                str(review.get("based_on_review_sha256") or ""), {})
+            base_keys = set(_finding_keys(base)) if isinstance(base, dict) else set()
+            for finding in findings:
+                severity = str(finding.get("severity") or "")
+                if severity not in ("blocking", "major"):
+                    continue
+                key = (str(review.get("work_item_id") or ""), severity,
+                       str(finding.get("file") or ""), finding.get("line"),
+                       str(finding.get("summary") or ""))
+                if key not in base_keys:
+                    incremental_new[severity] += 1
+        if str(review.get("verdict") or "").lower() == "pass" and \
+                not findings and not (review.get("unverified") or []) and \
+                not (review.get("evidence_manifest") or []):
+            no_information += 1
+        attempt = attempt_by_id.get(
+            str(review.get("review_attempt_id") or ""))
+        if attempt is not None:
+            elapsed = _seconds_between(attempt.get("created_at"),
+                                       review.get("received"))
+            if elapsed is not None and elapsed >= 0:
+                attempt_durations.append(elapsed)
+                wid = str(review.get("work_item_id") or "")
+                if scope == "full" and wid not in first_full_seen:
+                    first_full_seen.add(wid)
+                    first_full_durations.append(elapsed)
         package_chars.append(len(canonical_json({
             k: review.get(k) for k in (
                 "findings", "files_inspected", "commands_run", "unverified",
@@ -2570,6 +4702,18 @@ def review_metrics(state: dict, *, task_dir: str = "") -> dict:
     }
     formal_amendments = sum(len(r.get("amendments") or [])
                             for r in formal_records)
+    admissions = [item for item in state.get("review_admissions") or []
+                  if isinstance(item, dict)]
+    admission_triggers: dict[str, int] = {}
+    for item in admissions:
+        for trigger in item.get("triggers") or []:
+            value = str(trigger or "")
+            if value:
+                admission_triggers[value] = admission_triggers.get(value, 0) + 1
+    ledger = RP.ledger_summary(state)
+    ledger.pop("items", None)
+    stops = [item for item in state.get("review_stops") or []
+             if isinstance(item, dict)]
     return {
         "schema": "copilot-review-metrics/v1",
         "task_id": str(state.get("task_id") or ""),
@@ -2578,6 +4722,12 @@ def review_metrics(state: dict, *, task_dir: str = "") -> dict:
         "closed": bool(closure.get("closed")),
         "native_reviews_total": len(reviews),
         "g4_reviews": g4_reviews,
+        "g4_candidate_reviews": g4_candidate_reviews,
+        "full_reviews": scope_counts.get("full", 0),
+        "incremental_reviews": scope_counts.get("incremental", 0),
+        "review_admissions_total": len(admissions),
+        "review_admission_triggers": dict(sorted(admission_triggers.items())),
+        "review_stops_total": len(stops),
         "formal_reviews_total": len(formal_records),
         "formal_review_amendments_total": formal_amendments,
         "superseded_formal_reviews_total": len(superseded_ids),
@@ -2585,6 +4735,19 @@ def review_metrics(state: dict, *, task_dir: str = "") -> dict:
         "invalid_envelopes": invalid_attempts,
         "invalid_envelope_codes": dict(sorted(attempt_codes.items())),
         "review_scopes": dict(sorted(scope_counts.items())),
+        "finding_ledger": ledger,
+        "rereported_findings": len(ledger.get("rereported") or []),
+        "incremental_new_blocking": incremental_new["blocking"],
+        "incremental_new_major": incremental_new["major"],
+        "no_information_reviews": no_information,
+        "avg_review_seconds": (
+            round(sum(attempt_durations) / len(attempt_durations), 1)
+            if attempt_durations else None),
+        "avg_first_full_review_seconds": (
+            round(sum(first_full_durations) / len(first_full_durations), 1)
+            if first_full_durations else None),
+        "total_review_seconds": (
+            round(sum(attempt_durations), 1) if attempt_durations else 0),
         "work_items": items,
         "work_items_with_reviews": len(items),
         "avg_review_rounds": (round(sum(i["rounds"] for i in items) / len(items), 2)
@@ -2618,13 +4781,39 @@ def review_metrics(state: dict, *, task_dir: str = "") -> dict:
     }
 
 
+def _gate_findings(state: dict) -> dict:
+    """普通风险任务的 Finding 台账门禁：未闭合 blocking/major 阻断收口。
+
+    高风险任务由 G4 统一检查台账，避免同一问题在两个门里重复出现；普通风险
+    任务没有 G4，但 major/blocking 仍不能在收口时留在台账里。
+    """
+    if str(state.get("risk") or "").strip().lower() == "high":
+        return {"passed": True, "reasons": []}
+    reasons = []
+    for item in RP.blocking_findings(state):
+        status = str(item.get("status") or "open")
+        code = ("native_review_finding_unverified" if status == "fixed" else
+                "native_review_finding_regressed" if status == "regressed" else
+                "native_review_finding_open")
+        reasons.append({
+            "code": code,
+            "detail": _finding_reason_detail(item),
+            "finding_id": str(item.get("finding_id") or ""),
+        })
+    return {"passed": not reasons, "reasons": reasons}
+
+
 def closure_check(state: dict, *, task_dir: str = "") -> dict:
     criteria = _gate_criteria(state)
     code_scope = _gate_code_scope(state)
+    quality = _gate_quality(state)
+    findings = _gate_findings(state)
     risks = {
         "G1": _gate_actions(state),
-        "G2": {"passed": criteria["passed"] and code_scope["passed"],
-               "reasons": criteria["reasons"] + code_scope["reasons"]},
+        "G2": {"passed": criteria["passed"] and code_scope["passed"]
+               and quality["passed"] and findings["passed"],
+               "reasons": criteria["reasons"] + code_scope["reasons"]
+               + quality["reasons"] + findings["reasons"]},
         "G3": _gate_stalled(state),
         "G4": _gate_review(state),
     }
@@ -2634,6 +4823,7 @@ def closure_check(state: dict, *, task_dir: str = "") -> dict:
             reasons.append({"gate": name, **reason})
     return {"passed": not reasons, "iteration_id": _current_iteration_id(state),
             "gates": risks, "reasons": reasons,
+            "quality": quality["quality"],
             "warnings": contract_source_warnings(state)
             + evidence_warnings(state, task_dir=task_dir)}
 
@@ -2648,16 +4838,33 @@ def close_task(path: str, *, by: str = "zcode-native") -> dict:
     if not check["passed"]:
         summary = "; ".join(f"{r.get('gate')}:{r.get('code')}" for r in check["reasons"])
         raise GovernanceError(f"四门未通过，不能收口：{summary}")
+    quality = quality_summary(state)
+    # 原始质量结论与任务关闭状态分离：用户接受 PWW 不把 verdict 改写为 PASS。
+    verdict = PWW if quality.get("verdict") == PWW else "pass"
+    closure_quality = {
+        "verdict": quality.get("verdict"),
+        "raw_verdict": quality.get("raw_verdict"),
+        "report_id": quality.get("report_id") or "",
+        "acceptance_status": quality.get("acceptance_status"),
+        "accepted_ids": list(quality.get("accepted_ids") or []),
+        "accepted_by": quality.get("accepted_by") or "",
+        "accepted_at": quality.get("accepted_at") or "",
+        "binding_current": quality.get("binding_current"),
+    }
     state["closure"].update({
         "closed": True,
         "closed_by": by,
-        "verdict": "pass",
+        "verdict": verdict,
+        "quality": closure_quality,
         "iteration_id": _current_iteration_id(state),
         "closed_at": now_iso(),
         "gate": {"passed": True, "iteration_id": _current_iteration_id(state),
                  "reasons": []},
     })
-    _history(state, "task_closed", {"verdict": "pass", "by": by})
+    _history(state, "task_closed", {
+        "verdict": verdict, "quality_verdict": quality.get("verdict"),
+        "report_id": quality.get("report_id") or "",
+        "accepted_ids": closure_quality["accepted_ids"], "by": by})
     # 收口时结束当前迭代：否则状态里会留下 phase=RUNNING、ended=null 的迭代，
     # 与已 CLOSED 的任务自相矛盾。历史记录只增不改，这里只补 ended/phase。
     for iteration in state.get("iterations") or []:
@@ -2686,6 +4893,7 @@ def reopen_task(path: str, reason: str, *, authorized_by: str = "") -> dict:
         "closed": False,
         "closed_by": None,
         "verdict": None,
+        "quality": None,
         "iteration_id": None,
         "closed_at": None,
         "gate": {"passed": None, "iteration_id": None, "reasons": []},
@@ -2694,6 +4902,29 @@ def reopen_task(path: str, reason: str, *, authorized_by: str = "") -> dict:
         "reason": reason, "at": now_iso(), "authorized_by": authorized_by,
         "previous": old,
     })
+    # 重开意味着还会有新的工作/证据/代码；旧 PWW 接受不覆盖重开后的状态，
+    # 必须重新验收并经用户再次明确接受，不能直接拿旧接受再收口。
+    for report in active_quality_reports(state):
+        if str(report.get("verdict") or "") != PWW:
+            continue
+        if str(report.get("acceptance_status") or "") in ("accepted", "partial"):
+            report["acceptance_status"] = "stale"
+            acceptance = report.get("acceptance")
+            if isinstance(acceptance, dict):
+                acceptance["status"] = "stale"
+            _history(state, "pww_acceptance_invalidated",
+                     {"report_id": report.get("report_id"),
+                      "reason": "task_reopened"})
+    criterion = _acceptance_criterion(state)
+    if criterion is not None:
+        if str(criterion.get("status") or "") == "met":
+            criterion["status"] = "pending"
+            criterion["evidence_refs"] = []
+            criterion["updated_at"] = now_iso()
+            _history(state, "pww_acceptance_condition_reopened",
+                     {"criterion_id": criterion.get("criterion_id")})
+        if isinstance(criterion.get("acceptance"), dict):
+            criterion["acceptance"]["status"] = "pending"
     # 重开后任务重新进入活动状态：上一轮已随收口标为 CLOSED，不能改回 RUNNING
     # （会出现“同一轮既已收口又在进行”）。开一条新迭代承接后续工作。
     begin_iteration(state, note=f"重开：{reason[:80]}")
@@ -2741,6 +4972,8 @@ def derive_work(state: dict, *, reason: str = "partial") -> list[dict]:
     def previous_attempts(base_id: str) -> list[str]:
         # AUTO-G4 与 AUTO-G4-INGEST 是同一条 G4 缺口的两种工作项形态，累计尝试次数
         # 时按家族合并；否则反复回填失败会一直派生 INGEST 而不升级到替代路线。
+        # AUTO-FIX-F1 / AUTO-VERIFY-F1 同样按 finding 家族累计，避免修复反复失败
+        # 时无限产生 -R2/-R3。
         prefix = "AUTO-G4" if base_id.startswith("AUTO-G4") else base_id
         rows = []
         for item in state.get("actions") or []:
@@ -2754,8 +4987,17 @@ def derive_work(state: dict, *, reason: str = "partial") -> list[dict]:
             *, origin: str = "partial-derived", extra: dict | None = None) -> None:
         if len(created) >= MAX_DERIVED_PER_CALL:
             return
+        # 同一缺口已有可领取/进行中的工作项时不再派生第二条。重复调用 drive 或
+        # 多个治理入口同时求值时，不能把 AUTO-G4 / AUTO-C1 无限复制成 -R2/-R3。
+        for item in state.get("actions") or []:
+            if not isinstance(item, dict):
+                continue
+            aid = str(item.get("id") or "")
+            if (aid == base_id or aid.startswith(base_id + "-R")) and \
+                    str(item.get("status") or "") in ("pending", "running"):
+                return
         attempts = previous_attempts(base_id) if base_id.startswith(
-            ("AUTO-C", "AUTO-R-", "AUTO-G4")) else []
+            ("AUTO-C", "AUTO-R-", "AUTO-G4", "AUTO-FIX-", "AUTO-VERIFY-")) else []
         if len(attempts) >= 3 and not any(
                 str(a.get("id") or "") == "AUTO-REPLAN"
                 and str(a.get("status") or "") in ("pending", "running")
@@ -2820,8 +5062,42 @@ def derive_work(state: dict, *, reason: str = "partial") -> list[dict]:
         return created
 
     unmet = _unmet_criteria(state)
+    accept_derived = False
     for criterion in unmet[:MAX_DERIVED_PER_CALL]:
         cid = str(criterion.get("criterion_id") or "")
+        acceptance = criterion.get("acceptance")
+        if isinstance(acceptance, dict):
+            # 接受条件只能对应生效中的 PWW 报告且绑定仍当前；否则由 AUTO-QUALITY
+            # 负责重新验收，不能派生无法执行的 AUTO-ACCEPT。
+            report_id = str(acceptance.get("report_id") or "")
+            active = next((item for item in active_quality_reports(state)
+                           if str(item.get("report_id") or "") == report_id), None)
+            if active is None or active.get("verdict") != PWW or \
+                    not _quality_binding_current(state, active):
+                continue
+            if str(active.get("acceptance_status") or "") in ("stale",
+                                                              "superseded"):
+                continue
+            if _code_scope_status(active, state).get("reasons"):
+                continue
+            accept_derived = True
+            # 接受条件不能由执行方“核销”：只能把用户明确表达交给 accept。
+            if any(str(a.get("id") or "").startswith("AUTO-ACCEPT")
+                   and str(a.get("status") or "") in ("pending", "running")
+                   for a in state.get("actions") or []):
+                continue
+            required = "、".join(acceptance.get("required_ids") or [])
+            add("AUTO-ACCEPT", "请求用户明确接受 PWW 警告",
+                f"完成条件 {cid} 是 PWW 用户接受条件（报告 "
+                f"{acceptance.get('report_id') or ''}，待接受 {required}）。"
+                "请把原始 verdict、全部 W/R 标识、残余风险与未验证项如实呈现给用户，"
+                "取得用户明确接受后，用 accept --by user --accept <id列表> "
+                "--quote <用户原话> 登记；执行方、子代理、verify 与 Copilot 都不得"
+                "代替用户接受，也不得用 criterion 直接核销该条件。",
+                "用户明确接受的原话、接受范围（全部 W/R id）、接受时间；"
+                "accept 成功回执与 G2 通过结果",
+                origin="pww-acceptance")
+            continue
         add(f"AUTO-{cid}", f"闭合完成条件 {cid}",
             f"使完成条件 {cid}「{criterion.get('description') or ''}」闭合："
             "执行所需工作，登记覆盖该条件的原始证据，并用 criterion 记录 met。",
@@ -2833,9 +5109,10 @@ def derive_work(state: dict, *, reason: str = "partial") -> list[dict]:
         if len(created) >= MAX_DERIVED_PER_CALL:
             break
         aid = str(action.get("id") or "")
-        # 失败/停摆的 AUTO-C 工作项已由未闭合条件分支重新派生（AUTO-C1-R2），
-        # 不再额外派生一条恢复项，避免同一缺口出现两份工作单。
-        if aid.startswith("AUTO-C"):
+        # 失败/停摆的 AUTO-C / AUTO-FIX / AUTO-VERIFY 工作项已由各自缺口分支
+        # 重新派生（AUTO-C1-R2 / AUTO-FIX-F1-R2），不再额外派生恢复项，避免
+        # 同一缺口出现两份工作单。
+        if aid.startswith(("AUTO-C", "AUTO-FIX-", "AUTO-VERIFY-")):
             continue
         add(f"AUTO-R-{aid}", f"处理停摆工作项 {aid}",
             f"处理工作项 {aid}（{why}）：分析失败根因，重试、调整方案或说明真实阻塞；"
@@ -2844,8 +5121,57 @@ def derive_work(state: dict, *, reason: str = "partial") -> list[dict]:
             origin="recovery")
 
     check = closure_check(state)
+    acceptance_only = {"pww_acceptance_pending", "pww_acceptance_partial"}
+    quality_codes = sorted({
+        str(r.get("code") or "") for r in check.get("reasons") or []
+        if str(r.get("code") or "").startswith(("pww_", "quality_"))
+        and not (accept_derived and str(r.get("code") or "") in acceptance_only)})
+    if quality_codes and not any(
+            str(a.get("id") or "").startswith("AUTO-QUALITY")
+            and str(a.get("status") or "") in ("pending", "running")
+            for a in state.get("actions") or []):
+        add("AUTO-QUALITY", "重新验收并接入质量报告",
+            "G2 质量门禁未通过（" + "、".join(quality_codes) + "）。请对当前目标与代码"
+            "重新运行 verify；代码类报告先执行 code_scope_capture.py --workspace <repo> "
+            "--state <state> 并把 commit/code_scope_sha256/files_paths 写入 subject。"
+            "接入时用 report --verify-report <报告> --workspace <repo>，该路径必须与任务"
+            "绑定工作区一致（未绑定时先 start --workspace 或登记任务仓库内证据），并用 "
+            "supersedes_report_id 指向当前生效报告；旧未解决 W/R 必须继承到新 PWW 或用 "
+            "resolved_warning_ids/resolved_residual_risk_ids 在 subject 一致时声明解决。"
+            "不得自行接受 PWW，用户明确接受后才能 accept。",
+            "新的 verify 报告、替代/解决声明、代码快照摘要与 G2 通过结果",
+            origin="quality-gate")
+    # Finding 台账优先于“再派一次复核”：未闭合的 blocking/major 先修复，已修复
+    # 未验证的做定向测试验证。只有台账清零后，高风险任务才重新进入 G4 派发。
+    unresolved_findings = RP.blocking_findings(state)
+    for item in unresolved_findings[:MAX_DERIVED_PER_CALL]:
+        fid = str(item.get("finding_id") or "")
+        status = str(item.get("status") or "open")
+        where = str(item.get("file") or "")
+        if item.get("line") is not None:
+            where += f":{item.get('line')}"
+        summary = str(item.get("summary") or "")[:600]
+        severity = str(item.get("severity") or "")
+        if status == "fixed":
+            add(f"AUTO-VERIFY-{fid}",
+                f"定向验证已修复的 {fid}",
+                f"{fid}（{severity}）已标记 fixed 但尚未验证：{summary}。"
+                "只运行能判定该缺陷是否消除的定向测试/检查，登记命令输出或日志为"
+                "证据，再用 `finding --id %s --status verified --evidence <E>` 标记。"
+                "不需要为此重新派发完整 Reviewer。若问题仍复现，标记 regressed 并继续修复。" % fid,
+                "定向测试/检查的真实输出与 `finding` verified 回执；或仍复现的复现证据",
+                origin="finding-verify")
+            continue
+        add(f"AUTO-FIX-{fid}", f"修复 {fid}（{severity}）",
+            f"闭合复核 finding {fid}：{where} {summary}。先修根因，再用定向测试/证据"
+            "证明修复；把修复证据登记为 evidence 后标记 fixed，并运行定向验证。"
+            "同类问题请一并检查，不要只修表面位置。",
+            "修复后的 diff、定向测试输出与 `finding` fixed/verified 回执",
+            origin="finding-fix")
+
     g4_reasons = [r for r in check.get("reasons") or [] if r.get("gate") == "G4"]
-    if g4_reasons and str(state.get("risk") or "").lower() == "high":
+    if g4_reasons and not unresolved_findings and \
+            str(state.get("risk") or "").lower() == "high":
         done_g4 = [a for a in state.get("actions") or []
                    if str(a.get("origin") or "") == "g4-review"
                    and str(a.get("status") or "") == "done"]
@@ -2962,8 +5288,13 @@ def _evaluate_core(state: dict) -> dict:
         }
     check = closure_check(state)
     if check["passed"]:
+        quality = quality_summary(state)
+        reason = "完成条件与四门全部通过"
+        if quality.get("verdict") == PWW:
+            reason = ("四门通过，质量结论为已接受的 PASS_WITH_WARNINGS（"
+                      + "、".join(quality.get("accepted_ids") or []) + "）")
         return {
-            "phase": "PASS", "reason": "完成条件与四门全部通过",
+            "phase": "PASS", "reason": reason,
             "actions": [], "stalled": [], "gate": check, "criteria": criteria,
             "next_commands": ["copilot_auto.py drive --state <state>（收口）",
                               "或 copilot_dispatch.py closure --state <state> --close"],
@@ -3026,6 +5357,17 @@ def render_status(state: dict, evaluation: dict | None = None) -> str:
         + (f"；未闭合 {', '.join(criteria.get('unmet') or [])}"
            if criteria.get("unmet") else ""),
     ]
+    quality = quality_summary(state)
+    if quality.get("verdict") == PWW:
+        accepted = "、".join(quality.get("accepted_ids") or []) or "无"
+        lines.append(
+            f"质量结论：PASS_WITH_WARNINGS（接受状态 {quality.get('acceptance_status')}；"
+            f"已接受 {accepted}）报告 {quality.get('report_id')}")
+    elif quality.get("verdict") and quality.get("verdict") != "unrecorded":
+        lines.append(f"质量结论：{str(quality.get('raw_verdict') or quality.get('verdict')).upper()}"
+                     f"（报告 {quality.get('report_id')}）")
+    elif bool((state.get("closure") or {}).get("closed")):
+        lines.append("质量结论：未登记（历史收口不推断接受状态）")
     actions = state.get("actions") or []
     if actions:
         done = sum(1 for a in actions if str(a.get("status") or "") in TERMINAL)

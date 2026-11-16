@@ -85,10 +85,13 @@ Copilot 不派发 Agent、不调用模型、不写别人的会话。它只校验
   通过而伪造新工作项或改写历史。
 - 执行方必须提供 `executor.profile` 有效策略（缺失 → `executor_profile_invalid`），
   且不得等价于只读复核（`executor_profile_readonly`）；与 Profile 名称无关。
-- **信封文件不要写进代码工作区**：执行信封自身被排除在它自己的代码快照之外，而
-  `reviews` 的 attempt 快照会包含它；两者不一致会得到
-  `execution_code_scope_mismatch`。把 `A1.execution.json`、`A1.review.json` 写在工作区
-  之外（或任务状态目录与代码仓库分离）即可。
+- **信封/输出文件不要写进代码工作区**：执行信封与 `--output` 若位于代码工作区，会在执行
+  快照生成后才出现，attempt 复核时包含它而执行侧没有，最终得到
+  `native_review_code_scope_mismatch` / `execution_code_scope_mismatch`。新版执行信封
+  固化 `code_scope_excluded_paths` 供 attempt 复用；未被快照排除的工作区内 `--output`
+  会被直接拒绝。`--result-file` 若位于工作区内且未被排除，会进入执行代码快照，必须在
+  复核前保持稳定。把 `A1.execution.json`、`A1.review.json` 与输出写到工作区外或
+  `.copilot-tasks/` 任务目录。
 
 ### 2.3 review（`copilot-native-review/v2`）
 
@@ -262,7 +265,8 @@ python3 -B scripts/native_agent.py execution --state T/state.json \
 python3 -B scripts/native_agent.py review-context --state T/state.json \
   --dispatch T/state.dispatch.json --execution A1.execution.json \
   --work-item A1 --create-attempt --workspace "$(git rev-parse --show-toplevel)" \
-  [--base <任务开始 commit>] --output A1.context.json
+  [--base <任务开始 commit>] [--trigger major-fix --reason "修复后重验"] \
+  --output A1.context.json
 
 # 复核信封：必须绑定同一 attempt；高风险缺 attempt 直接拒绝
 python3 -B scripts/native_agent.py review --state T/state.json \
@@ -285,6 +289,14 @@ python3 -B scripts/native_agent.py review --state T/state.json \
 - `review-context --create-attempt` 只允许高风险 G4；存在未核销完成条件、执行证据漂移或
   工作区不是 git 仓库时拒绝创建，避免把即将过期/不可证明的快照交给 Reviewer。它把
   attempt id 与代码范围写入输出；派发时必须把该 id 放进 Reviewer prompt。
+- attempt 创建前做幂等复用与准入：同一工作项/执行结果/目标/代码范围/scope/证据清单的
+  未消费 attempt 直接返回；已有 PASS 覆盖当前快照时返回 `[review_not_needed]`，只有
+  文档/格式变化返回 `[review_not_needed_docs_only]`；代码/目标/证据实质变化时必须用
+  `--trigger` 与 `--reason` 说明重入原因，记录写入 `review_admissions` 并绑定到 attempt。
+- `review-context` 输出 `review_admission`（准入/停止判断）、`finding_ledger`（未闭合
+  finding）、`execution_evidence_unbound` 与 `scope_reason`；Reviewer 的 findings 在
+  ingest 时合并为稳定台账，修复与定向验证用 `copilot_dispatch.py finding` 推进，不因
+  minor/info 或已关闭问题重新派发完整复核。
 - `review` 只从宿主 DB 读取 Reviewer 的模型、工具调用与最终输出；不再依赖 rollout，
   也不再接受 Bash 命令。会话时间、prompt 与工作区绑定由 `g4_attest` 在 ingest 时
   独立复核；旧会话/旧工作区无法冒充新 attempt。

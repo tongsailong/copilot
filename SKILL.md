@@ -8,7 +8,7 @@ when_to_use: >
   原生完成，不进入本 Skill。
 ---
 
-# copilot：轻量协作治理（v6.6.1）
+# copilot：轻量协作治理（v6.8.0）
 
 Copilot 是运行在 ZCode 内的**协作治理层**，不是决策模型，也不是执行体。它负责把任务变成可
 追踪的合同、状态、证据与收口条件，并在任务没有真正完成时继续推进。
@@ -84,7 +84,9 @@ CONSULT / PLAN / REVIEW 是**本地工作模式**，不是审批节点，也不�
 PARTIAL 表示**仍有工作要做**，不是任务终点，也不是停止理由。
 
 - `drive` 遇到 PARTIAL 时本地派生下一步工作项：未闭合条件 → `AUTO-C<n>`；停摆工作项 →
-  `AUTO-R-<id>`；高风险缺 G4 → `AUTO-G4` / `AUTO-G4-INGEST`；无缺口时 → `AUTO-NEXT`。
+  `AUTO-R-<id>`；未闭合 finding → `AUTO-FIX-<F>`；已修复未验证 → `AUTO-VERIFY-<F>`；
+  高风险缺 G4 → `AUTO-G4` / `AUTO-G4-INGEST`；无缺口时 → `AUTO-NEXT`。同一缺口已有
+  `pending`/`running` 工作项时不再派生第二条，多个入口重复求值不会复制工作单。
 - 同一缺口重复派生仍不闭合时，增加 `AUTO-REPLAN`，要求分析根因并选择**实质不同的替代路线**，
   不得机械重复同一失败路径，也不得降低验收标准。
 - **禁止**因下列原因停止或宣布 BLOCKED：人为轮次上限、Token 预算、内部费用阈值、等待
@@ -154,7 +156,8 @@ BLOCKED 表示**不能正常收口或继续受阻动作**，不表示无法记�
 
 - **G1 工作项终态**：所有工作项为 `done` 或 `dropped`；`dropped` 必须写明放弃原因。
 - **G2 合同与条件**：合同指纹与当前目标/正文/条件一致；完成条件已确认且无漂移；每条 `met`
-  都有本任务已登记证据，且文件摘要重新核对一致。
+  都有本任务已登记证据，且文件摘要重新核对一致。普通风险任务另有 Finding 台账检查：
+  `open` / `regressed` / 已修复未验证（`fixed`）的 blocking/major 阻断收口；minor/info 不阻断。
 - **G3 无停摆**：没有 `running` / `failed` / `blocked` 遗留，也没有依赖不可满足的待办。
 - **G4 高风险复核**：`risk=high` 时必须存在绑定的原生独立复核：`verdict=pass`、无 blocking
   finding、`unverified` 为空、`changed_files` 为空、`g4_eligible=true` 且
@@ -166,6 +169,50 @@ BLOCKED 表示**不能正常收口或继续受阻动作**，不表示无法记�
   为 evidence 的源码、未跟踪文件、删除/重命名文件同样纳入范围，不能因“没登记证据”绕过。
 
 普通 Reviewer PASS **不等于** G4；`g4_eligible=false` 的结论只能作为参考。
+
+## PWW 质量结论与用户接受
+
+verify 的结构化质量报告（`copilot-verify-result/v1`）走报告接入路径时自动治理：
+
+- `report --verify-report <报告文件> [--workspace <repo>]` 解析并校验机器可读结论；PWW 自动创建
+  用户接受完成条件，绑定报告内容摘要、`W1..Wn` / `R1..Rn`、目标快照、代码快照（如声明）与
+  当前合同/条件。重复接入同一报告是幂等，不重复登记条件；FAIL/PARTIAL/BLOCKED 不创建接受
+  条件，其未解决项仍沿替代链保留。
+- **报告替代**：存在生效报告时，新报告必须用 `supersedes_report_id` 指向它，并显式处理旧报告
+  全部未解决 W/R：继承到新报告（新 PWW 的 W/R）或用 `resolved_warning_ids` /
+  `resolved_residual_risk_ids` 声明解决。解决声明仅在 `subject` 与警告来源报告完全一致时
+  生效；PASS 不能继承未解决警告；PASS/PWW 未覆盖旧 W/R 时整次替代被拒绝，
+  FAIL/PARTIAL/BLOCKED 则自动继承旧未解决项。旧接受记录保留但不会
+  继承，新 PWW 重新进入 pending；旧报告已由用户接受的 W/R 视为已解决，不要求新报告继承。
+- **代码范围**：声明了 `commit` / `files` / `diff_sha256` / `code_scope_sha256` 的报告必须在
+  verify 时先运行 `code_scope_capture.py --workspace <repo> --state <state> --exclude <报告文件>`，把 `commit`、`code_scope_sha256` 与 `files_paths`
+  （字符串路径数组，重命名含新旧路径）写入 `subject.files`；`dirty` 可选，给出时必须一致。
+  `diff_sha256` 若给出必须与 `code_scope_sha256` 相同；报告文件放任务目录或工作区外。
+  `subject.code_scope_sha256` 是报告生成时声明的摘要并进入 `report_sha256`；接入时用
+  `--workspace` 重算，代码在生成后/接入前变化即拒绝。Copilot 保存的是接入时重算快照，
+  只证明接入/收口时一致，不证明报告生成时刻。
+- **工作区身份**：任务工作区优先由 `start --workspace` 绑定，否则由 native execution
+  binding、合同来源、任务证据所属仓库、任务目录唯一派生；`report --workspace` 必须与
+  任务绑定一致，无法确认或指向其他仓库时 `quality_code_scope_workspace_unbound` /
+  `_mismatch` 失败关闭。G2 收口前重算快照，HEAD、tracked/untracked/新增/删除/重命名或
+  声明范围不一致即拒绝；质量报告快照不排除已登记证据，G4 仅排除未跟踪证据产物。纯文档
+  报告不要求代码快照或工作区；提供 `--workspace` 时必须声明代码字段。
+- **G2 强制**：未接受、只接受部分警告、接受绑定失效（目标/合同/条件/警告/代码变化）、
+  报告替代关系不合法或最新质量结论不是 PASS/PWW 时，`closure --close` 一律拒绝。接受检查
+  与条件列表相互独立，合同修订删除条件也不能绕过。
+- **只有用户能接受**：`accept --by user --accept <W/R id> --quote <用户原话>`；执行方、子代理、
+  verify 与 Copilot 不得代替用户接受，`criterion` 命令也不能直接核销接受条件。只接受部分
+  警告时保持 pending。Copilot 记录的是 user-declared 接受；CLI 无法从进程层证明来源，
+  伪造属于授权越界（见 `docs/DECISIONS.md` 第 49 条）。
+- **重开与失效**：任务重开后旧 PWW 接受立即失效，必须重新验收并再次取得用户接受；
+  目标/合同/条件/警告/代码变化、报告被替代或接受记录与证据/条件不一致时同样拒绝收口。
+- **原始结论保留**：接受 PWW 后收口记录为 `closure.verdict=pass_with_warnings` 与
+  `closure.quality`；原始 `PASS_WITH_WARNINGS` 不改写为 PASS。`quality --state ...` 查询
+  当前报告、替代关系、未解决项与接受状态；下游不得只看 `closure.verdict`。
+- **边界**：必需测试/证据缺失、完成条件未核销、blocking/major、存在未验证项或交付无法验证时
+  拒绝 PWW；FAIL/PARTIAL/BLOCKED 报告不会被接受机制提升。高风险任务在最终 G4 前完成接受
+  登记（接受会改变条件状态与最终证据摘要）。
+
 
 **`--risk high` 与 `--backend native` 是绑定关系**：复核信封只能通过原生派发链路产生，
 所以高风险任务用 `legacy` 后端启动会在 `start` 阶段被拒绝，而不是留一个永远无法收口的任务。
@@ -191,7 +238,7 @@ BLOCKED 表示**不能正常收口或继续受阻动作**，不表示无法记�
   `review_attempt_id` 与 `code_snapshot.files` 写入 Reviewer prompt。`review --attempt <id>`
   要求宿主 metadata 的会话创建时间晚于 attempt、prompt 携带该 id、`workspaceRoot` 等于
   attempt 冻结的代码根，信封绑定同一目标；旧会话、旧工作区或旧输出不能换一个新 target
-  重新封装。已登记证据由证据快照单独绑定，代码快照不重复纳入。
+  重新封装。G4 代码快照只排除未跟踪证据产物；已跟踪源文件即使登记为证据也进入快照。
 - 用 `native_agent.py review-context --state …
   --dispatch … --execution … --work-item … [--previous-review prev.json]
   [--create-attempt] [--workspace <任务仓库>] [--base <任务开始 commit>]` 生成绑定值、
@@ -219,6 +266,50 @@ BLOCKED 表示**不能正常收口或继续受阻动作**，不表示无法记�
   真实风险；不要求完整 G4 信封。
 - **高风险任务**：G1–G4 不变，独立上下文、只读约束、宿主记录与最终证据绑定，fail-closed。
 - **正式 REVIEW**：仅用户明确要求时登记（见 `references/review.md`）。
+
+### 风险准入与停止（v6.8.0）
+
+- **先判断要不要复核**：`copilot_dispatch.py review-admission --state … [--trigger …]
+  --reason …` 返回 `required` / `not_required` / `not_needed`。`risk=high` 恒为 `required`
+  （G4 原有门禁不变）；普通风险默认 `not_required`，只有声明实质触发因素（`security`、
+  `permissions`、`core-logic`、`data-integrity`、`architecture`、`global-execution`、
+  `production`、`release`）才建议派发。文案/格式/纯文档调整、仅注释改动、已被确定性测试
+  覆盖的局部修改不派 Reviewer。高风险 G4 例外：G4 代码范围包含 tracked 文档，PASS 后
+  文档变化同样使旧快照失效，需要重新 G4（这是代码范围绑定，不是文案复核）。
+- **一次完整复核**：代码与证据稳定后才派发。`review-context` 输出 `review_admission`、
+  `finding_ledger`、`execution_evidence_unbound` 与 `scope_reason`；存在未核销条件、
+  证据漂移或台账未闭合 finding 时先解决，不要让 Reviewer 基于即将过期的快照工作。
+- **停止标记**：PASS 回填时自动写入 `review_stops`（目标摘要、代码范围、findings 计数）。
+  同一目标与代码范围的再次 attempt 直接拒绝（`review_not_needed`）；上轮 PASS 之后只有
+  文档/格式文件变化时返回 `review_not_needed_docs_only`。不为 minor/info 建议改代码再重开
+  完整复核；把 minor 记录为 findings、把已核实非缺陷风险记录为 `residual_risks`。
+- **重入必须有实质原因**：代码/目标/证据变化后再次完整复核，需要 `--trigger`
+  （`blocking-fix` / `major-fix` / `code-changed` / `scope-expanded` / `evidence-changed` /
+  `risk-changed` / `security-fix` / `concurrency-fix`）与 `--reason`，写入
+  `review_admissions`。增量复核（`--based-on`，代码范围未变）不需要重入触发，但基线与覆盖
+  仍按原规则 fail-closed。
+- **派发幂等**：同一工作项、执行结果、目标与代码范围的未消费 attempt 直接复用；重复调用
+  `review-context --create-attempt` 不会生成第二个派发快照。派发失败/超时/上下文恢复时，
+  attempt 未被消费即可继续使用；已消费的 attempt 不能重放另一份输出。
+
+### Finding 台账与定向复验
+
+- 每条实质 finding 进入 `finding_ledger`，使用稳定 `F1..Fn`；同一根因换一种表述仍映射到
+  同一 ID（显式 `id` / `root_cause` / 文件+摘要相似度），已关闭问题没有新证据只记为
+  重复报告，不重复登记为新问题。
+- 生命周期 `open → fixed → verified → closed`；`fixed` 只表示已改，`verified` 才表示修复
+  被定向验证。`copilot_dispatch.py finding --state … --list` 查看；
+  `finding --state … --id F1 --status fixed --evidence E1` 登记修复；
+  `--status verified --evidence E2` 登记定向测试/检查结果。`fixed`/`verified` 必须有证据，
+  `closed` 只能从 `verified` 进入。
+- 未闭合 blocking/major 阻断 G4（高风险）与 G2（普通风险）；minor/info 不阻断、不派生
+  复核。已修复未验证的 finding 派生 `AUTO-VERIFY-<F>`：只跑对应定向测试并登记证据，**不**
+  重新派发完整复核；仍复现时标记 `regressed` 继续修复。
+- **不重报、不重复复核**：Reviewer 复用 finding ID 与状态；已关闭问题无新证据不得重报。
+  只有变更范围实质扩大、原结论依赖的代码变化、跨关键路径的新问题、风险判断失效或高风险
+  修复改变整体结论时，才按上面的重入触发重新完整复核。Reviewer PASS 后立即停止，不因还能
+  提出建议而重开任务；没有新增信息的复核由 `review-metrics` 统计为
+  `no_information_reviews`。
 
 收敛顺序：**充分自检 → 稳定最终执行结果与证据 → 首次全面复核（一次列出全部重要问题与
 severity）→ 集中修复 → 针对性复核（只验证修复、新问题、受影响区域与完成条件）→ 收口**。
@@ -280,7 +371,53 @@ severity）→ 集中修复 → 针对性复核（只验证修复、新问题、
 
 ## 版本
 
-当前版本 **v6.6.1（ZCode Autonomous Development Edition）**。v6.6.1 把工作区里最后一个
+当前版本 **v6.8.0（ZCode Autonomous Development Edition）**。v6.8.0 收敛独立复核效率：
+
+- **风险准入**：新增 `review-admission`；高风险恒需 G4，普通风险默认不派 Reviewer，声明
+  `security`/`core-logic`/`data-integrity` 等触发因素才建议复核；纯文档/格式调整不复核。
+- **一次完整复核 + 定向复验**：PASS 写入 `review_stops`；同一目标/代码范围拒绝重复
+  attempt；文档级变化返回 `review_not_needed_docs_only`；代码/目标变化必须声明
+  `blocking-fix`/`major-fix`/`code-changed` 等重入触发并记录 `review_admissions`。
+- **Finding 台账**：稳定 `F1..Fn`、跨轮去重、`open→fixed→verified→closed` 生命周期与
+  证据要求；未闭合 blocking/major 阻断 G4/G2，minor/info 不阻断；已修复未验证派生
+  `AUTO-VERIFY-<F>` 做定向测试，不重跑完整复核。
+- **调度幂等与失败恢复**：同一快照的未消费 attempt 直接复用；`derive_work` 不复制
+  `pending`/`running` 的同一缺口；派发失败不无限重试；上下文恢复沿用现有 attempt。
+- **度量**：`review-metrics` 新增 `full_reviews`、`incremental_reviews`、
+  `review_admissions_total`、`review_stops_total`、`rereported_findings`、
+  `incremental_new_blocking/major`、`no_information_reviews`、首次完整复核与总耗时。
+- **未放宽**：G1–G4、fail-closed、attempt 绑定、宿主记录、证据与 PWW 接受规则不变。
+
+v6.7.1 修复报告替代与代码范围绑定：
+
+- **替代关系**：新增 `supersedes_report_id`、`resolved_warning_ids`、
+  `resolved_residual_risk_ids`；新报告必须明确替代当前报告，旧未解决 W/R 必须继承或
+  在 subject 一致时声明解决，否则拒绝；未解决项沿替代链保留，PASS 不能携带未解决警告。
+- **代码范围**：`code_scope_capture.py` 在 verify 时先于报告生成 `commit`/`dirty`/
+  `code_scope_sha256`；声明摘要进入 `report_sha256`，接入时重算并绑定，G2 收口前再次
+  重算，代码漂移拒绝收口。Copilot 保存的 `code_scope` 标注为 ingest 重算，不冒充生成
+  时刻；纯文档报告不要求快照。
+- **工作区身份**：`start --workspace` 绑定任务工作区，未绑定时从证据/合同/派发上下文
+  唯一派生；`report --workspace` 必须一致，未绑定或指向其他仓库失败关闭；工作区进入
+  接受绑定。提供 `--workspace` 时报告必须声明代码字段，纯文档报告省略工作区。
+- **历史兼容**：v6.7.0 报告按旧载荷重算摘要（缺少 `generated_at` 时不写空串），兼容旧/
+  过渡绑定口径与缺少 `acceptance_history` 的历史接受记录；真实 v6.7.0 状态已验证。
+- **G2**：替代链、覆盖完整性、代码快照与接受记录一致性全部纳入检查；PASS 绑定变化报
+  `quality_binding_stale`，G4 仅排除未跟踪证据产物，原有 PWW 接受与原始结论保留规则不变。
+
+v6.7.0 建立 PWW 自动治理：
+
+- **报告接入即识别**：verify 结构化质量报告（`copilot-verify-result/v1`）经
+  `report --verify-report` 接入；只认标记 + JSON 结构，缺字段、正文关键词、校验失败一律
+  fail-closed。
+- **自动接受条件**：PWW 自动创建用户接受完成条件并绑定报告摘要、W/R 集合、目标快照与合同；
+  重复接入幂等，新报告替代旧报告时原接受不继承。
+- **G2 强制与用户边界**：未接受/部分接受/绑定失效/最新结论非 PASS 时拒绝收口；只有
+  `accept --by user` 能登记接受，部分接受保持 pending；执行方不得代替用户。
+- **原始结论分离**：`closure.verdict` 保留 `pass_with_warnings`，`closure.quality` 与
+  `quality` 命令记录原始 verdict、接受范围与时间，不改写为 PASS。
+
+v6.6.1 把工作区里最后一个
 Reviewer 专用文件改为通用只读权限载体：
 
 - **Profile 通用化**：`.zcode/agents/reviewer.md` → `.zcode/agents/independent-readonly.md`，

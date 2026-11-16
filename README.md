@@ -70,7 +70,8 @@ copilot/
 - 分发：`SKILL.md`、`scripts/**/*.py`、`references/**/*.md`。
 - 不分发：`legacy/`、`tests/`、`docs/`、`manifests/`、`scripts-sync/`、`README.md`、`AGENTS.md`。
 - 永不同步：`.env*`、密钥/凭据、`.audit/` 审计日志、临时状态、`__pycache__`、符号链接。
-- 每次运行同时检查 Skill 与 Reviewer，避免两者版本不一致。
+- 每次运行检查 Skill 受管理文件（`SKILL.md`、`scripts/`、`references/`）的一致性；
+  Reviewer Profile 不再分发。
 - 同步写入使用同目录临时文件 + `os.replace` 原子替换，写后重新校验 SHA-256。
 
 ## 安全与授权

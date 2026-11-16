@@ -1,6 +1,238 @@
 # STATUS
 
-更新：2026-11-15 CST。本文件只记录现场可核实的事实；规划与未完成事项单独标注。
+更新：2026-11-16 CST。本文件只记录现场可核实的事实；规划与未完成事项单独标注。
+
+## 独立复核效率专项（2026-11-16，v6.8.0）
+
+针对独立复核耗时过长、重复启动、修复后无条件完整复核、多入口重复触发与缺少停止条件
+的专项优化。本轮在 v6.7.1 工作区基线上继续，**不降低 G1–G4 与 G4 fail-closed 标准**。
+
+- **真实根因**：`derive_work` 对同一缺口没有 active 去重；完整复核没有“PASS 停止标记”，
+  同一目标可重复创建 attempt；复核 findings 只有单轮结构校验，没有跨轮稳定台账，
+  已关闭问题可换表述重报；修复后默认重跑完整复核，缺少定向验证入口；`review-metrics`
+  只有轮次/重复文本，没有准入、停止、定向复验与耗时口径。
+- **风险准入**：新增 `copilot_dispatch.py review-admission`（只读）。`risk=high` 恒需 G4；
+  普通风险默认 `not_required`，声明 `security`/`permissions`/`core-logic`/
+  `data-integrity`/`architecture`/`global-execution`/`production`/`release` 才建议派发；
+  纯文档/格式/注释调整不派 Reviewer。
+- **停止与重入**：PASS 回填写入 `review_stops`；同一目标/代码范围再次 attempt 返回
+  `review_not_needed`，只有文档/格式变化返回 `review_not_needed_docs_only`；代码/目标/
+  证据变化必须用 `review-admission --trigger ... --reason ...`（或
+  `review-context --trigger/--reason`）声明实质原因，记录到 `review_admissions` 并绑定
+  attempt。增量复核仍要求合法基线、代码范围未变、变化证据全覆盖。
+- **Finding 台账**：复核回填时合并到 `finding_ledger`，稳定 ID `F1..Fn`；按显式 id、
+  归一化 `root_cause`、同文件摘要相似度识别同一问题；生命周期
+  `open → fixed → verified → closed`，`fixed`/`verified` 必须有证据，`closed` 只能从
+  `verified` 进入；已验证/已关闭问题无新证据只记 `rereported`，有新证据才 `regressed`。
+  新增 `copilot_dispatch.py finding --list/--id/--status/--evidence/--note`。
+- **定向复验**：未闭合 blocking/major 派生 `AUTO-FIX-<F>`；`fixed` 未验证派生
+  `AUTO-VERIFY-<F>`，只跑对应定向测试/检查并登记证据，不重新派发完整 Reviewer。
+  未闭合 finding 清零前不派生 `AUTO-G4`。普通风险 G2 增加台账门禁，高风险由 G4 统一检查。
+- **幂等与恢复**：同一工作项/执行结果/目标/代码范围/scope/证据清单的未消费 attempt 直接
+  复用；`derive_work` 对同一缺口已有 `pending`/`running` 工作项时不再派生第二条；派发
+  失败或上下文中断时未消费 attempt 可继续使用，已消费 attempt 不能重放。
+- **度量**：`review-metrics` 新增 `full_reviews`、`incremental_reviews`、
+  `review_admissions_total`/`review_admission_triggers`、`review_stops_total`、
+  `finding_ledger`、`rereported_findings`、`incremental_new_blocking/major`、
+  `no_information_reviews`、`avg_review_seconds`、`avg_first_full_review_seconds`、
+  `total_review_seconds`；正式 REVIEW、原生复核与 G4 仍分别计数。
+- **测试**：新增 `tests/test_review_efficiency.py` 41 项，覆盖准入、停止、重入、稳定
+  ID、生命周期、severity 提级、目标变化保留 stop、定向验证、attempt 复用、ingest 台账
+  幂等、CLI `--workspace/--record`、文件证据重读与指标；`test_governance` 增加“干净 PASS
+  不能掩盖台账未闭合 major”用例。
+- **独立复核（首轮）**：发现 2 阻断 + 4 实质问题，已全部修复并补测：`dropped` 不能由
+  执行方清除 blocking/major；非正式 G4 复核只能新增/重复报告，不能把已有 finding 改成
+  `verified`；准入与重入 trigger 双向兼容；停止标记只在对应 PASS 仍有效时生效，
+  `--trigger` 可在同快照强制重入；高风险 G4 的文档变化仍需重新 G4，`.csv` 不再算文档；
+  `review-admission` 增加 `--workspace/--base/--record`；finding 证据重读文件并校验摘要；
+  ID 冲突、相似度比较、AUTO-FIX 重复派生与 candidate 异常半成品均已收敛。
+- **未验证/限制**：文档级变化按扩展名识别，不能证明改动语义；定向测试证据由 ZCode
+  负责真实性；真实高风险的完整 G4 + 重入链路仍需在最终 E2E 中复核。
+- **工程验证**：活动测试 712 通过；历史回归 853（跳过 32）；T4 四层 + 34/34 场景通过；
+  运行时分发 27 个文件，`--check` 缺失 0、不同 0；全新 ZCode headless 会话加载
+  `copilot v6.8.0` 并实际执行 `start` / `review-admission --workspace --record` /
+  `review-metrics`。工作区中已完成的 v6.7.1 基线与本轮改同一批模块，随 v6.8.0 一并提交。
+
+## 质量报告替代与代码范围绑定（2026-11-16，v6.7.1）
+
+专项评估确认 v6.7.0 存在两处实质缺陷：新 PASS 可无条件替代旧 PWW；质量报告未绑定实际
+代码范围。本轮在现有结构上修复，**未提交、未推送、未发布**（后续随 v6.8.0 一并提交，
+见上文工程验证）。
+
+- **显式替代**：报告新增 `supersedes_report_id`、`resolved_warning_ids`、
+  `resolved_residual_risk_ids`；存在生效报告时缺少/指向错误目标分别报
+  `pww_supersede_missing` / `pww_supersede_invalid_target`；未知字段直接拒绝。
+- **覆盖与继承**：旧未解决 W/R 必须在新报告继续列出（PWW 重新接受），或在
+  `subject_digest` 与警告来源一致时声明解决；部分覆盖、subject 不一致、PASS 携带未解决
+  项分别报 `pww_supersede_coverage_incomplete` / `pww_supersede_subject_mismatch` /
+  `pww_superseded_unresolved`。未解决项沿替代链持久化，FAIL/PARTIAL 中转不能洗掉；
+  旧接受记录保留但不继承；已由用户接受的 W/R 视为已解决，不要求新报告继承。
+- **代码范围**：新增 `scripts/code_scope_capture.py`（只读）；代码类报告必须把
+  `commit`、`code_scope_sha256` 与 `files_paths`（字符串数组，重命名含新旧路径）写入
+  `subject.files`；`dirty` 可选，给出时必须一致。接入时用 `--workspace` 重算并绑定，
+  G2 收口前再重算。HEAD、tracked/untracked/新增/删除/重命名、dirty 标记、声明范围不一致
+  均拒绝（`quality_code_scope_*`）。已登记证据文件不从快照排除：证据位于工作区内且发生
+  变更时同样必须声明，堵住 `evidence --add --file` 隐藏已修改源文件的路径。纯文档报告
+  不要求快照。
+- **P1 生成时机**：`subject.code_scope_sha256` 是 verify 报告生成时声明的摘要，已进入
+  `report_sha256`；Copilot 在 ingest 时重算当前工作区，生成后/接入前代码变化会因摘要
+  不一致被拒绝，G2 再重算检测后续漂移。`code_scope` 明确标注
+  `capture_source=copilot-ingest-recompute` 与 `captured_at`，并绑定 `report_id`、
+  `report_sha256`、`task_id`；它只证明接入/收口一致，不冒充生成时快照。生成与接入之间
+  “改动后又完全还原”无法在无可信宿主事件时区分，属已披露限制。
+- **P2 工作区身份**：`start --workspace` 绑定任务工作区；未显式绑定时从 native execution
+  binding、合同来源、证据所属 git 仓库、任务目录唯一派生。`report --workspace` 经
+  expanduser/abspath/realpath 并归一到 git root，必须与绑定一致；未绑定或指向其他仓库时
+  `quality_code_scope_workspace_unbound` / `_mismatch` 失败关闭。v6.7.1 的
+  `binding_sha256` 额外绑定 `report_id` 与 `workspace`；纯文档报告不需要工作区。
+- **接受条件范围**：只有 PWW 创建用户接受条件；FAIL/PARTIAL/BLOCKED 不创建，未解决项仍
+  沿替代链保留。`derive_work` 只在最新报告为 PWW 且绑定当前时派生 `AUTO-ACCEPT`，否则
+  派生 `AUTO-QUALITY`。空操作 `contract --amend` 保留原接受记录，不重置条件。
+- **G2**：新增替代链/覆盖完整性/代码范围/接受记录一致性检查；重算被替代报告摘要
+  （`pww_supersede_target_tampered`）并校验报告结构（`quality_report_state_invalid`）。
+  PASS 报告的目标/合同/条件/工作区绑定变化报 `quality_binding_stale`。G4 代码快照只排除
+  未跟踪证据产物，已跟踪源文件即使登记为证据也进入快照。G1–G4 标准与高风险 G4
+  attempt/binding/code_scope 不变。
+- **P3 历史兼容**：v6.7.0 报告没有替代/代码快照字段时按旧载荷重算摘要；缺少
+  `generated_at` 时旧载荷不写入空串（当时没有该字段）；绑定摘要同时接受旧口径与
+  “含 subject_digest”的过渡口径；旧接受记录缺少 `acceptance_history` 时只在历史报告上
+  回退到“接受记录 + 条件 + 证据”一致性校验。2026-11-16 对 `/tmp` 中 **9 个真实
+  v6.7.0 状态**做隔离复制后验证：7 个已接受 PWW/PASS 任务 `closure_check` 通过；FAIL
+  任务保持 `quality_verdict_not_pass`；失效 PWW 任务保持 stale/reverify；旧绑定匹配；
+  旧状态不会被伪造成已接受。另在副本上完成“v6.7.0 已接受 PWW → reopen → v6.7.1 报告
+  替代 → 用户接受 → CLOSED/pass_with_warnings”升级链路。原始历史文件未修改，复制件未
+  进入仓库。
+- **测试**：活动套件 `669 tests OK`（`tests/test_v671_quality.py` 66 项）；历史套件
+  `853 tests OK (skipped=32)`。
+- **运行时 E2E（隔离临时目录，已清理）**：旧 PWW → 新 PASS 无声明/部分覆盖均 exit 2；
+  完整解决 W1/W2/R1 后收口 `pass`；代码报告绑定快照 → 用户接受 → 修改代码 →
+  `quality_code_scope_drift` 拒绝收口与再次接受 → 新报告绑定新快照、替代旧报告 → 接受 →
+  `CLOSED/pass_with_warnings`；纯文档 PWW 正常收口。
+- **修复后 E2E（隔离临时目录，已清理）**：把已修改的 tracked 源文件登记为 evidence 后，
+  `code_scope_capture.py` 仍把 `src/app.py` 列入 `files_paths`；声明范围漏掉它时接入 exit 2；
+  完整声明后绑定、接受、空操作 `contract --amend`、幂等再接受、收口
+  `CLOSED/pass_with_warnings` 全部通过。
+- **P3 升级 E2E（隔离副本，已清理）**：复制真实 v6.7.0 已接受 PWW 状态，`reopen` 后接入
+  v6.7.1 报告（替代旧报告、继承 W1/W2/R1），用户接受后 `CLOSED/pass_with_warnings`；
+  旧接受记录保留在旧报告，未被伪造为已接受。
+- **T4 验收**：`tests/t4_acceptance.py` 全层 `all_layers_ok=true`、`all_scenarios_ok=true`，
+  34/34 场景（隔离目录）。
+- **独立只读复核**：`independent-readonly` 子代理结论 PARTIAL，1 个 MAJOR + 7 个 MINOR/
+  INFO：`evidence --add --file` 可把已修改源文件从代码快照排除（MAJOR）；G2 重算沿用了
+  冻结的 evidence 排除、空操作 `contract --amend` 重置接受条件、非 PWW 报告创建
+  `AUTO-ACCEPT`、被替代报告摘要未重算、`subject.files` 对象/rename 契约、`--workspace`
+  未交叉校验、接受绑定措辞等。已修复：质量报告代码快照只排除治理文件与报告文件，任何
+  工作区变更都必须声明；G2 重算被替代报告摘要并校验报告结构；空操作 amend 保留接受；
+  仅 PWW 创建接受条件；`files_paths` 含新旧路径且拒绝非字符串项；绑定兼容旧/过渡口径。
+  复核方只读，未执行测试；本轮测试由执行方重跑。
+- **最终独立只读复核**：第二轮 `independent-readonly` 子代理结论 PARTIAL，指出 4 个
+  MAJOR：PASS 报告 `binding_sha256` 未在 G2 校验、`derive_work` 在 reopen/代码漂移后仍
+  派生不可执行的 `AUTO-ACCEPT`、G4/native review 仍把已登记证据从代码快照排除、
+  给 `--workspace` 但 subject 未声明代码字段时只警告并落盘。已修复：PASS 绑定变化报
+  `quality_binding_stale`；`AUTO-ACCEPT` 增加 stale/code drift 检查；G4 仅排除未跟踪
+  证据产物、已跟踪源文件进入快照；`--workspace` + 文档 subject 直接失败关闭。另修
+  `files: []`、短接受语、severity 枚举、subject 类型、reopen 子状态、legacy 过渡绑定
+  幂等、报告文件位于工作区内拒绝、`GIT_DIR` 等环境变量清理。复核方只读、未执行测试；
+  最终测试由执行方重跑。
+- **第三轮独立只读复核**：结论 PARTIAL，1 个 MAJOR：执行信封仍排除全部 evidence，而
+  review attempt 已改为只排除未跟踪证据，导致“已跟踪文件作证据”时 G4 两侧代码摘要不一致。
+  已修复：执行信封与 attempt 共用 `safe_path_excludes`（只排除未跟踪产物）；新增
+  tracked-evidence 执行绑定回归测试。另修 AUTO-QUALITY 对正常 pending/partial 接受状态的
+  过度派生、CLI 重复接入仍显示“待接受”、任务目录内报告文件的误拒、falsy warnings 类型
+  缺口、锁文件路径、`quality` 查询不重算报告摘要、partial accept 重复追加历史。
+  复核方只读、未执行测试；最终测试由执行方重跑。
+- **第四轮独立只读复核**：结论 PASS_WITH_WARNINGS，无 blocking/major；2 个 WARNING：
+  执行信封与 attempt 的 evidence 集合仍可能不同（执行后才登记为证据的未跟踪产物）、
+  `--output` 位于工作区内会造成两侧摘要不一致。已修复：执行信封固化
+  `code_scope_excluded_paths`，attempt 直接复用；旧信封回退到“只排除未跟踪证据/不排除
+  证据”双候选；未被快照排除的工作区内 `--output` 直接拒绝。另同步旧证据/锁文件文档与
+  helper 帮助文本。复核方只读、未执行测试。
+- **第五轮独立只读复核**：结论 PARTIAL，4 个 WARNING：`code_scope_problems` 仍动态并集
+  全部未跟踪证据（late-registered 产物端到端仍失败）、信封排除集可放入任意未跟踪/
+  不存在路径、`--output` 守卫在 task_dir==workspace 时退化为空操作、sanitization 对
+  符号链接做 realpath 而执行侧做 abspath。已修复：重算只动态排除“attempt 时不在快照中
+  的未跟踪证据”；信封排除集只接受治理路径或已登记且存在的证据；`--output` 仅允许
+  工作区外或 `.copilot-tasks/`/`.audit/` 任务目录；两侧统一 abspath；嵌套仓库同时检查
+  外层与最近 git root。复核方只读、未执行测试；最终测试由执行方重跑。
+- **运行时同步**：分发 26 个文件（新增 `scripts/code_scope_capture.py`），`--check`
+  缺失 0、不同 0。
+- **headless 加载**：全新 ZCode headless 会话读取运行时 `~/.zcode/skills/copilot/SKILL.md`，
+  确认加载 v6.7.1、`files_paths`、质量报告证据不从快照排除、`AUTO-ACCEPT` 仅对 PWW
+  当前绑定派生、已接受 W/R 视为已解决；运行时与源码逐字节一致。
+- **headless 宿主 E2E**：全新 ZCode headless 会话在隔离目录执行运行时 CLI：另一仓库
+  `--workspace` 接入 exit 2；代码漂移后 `closure --close` exit 2 且
+  `quality_code_scope_drift`；还原代码、空操作 amend、再次接受后
+  `CLOSED/pass_with_warnings`。
+- **限制**：用户接受仍是 user-declared，不是身份认证；代码快照证明接入/收口与报告一致，
+  不证明生成时刻（无可信时钟），生成与接入间“改动后完全还原”不可区分；旧任务未显式
+  绑定工作区时只能在证据/合同/派发上下文唯一时派生，否则代码报告失败关闭；报告来源
+  真实性仍由 verify/执行方负责。
+
+## PWW 自动治理与验收闭环（2026-11-15，v6.7.0）
+
+用户要求解决 PWW 依赖执行方手动登记、接受后缺少端到端验证、收口丢失原始质量结论三个问题。
+本轮只扩展 Copilot 的报告接入、G2、收口与事件记录，不改变 G1–G4 标准、正式 REVIEW 授权、
+状态机或执行后端默认值；**未提交、未推送、未发布**。
+
+- **报告接入**：verify 报告固定输出 `<!-- copilot-verify-result/v1 -->` + JSON
+  （`report_id`、`generated_at`、原始 verdict、`warnings`、`residual_risks`、`unverified`、
+  `acceptance_required`、`acceptance_status`、四项 `checks`、`subject`）。
+  `report --verify-report` 只认该标记与结构（纯 JSON 无标记也拒绝）；缺字段、PWW/PASS 的
+  `checks` 不全 true、PWW 带未验证项或 blocking/major、报告自报 accepted、合同完成条件
+  未核销、内容摘要不符都失败关闭，不从正文关键词推断。
+- **自动登记**：PWW 自动创建**一个**用户接受完成条件（`acceptance` 元数据），绑定
+  `report_sha256`、W/R 集合、`subject` 摘要、目标/合同/条件摘要与报告文件；重复接入按内容
+  摘要幂等，已替代的旧报告拒绝再次接入；新报告替代旧报告时旧接受不继承，条件重置 pending。
+- **G2 强制**：`_gate_quality` 独立于条件列表检查最新生效报告；未接受
+  `pww_acceptance_pending`、部分接受 `pww_acceptance_partial`、目标/合同/条件/警告变化
+  `pww_acceptance_stale`、重开后 `pww_reverify_required`、最新结论非 PASS
+  `quality_verdict_not_pass`、报告内容被改写 `quality_report_tampered`、报告集合/接受
+  历史/接受证据与条件不一致 `quality_report_state_inconsistent` 时拒绝收口。合同修订删除
+  接受条件也不能绕过。任务 `reopen` 会使旧接受失效，必须重新验收并再次接受。
+- **用户边界**：只有 `accept --by user --accept <W/R id> --quote <用户原话>` 能登记接受；
+  执行方/子代理/verify/Copilot 与 `decide`、`criterion` 命令都不能替代。只接受部分警告时
+  保持 pending；接受事件（范围、原话、时间、绑定）写入 `acceptance_history`。
+- **原始结论分离**：收口写 `closure.verdict=pass_with_warnings` 与 `closure.quality`
+  （原始 verdict、report_id、接受状态、accepted_ids、时间）；`quality --state` 与
+  `closure-check` 均展示。历史任务没有质量报告时显示 `unrecorded`，不伪造接受。
+- **测试**：活动套件 `599 tests OK`（新增 `tests/test_pww_acceptance.py` 43 项，覆盖 PASS、
+  自动登记、G2 拦截、伪造接受、部分接受、警告/目标变化、幂等、替代关系、PWW/PASS 前置
+  条件、FAIL 保留、历史兼容、重开失效、状态篡改、保存失败与 CLI 闭环）；历史套件
+  `853 tests OK (skipped=32)`。
+- **真实 E2E（运行时脚本，非源码直调）**：`/tmp/copilot-e2e-pww-v2-5DGnlR` 完成
+  PWW 接入 → 自动登记 `C2` → `closure --close` exit 2（`G2:criterion_pending;
+  G2:pww_acceptance_pending`）→ `accept --by zcode` exit 2 → 用户接受 W1/R1 →
+  四门 PASS → `CLOSED/verdict=pass_with_warnings`；`reopen` 后旧接受失效
+  （`pww_reverify_required`，再接受 exit 2）→ 新报告 `VR-E2E-2` + 用户再次接受 →
+  再次 `CLOSED/pass_with_warnings`。另验证普通 PASS 直接收口 `verdict=pass`
+  （`/tmp/copilot-e2e-pass-wXe1Hh`）、新报告替代旧接受与合同变化 stale
+  （`/tmp/copilot-e2e-invalid-cyAQnm`）、PASS 但 `checks` 含 false 被拒（exit 2）。
+- **T4 验收**：`tests/t4_acceptance.py` 全层 `all_layers_ok=true`、`all_scenarios_ok=true`
+  （T0/T1/T2/T3），34/34 场景。
+- **独立只读复核**：`independent-readonly` 子代理首轮 PARTIAL（2 major + 6 minor），指出
+  PASS 报告未校验 `checks`、纯 JSON 无标记可接入、`accept` stale 分支先落盘、缺失字段会
+  抛 `KeyError`、状态篡改与重开接受等缺口。已修复并补测：PASS/PWW 均要求四项 checks 全
+  true；只认 marker + JSON；`generated_at` 必填；stale 不落盘；防御性解析；接受记录/
+  历史/证据/条件一致性检查；报告集合删除与多 active 报告 fail-closed；`reopen` 使旧接受
+  失效。复核提出的“状态文件直改可伪造任一记录”属本地可信边界，已在 DECISIONS 49 披露。
+- **规则同步**：`~/.zcode/AGENTS.md` 第 85 行 PWW 段落原写“用现有 `decide`/`report` 记录
+  接受、必要时 `contract --amend` 登记条件”，与自动接入机制冲突；已最小改为
+  `report --verify-report` 自动登记 + `accept --by user --quote`，并注明
+  `decide`/`criterion` 不能替代、CLI 无法证明用户来源。备份
+  `AGENTS.md.bak-20261115-pre-pww-automation`（`45ec4a34…`），新文件 88 行 /
+  21,289 字节 / `f99a83c9…`。
+- **运行时同步**：`sync_runtime.py --apply` 写入 6 个文件，`--check` 缺失 0、不同 0
+  （25 个受管理文件，8 个未受管理文件保留）。
+- **新会话加载**：headless 新进程读取运行时 Skill，确认 `copilot` v6.7.0、verify 第 10 节
+  marker/`checks`/`generated_at` 规则、`accept --by user --quote` 与 reopen 失效规则均
+  实际加载。
+- **限制（未验证/残余）**：CLI 无法从进程层证明接受来自用户，`accept` 记录为
+  `origin=user-declared`（要求用户原话与完整 W/R，执行方仍可能伪造；属于授权越界，
+  不是可机械阻止的能力）；高风险任务接受会改变条件状态与最终证据摘要，必须在最终 G4
+  之前完成接受；`subject` 只参与报告摘要与绑定，不核对报告声明的 commit/files 是否
+  等于当前工作区；新 PASS 报告按“最新结论替代旧结论”处理，可替代未接受的 PWW，报告
+  来源真实性由 verify/执行方负责；真实生产高风险任务未跑本链路，E2E 仅使用 `/tmp`
+  临时目录与本地任务状态。
 
 ## 通用只读 Profile 与旧 Reviewer 文件退役（2026-11-15，v6.6.1）
 

@@ -47,7 +47,11 @@
 |---|---|---|
 | 合同缺条件/未确认 | `AUTO-CONTRACT` | 补齐可核销条件与边界 |
 | 条件未闭合 | `AUTO-C1`、`AUTO-C2`… | 执行工作、登记证据、`criterion met` |
+| 最新报告为 PWW、绑定当前且接受条件未闭合 | `AUTO-ACCEPT` | 把原始结论与全部 W/R 如实呈现给用户，取得用户明确接受后 `accept --by user`；执行方不得代接受。非 PWW 或绑定失效时改派 `AUTO-QUALITY` |
+| 质量报告替代/代码范围/工作区/接受门禁未过 | `AUTO-QUALITY` | 重新 verify、声明替代与解决、确认任务工作区并用当前代码快照重新接入 |
 | 停摆工作项 `A1` | `AUTO-R-A1` | 分析失败根因并重试/调整/记录真实阻塞 |
+| Finding 台账有 `open`/`regressed` 的 blocking/major | `AUTO-FIX-<F>` | 修根因、登记修复证据并标记 fixed，不直接重跑完整复核 |
+| Finding 已 `fixed` 但未验证 | `AUTO-VERIFY-<F>` | 只跑对应定向测试/检查，登记证据并标记 verified |
 | 高风险缺 G4 | `AUTO-G4` | 组织一次独立只读复核并回填 |
 | 已有 G4 标记完成但门禁仍缺 | `AUTO-G4-INGEST` | 检查回填/绑定/拒绝原因，必要时重做复核 |
 | `AUTO-C*` / `AUTO-R-*` / `AUTO-G4*` 已派生 ≥3 次仍不闭合 | `AUTO-REPLAN` | 根因分析 + 实质不同的替代路线 |
@@ -55,6 +59,10 @@
 | 存在连续失败工作项 | `AUTO-REPLAN` | 同上 |
 
 - 重名时用 `-R2`、`-R3` 递增（`_derive_id`），不覆盖已有工作项。
+- 同一缺口已有 `pending`/`running` 工作项时不再派生第二条；重复调用 `drive` 或多个入口
+  同时求值不会把 `AUTO-C1` / `AUTO-G4` 复制成 `-R2`/`-R3`。
+- 存在未闭合 finding 时优先生成 `AUTO-FIX-*` / `AUTO-VERIFY-*`，不派生 `AUTO-G4`；定向
+  验证完成、台账清零后才重新进入 G4 派发。
 - 失败/停摆的 `AUTO-C*` 项不再额外派生恢复项，避免同一缺口两份工作单。
 - 派生项带通用约束：不得越过原始授权范围、不得改目标/条件/业务规则、只做缺口需要的最小
   改动；若合同写有 `boundaries`，原样带入。

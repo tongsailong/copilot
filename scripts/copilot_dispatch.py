@@ -32,8 +32,9 @@ if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
 import governance as G  # noqa: E402
+import review_policy as RP  # noqa: E402
 
-__version__ = "6.6.1"
+__version__ = "6.8.0"
 
 
 class CLIError(Exception):
@@ -130,14 +131,20 @@ def _brief(state: dict) -> str:
 def cmd_start(args) -> int:
     contract = _read_text(args.contract_file) if args.contract_file else ""
     criteria = _load_criteria(args.criteria_file) if args.criteria_file else None
+    state_path = _state_path(args)
+    workspace = args.workspace or G._git_workspace(
+        os.path.dirname(os.path.abspath(state_path)))
     state = G.start_state(
-        _state_path(args), args.goal, contract=contract, criteria=criteria,
+        state_path, args.goal, contract=contract, criteria=criteria,
         risk=args.risk, execution_backend=args.backend,
         task_id=args.task_id or "", mode=args.mode or "", note=args.note or "",
         contract_source=args.contract_file or "",
+        workspace=workspace,
         test_policy=_load_test_policy(args))
     print(f"任务已创建：{state['task_id']}")
-    print(f"状态文件：{os.path.abspath(_state_path(args))}")
+    print(f"状态文件：{os.path.abspath(state_path)}")
+    if state.get("workspace"):
+        print(f"任务工作区：{state['workspace']}")
     print(f"完成条件：{len(state['contract']['criteria'])} 条 "
           f"（{', '.join(c['criterion_id'] for c in state['contract']['criteria'])}）")
     print(f"风险：{state['risk']} · 执行后端：{state['execution_backend']}")
@@ -203,9 +210,115 @@ def cmd_judgment(args) -> int:
 
 
 def cmd_report(args) -> int:
-    entry = G.add_report(_state_path(args), args.summary,
+    path = _state_path(args)
+    verify_file = str(getattr(args, "verify_report", "") or "").strip()
+    summary = str(getattr(args, "summary", "") or "").strip()
+    if not verify_file and not summary:
+        raise CLIError("report 需要 --summary 或 --verify-report 之一。")
+    if verify_file:
+        result = G.ingest_quality_report(path, verify_file, note=args.reason or "",
+                                         summary=summary,
+                                         workspace=getattr(args, "workspace", "") or "")
+        report = result["report"]
+        if result["idempotent"]:
+            print(f"质量报告已接入（幂等，未重复登记）：{report.get('report_id')} "
+                  f"verdict={report.get('raw_verdict')} "
+                  f"acceptance={report.get('acceptance_status')}")
+        else:
+            print(f"质量报告已接入：{report.get('report_id')} "
+                  f"verdict={report.get('raw_verdict')} "
+                  f"acceptance={report.get('acceptance_status')}")
+        if report.get("supersedes_report_id"):
+            supersede = report.get("supersede") or {}
+            print(f"替代关系：{report.get('supersedes_report_id')} → "
+                  f"{report.get('report_id')}；继承 "
+                  f"{'、'.join(supersede.get('carried_ids') or []) or '无'}；"
+                  f"解决 {'、'.join(supersede.get('resolved_ids') or []) or '无'}")
+        if report.get("code_scope_sha256"):
+            print(f"代码范围已绑定：commit={report.get('code_scope', {}).get('git_head')} "
+                  f"sha256={report.get('code_scope_sha256')[:16]}…")
+        required = [entry.get("id") for entry in G._report_unresolved(report)]
+        if required:
+            criterion = result.get("criterion") or {}
+            if not report.get("binding_sha256"):
+                print("警告：报告绑定缺失；请重新接入后再接受。")
+            state = G.load_state(path)
+            if G.quality_summary(state).get("binding_current") is False:
+                print("警告：该报告与当前目标/合同/条件不一致（绑定已过期）；"
+                      "请重新验收并接入新报告，旧接受不继承。")
+            print(f"已自动登记用户接受条件：{criterion.get('criterion_id')} "
+                  f"（待接受 {'、'.join(required)}）")
+            print("用户明确接受后运行：copilot_dispatch.py accept --state <state> "
+                  f"--report {report.get('report_id')} --accept "
+                  f"{','.join(required)} --by user --quote \"<用户原话>\"")
+            print("未接受前 G2 拒绝收口；verify/执行方不得代替用户接受。")
+        elif report.get("acceptance_required"):
+            print("警告：PWW 报告没有可接受的 W/R；按 fail-closed 处理。")
+        if summary:
+            print("报告已登记：已随质量报告一并写入（同一保存轮次）。")
+        return 0
+    entry = G.add_report(path, summary,
                          blocked=bool(args.blocked), reason=args.reason or "")
     print(f"报告已登记：sha256={entry['report_sha256'][:16]}…")
+    return 0
+
+
+def cmd_accept(args) -> int:
+    result = G.accept_pww(
+        _state_path(args), report_id=args.report or "",
+        ids=_evidence_ids(args.accept), accepted_by=args.by or "",
+        quote=args.quote or "", note=args.note or "")
+    report = result["report"]
+    print(f"用户接受已登记：{report.get('report_id')} → {result['status']}")
+    print(f"已接受：{'、'.join((report.get('acceptance') or {}).get('accepted_ids') or []) or '无'}")
+    if result["pending_ids"]:
+        print(f"仍未接受：{'、'.join(result['pending_ids'])}；G2 继续拒绝收口。")
+    else:
+        print("全部警告/残余风险已接受；原始 verdict 保持 "
+              f"{report.get('raw_verdict')}，不改写为 PASS。")
+    return 0
+
+
+def cmd_quality(args) -> int:
+    state = G.load_state(_state_path(args))
+    summary = G.quality_summary(state)
+    if args.json:
+        _print({"task_id": state.get("task_id"), **summary,
+                "reports": state.get("quality_reports") or []})
+        return 0
+    print(f"任务 {state.get('task_id')} 质量结论："
+          f"{str(summary.get('raw_verdict') or summary.get('verdict')).upper()}")
+    if summary.get("verdict") == "unrecorded":
+        print("- 未接入 verify 结构化质量报告；不推断接受状态。")
+    else:
+        print(f"- 报告：{summary.get('report_id')}")
+        if summary.get("supersedes_report_id"):
+            print(f"- 替代：{summary.get('supersedes_report_id')} → "
+                  f"{summary.get('report_id')}")
+        print(f"- 接受状态：{summary.get('acceptance_status')}")
+        if summary.get("accepted_ids"):
+            print(f"- 已接受：{'、'.join(summary.get('accepted_ids'))}")
+        if summary.get("unresolved_ids"):
+            print(f"- 未解决：{'、'.join(summary.get('unresolved_ids'))}")
+        if summary.get("code_scope_declared"):
+            if summary.get("code_scope_sha256"):
+                print(f"- 代码范围：{summary.get('code_scope_sha256')[:16]}…"
+                      f"（{summary.get('code_scope_status') or 'unknown'}；"
+                      "G2 收口时重算）")
+                if summary.get("workspace"):
+                    print(f"- 工作区：{summary.get('workspace')}"
+                          f"（{summary.get('workspace_source') or 'unknown'}）")
+                if summary.get("code_scope_captured_at"):
+                    print("- 快照来源：Copilot ingest 重算 "
+                          f"{summary.get('code_scope_captured_at')}；"
+                          "不是报告生成时刻证明")
+            else:
+                print("- 代码范围：历史报告未绑定快照")
+        elif summary.get("workspace"):
+            print(f"- 工作区：{summary.get('workspace')}"
+                  f"（{summary.get('workspace_source') or 'unknown'}）")
+        if not summary.get("binding_current"):
+            print("- 绑定已过期：目标/合同/条件/工作区变化，原接受不继承。")
     return 0
 
 
@@ -320,6 +433,11 @@ def cmd_closure_check(args) -> int:
         print(f"- {name}: {'PASS' if gate.get('passed') else 'FAIL'}")
         for reason in gate.get("reasons") or []:
             print(f"    {reason.get('code')}: {reason.get('detail')}")
+    quality = check.get("quality") or {}
+    if quality.get("verdict") and quality.get("verdict") != "unrecorded":
+        print(f"- 质量结论：{str(quality.get('raw_verdict') or quality.get('verdict')).upper()}"
+              f"（接受状态 {quality.get('acceptance_status')}；"
+              f"已接受 {'、'.join(quality.get('accepted_ids') or []) or '无'}）")
     for warning in check.get("warnings") or []:
         print(f"- 提醒（不阻断）：{warning}")
     return 0
@@ -334,13 +452,94 @@ def cmd_review_metrics(args) -> int:
     return 0
 
 
+def cmd_finding(args) -> int:
+    path = _state_path(args)
+    if args.list or not args.id:
+        state = G.load_state(path)
+        summary = G.list_findings(state)
+        if args.json:
+            _print(summary)
+        else:
+            items = summary.get("items") or []
+            print(f"Finding 台账：{summary.get('total', 0)} 条；"
+                  f"未闭合 blocking/major：{len(summary.get('blocking') or [])}")
+            for item in items:
+                where = str(item.get("file") or "")
+                if item.get("line") is not None:
+                    where += f":{item.get('line')}"
+                print(f"- {item.get('finding_id')} [{item.get('severity')}] "
+                      f"{item.get('status')} {where} {item.get('summary')}")
+        return 0
+    if not args.status:
+        raise CLIError("更新 finding 需要 --status。")
+    item = G.record_finding_status(
+        path, args.id, args.status,
+        evidence_ids=args.evidence, note=args.note)
+    print(f"Finding {item['finding_id']} → {item['status']}"
+          f"（{item.get('severity')}）")
+    if item["status"] == "fixed":
+        print("下一步：运行定向测试/检查并登记证据，再标记 verified；"
+              "不需要重新派发完整复核。")
+    return 0
+
+
+def cmd_review_admission(args) -> int:
+    path = _state_path(args)
+    state = G.load_state(path)
+    files = None
+    digest = ""
+    if args.workspace:
+        excludes = G.governance_paths(path) + G.CS.safe_evidence_excludes(
+            state, args.workspace, args.base)
+        snapshot = G.capture_code_snapshot(
+            args.workspace, exclude_paths=excludes, base=args.base)
+        if not snapshot.get("available"):
+            raise CLIError(
+                f"workspace 不是可读取的 git 仓库：{args.workspace}"
+                f"（{snapshot.get('reason') or 'unknown'}）")
+        files = [item for item in snapshot.get("files") or []
+                 if isinstance(item, dict)]
+        digest = str(snapshot.get("digest") or "")
+    try:
+        decision = G.review_admission(
+            state, triggers=args.trigger, reason=args.reason,
+            code_scope_sha256=digest, files=files, scope=args.scope)
+    except RP.ReviewPolicyError as exc:
+        raise CLIError(str(exc)) from None
+    if args.record:
+        G.record_review_admission(
+            path, decision=decision, target_sha256=decision.get(
+                "target_sha256") or "",
+            code_scope_sha256=digest, scope=args.scope, base=args.base)
+        decision["recorded"] = True
+    if args.json:
+        _print(decision)
+    else:
+        print(f"复核准入：{decision['decision']}（risk={decision['risk']}）")
+        print(decision.get("detail") or "")
+        reentry = decision.get("reentry") or {}
+        if reentry.get("detail"):
+            print(f"停止/重入：{reentry.get('detail')}")
+        if decision.get("triggers"):
+            print("触发因素：" + ", ".join(decision["triggers"]))
+        if not decision.get("code_scope_checked"):
+            print("提示：未提供 --workspace，未比较当前代码范围；"
+                  "same-snapshot/docs-only 判断不可用。")
+    return 0
+
+
 def cmd_closure(args) -> int:
     path = _state_path(args)
     if not args.close:
         return cmd_closure_check(args)
     closure = G.close_task(path, by=args.by)
+    quality = closure.get("quality") or {}
     print(f"任务已收口：verdict={closure['verdict']} "
           f"iteration={closure['iteration_id']} by={closure['closed_by']}")
+    if quality.get("verdict") == "pass_with_warnings":
+        print(f"质量结论：{str(quality.get('raw_verdict') or 'PASS_WITH_WARNINGS').upper()}"
+              "（原始结论保留，不改写为 PASS；已接受 "
+              f"{'、'.join(quality.get('accepted_ids') or []) or '无'}）")
     return 0
 
 
@@ -599,6 +798,8 @@ def cmd_contract(args) -> int:
         contract = state.get("contract") or {}
         print(f"合同指纹：{state.get('contract_sha256')}")
         print(f"条件状态：{contract.get('criteria_state')}")
+        if state.get("workspace"):
+            print(f"任务工作区：{state['workspace']}（{state.get('workspace_source') or 'unknown'}）")
         print("完成条件：")
         for criterion in contract.get("criteria") or []:
             refs = ", ".join(r.get("id") for r in criterion.get("evidence_refs") or [])
@@ -709,6 +910,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--task-id", default="")
     p.add_argument("--mode", default="")
     p.add_argument("--note", default="")
+    p.add_argument("--workspace", default="",
+                   help="任务实际 git 工作区；省略时取状态文件所在目录的 git 根")
     p.set_defaults(func=cmd_start)
 
     p = sub.add_parser("plan", help="登记 ZCode 本地计划（JSON）")
@@ -767,12 +970,34 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--reason", default="")
     p.set_defaults(func=cmd_evidence)
 
-    p = sub.add_parser("report", help="登记执行报告")
+    p = sub.add_parser("report", help="登记执行报告或接入 verify 质量报告")
     p.add_argument("--state", required=True)
-    p.add_argument("--summary", required=True)
+    p.add_argument("--summary", default="",
+                   help="执行报告摘要；单独使用或与 --verify-report 同用")
+    p.add_argument("--verify-report", default="",
+                   help="verify 结构化质量报告文件；PWW 自动登记用户接受条件")
+    p.add_argument("--workspace", default="",
+                   help="代码类质量报告的实际工作区；纯文档报告可省略")
     p.add_argument("--blocked", action="store_true")
     p.add_argument("--reason", default="")
     p.set_defaults(func=cmd_report)
+
+    p = sub.add_parser("accept", help="登记用户对 PWW 的明确接受")
+    p.add_argument("--state", required=True)
+    p.add_argument("--report", default="", help="质量报告 report_id；仅一份时可省略")
+    p.add_argument("--accept", action="append", default=[],
+                   help="用户接受的 W/R id，逗号分隔或重复传入")
+    p.add_argument("--by", required=True,
+                   help="必须是 user；执行方/子代理/verify 不得代为接受")
+    p.add_argument("--quote", required=True,
+                   help="用户接受的原话（原样记录，不能只写调用方结论）")
+    p.add_argument("--note", default="")
+    p.set_defaults(func=cmd_accept)
+
+    p = sub.add_parser("quality", help="查看质量结论与 PWW 接受状态")
+    p.add_argument("--state", required=True)
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_quality)
 
     p = sub.add_parser("decide", help="记录用户/任务决策")
     p.add_argument("--state", required=True)
@@ -801,7 +1026,36 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("review-metrics",
                        help="统计真实复核轮次/重复 finding/无效信封等效率指标")
     p.add_argument("--state", required=True)
+    p.add_argument("--json", action="store_true", help="输出 JSON（默认即为 JSON）")
     p.set_defaults(func=cmd_review_metrics)
+
+    p = sub.add_parser("review-admission",
+                       help="复核风险准入与停止/重入判断（只读）")
+    p.add_argument("--state", required=True)
+    p.add_argument("--trigger", action="append", default=[],
+                   help="实质触发因素；普通风险任务显式声明才建议派发复核")
+    p.add_argument("--reason", default="", help="准入/重入原因")
+    p.add_argument("--scope", default="full", choices=("full", "incremental"))
+    p.add_argument("--workspace", default="",
+                   help="任务 git 工作区；提供后比较当前代码范围（停止/文档变化判断）")
+    p.add_argument("--base", default="",
+                   help="可选：任务开始 commit，与 review-context --base 一致")
+    p.add_argument("--record", action="store_true",
+                   help="把本次准入判断写入 review_admissions（普通风险也留痕）")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_review_admission)
+
+    p = sub.add_parser("finding",
+                       help="查看/更新 Finding 台账（修复与定向验证，不触发复核）")
+    p.add_argument("--state", required=True)
+    p.add_argument("--list", action="store_true")
+    p.add_argument("--id", default="")
+    p.add_argument("--status", choices=RP.FINDING_STATUSES)
+    p.add_argument("--evidence", action="append", default=[],
+                   help="修复/定向验证证据 id（fixed/verified/regressed 必填）")
+    p.add_argument("--note", default="", help="状态变更说明（regressed/dropped/open 必填）")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_finding)
 
     p = sub.add_parser("closure", help="收口任务（必须四门通过）")
     p.add_argument("--state", required=True)

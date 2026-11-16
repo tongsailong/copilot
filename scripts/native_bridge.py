@@ -827,6 +827,8 @@ def validate_execution_result(envelope: object, dispatch: dict | None, state: di
         "test_artifacts": sorted(set(test_artifacts)),
         "execution_binding": binding,
         "code_scope_sha256": code_scope,
+        "code_scope_excluded_paths": [
+            str(item) for item in env.get("code_scope_excluded_paths") or []],
         "result_sha256": declared_sha,
     }
 
