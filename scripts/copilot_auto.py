@@ -146,19 +146,22 @@ def _write_dispatch(state: dict, ready: list[dict], path: str,
 # ── drive ──────────────────────────────────────────────────────────────────
 def drive(args) -> int:
     path = _state_path(args)
+    # 单次驱动内工作区不会被本进程改写：代码快照与证据摘要只算一次，
+    # 后续求值/派生/收口复用同一份，避免同一命令里重复扫描 git 工作区。
+    cache: dict = {}
     for step in range(MAX_DRIVE_STEPS):
         state = G.load_state(path)
-        evaluation = G.evaluate(state)
+        evaluation = G.evaluate(state, cache=cache)
         phase = evaluation.get("phase")
         print(f"[{step}] {state.get('task_id')} → {phase}：{evaluation.get('reason')}")
         if phase == "CLOSED":
-            print(G.render_status(state, evaluation))
+            print(G.render_status(state, evaluation, cache=cache))
             return EXIT_DONE
         if phase == "BLOCKED":
-            print(G.render_status(state, evaluation))
+            print(G.render_status(state, evaluation, cache=cache))
             return EXIT_WAIT
         if phase == "PASS":
-            closure = G.close_task(path)
+            closure = G.close_task(path, cache=cache)
             print(f"四门通过，任务已收口：verdict={closure.get('verdict')} "
                   f"iteration={closure['iteration_id']} by={closure['closed_by']}")
             quality = closure.get("quality") or {}
@@ -184,7 +187,7 @@ def drive(args) -> int:
             return EXIT_EXECUTE
         # PARTIAL：本地派生下一步，不等待任何外部判断。
         before = G.progress_digest(state)
-        created = G.derive_work(state)
+        created = G.derive_work(state, cache=cache)
         if not created:
             print("PARTIAL 但无法派生新的工作项（派生上限或状态异常）；"
                   "请检查未闭合条件与停摆项。", file=sys.stderr)

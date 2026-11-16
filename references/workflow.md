@@ -13,6 +13,14 @@
   “临时文件 + fsync + `os.replace`”，并用单调 `save_seq` 做 CAS 并发校验。
 - 状态已存在时 `start` 会拒绝，避免覆盖进行中的任务；续跑直接使用同一文件。
 
+### 启动开销
+
+- 命令一律用 `python3 -B`：`-B` 只禁止**写入** `.pyc`，不禁止读取。运行时由
+  `sync_runtime.py --apply` 预编译字节码；源码仓库可执行 `python3 -m compileall -q scripts`。
+  没有有效字节码时每条命令要重编译约 17k 行源码（约 +130ms）。
+- 同一命令内只扫描工作区一次：`status`/`drive`/`closure-check` 复用同一份代码快照与
+  `git_root` 结果；这不是跨命令缓存，下一次命令仍重新计算（漂移检测不受影响）。
+
 ## 2. `copilot_dispatch.py`：任务与证据
 
 ```bash

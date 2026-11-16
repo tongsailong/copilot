@@ -2025,8 +2025,12 @@ def _capture_quality_code_scope(state: dict, state_path: str,
     return snapshot
 
 
-def _code_scope_status(report: dict, state: dict | None = None) -> dict:
-    """当前工作区是否仍等于报告绑定的代码快照。"""
+def _code_scope_status(report: dict, state: dict | None = None,
+                       cache: dict | None = None) -> dict:
+    """当前工作区是否仍等于报告绑定的代码快照。
+
+    `cache` 为单次命令内的快照复用容器（见 `CS.capture_code_snapshot`）。
+    """
     subject = report.get("subject") or {}
     snapshot = report.get("code_scope")
     if not isinstance(snapshot, dict) or not snapshot:
@@ -2065,7 +2069,7 @@ def _code_scope_status(report: dict, state: dict | None = None) -> dict:
     current = CS.capture_code_snapshot(
         snapshot_ws,
         exclude_paths=sorted(set(snapshot.get("excluded_paths") or [])),
-        base=str(snapshot.get("git_base") or ""))
+        base=str(snapshot.get("git_base") or ""), cache=cache)
     if not current.get("available"):
         return {"status": "unavailable",
                 "reasons": ["quality_code_scope_unavailable"]}
@@ -2365,7 +2369,7 @@ def latest_quality_report(state: dict) -> dict | None:
     return reports[-1] if reports else None
 
 
-def quality_summary(state: dict) -> dict:
+def quality_summary(state: dict, *, cache: dict | None = None) -> dict:
     report = latest_quality_report(state)
     if report is None:
         closure = state.get("closure") or {}
@@ -2406,7 +2410,7 @@ def quality_summary(state: dict) -> dict:
     except (TypeError, ValueError, KeyError, AttributeError):
         digest_ok = False
     binding_current = digest_ok and _quality_binding_current(state, report)
-    scope = _code_scope_status(report, state)
+    scope = _code_scope_status(report, state, cache)
     acceptance = report.get("acceptance")
     if not isinstance(acceptance, dict):
         acceptance = {}
@@ -2835,7 +2839,7 @@ def accept_pww(path: str, *, report_id: str = "", ids: list[str] | None = None,
                             if value not in set(record["accepted_ids"])]}
 
 
-def _gate_quality(state: dict) -> dict:
+def _gate_quality(state: dict, *, cache: dict | None = None) -> dict:
     """G2 的 PWW 接受检查：与条件列表独立，合同修订删条件也不能绕过。"""
     reports = [item for item in state.get("quality_reports") or []
                if isinstance(item, dict)]
@@ -2846,11 +2850,13 @@ def _gate_quality(state: dict) -> dict:
                            if isinstance(event, dict)
                            and event.get("event") == "quality_report_ingested"]
         if reports or ingested_events:
-            return {"passed": False, "quality": quality_summary(state), "reasons": [{
+            return {"passed": False,
+                    "quality": quality_summary(state, cache=cache),
+                    "reasons": [{
                 "code": "quality_report_state_inconsistent",
                 "detail": "历史记录了质量报告接入，但当前没有生效报告；"
                           "状态被删除或写入不完整，按 fail-closed 拒绝收口。"}]}
-        return {"passed": True, "reasons": [], "quality": quality_summary(state)}
+        return {"passed": True, "reasons": [], "quality": quality_summary(state, cache=cache)}
     reasons: list[dict] = []
     if len(active) > 1:
         reasons.append({
@@ -2870,7 +2876,7 @@ def _gate_quality(state: dict) -> dict:
             "code": "quality_report_state_invalid",
             "detail": f"报告 {report.get('report_id')} 的 warnings/residual_risks/"
                       "unverified/unresolved 结构被改写；按 fail-closed 拒绝收口。"}],
-            "quality": quality_summary(state)}
+            "quality": quality_summary(state, cache=cache)}
     if recomputed and recomputed != str(report.get("report_sha256") or ""):
         reasons.append({
             "code": "quality_report_tampered",
@@ -2881,7 +2887,7 @@ def _gate_quality(state: dict) -> dict:
             "code": code,
             "detail": (f"报告 {report.get('report_id')} 的替代关系不合法或覆盖不完整；"
                        "不能据此解除旧 PWW 的接受要求。")})
-    scope = _code_scope_status(report, state)
+    scope = _code_scope_status(report, state, cache)
     for code in scope["reasons"]:
         reasons.append({
             "code": code,
@@ -2908,7 +2914,7 @@ def _gate_quality(state: dict) -> dict:
                            + "、".join(sorted(unresolved_ids))
                            + "；不能按通过收口。")})
         return {"passed": not reasons, "reasons": reasons,
-                "quality": quality_summary(state)}
+                "quality": quality_summary(state, cache=cache)}
     if verdict != PWW:
         reasons.append({
             "code": "quality_verdict_not_pass",
@@ -2916,7 +2922,7 @@ def _gate_quality(state: dict) -> dict:
                        f"{str(report.get('raw_verdict') or verdict).upper()}；"
                        "先修复并重新验收，不能按收口处理。")})
         return {"passed": not reasons, "reasons": reasons,
-                "quality": quality_summary(state)}
+                "quality": quality_summary(state, cache=cache)}
     current = _quality_binding(state, report)
     if not _quality_binding_current(state, report):
         reasons.append({
@@ -2993,7 +2999,7 @@ def _gate_quality(state: dict) -> dict:
                 "code": "pww_acceptance_record_inconsistent",
                 "detail": "完整接受缺少绑定的接受证据/条件核销；接受记录不可信。"})
     return {"passed": not reasons, "reasons": reasons,
-            "quality": quality_summary(state)}
+            "quality": quality_summary(state, cache=cache)}
 
 
 # ── 证据 ───────────────────────────────────────────────────────────────────
@@ -3139,7 +3145,7 @@ def _gate_actions(state: dict) -> dict:
     return {"passed": not reasons, "reasons": reasons}
 
 
-def _gate_criteria(state: dict) -> dict:
+def _gate_criteria(state: dict, *, cache: dict | None = None) -> dict:
     contract = state.get("contract") or {}
     criteria = contract.get("criteria") or []
     reasons = []
@@ -3194,7 +3200,17 @@ def _gate_criteria(state: dict) -> dict:
                                     "detail": f"{eid} 证据文件已不存在：{hint}"})
                     continue
                 try:
-                    if _sha256_file(hint) != str(entry.get("sha256") or ""):
+                    # 同一文件被多条条件引用时只重读一次；键里带 mtime/size，
+                    # 进程内文件被改写仍会重新计算，不把旧摘要当成本次结果。
+                    stat = os.stat(hint)
+                    key = ("evidence_sha256", hint, stat.st_mtime_ns,
+                           stat.st_size)
+                    actual = cache.get(key) if cache is not None else None
+                    if actual is None:
+                        actual = _sha256_file(hint)
+                        if cache is not None:
+                            cache[key] = actual
+                    if actual != str(entry.get("sha256") or ""):
                         reasons.append({"code": "evidence_tampered",
                                         "detail": f"{eid} 文件内容已被改动"})
                 except OSError as exc:
@@ -3209,7 +3225,7 @@ def _gate_stalled(state: dict) -> dict:
     return {"passed": not reasons, "reasons": reasons}
 
 
-def _gate_code_scope(state: dict) -> dict:
+def _gate_code_scope(state: dict, *, cache: dict | None = None) -> dict:
     """G2 的代码范围检查：高风险任务的最终 G4 attempt 必须覆盖当前工作区。
 
     G2 原本只核销合同/条件/证据；未登记为 evidence 的源码变化不会进入
@@ -3223,7 +3239,7 @@ def _gate_code_scope(state: dict) -> dict:
     candidate = None
     for review in reviews:
         # 使用与 G4 相同的“首条合格复核”，而不是无关的最近 attempt。
-        ok, _code = _eligible_review(review, state)
+        ok, _code = _eligible_review(review, state, cache=cache)
         if ok:
             candidate = review
             break
@@ -3237,7 +3253,8 @@ def _gate_code_scope(state: dict) -> dict:
         # 没有可检查的已消费 attempt 时由 G4 报 native_review_missing；这里不重复。
         return {"passed": True, "reasons": []}
     reasons = []
-    for code in code_scope_problems(attempt, state, check_current=True):
+    for code in code_scope_problems(attempt, state, check_current=True,
+                                    cache=cache):
         detail = {
             "native_review_code_scope_missing":
                 "G4 attempt 没有冻结代码变更范围；无法证明 Reviewer 看过未登记"
@@ -4027,7 +4044,8 @@ def execution_binding_problems(state: dict, binding_id: str,
 
 
 def review_attempt_problems(review: dict, state: dict, *,
-                            check_current: bool = True) -> list[str]:
+                            check_current: bool = True,
+                            cache: dict | None = None) -> list[str]:
     """检查复核记录是否属于当前有效 attempt，且快照仍与当前状态一致。"""
     aid = str((review or {}).get("review_attempt_id") or "").strip()
     if not aid:
@@ -4077,7 +4095,8 @@ def review_attempt_problems(review: dict, state: dict, *,
             problems.append("native_review_attempt_workspace_drift")
             break
     if check_current:
-        problems.extend(code_scope_problems(attempt, state, check_current=True))
+        problems.extend(code_scope_problems(attempt, state, check_current=True,
+                                            cache=cache))
         problems.extend(_execution_current_problems(
             state, str(attempt.get("execution_result_sha256") or ""),
             str(attempt.get("work_item_id") or "")))
@@ -4127,7 +4146,8 @@ def _reviewer_policy_problems(profile: object) -> list[str]:
 
 
 def _review_trust_problems(review: dict, state: dict, *, check_target: bool,
-                           target: str = "") -> list[str]:
+                           target: str = "",
+                           cache: dict | None = None) -> list[str]:
     """复核记录的可信性检查（可选是否要求绑定当前最终证据）。
 
     增量复核的基线需要“除过期以外全部可信”：它绑定的是旧的最终证据，不能
@@ -4161,7 +4181,7 @@ def _review_trust_problems(review: dict, state: dict, *, check_target: bool,
         # G4 必须绑定派发前创建的 attempt；仅有一个“生成时算出的 target”
         # 不能证明 Reviewer 实际审查的是同一快照。
         problems.extend(review_attempt_problems(
-            review, state, check_current=check_target))
+            review, state, check_current=check_target, cache=cache))
         # ingest 是 attempt 的唯一消费点：未经 ingest 消费的记录不能作为门禁
         # 依据，否则手工写入 native_reviews 就能绕过会话/时间绑定。
         attempt = find_review_attempt(
@@ -4199,7 +4219,8 @@ def _review_trust_problems(review: dict, state: dict, *, check_target: bool,
     return problems
 
 
-def _incremental_review_problems(review: dict, state: dict) -> str:
+def _incremental_review_problems(review: dict, state: dict,
+                                 cache: dict | None = None) -> str:
     """增量复核的覆盖复核：基线可信 + 变化量被本轮逐条覆盖。
 
     返回空串表示通过；否则返回原因码。这里是 ingest 校验的收口期复算，
@@ -4217,11 +4238,11 @@ def _incremental_review_problems(review: dict, state: dict) -> str:
             break
     if base is None:
         return "native_review_incremental_base_missing"
-    if _review_trust_problems(base, state, check_target=False):
+    if _review_trust_problems(base, state, check_target=False, cache=cache):
         return "native_review_incremental_base_invalid"
     base_attempt = find_review_attempt(
         state, str(base.get("review_attempt_id") or ""))
-    if code_scope_problems(base_attempt, state, check_current=True):
+    if code_scope_problems(base_attempt, state, check_current=True, cache=cache):
         return "native_review_incremental_code_changed"
     base_coverage = base.get("coverage")
     if not isinstance(base_coverage, dict) or not base_coverage:
@@ -4251,14 +4272,16 @@ def _incremental_review_problems(review: dict, state: dict) -> str:
 
 
 def _eligible_review(review: dict, state: dict, *,
-                     target: str = "") -> tuple[bool, str]:
+                     target: str = "",
+                     cache: dict | None = None) -> tuple[bool, str]:
     """检查一条原生复核记录是否可作为 G4 依据；失败返回原因码。"""
     problems = _review_trust_problems(review, state, check_target=True,
-                                      target=target or final_evidence_digest(state))
+                                      target=target or final_evidence_digest(state),
+                                      cache=cache)
     if problems:
         return False, problems[0]
     if str(review.get("review_scope") or "full").strip().lower() == "incremental":
-        code = _incremental_review_problems(review, state)
+        code = _incremental_review_problems(review, state, cache=cache)
         if code:
             return False, code
     return True, ""
@@ -4366,7 +4389,7 @@ def _review_reason_detail(review: dict, state: dict, code: str) -> str:
     return f"{label} 不可用（{code}）"
 
 
-def _gate_review(state: dict) -> dict:
+def _gate_review(state: dict, *, cache: dict | None = None) -> dict:
     risk = str(state.get("risk") or "").strip().lower()
     if risk in ("low", "medium", "normal"):
         return {"passed": True, "reasons": []}
@@ -4384,7 +4407,7 @@ def _gate_review(state: dict) -> dict:
     reasons = []
     best = None
     for review in reviews:
-        ok, code = _eligible_review(review, state, target=target)
+        ok, code = _eligible_review(review, state, target=target, cache=cache)
         if ok:
             best = review
             break
@@ -4820,10 +4843,14 @@ def _gate_findings(state: dict) -> dict:
     return {"passed": not reasons, "reasons": reasons}
 
 
-def closure_check(state: dict, *, task_dir: str = "") -> dict:
-    criteria = _gate_criteria(state)
-    code_scope = _gate_code_scope(state)
-    quality = _gate_quality(state)
+def closure_check(state: dict, *, task_dir: str = "",
+                  cache: dict | None = None) -> dict:
+    """四门检查。`cache` 只在单次命令内复用代码快照与证据摘要。"""
+    if cache is None:
+        cache = {}
+    criteria = _gate_criteria(state, cache=cache)
+    code_scope = _gate_code_scope(state, cache=cache)
+    quality = _gate_quality(state, cache=cache)
     findings = _gate_findings(state)
     risks = {
         "G1": _gate_actions(state),
@@ -4832,7 +4859,7 @@ def closure_check(state: dict, *, task_dir: str = "") -> dict:
                "reasons": criteria["reasons"] + code_scope["reasons"]
                + quality["reasons"] + findings["reasons"]},
         "G3": _gate_stalled(state),
-        "G4": _gate_review(state),
+        "G4": _gate_review(state, cache=cache),
     }
     reasons = []
     for name in ("G1", "G2", "G3", "G4"):
@@ -4845,17 +4872,21 @@ def closure_check(state: dict, *, task_dir: str = "") -> dict:
             + evidence_warnings(state, task_dir=task_dir)}
 
 
-def close_task(path: str, *, by: str = "zcode-native") -> dict:
+def close_task(path: str, *, by: str = "zcode-native",
+               cache: dict | None = None) -> dict:
+    if cache is None:
+        cache = {}
     state = load_state(path)
     if bool((state.get("closure") or {}).get("closed")):
         return state["closure"]
     if any(not b.get("resolved_at") for b in state.get("blocks") or []):
         raise GovernanceError("存在未解除的阻塞：先 unblock 再收口。")
-    check = closure_check(state, task_dir=os.path.dirname(os.path.abspath(path)))
+    check = closure_check(state, task_dir=os.path.dirname(os.path.abspath(path)),
+                          cache=cache)
     if not check["passed"]:
         summary = "; ".join(f"{r.get('gate')}:{r.get('code')}" for r in check["reasons"])
         raise GovernanceError(f"四门未通过，不能收口：{summary}")
-    quality = quality_summary(state)
+    quality = quality_summary(state, cache=cache)
     # 原始质量结论与任务关闭状态分离：用户接受 PWW 不把 verdict 改写为 PASS。
     verdict = PWW if quality.get("verdict") == PWW else "pass"
     closure_quality = {
@@ -4972,7 +5003,8 @@ def _derive_id(state: dict, base: str) -> str:
     raise GovernanceError(f"派生工作项 id 已用尽：{base}")
 
 
-def derive_work(state: dict, *, reason: str = "partial") -> list[dict]:
+def derive_work(state: dict, *, reason: str = "partial",
+                cache: dict | None = None) -> list[dict]:
     """按未闭合条件 / 停摆项 / G4 缺口本地派生工作项；不调用任何模型。
 
     无进展保护：同一根因被反复派生仍未闭合时，额外派生 AUTO-REPLAN，要求分析根因
@@ -5095,7 +5127,7 @@ def derive_work(state: dict, *, reason: str = "partial") -> list[dict]:
             if str(active.get("acceptance_status") or "") in ("stale",
                                                               "superseded"):
                 continue
-            if _code_scope_status(active, state).get("reasons"):
+            if _code_scope_status(active, state, cache).get("reasons"):
                 continue
             accept_derived = True
             # 接受条件不能由执行方“核销”：只能把用户明确表达交给 accept。
@@ -5137,7 +5169,7 @@ def derive_work(state: dict, *, reason: str = "partial") -> list[dict]:
             "失败原因分析 + 新的执行结果/证据；若确属外部阻塞，用 block 记录原因与所需条件",
             origin="recovery")
 
-    check = closure_check(state)
+    check = closure_check(state, cache=cache)
     acceptance_only = {"pww_acceptance_pending", "pww_acceptance_partial"}
     quality_codes = sorted({
         str(r.get("code") or "") for r in check.get("reasons") or []
@@ -5242,7 +5274,7 @@ def derive_work(state: dict, *, reason: str = "partial") -> list[dict]:
     return created
 
 
-def _evaluate_core(state: dict) -> dict:
+def _evaluate_core(state: dict, *, cache: dict | None = None) -> dict:
     """本地阶段求值；返回 phase、work、gate、next_commands 与说明。"""
     if bool((state.get("closure") or {}).get("closed")):
         return {
@@ -5303,9 +5335,9 @@ def _evaluate_core(state: dict) -> dict:
             "gate": None, "criteria": criteria,
             "next_commands": ["copilot_auto.py drive --state <state>（本地派生恢复工作项）"],
         }
-    check = closure_check(state)
+    check = closure_check(state, cache=cache)
     if check["passed"]:
-        quality = quality_summary(state)
+        quality = quality_summary(state, cache=cache)
         reason = "完成条件与四门全部通过"
         if quality.get("verdict") == PWW:
             reason = ("四门通过，质量结论为已接受的 PASS_WITH_WARNINGS（"
@@ -5323,9 +5355,9 @@ def _evaluate_core(state: dict) -> dict:
     }
 
 
-def evaluate(state: dict) -> dict:
+def evaluate(state: dict, *, cache: dict | None = None) -> dict:
     """本地阶段求值；附带非阻断提醒（不影响 phase 与四门）。"""
-    result = _evaluate_core(state)
+    result = _evaluate_core(state, cache=cache)
     warnings = contract_source_warnings(state)
     if warnings:
         result["warnings"] = warnings
@@ -5363,8 +5395,9 @@ def _assert_open(state: dict, action: str, *, allow_blocked: bool = False) -> No
 
 
 # ── 渲染 / 历史只读 ────────────────────────────────────────────────────────
-def render_status(state: dict, evaluation: dict | None = None) -> str:
-    ev = evaluation or evaluate(state)
+def render_status(state: dict, evaluation: dict | None = None, *,
+                  cache: dict | None = None) -> str:
+    ev = evaluation or evaluate(state, cache=cache)
     criteria = ev.get("criteria") or _criteria_summary(state)
     lines = [
         f"任务 {state.get('task_id')} · 阶段 {ev.get('phase')} · "
@@ -5374,7 +5407,7 @@ def render_status(state: dict, evaluation: dict | None = None) -> str:
         + (f"；未闭合 {', '.join(criteria.get('unmet') or [])}"
            if criteria.get("unmet") else ""),
     ]
-    quality = quality_summary(state)
+    quality = quality_summary(state, cache=cache)
     if quality.get("verdict") == PWW:
         accepted = "、".join(quality.get("accepted_ids") or []) or "无"
         lines.append(

@@ -8,7 +8,7 @@ when_to_use: >
   原生完成，不进入本 Skill。
 ---
 
-# copilot：轻量协作治理（v6.10.0）
+# copilot：轻量协作治理（v6.11.0）
 
 Copilot 是运行在 ZCode 内的**协作治理层**，不是决策模型，也不是执行体。它负责把任务变成可
 追踪的合同、状态、证据与收口条件，并在任务没有真正完成时继续推进。
@@ -481,8 +481,23 @@ severity）→ 集中修复 → 针对性复核（只验证修复、新问题、
 
 ## 版本
 
-当前版本 **v6.10.0（ZCode Autonomous Development Edition）**。v6.10.0 收敛复核频率与
-工具执行判定：
+当前版本 **v6.11.0（ZCode Autonomous Development Edition）**。v6.11.0 是效率与性能专项，
+只减少重复开销，不改判定规则：
+
+- **字节码预编译**：文档命令统一用 `python3 -B`，`-B` 只禁止写 `.pyc`、不禁止读取。
+  `sync_runtime.py --apply` 在同步后编译运行时字节码，单次命令不再重复编译约
+  17k 行源码。行为不变；解释器版本或源码变化时 Python 自行重编译。
+- **一次命令一次快照**：`capture_code_snapshot` 新增可选 `cache`，由命令入口
+  （`drive`/`status`/`closure-check`）在单次进程内复用同一工作区快照；`close_task`、
+  `_evaluate_core`、`_gate_quality`、`derive_work` 共用一份，不再对同一工作区反复
+  扫描 git。库调用与测试默认 `cache=None`，漂移检测仍逐次重算。
+- **更少的 git 子进程**：工作区根与 HEAD 合并为一次 `rev-parse`（失败才分开重试）；
+  `git_root()` 单进程按目录缓存（一个任务的多个证据路径不再各跑一次 git）。
+- **未放宽**：G1–G4、fail-closed、代码范围/证据绑定、漂移检测与 PWW 接受规则不变；
+  缓存只复用同一命令内的只读结果，不跨进程。畸形仓库（index 有 gitlink 但缺
+  `.gitmodules`）仍按 `submodule_status_failed` 让快照不可用。
+
+v6.10.0 收敛复核频率与工具执行判定：
 
 - **三级复核策略**：`risk=low`（文档/文案/样式/简单修复）与 `risk=medium`（普通开发/
   多页面 UI/常规重构，历史 `normal` 等价）默认不派 Reviewer；只有声明实质触发因素且独立

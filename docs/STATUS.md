@@ -2,6 +2,96 @@
 
 更新：2026-11-16 CST。本文件只记录现场可核实的事实；规划与未完成事项单独标注。
 
+## 效率与性能专项（2026-11-16，v6.11.0）
+
+基线：HEAD `0ee2209`（v6.10.0，工作区 clean）；本轮只改源码与运行时，**未提交、未推送**。
+
+### 现场证据（升级前）
+
+- 单条命令约 200ms，其中约 130ms 为源码重编译：`python3 -X importtime` 显示
+  `governance` 自身 92.7ms、`copilot_dispatch` 20.5ms、`native_bridge` 18.3ms；
+  而同一份代码在存在有效 `__pycache__` 时 `import copilot_dispatch` 仅 65ms。
+  `-B` 只禁止**写入** `.pyc`，因此没有预编译时每条命令都重新编译约 17k 行源码。
+- `closure-check` 对同一工作区做 2 次 `capture_code_snapshot`（各约 60ms），
+  `drive` 到 PASS 的路径最多 4 次（`evaluate` → `_gate_quality` → `close_task` →
+  `quality_summary`）；`derive_work` 对每个 PWW 接受条件各 1 次。
+- 每次快照 4 个 git 子进程（各约 13ms）；`_task_workspace_info` 对每个证据路径各跑
+  一次 `git_root`。
+
+### 已实施
+
+- `code_scope.capture_code_snapshot(..., cache=None)` + `code_scope_problems(cache=)`：
+  单次命令内按 `(workspace, 排除集, base)` 复用快照，命中返回深拷贝；库调用与测试
+  默认不缓存，漂移检测仍逐次重算。
+- `governance` 侧 `closure_check` / `_evaluate_core` / `evaluate` / `render_status` /
+  `derive_work` / `close_task` / `quality_summary` / `_gate_quality` /
+  `_gate_code_scope` / `_gate_criteria` / `_gate_review` / `review_attempt_problems` /
+  `_review_trust_problems` / `_eligible_review` / `_incremental_review_problems`
+  增加可选 `cache`；`drive`、`status`（含 `_brief`）、`closure-check` 入口创建并复用。
+- `_gate_criteria` 证据文件重读按 `(path, mtime_ns, size)` 去重。
+- `capture_code_snapshot`：`rev-parse --show-toplevel HEAD` 合并为一次调用（失败才分开
+  重试）。**否决**“无 `.gitmodules` 跳过 `git submodule status`”：实测该调用在 index
+  含 gitlink 而缺 `.gitmodules` 时以 128 失败，旧行为是快照不可用，跳过会静默缩小代码
+  范围；保留无条件调用并加回归测试。
+- `code_scope.git_root()` 单进程按起始目录缓存**成功**结果（非仓库不缓存）。
+- `sync_runtime.py --apply` 同步后 `compileall` 运行时 `scripts/*.py`（只编译受管理
+  文件，运行时里未受管理的遗留脚本不会让同步失败）；`--check` 口径不变
+  （`__pycache__`、`.pyc` 不在分发集合内）。
+- `references/runtime.md` 补充恢复语义：没有单独 `--resume` 开关（续跑即用同一
+  `--state`）；恢复后重新核实工具权限、不继承历史权限声明；仍有效的证据与未消费
+  attempt 复用，已消费/漂移/宿主记录变化的重建。
+- 版本 `6.11.0`；`SKILL.md`、`README.md`、`DECISIONS.md` 第 54 条同步记录。
+
+### 实测（同一基准：400 文件 / 60 变更 / 10 未跟踪，重复 3 次取最小值）
+
+| 命令 | 升级前 | 升级后 | 变化 |
+|---|---|---|---|
+| `status --json` | 204ms | 96ms | −53% |
+| `closure-check --json` | 211ms | 98ms | −54% |
+| `review-metrics --json` | 215ms | 94ms | −56% |
+| `handoff --json` | 227ms | 103ms | −55% |
+| `review-admission --workspace` | 275ms | 159ms | −42% |
+| `status`（已接入质量报告） | 396ms | 158ms | −60% |
+| `closure-check`（同上） | 323ms | 158ms | −51% |
+| `quality`（同上） | 301ms | 166ms | −45% |
+| `drive`（同上，到 PASS/CLOSED） | 311ms | 166ms | −47% |
+| `report --verify-report`（含采集子进程） | 540ms | 282ms | −48% |
+
+（口径：同一基准目录、每条命令重复 3 次取最小值，升级前/后同一机器、无并发负载。
+上表为**最终代码**的复测值；保留 `git submodule status` 无条件调用与机器波动使
+部分项比中途版本高约 10–40ms。）
+
+- 测试（最终代码）：活动 **799 条 OK，63.0s**（升级前 786 条 78.5s）；legacy
+  **853 条 OK（skip 32），98.3s**（升级前 93.7s）；新增
+  `tests/test_efficiency_v611.py` 13 条，覆盖缓存复用、缓存键、`git_root` 缓存、
+  单次 `closure-check` 只扫描一次、跨命令篡改检测、gitlink 畸形仓库 fail-closed
+  与同步预编译。
+- 运行时实测（`~/.zcode/skills/copilot/scripts/copilot_dispatch.py status`，
+  同一任务、同一机器、多次取最小值）：有预编译字节码 **115–144ms**；移走
+  `scripts/__pycache__` 后 **250–262ms**；恢复后与 warm 一致（波动来自机器负载）。
+- T4 隔离验收（最终代码）：T0 28 条 OK / T1 356 条 OK / T2 799 条 OK / T3 853 条
+  OK（skip 32），34/34 场景通过，`all_layers_ok` 与 `all_scenarios_ok` 均为 true
+  （`/tmp/copilot-bench/t4-freeze.json`，临时文件不进仓库）。
+- 新会话加载（已实测）：全新 headless ZCode 会话
+  （`node /opt/ZCode/resources/glm/zcode.cjs -p …`，空目录、只读提问）加载运行时 Skill，
+  正确回答版本 `v6.11.0`、`capture_code_snapshot` 单次进程快照复用规则，以及
+  `risk=low/medium` 默认不派 Reviewer、`risk=high` 恒走 G4。
+- 运行时一致：`--check` 缺失 0 / 不同 0（28 个受管理文件），8 个未受管理历史文件保留；
+  `--baseline` 刷新为 28 个文件。关键文件源码与运行时 SHA-256 相同
+  （`SKILL.md` `6bf54b32…`、`governance.py` `56ce0127…`、`code_scope.py` `0700e33d…`、
+  `copilot_auto.py` `f2b5eaf2…`、`copilot_dispatch.py` `32244f39…`、
+  `references/runtime.md` `09a763a7…`、`references/workflow.md` `817f7df2…`）。
+- **未验证**：
+  - 真实 GUI 会话内加载：未启动新 GUI 会话（当前会话启动期缓存的是旧版本）；
+    headless 新会话已实测。
+  - 真实高风险 G4 全链路耗时（需要宿主只读子代理会话）。
+  - 数万文件大仓库上的快照耗时：只按 400 文件基准外推，未实测。
+
+### 未改变
+
+G1–G4 判定、fail-closed、证据/代码范围绑定、漂移与篡改检测、PWW 接受规则、状态字段、
+运行时分发集合均未变化；没有新增依赖、MCP、Provider 或远程模型调用。
+
 ## 复核频率与工具执行判定（2026-11-16，v6.10.0）
 
 基线：HEAD `92a1105`（v6.9.0，工作区 clean）。**本轮未提交、未推送。**

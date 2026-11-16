@@ -30,6 +30,7 @@ tests/、docs/、manifests/、scripts-sync/、README.md、AGENTS.md 属于源码
 from __future__ import annotations
 
 import argparse
+import compileall
 import hashlib
 import os
 import re
@@ -240,6 +241,45 @@ def apply_tree(source_root: str, target_root: str, prune: bool = False) -> dict[
             "extra": len(extra) - pruned}
 
 
+def precompile_bytecode(skill_dest: str,
+                        names: list[str] | None = None) -> dict[str, int]:
+    """预编译运行时的 Python 字节码（构建产物，不参与分发比对）。
+
+    文档里的命令统一使用 `python3 -B`：`-B` 只禁止**写入** `.pyc`，不禁止读取。
+    因此缺少有效 `.pyc` 时，每次调用都要重新编译约一万七千行源码（实测每次
+    ~130ms，占单命令耗时的大半）。同步后编译一次，后续命令直接复用；
+    解释器版本变化或源码被改动时 Python 会自行重新编译，不会用旧字节码。
+
+    `names` 给出受管理文件的相对路径时只编译这些文件：运行时里遗留的未受管理
+    脚本不应让同步失败。
+    """
+    scripts = os.path.join(skill_dest, "scripts")
+    if not os.path.isdir(scripts):
+        return {"compiled": 0, "failed": 0}
+    if names is None:
+        targets = [name for name in sorted(os.listdir(scripts))
+                   if name.endswith(".py")]
+    else:
+        targets = sorted(name[len("scripts/"):] for name in names
+                         if name.startswith("scripts/")
+                         and name.endswith(".py")
+                         and "/" not in name[len("scripts/"):])
+    compiled = failed = 0
+    for name in targets:
+        path = os.path.join(scripts, name)
+        if not os.path.isfile(path):
+            continue
+        try:
+            ok = compileall.compile_file(path, quiet=2, force=True)
+        except (OSError, SyntaxError):
+            ok = False
+        if ok:
+            compiled += 1
+        else:
+            failed += 1
+    return {"compiled": compiled, "failed": failed}
+
+
 def _looks_like_copilot_skill(target: str) -> bool:
     skill_md = os.path.join(target, "SKILL.md")
     if not os.path.isfile(skill_md):
@@ -359,6 +399,20 @@ def main(argv=None) -> int:
               file=sys.stderr)
         return 1
     print("同步后复查：Skill 缺失 0、不同 0。")
+
+    # 字节码是运行时构建产物（__pycache__ 不在分发集合内），同步后编译一次，
+    # 让文档里的 `python3 -B` 命令不再每次重编译源码。
+    try:
+        bytecode = precompile_bytecode(skill_dest, sorted(src))
+    except OSError as exc:
+        print(f"提示：运行时字节码预编译失败（不影响源码一致性）：{exc}",
+              file=sys.stderr)
+        return 0
+    if bytecode["failed"]:
+        print(f"错误：字节码预编译失败 {bytecode['failed']} 个文件；"
+              "运行时脚本可能存在语法错误。", file=sys.stderr)
+        return 1
+    print(f"运行时字节码：已编译 {bytecode['compiled']} 个文件（-B 下复用，不参与分发比对）。")
     return 0
 
 

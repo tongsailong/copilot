@@ -1304,3 +1304,47 @@
     - **G4 权限不变**：仍是 `Read/Grep/Glob` + 禁用 `Write/Edit/Bash`；不新建沙箱、不修改
       宿主安全策略、不扩大子代理写入权限。`host_records.tool_execution_state()` 为
       `g4_attest`、`native_agent review` 与 `capability` 的唯一判定入口。
+
+54. **效率与性能专项：一次命令一次快照，同步后预编译字节码（2026-11-16，v6.11.0）。**
+    - **问题证据（升级前实测，400 文件 / 60 变更的基准工作区）**：单条命令约 200ms，
+      其中约 130ms 是源码重编译——文档命令统一用 `python3 -B`，`-B` 禁止写 `.pyc`，
+      但没有有效 `.pyc` 时每次都要重新编译 `governance.py`（80ms/231KB）等模块。
+      `closure-check` 对同一工作区做 **2** 次完整代码快照（各约 60ms），
+      `drive` 到 PASS 的路径最多 4 次；`derive_work` 对每个 PWW 接受条件各做 1 次；
+      每次快照 4 个 git 子进程（`rev-parse` ×2、`status`、`submodule status`，各约
+      13ms），`_task_workspace_info` 还会对每个证据路径各跑一次 `git_root`。
+    - **决策**：只做“同一次命令内复用只读结果”的优化，不改任何判定规则、门禁、
+      证据绑定或漂移语义。
+      - `code_scope.capture_code_snapshot(..., cache=None)`：`cache` 为单次命令的
+        复用容器，键为 `(workspace, 排除集, base)`；命中返回深拷贝，避免调用方
+        改写污染；`code_scope_problems` 同样接收 `cache`。
+      - `governance.closure_check/_evaluate_core/evaluate/render_status/derive_work/
+        close_task/quality_summary/_gate_quality/_gate_code_scope/_gate_criteria/
+        _gate_review/review_attempt_problems/_review_trust_problems/
+        _eligible_review/_incremental_review_problems` 增加可选 `cache`；
+        `drive`、`status`、`closure-check` 命令入口创建并复用一份。
+        **库调用与测试默认 `cache=None`**：漂移检测、篡改检测仍逐次重算，
+        不继承任何旧快照。
+      - `_gate_criteria` 重读证据文件时按 `(path, mtime_ns, size)` 去重，
+        同一文件被多条条件引用只算一次（文件在进程内被改写会重新计算）。
+      - `capture_code_snapshot` 合并 `rev-parse --show-toplevel HEAD`（失败才分开
+        重试，空仓库行为不变）；`code_scope.git_root()` 按起始目录缓存成功结果
+        （不缓存“非仓库”）。
+      - **否决**“无 `.gitmodules` 就跳过 `git submodule status`”：实测该调用在 index
+        含 gitlink 而缺 `.gitmodules` 时以 128 失败，原行为是快照不可用（fail-closed）。
+        跳过会把未初始化/未声明的 gitlink 目录静默移出代码范围，为省一次子进程降低
+        强度不值得。保留无条件调用并加回归测试。
+      - `sync_runtime.py --apply` 同步后对运行时 `scripts/*.py` 执行
+        `compileall`（构建产物，`__pycache__`/`.pyc` 本就不在分发集合内，不影响
+        `--check` 一致性）。`-B` 允许**读取**已有 `.pyc`，因此命令启动不再编译。
+    - **不采纳**：去掉文档里的 `-B`。`-B` 让每次执行都从源码编译，是当前唯一的
+      “绝不使用过期字节码”保证；预编译 + Python 自带的 mtime/size 校验已足够，
+      无需靠关闭 `-B` 换取速度。
+    - **实测（同一基准，重复 3 次取最小值，最终代码）**：`status` 204→96ms、
+      `closure-check` 211→98ms、`review-metrics` 215→94ms、`handoff` 227→103ms、
+      `review-admission` 275→159ms、`drive`（已接入 PASS 报告）311→166ms、
+      `quality` 301→166ms、`report --verify-report` 540→282ms（含
+      `code_scope_capture.py` 子进程）；运行时 CLI 单命令 253ms→115ms（有/无预编译
+      字节码）。活动测试 799 条 63.0s（升级前 786 条 78.5s）、legacy 853 条 98.3s
+      （升级前 93.7s）、T4 34/34 场景通过。没有远程模型调用、没有新增依赖、
+      没有状态字段变化。

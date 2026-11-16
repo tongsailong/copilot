@@ -35,7 +35,7 @@ import governance as G  # noqa: E402
 import agent_policy as AP  # noqa: E402
 import review_policy as RP  # noqa: E402
 
-__version__ = "6.10.0"
+__version__ = "6.11.0"
 
 
 class CLIError(Exception):
@@ -124,8 +124,9 @@ def _print(obj) -> None:
 
 
 def _brief(state: dict) -> str:
-    ev = G.evaluate(state)
-    return G.render_status(state, ev)
+    cache: dict = {}
+    ev = G.evaluate(state, cache=cache)
+    return G.render_status(state, ev, cache=cache)
 
 
 # ── 命令实现 ───────────────────────────────────────────────────────────────
@@ -154,11 +155,12 @@ def cmd_start(args) -> int:
 
 def cmd_next(args) -> int:
     state = G.load_state(_state_path(args))
-    ev = G.evaluate(state)
+    cache: dict = {}
+    ev = G.evaluate(state, cache=cache)
     if args.json:
         _print({"task_id": state.get("task_id"), **ev})
     else:
-        print(G.render_status(state, ev))
+        print(G.render_status(state, ev, cache=cache))
     return 0
 
 

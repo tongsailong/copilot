@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import copy
 import json
 import os
 import re
@@ -20,6 +21,9 @@ _EXCLUDE_PARTS = {
     "node_modules", ".venv", "venv",
 }
 _EXCLUDE_NAMES = {".state.json.lock"}
+
+# 单进程内的 git 根缓存（成功结果）；不跨进程，不写盘。
+_GIT_ROOT_CACHE: dict[str, str] = {}
 
 
 def _name_allowed(rel: str) -> bool:
@@ -89,10 +93,22 @@ def governance_paths(state_path: str) -> list[str]:
 
 
 def git_root(path: str) -> str:
+    """路径所属 git 仓库根。
+
+    结果在单进程内按起始目录缓存（`git rev-parse` 每次约 3ms，而一个任务可能
+    对每个证据路径各查一次）。只缓存成功结果：非仓库目录不缓存，避免测试或
+    新建仓库场景读到旧判断。
+    """
     target = os.path.abspath(path)
     start = target if os.path.isdir(target) else os.path.dirname(target)
+    cached = _GIT_ROOT_CACHE.get(start)
+    if cached is not None:
+        return cached
     result = _git(start, "rev-parse", "--show-toplevel")
-    return os.path.abspath(result.stdout.strip()) if result.returncode == 0 else ""
+    root = os.path.abspath(result.stdout.strip()) if result.returncode == 0 else ""
+    if root:
+        _GIT_ROOT_CACHE[start] = root
+    return root
 
 
 def evidence_roots(state: dict) -> list[str]:
@@ -401,17 +417,29 @@ def _nested_repo_roots(root: str, rel_paths: list[str],
 
 def capture_code_snapshot(workspace: str = "",
                           exclude_paths: list[str] | None = None,
-                          base: str = "") -> dict:
+                          base: str = "",
+                          cache: dict | None = None) -> dict:
     """读取工作区 git 变更并计算每个文件的 SHA-256。
 
     覆盖 tracked 修改、untracked、删除、重命名；`.gitignore` 排除构建输出，
     治理临时目录与常见缓存目录另行排除。证据文件是否排除由调用方决定：质量报告
     不排除已登记证据；G4 只排除未被 git 跟踪的证据产物，已跟踪源文件即使登记为
     证据也必须进入快照。证据内容由独立证据快照绑定。
+
+    `cache` 是**单次命令内**的复用容器（同一进程内同一工作区的快照只算一次）。
+    默认 `None` 表示不缓存：库调用方与测试需要看到调用时刻的真实工作区状态，
+    不能继承旧快照。命中缓存时返回深拷贝，避免调用方改写污染后续读取。
     """
     workspace = os.path.abspath(os.path.expanduser(workspace or os.getcwd()))
     excluded = {os.path.abspath(os.path.expanduser(p))
                 for p in (exclude_paths or [])}
+    cache_key = None
+    if cache is not None:
+        cache_key = ("code_snapshot", workspace, tuple(sorted(excluded)),
+                     str(base or "").strip())
+        cached = cache.get(cache_key)
+        if isinstance(cached, dict):
+            return copy.deepcopy(cached)
     snapshot: dict = {
         "workspace": workspace,
         "git_root": "",
@@ -426,15 +454,24 @@ def capture_code_snapshot(workspace: str = "",
         "excluded_paths": sorted(excluded),
         "digest": "",
     }
-    top = _git(workspace, "rev-parse", "--show-toplevel")
+    # 一次 git 调用同时取工作区根与 HEAD；失败时才分开重试（空仓库没有 HEAD）。
+    top = _git(workspace, "rev-parse", "--show-toplevel", "HEAD")
     if top.returncode != 0:
+        only_top = _git(workspace, "rev-parse", "--show-toplevel")
+        if only_top.returncode != 0:
+            snapshot["reason"] = "not_git_repository"
+            return snapshot
+        top_lines = [only_top.stdout.strip()]
+    else:
+        top_lines = [line.strip() for line in top.stdout.splitlines()
+                     if line.strip()]
+    root = os.path.abspath(top_lines[0]) if top_lines and top_lines[0] else ""
+    if not root:
         snapshot["reason"] = "not_git_repository"
         return snapshot
-    root = os.path.abspath(top.stdout.strip())
     snapshot["git_root"] = root
-    head = _git(root, "rev-parse", "HEAD")
-    if head.returncode == 0:
-        snapshot["git_head"] = head.stdout.strip()
+    if len(top_lines) > 1 and top_lines[1]:
+        snapshot["git_head"] = top_lines[1]
     base_entries: dict[str, dict] = {}
     base = str(base or "").strip()
     if base:
@@ -518,6 +555,9 @@ def capture_code_snapshot(workspace: str = "",
             entry["kind"] = "missing"
         files.append(entry)
     files.sort(key=lambda item: (item["path"], item["status"]))
+    # `.gitmodules` 缺失但 index 里有 gitlink（160000）时，本调用会以 128 失败。
+    # 这是畸形仓库：旧行为是快照不可用（fail-closed），不能为了省一次子进程把
+    # 未初始化/未声明的 gitlink 目录静默移出代码范围。因此这里保持无条件调用。
     submodules = _git(root, "submodule", "status", "--recursive")
     if submodules.returncode != 0:
         snapshot["reason"] = "submodule_status_failed"
@@ -558,6 +598,8 @@ def capture_code_snapshot(workspace: str = "",
         return snapshot
     snapshot["available"] = True
     snapshot["digest"] = snapshot_digest(snapshot)
+    if cache_key is not None:
+        cache[cache_key] = copy.deepcopy(snapshot)
     return snapshot
 
 
@@ -578,7 +620,8 @@ def _snapshot_known_paths(items: object) -> set[str]:
 
 
 def code_scope_problems(attempt: dict, state: dict | None = None, *,
-                        check_current: bool = True) -> list[str]:
+                        check_current: bool = True,
+                        cache: dict | None = None) -> list[str]:
     """attempt 冻结的代码范围必须存在，且当前工作区未发生漂移。"""
     if not isinstance(attempt, dict):
         return ["native_review_code_scope_missing"]
@@ -616,7 +659,7 @@ def code_scope_problems(attempt: dict, state: dict | None = None, *,
                 excluded.add(absolute)
     current = capture_code_snapshot(
         str(snapshot.get("workspace") or ""), exclude_paths=sorted(excluded),
-        base=str(snapshot.get("git_base") or ""))
+        base=str(snapshot.get("git_base") or ""), cache=cache)
     if not current.get("available"):
         return ["native_review_code_scope_unavailable"]
     if str(current.get("digest") or "") != str(snapshot.get("digest") or ""):

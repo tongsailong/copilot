@@ -84,6 +84,9 @@ Agent、G4 只读复核、DesignWise。Executor / Reviewer 是 ZCode 工程执�
    ```
 
    同步只覆盖 Skill（Profile 不参与分发）；`--prune` 仅在明确要求清理运行时多余文件时使用。
+   `--apply` 结束时会预编译运行时字节码（`__pycache__` 不在分发集合内，`--check` 口径不变）。
+   源码仓库本地同样可以执行 `python3 -m compileall -q scripts`：文档命令都用 `python3 -B`，
+   `-B` 只禁止写 `.pyc` 不禁止读，预编译后每条命令少约 130ms 源码重编译；不要为提速去掉 `-B`。
 6. 真实模型调用、push、发布、部署均需单独授权；本地 commit 仅在任务明确授权时执行。
 
 ## 5. Copilot 闭环规则
