@@ -7,6 +7,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -48,7 +49,48 @@ class AdmissionTests(unittest.TestCase):
         decision = G.review_admission(state)
         self.assertEqual(decision["decision"], "not_required")
         self.assertEqual(decision["scope"], "none")
-        self.assertIn("确定性测试", decision["detail"])
+        self.assertEqual(decision["tier"], "medium")
+        self.assertIn("主代理", decision["detail"])
+
+    def test_low_risk_task_never_dispatches_reviewer(self):
+        decision = G.review_admission({"risk": "low", "review_stops": []})
+        self.assertEqual(decision["decision"], "not_required")
+        self.assertEqual(decision["scope"], "none")
+        self.assertEqual(decision["tier"], "low")
+        self.assertIn("低风险", decision["detail"])
+
+    def test_medium_risk_task_does_not_force_full_review(self):
+        decision = G.review_admission({"risk": "medium", "review_stops": []})
+        self.assertEqual(decision["decision"], "not_required")
+        self.assertEqual(decision["tier"], "medium")
+
+    def test_low_risk_explicit_trigger_escalates_to_advisory(self):
+        decision = G.review_admission(
+            {"risk": "low", "review_stops": []},
+            triggers=["security"], reason="意外涉及凭据读取")
+        self.assertEqual(decision["decision"], "required")
+        self.assertEqual(decision["scope"], "advisory")
+
+    def test_unknown_risk_fails_closed(self):
+        with self.assertRaises(RP.ReviewPolicyError):
+            RP.admission(risk="whatever")
+        with self.assertRaises(RP.ReviewPolicyError):
+            RP.admission(risk="")
+
+    def test_stop_marker_maps_to_not_needed_for_non_high(self):
+        state = {"task_id": "t", "risk": "medium", "review_stops": []}
+        blocked = {"allowed": False, "code": "review_not_needed",
+                   "detail": "same snapshot"}
+        with mock.patch.object(G.RP, "reentry_decision",
+                               return_value=blocked):
+            decision = G.review_admission(state)
+        self.assertEqual(decision["decision"], "not_needed")
+        state["risk"] = "high"
+        with mock.patch.object(G.RP, "reentry_decision",
+                               return_value=blocked):
+            decision = G.review_admission(state)
+        self.assertEqual(decision["decision"], "required")
+        self.assertEqual(decision["scope"], "g4")
 
     def test_high_risk_always_requires_g4(self):
         decision = G.review_admission({"risk": "high", "review_stops": []})
@@ -493,6 +535,28 @@ class CliEfficiencyTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         payload = json.loads(proc.stdout)
         self.assertEqual(payload["decision"], "not_required")
+        self.assertEqual(payload["tier"], "medium")
+
+    def test_admission_cli_reports_low_tier_without_review(self):
+        path = os.path.join(self.tmp.name, "low.json")
+        G.start_state(path, goal="改文案", contract=F.CONTRACT, risk="low")
+        proc = F.run_cli("copilot_dispatch.py", "review-admission",
+                         "--state", path, "--json")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        payload = json.loads(proc.stdout)
+        self.assertEqual(payload["tier"], "low")
+        self.assertEqual(payload["decision"], "not_required")
+
+    def test_legacy_normal_risk_is_stored_as_medium(self):
+        path = os.path.join(self.tmp.name, "normal.json")
+        G.start_state(path, goal="目标", contract=F.CONTRACT, risk="normal")
+        self.assertEqual(G.load_state(path)["risk"], "medium")
+
+    def test_start_accepts_low_and_medium_risks(self):
+        for risk in ("low", "medium"):
+            path = os.path.join(self.tmp.name, f"{risk}.json")
+            G.start_state(path, goal="目标", contract=F.CONTRACT, risk=risk)
+            self.assertEqual(G.load_state(path)["risk"], risk)
 
     def test_admission_cli_reports_required_for_security_trigger(self):
         proc = F.run_cli("copilot_dispatch.py", "review-admission",

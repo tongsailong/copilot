@@ -89,7 +89,7 @@ copilot_dispatch.py formal-review --state <state> --verdict pass \
 生成完整 G4 信封。普通复核的价值是发现 ZCode 自检看不到的问题，不是重复一遍自检。
 是否派发子代理按 `SKILL.md` 的五问清单判断；0–2 个是常见起点，不是配额。
 
-### 风险准入与停止（v6.8.0）
+### 风险准入与停止（v6.8.0；三级策略 v6.10.0）
 
 派发前先做一次本地准入判断：
 
@@ -98,9 +98,14 @@ copilot_dispatch.py review-admission --state <state> [--trigger security \
   --trigger core-logic] --reason "为什么需要独立复核"
 ```
 
-- `risk=high` 恒为 `required`（G4）；普通风险默认 `not_required`，只有声明
-  `security` / `permissions` / `core-logic` / `data-integrity` / `architecture` /
-  `global-execution` / `production` / `release` 之一才建议派发。
+- 决策附带 `tier=low|medium|high`：`low`（文档/文案/样式/简单修复/小范围既有模式改动）
+  与 `medium`（普通开发/多页面 UI/常规重构；历史 `normal` 等价）默认 `not_required`；
+  `high` 恒为 `required`（G4）。低/中风险任务由主代理完成实现、自检与测试，不建立复核
+  计划。只有声明 `security` / `permissions` / `core-logic` / `data-integrity` /
+  `architecture` / `global-execution` / `production` / `release` 之一且独立视角确有
+  收益时，才派发一次定向只读复核；显式触发因素优先于风险标签（低风险声明 `security`
+  会升级为一次定向复核）。
+- 针对性调查、`Explore` 咨询不是正式复核：不创建 attempt、G4 任务或台账。
 - 文案、格式、纯文档、注释与已被确定性测试覆盖的局部修改不派 Reviewer。高风险 G4 的
   代码范围包含 tracked 文档：G4 PASS 之后文档变化同样使旧快照失效，需要重新完整复核；
   这是代码范围绑定，不表示低风险文案任务也必须复核。
@@ -115,6 +120,8 @@ copilot_dispatch.py review-admission --state <state> [--trigger security \
   并给出 `--reason`；准入记录写入 `review_admissions`，可审计。
 - 同一工作项、执行结果、目标、代码范围、scope 与证据清单的未消费 attempt 直接复用；
   重复运行 `review-context --create-attempt` 不会产生第二个派发快照。
+- 不重复检查未变化的代码/证据，不为凑轮次重新派发；局部修复只验证受影响部分，只有整体
+  架构、关键契约或风险范围实质变化时才重新完整复核。
 
 ### Finding 台账与定向复验
 
@@ -220,6 +227,18 @@ finding 必须有可达的缺陷机制、实际影响与可核实证据（文件
 - 实际读取由 `native_agent.py` 从宿主 `tool_usage`/`part` 合并，不要求 Reviewer 手工
   复述；`commands_run` 恒为空。结论可用 `native_agent.py review` 生成信封并回填；
   `g4_eligible` 只是信封结构预检，正式资格由新链 `g4_attest`/`g4_shadow` 决定。
+- **工具请求 ≠ 工具执行**：宿主记录分为 `completed`、`denied_not_executed`、
+  `executed_failed`、`execution_unknown`。只有错误类型为策略/权限/工具缺失
+  （`permission_denied`/`policy_denied`/`tool_not_allowed`/`tool_not_found`）且执行
+  时长、输出、退出码都为空或零时，才算“拒绝且未执行”。被拒绝的 `Bash`/`Write`/`Edit`
+  请求不计入 G4 白名单违规、不触发只读/副作用检查、不消耗 attempt，Reviewer 继续用
+  `Read/Grep/Glob` 完成复核；实际执行写/执行工具仍不合格，`running`/`cancelled` 等
+  状态未知一律 fail-closed。同一越权工具反复被拒绝时记录 `repeated_denied_calls`，
+  应停止无效重试，必要时由主代理终止会话并新建只读复核。
+- **审计字段口径**：`g4_attest` 的 `tools`/`tool_counts` 是**请求**计数（含 denied），
+  `executed_tools` 只含实际执行/状态未知的调用，`denied_tool_calls`/
+  `denied_tool_counts` 单独列出拒绝请求；`native_agent` 的 `host.tool_calls` 只统计
+  实际执行调用。读取审计记录时不要混用两类计数。
 - **普通复核 PASS 不等于 G4**；`g4_eligible=false` 的结论只能作参考。
 - 失败处理：复核信封被拒时先看原因码——绑定/过期/只读边界是流程问题，修流程后
   重试；finding 是实质问题，修复后复核。不要因为复核失败就把任务标为 BLOCKED；被拒

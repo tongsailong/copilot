@@ -21,7 +21,7 @@ python3 -B scripts/copilot_dispatch.py <子命令> --state <state.json> [参数]
 
 | 子命令 | 用途 | 关键参数 |
 |---|---|---|
-| `start` | 创建任务合同 | `--goal`、`--contract-file`、`--criteria-file`、`--test-policy`/`--test-policy-file`（JSON：`required`/`commands`/`report`/`artifacts`/`require_*`）、`--risk normal\|high`、`--backend legacy\|native`、`--task-id`、`--mode`、`--note`、`--workspace`（省略取状态文件所在目录的 git 根）；`--risk high` 必须配 `--backend native` |
+| `start` | 创建任务合同 | `--goal`、`--contract-file`、`--criteria-file`、`--test-policy`/`--test-policy-file`（JSON：`required`/`commands`/`report`/`artifacts`/`require_*`）、`--risk low\|medium\|high`（历史 `normal` 等价 `medium`）、`--backend legacy\|native`、`--task-id`、`--mode`、`--note`、`--workspace`（省略取状态文件所在目录的 git 根）；`--risk high` 必须配 `--backend native` |
 | `plan` | 登记 ZCode 本地计划 | `--plan <plan.json>`（或 stdin）、`--source` |
 | `status` / `next` | 查看阶段、工作项、四门、下一步 | `--json` |
 | `record` | 回填工作项结果 | `--id`、`--status`、`--result`、`--evidence E1`（可重复） |
@@ -196,7 +196,7 @@ python3 -B scripts/copilot_auto.py ingest --state <state.json> [--result-file f]
 ```bash
 # 1. 建立合同
 python3 -B scripts/copilot_dispatch.py start --state T/state.json \
-  --goal "目标" --contract-file contract.md --risk normal \
+  --goal "目标" --contract-file contract.md --risk medium \
   --workspace /path/to/task-repo
 
 # 2. 登记 ZCode 计划

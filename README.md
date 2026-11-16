@@ -5,6 +5,11 @@ Copilot 是运行于 ZCode 内的**轻量协作治理 Skill**：用户侧 ChatGP
 调试、测试与验证；Copilot 负责任务合同、完成条件、状态、证据、审计与收口门禁，并用 PARTIAL
 派生持续推进任务；高风险 G4 由宿主可证明只读的子代理承担独立复核。
 
+**v6.10.0 起复核按风险驱动**：`risk=low`/`medium`（历史 `normal` 等价）默认不派 Reviewer，
+只有声明实质触发因素且独立视角确有收益时才派一次定向复核；`risk=high` 仍走 G4。工具请求
+不等于执行：宿主明确拒绝且确认未执行的 `Bash`/`Write`/`Edit` 不再使复核会话失效，实际
+执行写/执行工具仍不符合 G4。
+
 **v6.9.0 起 Agent 调度以主代理为默认**：`Explore` 只做独立只读调查，`general-purpose` 只
 承担边界清晰的独立交付物；不设调用比例或预算。内置 `Explore` 含 Bash、`general-purpose`
 为全工具，均不能作为 G4 执行者；没有可证明只读能力时 G4 保持 fail-closed。

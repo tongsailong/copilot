@@ -293,7 +293,9 @@ execution binding → 真实 Executor 会话 → 测试执行/证据
   等于 `profileSnapshot.systemPrompt`；
 - Agent/Child Session/父会话/trace、会话开始/结束时间晚于 attempt、prompt 携带
   attempt id、`workspaceRoot` 等于 attempt 代码根；
-- `tool_usage`/`part` 的每次调用均只读、计数与 `totalToolUseCount` 一致，无 Bash；
+- `tool_usage`/`part` 的每次**实际执行**调用均只读、计数与 `totalToolUseCount` 一致，
+  无 Bash；宿主明确拒绝且证明未执行的请求（`denied_not_executed`，含 Bash/Write/Edit）
+  允许出现在记录中并计入请求数，但不构成 G4 工具违规；
 - 原始输出（`outputFile` 优先，缺失时回退 `message/part`，两者都在时 SHA 必须一致）
   通过 `review-json/v2` 严格解析，verdict/findings/unverified/changed_files 与信封一致；
 - 证据文件 SHA、inspect 记录、敏感路径/越界读取、attempt 的 `code_snapshot` 代码范围

@@ -22,7 +22,8 @@ SHA-256 或计划绑定写错/编造。这里把这些字段从实际记录中�
 * 复核身份只来自 Reviewer 的 metadata，Reviewer 原始结论只提供
   verdict/findings/files_inspected 等判断内容；
 * 复核实际调用的工具只来自宿主 `tool_usage`/`part`：Reviewer 无 Bash 权限，
-  `commands_run` 恒为空，调用计数必须与 metadata 相符；
+  `commands_run` 恒为空，请求计数必须与 metadata 相符；宿主明确拒绝且确认未执行的
+  请求不算实际调用（实际执行或状态未知的写/执行工具仍拒绝）；
 * 官方 G4 资格由 `g4_attest` 对新链宿主记录独立核验；本脚本生成的
   `g4_eligible` 只是信封结构预检，Reviewer 不能自述正式资格。
 
@@ -374,11 +375,14 @@ def _host_tool_summary(child: str, db: str) -> dict:
                     "session_state": session_state,
                     "db": os.path.abspath(os.path.expanduser(db))}
         try:
+            available = host_records.table_columns(con, "tool_usage")
+            optional = [name for name in host_records.TOOL_USAGE_OPTIONAL_COLUMNS
+                        if name in available]
             rows = con.execute(
-                "select tool_name, coalesce(read_only, -1), status, count(*) "
-                "from tool_usage where session_id=? "
-                "group by tool_name, read_only, status order by tool_name",
-                (child,)).fetchall()
+                "select tool_name, coalesce(read_only, -1), status"
+                + "".join(", " + name for name in optional)
+                + " from tool_usage where session_id=? "
+                  "order by rowid", (child,)).fetchall()
         except sqlite3.Error as exc:
             return {"available": False,
                     "reason": f"tool_usage_query_failed: {exc}",
@@ -386,33 +390,55 @@ def _host_tool_summary(child: str, db: str) -> dict:
     finally:
         con.close()
     calls: list[dict] = []
+    grouped: dict[tuple, dict] = {}
     total = 0
-    write_capable = 0
-    unclassified = 0
-    for name, read_only, status, count in rows:
-        tool = str(name or "")
-        amount = int(count or 0)
-        total += amount
+    denied = 0
+    denied_tools: dict[str, int] = {}
+    for row in rows:
+        tool = str(row[0] or "")
+        read_only = int(row[1])
+        status = str(row[2] or "")
+        record = {"name": tool, "read_only": read_only, "status": status}
+        for index, name in enumerate(optional):
+            record[name] = row[3 + index]
+        total += 1
+        if host_records.tool_execution_state(record) == "denied_not_executed":
+            # 宿主拒绝且确认未执行：只记请求，不算写能力，也不告警。
+            denied += 1
+            denied_tools[tool] = denied_tools.get(tool, 0) + 1
+            continue
         # 工具名命中写/执行集合，或宿主记录 read_only=0（非只读）都算写能力；
         # 名称未知且宿主未分类的调用单独计数并告警，不静默当作只读。
-        is_write, is_unclassified = AP.tool_call_is_write(tool, int(read_only))
-        if is_write:
-            write_capable += amount
-        elif is_unclassified:
-            unclassified += amount
-        calls.append({
-            "name": tool,
-            "read_only": int(read_only),
-            "status": str(status or ""),
-            "count": amount,
-            "write_capable": is_write,
-            "unclassified": is_unclassified,
-        })
+        is_write, is_unclassified = AP.tool_call_is_write(tool, read_only)
+        key = (tool, read_only, status)
+        entry = grouped.get(key)
+        if entry is None:
+            entry = {
+                "name": tool,
+                "read_only": read_only,
+                "status": status,
+                "count": 0,
+                "write_capable": is_write,
+                "unclassified": is_unclassified,
+            }
+            grouped[key] = entry
+        entry["count"] += 1
+    calls = [grouped[key] for key in sorted(grouped)]
+    write_capable = sum(entry["count"] for entry in calls
+                        if entry["write_capable"])
+    unclassified = sum(entry["count"] for entry in calls
+                       if entry["unclassified"])
     return {
         "available": True,
         "session_state": session_state,
         "db": os.path.abspath(os.path.expanduser(db)),
         "total_calls": total,
+        "executed_calls": total - denied,
+        "denied_calls": denied,
+        "denied_tools": dict(sorted(denied_tools.items())),
+        "repeated_denied_tools": sorted(
+            name for name, count in denied_tools.items()
+            if count >= host_records.REPEATED_DENIAL_THRESHOLD),
         "write_capable_calls": write_capable,
         "unclassified_calls": unclassified,
         "calls": calls,
@@ -437,11 +463,14 @@ def build_capability(args) -> dict:
     evidence = report["host_evidence"]
     if report["g4"].get("executor"):
         # 宿主快照是只读、但实际记录出现写入/执行调用或无法分类的调用：
-        # 不能当作“行为只读”放行，如实告警。
+        # 不能当作“行为只读”放行，如实告警。被拒绝且未执行的请求不计入。
         if evidence.get("write_capable_calls"):
             report["warnings"].append("observed_write_capable_calls")
         if evidence.get("unclassified_calls"):
             report["warnings"].append("observed_unclassified_calls")
+    if evidence.get("repeated_denied_tools"):
+        # 同一越权工具被反复请求：权限边界有效，但属于无效重试循环。
+        report["warnings"].append("repeated_denied_calls")
     return report
 
 
@@ -807,9 +836,11 @@ def _call_blobs(calls: list[tuple[str, str, dict]]) -> list[str]:
 
 
 def _db_review_tool_calls(meta: dict, db: str) -> list[tuple[str, str, dict]]:
-    """从宿主 `tool_usage`/`part` 读取 Reviewer 工具调用。
+    """从宿主 `tool_usage`/`part` 读取 Reviewer 实际执行的工具调用。
 
-    Reviewer 无 Bash 权限；缺失、计数不符或出现非只读工具时失败关闭。
+    Reviewer 无 Bash 权限；缺失、计数不符或出现实际执行的非只读工具时失败关闭。
+    宿主明确拒绝且证明没有执行的请求（如 plan 模式拒绝 Bash）不算实际调用：
+    它们仍计入 `totalToolUseCount`，但不进入 `calls`，也不使复核信封失效。
     """
     child = meta["child_session_id"]
     total = meta["data"].get("totalToolUseCount")
@@ -824,9 +855,14 @@ def _db_review_tool_calls(meta: dict, db: str) -> list[tuple[str, str, dict]]:
         raise AgentRecordError(
             f"[review_host_db_unavailable] 无法读取宿主数据库：{exc}") from None
     try:
+        available = host_records.table_columns(con, "tool_usage")
+        optional = [name for name in host_records.TOOL_USAGE_OPTIONAL_COLUMNS
+                    if name in available]
         rows = con.execute(
-            "select tool_call_id, tool_name from tool_usage "
-            "where session_id=? order by started_at, rowid", (child,)).fetchall()
+            "select tool_call_id, tool_name, status"
+            + "".join(", " + name for name in optional)
+            + " from tool_usage where session_id=? "
+              "order by started_at, rowid", (child,)).fetchall()
         parts = con.execute(
             "select data from part where session_id=?", (child,)).fetchall()
     except sqlite3.Error as exc:
@@ -849,26 +885,32 @@ def _db_review_tool_calls(meta: dict, db: str) -> list[tuple[str, str, dict]]:
             payloads[call_id] = payload
     calls: list[tuple[str, str, dict]] = []
     seen: set[str] = set()
-    for call_id, name in rows:
-        cid = str(call_id or "")
-        tool = str(name or "").strip()
-        if tool not in _REVIEW_TOOL_NAMES:
-            raise AgentRecordError(
-                f"[review_tool_not_allowed] 复核实际调用了未授权工具 {tool!r}；"
-                f"Reviewer 只允许 {sorted(_REVIEW_TOOL_NAMES)}。")
+    for row in rows:
+        cid = str(row[0] or "")
+        tool = str(row[1] or "").strip()
+        record = {"call_id": cid, "name": tool, "status": str(row[2] or "")}
+        for index, name in enumerate(optional):
+            record[name] = row[3 + index]
         if cid:
             if cid in seen:
                 raise AgentRecordError(
                     f"[review_rollout_duplicate_call] 宿主记录出现重复 tool call id {cid!r}。")
             seen.add(cid)
+        if host_records.tool_execution_state(record) == "denied_not_executed":
+            # 宿主拒绝请求：已确认没有执行，保留会话与复核资格。
+            continue
+        if tool not in _REVIEW_TOOL_NAMES:
+            raise AgentRecordError(
+                f"[review_tool_not_allowed] 复核实际调用了未授权工具 {tool!r}；"
+                f"Reviewer 只允许 {sorted(_REVIEW_TOOL_NAMES)}。")
         payload = payloads.get(cid)
         if not isinstance(payload, dict):
             raise AgentRecordError(
                 f"[review_toolcalls_invalid] 宿主 part 缺少 {tool} 的 input：{cid}")
         calls.append((tool, "", payload))
-    if len(calls) != total:
+    if len(rows) != total:
         raise AgentRecordError(
-            f"[review_toolcalls_incomplete] 宿主记录 {len(calls)} 次工具调用，但 "
+            f"[review_toolcalls_incomplete] 宿主记录 {len(rows)} 次工具请求，但 "
             f"metadata.totalToolUseCount={total}；拒绝复核信封。")
     return calls
 
@@ -1344,7 +1386,7 @@ def build_review_context(args) -> dict:
             + "（如需重入，显式给出 --trigger 与 --reason）。")
     if admission.get("decision") == "not_required":
         warnings.append(
-            "普通风险且未声明实质触发因素：默认不派发 Reviewer；"
+            "低/中风险且未声明实质触发因素：默认不派发 Reviewer；"
             "自检、diff 与确定性测试足以覆盖时直接停止。")
     if previous and not previous.get("trust_problems") and \
             previous.get("g4_eligible") and previous_target and \

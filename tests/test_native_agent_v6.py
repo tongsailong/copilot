@@ -126,7 +126,11 @@ class BuildReviewTests(unittest.TestCase):
         con.execute("create table session_entry (session_id text, type text,"
                     " data text, time_created integer)")
         con.execute("create table tool_usage (tool_call_id text, session_id text,"
-                    " tool_name text, status text, started_at integer)")
+                    " tool_name text, status text, started_at integer,"
+                    " error_type text, error_code text, duration_ms integer,"
+                    " output_bytes integer, stdout_bytes integer,"
+                    " stderr_bytes integer, exit_code integer,"
+                    " error_message text)")
         con.execute("create table part (id text, message_id text,"
                     " session_id text, data text, sequence integer)")
         con.execute("create table message (id text, session_id text,"
@@ -142,8 +146,10 @@ class BuildReviewTests(unittest.TestCase):
             calls = [("c1", "Read", {"file_path": self.evidence}),
                      ("c2", "Grep", {"pattern": "done", "path": self.evidence})]
         for idx, (cid, name, payload) in enumerate(calls):
-            con.execute("insert into tool_usage values (?,?,?,?,?)",
-                        (cid, child, name, "completed", idx))
+            con.execute(
+                "insert into tool_usage (tool_call_id, session_id, tool_name,"
+                " status, started_at) values (?,?,?,?,?)",
+                (cid, child, name, "completed", idx))
             con.execute("insert into part values (?,?,?,?,?)",
                         (f"p{idx}", f"m{idx}", child, json.dumps({
                             "type": "tool", "tool": name, "callID": cid,
@@ -171,6 +177,60 @@ class BuildReviewTests(unittest.TestCase):
         for key, value in overrides.items():
             setattr(args, key, value)
         return args
+
+    def _set_total_tool_use(self, count: int) -> None:
+        path = self.host["metadata_path"]
+        with open(path, encoding="utf-8") as fh:
+            meta = json.load(fh)
+        meta["totalToolUseCount"] = count
+        write_json(path, meta)
+
+    def _add_tool_usage(self, db: str, *, call_id: str, tool: str,
+                        status: str, error_type: str = "",
+                        duration_ms: int | None = None,
+                        output_bytes: int = 0) -> None:
+        con = sqlite3.connect(db)
+        con.execute(
+            "insert into tool_usage (tool_call_id, session_id, tool_name,"
+            " status, started_at, error_type, duration_ms, output_bytes)"
+            " values (?,?,?,?,?,?,?,?)",
+            (call_id, self.host["child_session_id"], tool, status, 5,
+             error_type or None, duration_ms, output_bytes))
+        con.commit()
+        con.close()
+
+    def test_denied_bash_request_does_not_invalidate_review(self):
+        # plan 模式拒绝 Bash：宿主记录有请求，但确认没有执行。
+        db = self._db()
+        self._add_tool_usage(db, call_id="c-denied", tool="Bash",
+                             status="error", error_type="permission_denied",
+                             duration_ms=0, output_bytes=0)
+        self._set_total_tool_use(3)
+        env = NA.build_review(self._args(db=db))
+        self.assertTrue(env["g4_eligible"])
+        self.assertEqual([c["name"] for c in env["host"]["tool_calls"]],
+                         ["Grep", "Read"])
+        self.assertEqual(env["files_inspected"], [self.evidence])
+
+    def test_executed_bash_request_still_rejected(self):
+        db = self._db()
+        self._add_tool_usage(db, call_id="c-exec", tool="Bash",
+                             status="error", error_type="tool_execution_failed",
+                             duration_ms=9, output_bytes=3)
+        self._set_total_tool_use(3)
+        with self.assertRaises(NA.AgentRecordError) as ctx:
+            NA.build_review(self._args(db=db))
+        self.assertIn("review_tool_not_allowed", str(ctx.exception))
+
+    def test_unknown_bash_request_state_still_rejected(self):
+        db = self._db()
+        self._add_tool_usage(db, call_id="c-unknown", tool="Bash",
+                             status="error", error_type="", duration_ms=None,
+                             output_bytes=0)
+        self._set_total_tool_use(3)
+        with self.assertRaises(NA.AgentRecordError) as ctx:
+            NA.build_review(self._args(db=db))
+        self.assertIn("review_tool_not_allowed", str(ctx.exception))
 
     def test_build_review_uses_db_records_for_identity(self):
         env = NA.build_review(self._args())

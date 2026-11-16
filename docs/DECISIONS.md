@@ -1281,3 +1281,26 @@
       BLOCKED；G4 能力缺口与业务源码缺陷分开报告。
     - **保留**：任务合同、状态管理、证据与 SHA、G1–G4、PARTIAL 推进、上下文恢复与最终收口；
       不新增自定义子代理、不修改 Provider/模型路由/账户、不新增 MCP、不引入外部 Reviewer。
+
+53. **复核按风险三级准入；工具请求不等于实际执行（2026-11-16，v6.10.0）。**
+    - **三级策略**：`risk=low`（文档/文案/样式/简单修复/小范围既有模式改动）与
+      `risk=medium`（普通开发/多页面 UI/常规重构；历史 `normal` 等价）默认
+      `not_required`，由主代理完成实现、自检与测试；只有声明实质触发因素
+      （`security`/`permissions`/`core-logic`/`data-integrity`/`architecture`/
+      `global-execution`/`production`/`release`）且独立视角确有收益时，才派一次定向
+      只读复核。`risk=high` 恒为 `required`（G4），G1–G4 门禁不降低。正式 REVIEW 仍
+      只在用户明确授权时登记，不因风险等级推定授权。
+    - **不建评分体系**：复用风险标签与既有触发因素，不新增评分模型、决策 Agent、
+      逐层审批或固定复核轮次；低/中风险无触发因素时直接执行，不建立复核计划。
+    - **请求 ≠ 执行**：宿主 `tool_usage` 分为 `completed`、`denied_not_executed`、
+      `executed_failed`、`execution_unknown`。只有错误类型为策略/权限/工具缺失、诊断列
+      （`duration_ms`/`output_bytes`）存在且为零、无退出码时，才认定“拒绝且未执行”；
+      诊断列缺失按 `execution_unknown` fail-closed。
+    - **拒绝不失效**：被拒绝且未执行的 `Bash`/`Write`/`Edit` 请求不计入 G4 白名单违规、
+      不触发只读/副作用检查、不消耗有效 attempt，原会话继续用 `Read/Grep/Glob`；一次
+      拒绝不触发重新派发。实际执行写/执行工具仍不符合 G4；`running`/`cancelled`/证据
+      缺失一律 fail-closed；同一工具反复被拒绝记录 `repeated_denied_calls`，停止无效
+      重试，必要时终止会话并新建只读复核。
+    - **G4 权限不变**：仍是 `Read/Grep/Glob` + 禁用 `Write/Edit/Bash`；不新建沙箱、不修改
+      宿主安全策略、不扩大子代理写入权限。`host_records.tool_execution_state()` 为
+      `g4_attest`、`native_agent review` 与 `capability` 的唯一判定入口。

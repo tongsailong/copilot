@@ -35,6 +35,64 @@ def _json(raw: object) -> dict:
     return data if isinstance(data, dict) else {}
 
 
+# 宿主明确拒绝且确认没有执行的错误类型。分类只依据宿主记录：错误类型必须
+# 属于策略/权限/工具缺失，且执行时长、输出、退出码都为空或零；任何一项不满足
+# 都按 executed_failed（不能证明未执行）处理，只有状态本身未知才走
+# execution_unknown（同样 fail-closed）。
+DENIED_ERROR_TYPES = frozenset({
+    "permission_denied", "policy_denied", "tool_not_allowed", "tool_not_found",
+})
+# 同一违规工具被反复拒绝的次数达到该值时，视为无效重试循环。
+REPEATED_DENIAL_THRESHOLD = 3
+TOOL_USAGE_OPTIONAL_COLUMNS = (
+    "error_type", "error_code", "duration_ms", "output_bytes",
+    "stdout_bytes", "stderr_bytes", "exit_code", "error_message",
+)
+
+
+def table_columns(con: sqlite3.Connection, table: str) -> set[str]:
+    """读取表列名；宿主版本不同可能没有可选诊断列。"""
+    try:
+        return {str(row[1]) for row in con.execute(f"pragma table_info({table})")}
+    except sqlite3.Error:
+        return set()
+
+
+def tool_execution_state(record: dict) -> str:
+    """把一次工具记录归类为 completed / denied_not_executed /
+    executed_failed / execution_unknown。
+
+    “请求了工具”不等于“工具执行了”。只有宿主明确给出策略拒绝错误码、且诊断列
+    （`duration_ms`/`output_bytes`）实际存在并**显式为零**、无退出码时，才返回
+    denied_not_executed；诊断列缺失或为 NULL 时无法证明未执行，返回
+    execution_unknown（fail-closed）。
+    """
+    status = str(record.get("status") or "")
+    if status == "completed":
+        return "completed"
+    if status == "error":
+        error_type = str(record.get("error_type") or "").strip().lower()
+        if error_type not in DENIED_ERROR_TYPES:
+            return "executed_failed"
+        if any(key not in record for key in ("duration_ms", "output_bytes")):
+            return "execution_unknown"
+        duration = record.get("duration_ms")
+        output = record.get("output_bytes")
+        if duration in (None, "") or output in (None, ""):
+            # 诊断列存在但值为 NULL：宿主没有给出“零执行”证据。
+            return "execution_unknown"
+        if duration not in (0, "0") or output not in (0, "0"):
+            return "executed_failed"
+        for key in ("stdout_bytes", "stderr_bytes"):
+            if record.get(key) not in (None, 0, "0"):
+                return "executed_failed"
+        if record.get("exit_code") not in (None, ""):
+            return "executed_failed"
+        return "denied_not_executed"
+    # running / cancelled / 未知状态：无法证明未执行，保持 fail-closed。
+    return "execution_unknown"
+
+
 def session_row(db: str, session_id: str) -> dict | None:
     """读取 session 基本行；不存在或表不可用时返回 None。"""
     try:

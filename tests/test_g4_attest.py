@@ -156,7 +156,11 @@ class Fixture:
                     " task_type text, trace_id text)")
         cur.execute("create table tool_usage (tool_call_id text, session_id text,"
                     " tool_name text, read_only integer, side_effect_scope text,"
-                    " status text, trace_id text, turn_id text, started_at integer)")
+                    " status text, trace_id text, turn_id text,"
+                    " started_at integer, error_type text, error_code text,"
+                    " duration_ms integer, output_bytes integer,"
+                    " stdout_bytes integer, stderr_bytes integer,"
+                    " exit_code integer, error_message text)")
         cur.execute("create table part (id text, session_id text, data text,"
                     " sequence integer, message_id text)")
         cur.execute("create table session_entry (session_id text, type text,"
@@ -188,11 +192,22 @@ class Fixture:
     def add_call(self, call_id: str, tool: str, payload: dict, *,
                  name: str | None = None, read_only: int | None = 1,
                  scope: str | None = "none", status: str = "completed",
-                 trace: str = TRACE, turn: str = TURN) -> None:
+                 trace: str = TRACE, turn: str = TURN,
+                 error_type: str | None = None, error_code: str | None = None,
+                 duration_ms: int | None = None, output_bytes: int | None = 0,
+                 stdout_bytes: int | None = 0, stderr_bytes: int | None = 0,
+                 exit_code: int | None = None,
+                 error_message: str = "") -> None:
         """同时写入 tool_usage 与 part，保持同一 call id。"""
-        self.sql("insert into tool_usage values (?,?,?,?,?,?,?,?,?)",
+        self.sql("insert into tool_usage (tool_call_id, session_id, tool_name,"
+                 " read_only, side_effect_scope, status, trace_id, turn_id,"
+                 " started_at, error_type, error_code, duration_ms,"
+                 " output_bytes, stdout_bytes, stderr_bytes, exit_code,"
+                 " error_message) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                  (call_id, CHILD, name or tool, read_only, scope, status,
-                  trace, turn, self._seq))
+                  trace, turn, self._seq, error_type, error_code, duration_ms,
+                  output_bytes, stdout_bytes, stderr_bytes, exit_code,
+                  error_message))
         self._seq += 1
         self.add_part(call_id, tool, payload, status)
 
@@ -584,6 +599,117 @@ class HostRecordTests(AttestTestCase):
         self.f.add_call("call_4", "Bash", {"command": "id"})
         self.f.set_meta(totalToolUseCount=4)
         self.assertCode(self.f.run(), "host_tool_not_allowed")
+
+    def test_host_denied_bash_without_execution_keeps_eligibility(self):
+        # 宿主 plan 模式拒绝 Bash：状态 error、permission_denied、零时长零输出。
+        self.f.add_call(
+            "call_4", "Bash", {"command": "git status"}, name="Bash",
+            read_only=0, scope="system", status="error",
+            error_type="permission_denied", duration_ms=0, output_bytes=0,
+            error_message="Plan mode only allows read-only, non-destructive tools")
+        self.f.set_meta(totalToolUseCount=4)
+        record = self.f.run()
+        self.assertTrue(record["eligible"], record["rejections"])
+        self.assertEqual(record["denied_tool_counts"], {"Bash": 1})
+        self.assertEqual(record["denied_tool_calls"][0]["tool"], "Bash")
+        self.assertEqual(record["denied_tool_calls"][0]["error_type"],
+                         "permission_denied")
+        self.assertNotIn("Bash", record["executed_tools"])
+        self.assertEqual(record["failed_tool_calls"], [])
+        # attest() 只取证不消费；正式消费只发生在 ingest 的 formal G4 路径。
+        self.assertFalse(self.f.attempt["consumed"])
+
+    def test_denied_row_with_completed_part_is_rejected(self):
+        # 宿主 tool_usage 说“拒绝未执行”，part 却说 completed：记录不一致，拒绝。
+        self.f.add_call(
+            "call_4", "Bash", {"command": "git status"}, name="Bash",
+            read_only=0, scope="system", status="error",
+            error_type="permission_denied", duration_ms=0, output_bytes=0)
+        self.f.set_meta(totalToolUseCount=4)
+        self.f.sql("update part set data=replace(data, '\"error\"', "
+                   "'\"completed\"') where id='call_4:part'")
+        self.assertCode(self.f.run(), "host_call_status_mismatch")
+
+    def test_denied_write_and_edit_are_not_execution(self):
+        self.f.add_call(
+            "call_4", "Write", {"file_path": "src/a.js"}, name="Write",
+            read_only=0, scope="workspace", status="error",
+            error_type="permission_denied", duration_ms=0, output_bytes=0)
+        self.f.add_call(
+            "call_5", "Edit", {"file_path": "src/a.js"}, name="Edit",
+            read_only=0, scope="workspace", status="error",
+            error_type="permission_denied", duration_ms=0, output_bytes=0)
+        self.f.set_meta(totalToolUseCount=5)
+        record = self.f.run()
+        self.assertTrue(record["eligible"], record["rejections"])
+        self.assertEqual(record["denied_tool_counts"],
+                         {"Edit": 1, "Write": 1})
+
+    def test_executed_bash_failure_still_disqualifies(self):
+        # error 但有执行时长/输出：按实际执行处理，不符合当前 G4 工具策略。
+        self.f.add_call(
+            "call_4", "Bash", {"command": "id"}, name="Bash", read_only=0,
+            scope="system", status="error",
+            error_type="tool_execution_failed", duration_ms=12,
+            output_bytes=5, exit_code=1)
+        self.f.set_meta(totalToolUseCount=4)
+        record = self.f.run()
+        self.assertCode(record, "host_tool_not_allowed")
+        self.assertIn("Bash", record.get("tools") or [])
+
+    def test_bash_error_without_execution_evidence_fails_closed(self):
+        # 错误类型未知：无法证明未执行，保持 fail-closed。
+        self.f.add_call(
+            "call_4", "Bash", {"command": "id"}, name="Bash", read_only=0,
+            scope="system", status="error")
+        self.f.set_meta(totalToolUseCount=4)
+        self.assertCode(self.f.run(), "host_tool_not_allowed")
+
+    def test_denied_with_duration_is_not_treated_as_not_executed(self):
+        self.f.add_call(
+            "call_4", "Bash", {"command": "id"}, name="Bash", read_only=0,
+            scope="system", status="error",
+            error_type="permission_denied", duration_ms=3, output_bytes=0)
+        self.f.set_meta(totalToolUseCount=4)
+        self.assertCode(self.f.run(), "host_tool_not_allowed")
+
+    def test_repeated_denials_are_flagged_but_keep_eligibility(self):
+        for index in range(3):
+            self.f.add_call(
+                f"call_denied_{index}", "Bash", {"command": "git status"},
+                name="Bash", read_only=0, scope="system", status="error",
+                error_type="permission_denied", duration_ms=0,
+                output_bytes=0)
+        self.f.set_meta(totalToolUseCount=6)
+        record = self.f.run()
+        self.assertTrue(record["eligible"], record["rejections"])
+        self.assertEqual(record["denied_tool_counts"], {"Bash": 3})
+        self.assertEqual(record["repeated_denied_tools"], ["Bash"])
+        self.assertTrue(any("重复被宿主拒绝" in item
+                            for item in record.get("residual") or []))
+
+    def test_cancelled_disallowed_tool_is_unknown(self):
+        self.f.add_call(
+            "call_4", "Bash", {"command": "id"}, name="Bash", read_only=0,
+            scope="system", status="cancelled")
+        self.f.set_meta(totalToolUseCount=4)
+        record = self.f.run()
+        self.assertFalse(record["eligible"])
+        codes = {item["code"] for item in record["checks"]
+                 if not item["passed"]}
+        self.assertIn("host_tool_status_invalid", codes)
+        self.assertIn("host_tool_not_allowed", codes)
+
+    def test_denied_read_call_is_still_readonly(self):
+        self.f.add_call(
+            "call_4", "Read", {"file_path": "src/missing.js"}, name="Read",
+            read_only=1, scope="none", status="error",
+            error_type="permission_denied", duration_ms=0, output_bytes=0)
+        self.f.set_meta(totalToolUseCount=4)
+        record = self.f.run()
+        self.assertTrue(record["eligible"], record["rejections"])
+        self.assertEqual(record["denied_tool_counts"], {"Read": 1})
+
 
     def test_tool_not_readonly(self) -> None:
         self.f.sql("update tool_usage set read_only=0 where tool_name='Grep'")

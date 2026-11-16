@@ -43,6 +43,8 @@ READONLY_TOOLS = frozenset({"Read", "Grep", "Glob"})
 REQUIRED_DISALLOWED = frozenset({"Write", "Edit", "Bash"})
 ALLOWED_PERMISSION_MODES = frozenset({"default", "plan"})
 REVIEW_SCHEMAS = frozenset({"copilot-native-review/v2"})
+# 同一违规工具被宿主反复拒绝的次数达到该值时，视为无效重试循环，记录残余告警。
+REPEATED_DENIAL_THRESHOLD = host_records.REPEATED_DENIAL_THRESHOLD
 METADATA_FIELDS = ("agentId", "childSessionId", "parentSessionId", "profileId",
                    "profileSnapshot", "prompt", "status", "createdAt",
                    "workspaceRoot", "outputFile", "totalToolUseCount")
@@ -202,6 +204,18 @@ def _db_rows(con: sqlite3.Connection, sql: str, params: tuple,
         return con.execute(sql, params).fetchall()
     except sqlite3.Error as exc:
         raise AttestError(code, f"{sql.split()[0]}: {exc}") from None
+
+
+def _call_label(record: dict) -> str:
+    """拒绝记录的可审计摘要：只保留工具、call id 与宿主错误码/短消息。"""
+    return {
+        "call_id": str(record.get("call_id") or ""),
+        "tool": str(record.get("name") or ""),
+        "status": str(record.get("status") or ""),
+        "error_type": str(record.get("error_type") or ""),
+        "error_code": str(record.get("error_code") or ""),
+        "error_message": str(record.get("error_message") or "")[:200],
+    }
 
 
 def _db_fingerprint(path: str) -> dict:
@@ -453,11 +467,16 @@ def attest(*, metadata: str, attempt: str, task_id: str, workspace: str,
         check("host_session_kind_mismatch", str(task_type or "") == "subagent_child",
               str(task_type))
 
-        usage = _db_rows(
-            con,
+        usage_columns = host_records.table_columns(con, "tool_usage")
+        optional = [name for name in host_records.TOOL_USAGE_OPTIONAL_COLUMNS
+                    if name in usage_columns]
+        usage_sql = (
             "select tool_call_id, tool_name, read_only, side_effect_scope, "
-            "status, trace_id, turn_id from tool_usage where session_id=? "
-            "order by started_at, tool_call_id", (child,))
+            "status, trace_id, turn_id"
+            + "".join(", " + name for name in optional)
+            + " from tool_usage where session_id=? "
+              "order by started_at, tool_call_id")
+        usage = _db_rows(con, usage_sql, (child,))
         if not check("host_tool_usage_missing", bool(usage), child):
             return _finish(checks, residual, meta, att, observed,
                            evidence_paths, meta_path, meta_sha, attempt_path,
@@ -467,23 +486,51 @@ def attest(*, metadata: str, attempt: str, task_id: str, workspace: str,
               isinstance(declared, int) and not isinstance(declared, bool)
               and declared == len(usage),
               f"tool_usage={len(usage)} metadata={declared!r}")
-        names = [str(row[1]) for row in usage]
-        call_ids = [str(row[0] or "") for row in usage]
+        records: list[dict] = []
+        for row in usage:
+            record = {
+                "call_id": str(row[0] or ""),
+                "name": str(row[1] or ""),
+                "read_only": row[2],
+                "side": row[3],
+                "status": str(row[4] or ""),
+                "trace": str(row[5] or ""),
+                "turn": str(row[6] or ""),
+            }
+            for index, key in enumerate(optional):
+                record[key] = row[7 + index]
+            record["execution"] = host_records.tool_execution_state(record)
+            records.append(record)
+        names = [record["name"] for record in records]
+        call_ids = [record["call_id"] for record in records]
+        denied_calls = [record for record in records
+                        if record["execution"] == "denied_not_executed"]
+        executed_calls = [record for record in records
+                          if record["execution"] != "denied_not_executed"]
         check("host_call_id_missing", all(call_ids), "tool_usage 存在空 call id")
         check("host_call_id_duplicate",
               len(set(call_ids)) == len(call_ids), "tool_usage 存在重复 call id")
-        check("host_tool_not_allowed", set(names) <= READONLY_TOOLS,
-              ",".join(sorted(set(names) - READONLY_TOOLS)))
+        # 白名单只约束实际执行/状态未知的调用。宿主明确拒绝且证明未执行的
+        # 请求（如 plan 模式拒绝 Bash）不构成工具违规，也不消耗复核资格。
+        violations = {record["name"] for record in executed_calls} - READONLY_TOOLS
+        check("host_tool_not_allowed", not violations,
+              ",".join(sorted(violations)))
 
-        for _call_id, name, read_only, side, status, _trace, _turn in usage:
-            if str(status) == "completed":
+        for record in records:
+            name = record["name"]
+            status = record["status"]
+            if record["execution"] == "denied_not_executed":
+                continue
+            if status == "completed":
+                read_only, side = record["read_only"], record["side"]
                 if int(read_only or 0) != 1:
                     check("host_tool_not_readonly", False,
                           f"{name} read_only={read_only}")
                 if str(side or "") != "none":
                     check("host_tool_side_effect", False, f"{name} scope={side}")
-            elif str(status) == "error":
+            elif status == "error":
                 # 失败调用没有副作用分类：允许 NULL，但工具名仍受白名单约束。
+                read_only, side = record["read_only"], record["side"]
                 if read_only not in (1, None):
                     check("host_tool_not_readonly", False,
                           f"{name} read_only={read_only} (error)")
@@ -493,8 +540,25 @@ def attest(*, metadata: str, attempt: str, task_id: str, workspace: str,
                 failed_calls.append(name)
             else:
                 check("host_tool_status_invalid", False, f"{name} status={status}")
-        traces = {str(row[5] or "") for row in usage}
-        turns = {str(row[6] or "") for row in usage}
+        denied_tool_counts: dict[str, int] = {}
+        for record in denied_calls:
+            value = record["name"]
+            denied_tool_counts[value] = denied_tool_counts.get(value, 0) + 1
+        if denied_calls:
+            residual.append(
+                "宿主拒绝且确认未执行的调用 "
+                + str(len(denied_calls)) + " 次（"
+                + ", ".join(sorted(denied_tool_counts))
+                + "）：不计入 G4 工具违规，也不消耗复核资格")
+        repeated_denied = sorted(name for name, count in denied_tool_counts.items()
+                                 if count >= REPEATED_DENIAL_THRESHOLD)
+        if repeated_denied:
+            residual.append(
+                "重复被宿主拒绝的调用（" + ", ".join(repeated_denied)
+                + "）：Reviewer 应停止无效重试，继续用 Read/Grep/Glob 完成复核；"
+                  "若仍持续尝试越权工具，由主代理终止该会话并新建只读复核")
+        traces = {record["trace"] for record in records}
+        turns = {record["turn"] for record in records}
         check("host_execution_split",
               len(traces) == 1 and len(turns) == 1
               and all(traces) and all(turns),
@@ -554,8 +618,9 @@ def attest(*, metadata: str, attempt: str, task_id: str, workspace: str,
               f"parts={sorted(part_names)} usage={sorted(names)}")
         check("host_part_call_mismatch", set(part_calls) == set(call_ids),
               f"parts={len(part_calls)} usage={len(set(call_ids))}")
-        usage_status = {str(row[0]): str(row[4]) for row in usage}
-        usage_tool = {str(row[0]): str(row[1]) for row in usage}
+        usage_status = {record["call_id"]: record["status"]
+                        for record in records}
+        usage_tool = {record["call_id"]: record["name"] for record in records}
         status_mismatch = [cid for cid, (tool, pstatus, _payload) in part_calls.items()
                            if usage_status.get(cid) != pstatus]
         check("host_call_status_mismatch", not status_mismatch,
@@ -1045,6 +1110,13 @@ def attest(*, metadata: str, attempt: str, task_id: str, workspace: str,
                        "tool_counts": {name: names.count(name)
                                        for name in sorted(set(names))},
                        "tools": sorted(set(names)),
+                       "executed_tools": sorted(
+                           {record["name"] for record in executed_calls}),
+                       "denied_tool_calls": [
+                           _call_label(record) for record in denied_calls],
+                       "denied_tool_counts": dict(sorted(
+                           denied_tool_counts.items())),
+                       "repeated_denied_tools": repeated_denied,
                        "tool_call_ids": sorted(call_ids),
                        "turn_id": turn_id,
                        "trace_id": only_trace,

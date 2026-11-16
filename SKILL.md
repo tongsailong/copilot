@@ -8,7 +8,7 @@ when_to_use: >
   原生完成，不进入本 Skill。
 ---
 
-# copilot：轻量协作治理（v6.9.0）
+# copilot：轻量协作治理（v6.10.0）
 
 Copilot 是运行在 ZCode 内的**协作治理层**，不是决策模型，也不是执行体。它负责把任务变成可
 追踪的合同、状态、证据与收口条件，并在任务没有真正完成时继续推进。
@@ -328,24 +328,59 @@ verify 的结构化质量报告（`copilot-verify-result/v1`）走报告接入�
 
 ## 复核策略与收敛
 
-复核按需使用，不是流程门禁：
+复核是风险控制手段，不是开发流程的必经节点：
 
-- **普通任务**：ZCode 自检（diff、针对性测试、完成条件核对），不派 Reviewer。
-- **复杂非高风险任务**：自检 + 必要时一个内置 `Explore` 做独立只读调查；聚焦目标符合性、
-  关键改动、测试结果与真实风险，不要求完整 G4 信封。
-- **高风险任务**：G1–G4 不变，独立上下文、宿主精确只读约束、宿主记录与最终证据绑定，
-  fail-closed；没有可证明的只读能力载体时如实报告 G4 能力缺口。
-- **正式 REVIEW**：仅用户明确要求时登记（见 `references/review.md`）。
+- **低风险（`risk=low`）**：README/文档/项目规则、文案与样式、普通 UI 布局、简单 bug 修复、
+  普通测试代码、小范围既有模式改动。主代理自检（diff、定向测试、完成条件核对）闭环，
+  默认不派 Reviewer。
+- **中风险（`risk=medium`，历史 `normal` 等价）**：普通功能开发、多页面 UI、常规流程/
+  性能优化、普通模块重构。主代理完成开发与验证；存在特定技术不确定性时可按需用内置子代理
+  做针对性调查/咨询，但**不自动**创建 review attempt、G4 任务或复核台账。只有声明实质
+  触发因素、且独立视角确实能显著降低风险时，才派发一次定向只读复核。
+- **高风险（`risk=high`）**：权限/安全、计费/归因、迁移/一致性、共享基础设施/核心状态机、
+  关键业务链路、生产发布。G1–G4 不变：主代理先自检与测试，再按剩余风险完成一次 G4，
+  独立上下文、宿主精确只读约束、宿主记录与最终证据绑定，fail-closed。
+- **正式 REVIEW**：仅用户明确要求时登记（见 `references/review.md`），不因风险等级推定授权。
+
+### 三级复核策略（v6.10.0）
+
+- **不做复杂评分**：只看任务风险标签与已声明的实质触发因素，不新建评分模型、决策 Agent
+  或层层审批。`review-admission` 返回 `tier=low|medium|high` 与
+  `required`/`not_required`/`not_needed`；低/中风险无触发因素时直接执行，不建立复核计划。
+- **低风险不自动复核**；**中风险不强制完整复核**；**高风险按真实剩余风险做 G4**。风险标签
+  与触发因素冲突时以显式触发因素为准（低风险声明 `security` 会升级为一次定向复核）。
+- **避免过度复核**：不要求每个开发任务启动 Reviewer；不把主代理自检转成正式 REVIEW；
+  不把普通子 Agent 调查转成 G4；没有新证据/源码变化不重复复核；不为凑复核轮次重复派发。
+- **PASS 即停止**：首次有效复核覆盖约定风险、无未解决 blocking/major、证据满足要求、
+  基线与目标一致时立即结束；局部修复只验证受影响部分，只有架构/关键契约/风险范围实质
+  变化才重新完整复核。
+- **针对性调查不是正式复核**：子代理咨询、`Explore` 调查不消耗复核 attempt，也不进入
+  G4 台账。
+
+### 工具请求不等于工具执行（v6.10.0）
+
+- 宿主 `tool_usage` 记录区分 `completed`、`denied_not_executed`、`executed_failed` 与
+  `execution_unknown`。只有错误类型明确为策略/权限/工具缺失
+  （`permission_denied`/`policy_denied`/`tool_not_allowed`/`tool_not_found`）、诊断列
+  （`duration_ms`/`output_bytes`）存在且为零、无退出码时，才认定为“拒绝且未执行”。
+- **被拒绝且确认未执行的** `Bash`/`Write`/`Edit` 请求不使复核会话失效、不算 G4 工具违规、
+  不消耗有效 attempt；Reviewer 继续用 `Read/Grep/Glob` 完成复核，一次拒绝不触发重新派发。
+- **实际执行** `Bash`/`Write`/`Edit` 仍不符合当前 G4 工具策略；执行状态未知
+  （`running`/`cancelled`/证据缺失）保持 fail-closed。同一越权工具被反复拒绝时记录
+  `repeated_denied_calls`，Reviewer 应停止无效重试，必要时由主代理终止该会话并新建只读复核。
+- **G4 权限不变**：仍是 `Read/Grep/Glob` + 禁用 `Write/Edit/Bash`；本次不建设新沙箱、
+  不修改宿主安全策略、不扩大子代理写入权限。
 
 ### 风险准入与停止（v6.8.0）
 
 - **先判断要不要复核**：`copilot_dispatch.py review-admission --state … [--trigger …]
-  --reason …` 返回 `required` / `not_required` / `not_needed`。`risk=high` 恒为 `required`
-  （G4 原有门禁不变）；普通风险默认 `not_required`，只有声明实质触发因素（`security`、
-  `permissions`、`core-logic`、`data-integrity`、`architecture`、`global-execution`、
-  `production`、`release`）才建议派发。文案/格式/纯文档调整、仅注释改动、已被确定性测试
-  覆盖的局部修改不派 Reviewer。高风险 G4 例外：G4 代码范围包含 tracked 文档，PASS 后
-  文档变化同样使旧快照失效，需要重新 G4（这是代码范围绑定，不是文案复核）。
+  --reason …` 返回 `required` / `not_required` / `not_needed`，并给出
+  `tier=low|medium|high`。`risk=high` 恒为 `required`（G4 原有门禁不变）；`low`/`medium`
+  默认 `not_required`，只有声明实质触发因素（`security`、`permissions`、`core-logic`、
+  `data-integrity`、`architecture`、`global-execution`、`production`、`release`）才建议
+  派发。文案/格式/纯文档调整、仅注释改动、已被确定性测试覆盖的局部修改不派 Reviewer。
+  高风险 G4 例外：G4 代码范围包含 tracked 文档，PASS 后文档变化同样使旧快照失效，需要
+  重新 G4（这是代码范围绑定，不是文案复核）。
 - **一次完整复核**：代码与证据稳定后才派发。`review-context` 输出 `review_admission`、
   `finding_ledger`、`execution_evidence_unbound` 与 `scope_reason`；存在未核销条件、
   证据漂移或台账未闭合 finding 时先解决，不要让 Reviewer 基于即将过期的快照工作。
@@ -446,8 +481,25 @@ severity）→ 集中修复 → 针对性复核（只验证修复、新问题、
 
 ## 版本
 
-当前版本 **v6.9.0（ZCode Autonomous Development Edition）**。v6.9.0 优化 Agent 调度与原生
-子代理集成：
+当前版本 **v6.10.0（ZCode Autonomous Development Edition）**。v6.10.0 收敛复核频率与
+工具执行判定：
+
+- **三级复核策略**：`risk=low`（文档/文案/样式/简单修复）与 `risk=medium`（普通开发/
+  多页面 UI/常规重构，历史 `normal` 等价）默认不派 Reviewer；只有声明实质触发因素且独立
+  视角确有收益时才派一次定向复核。`risk=high` 恒走 G4，门禁不变。正式 REVIEW 仍要求用户
+  明确授权。`start --risk` 接受 `low|medium|high`（`normal` 兼容映射到 `medium`），
+  `review-admission` 输出 `tier` 与风险准入/重入结论。
+- **工具请求不等于执行**：`host_records.tool_execution_state()` 把宿主记录分为
+  `completed`/`denied_not_executed`/`executed_failed`/`execution_unknown`；只有策略拒绝
+  错误码且零时长/零输出/无退出码才认定未执行。`g4_attest`、`native_agent review` 与
+  `capability` 统一使用该判定。
+- **Bash 拒绝不再使复核失效**：plan 模式拒绝 Bash 等“请求但未执行”的记录不计入 G4 工具
+  白名单违规、不触发只读检查、不消耗 attempt；原会话继续用 `Read/Grep/Glob`。实际执行
+  Bash/Write/Edit 仍不合格；状态未知 fail-closed；重复拒绝记录
+  `repeated_denied_calls`。
+- **未放宽**：G1–G4、fail-closed、attempt/宿主记录绑定、证据与 PWW 接受规则不变。
+
+v6.9.0 优化 Agent 调度与原生子代理集成：
 
 - **调度策略落地**：主代理直接执行为默认；`Explore` 只做独立只读调查；`general-purpose`
   只承担边界清晰、可独立交付且并行收益明显的工作。新增五问决策清单与

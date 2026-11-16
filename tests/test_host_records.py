@@ -97,5 +97,50 @@ class HostRecordsTests(unittest.TestCase):
         self.assertIn("session_entry", selection["source"])
 
 
+class ToolExecutionStateTests(unittest.TestCase):
+    """工具请求与执行状态的统一分类：拒绝必须有完整诊断证据。"""
+
+    def test_completed_is_execution(self):
+        self.assertEqual(H.tool_execution_state(
+            {"status": "completed", "name": "Read"}), "completed")
+
+    def test_denied_requires_full_diagnostics(self):
+        record = {"status": "error", "error_type": "permission_denied",
+                  "duration_ms": 0, "output_bytes": 0, "exit_code": None}
+        self.assertEqual(H.tool_execution_state(record),
+                         "denied_not_executed")
+
+    def test_missing_diagnostics_fail_closed(self):
+        # 只有 error_type，没有 duration_ms/output_bytes：无法证明未执行。
+        record = {"status": "error", "error_type": "permission_denied"}
+        self.assertEqual(H.tool_execution_state(record),
+                         "execution_unknown")
+        # 列存在但值为 NULL：同样没有“零执行”证据。
+        record = {"status": "error", "error_type": "permission_denied",
+                  "duration_ms": None, "output_bytes": None}
+        self.assertEqual(H.tool_execution_state(record),
+                         "execution_unknown")
+
+    def test_denied_with_output_is_executed(self):
+        record = {"status": "error", "error_type": "permission_denied",
+                  "duration_ms": 0, "output_bytes": 12}
+        self.assertEqual(H.tool_execution_state(record), "executed_failed")
+
+    def test_denied_with_exit_code_is_executed(self):
+        record = {"status": "error", "error_type": "permission_denied",
+                  "duration_ms": 0, "output_bytes": 0, "exit_code": 1}
+        self.assertEqual(H.tool_execution_state(record), "executed_failed")
+
+    def test_non_policy_error_is_executed(self):
+        record = {"status": "error", "error_type": "tool_execution_failed",
+                  "duration_ms": 0, "output_bytes": 0}
+        self.assertEqual(H.tool_execution_state(record), "executed_failed")
+
+    def test_running_or_cancelled_is_unknown(self):
+        for status in ("running", "cancelled"):
+            self.assertEqual(H.tool_execution_state({"status": status}),
+                             "execution_unknown")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -35,7 +35,7 @@ import governance as G  # noqa: E402
 import agent_policy as AP  # noqa: E402
 import review_policy as RP  # noqa: E402
 
-__version__ = "6.9.0"
+__version__ = "6.10.0"
 
 
 class CLIError(Exception):
@@ -516,7 +516,8 @@ def cmd_review_admission(args) -> int:
     if args.json:
         _print(decision)
     else:
-        print(f"复核准入：{decision['decision']}（risk={decision['risk']}）")
+        print(f"复核准入：{decision['decision']}"
+              f"（tier={decision.get('tier') or decision['risk']}）")
         print(decision.get("detail") or "")
         reentry = decision.get("reentry") or {}
         if reentry.get("detail"):
@@ -935,8 +936,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="合同测试策略 JSON（required/commands/report/artifacts/require_*）")
     p.add_argument("--test-policy-file", default="",
                    help="合同测试策略 JSON 文件")
-    p.add_argument("--risk", default="normal", choices=G.RISKS,
-                   help="high 需要 G4，只能配 --backend native")
+    p.add_argument("--risk", default="medium", choices=G.RISKS,
+                   help="low/medium 默认不派 Reviewer；high 需要 G4，只能配 "
+                        "--backend native")
     p.add_argument("--backend", default="legacy", choices=G.BACKENDS)
     p.add_argument("--task-id", default="")
     p.add_argument("--mode", default="")

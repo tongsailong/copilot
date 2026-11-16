@@ -34,7 +34,12 @@ RESOLVED_STATUSES = {"verified", "closed", "dropped"}
 BLOCKING_SEVERITIES = {"blocking", "major"}
 SEVERITY_ORDER = {"blocking": 0, "major": 1, "minor": 2, "info": 3}
 
-# 普通风险任务按需复核的触发因素；没有触发因素时默认不派 Reviewer。
+# 复核层级：按任务影响、失败后果、变更范围与不确定性划分，不引入评分模型。
+# `normal` 是历史风险标签，语义等同于 `medium`；读取旧状态时按 medium 处理。
+REVIEW_TIERS = ("low", "medium", "high")
+RISK_TIER = {"low": "low", "medium": "medium", "normal": "medium", "high": "high"}
+
+# 中风险任务按需复核的触发因素；没有触发因素时默认不派 Reviewer。
 ADMISSION_TRIGGERS = {
     "security": "安全/隐私/凭据处理",
     "permissions": "权限或访问控制",
@@ -538,9 +543,31 @@ def ledger_summary(state: dict) -> dict:
     }
 
 
-def admission(*, risk: str = "normal", triggers: list[str] | None = None,
+def tier_for(risk: object) -> str:
+    """把风险标签归一化为复核层级；缺失或未知标签失败关闭，不猜测。"""
+    value = _text(risk).lower()
+    tier = RISK_TIER.get(value)
+    if tier is None:
+        raise ReviewPolicyError(
+            f"风险等级 {value!r} 缺失或未知；只能是 {' / '.join(REVIEW_TIERS)}"
+            "（历史 normal 等价于 medium）。")
+    return tier
+
+
+def admission(*, risk: str = "medium", triggers: list[str] | None = None,
               reason: str = "") -> dict:
-    """风险准入：默认不派 Reviewer，除非任务高风险或声明了实质触发因素。"""
+    """风险准入：按 low/medium/high 三级决定是否需要独立复核。
+
+    * `low`：文档/文案/样式/简单修复/小范围既有模式改动——主代理自检闭环，
+      默认不派 Reviewer；显式声明的实质触发因素仍然优先。
+    * `medium`（含历史 `normal`）：普通开发/多页面 UI/常规重构——主代理完成
+      开发与验证；只有声明实质触发因素时才建议一次定向只读复核。
+    * `high`：高风险任务仍走 G4，门禁不因复核频率优化而降低。
+
+    “针对性调查”不是正式复核：普通子 Agent 咨询、`Explore` 调查不会创建
+    review attempt、G4 任务或台账。
+    """
+    tier = tier_for(risk)
     risk_value = _text(risk).lower()
     requested = []
     for item in triggers or []:
@@ -554,17 +581,22 @@ def admission(*, risk: str = "normal", triggers: list[str] | None = None,
             "未知复核触发因素：" + ", ".join(unknown) + "；可选："
             + ", ".join(sorted(set(ADMISSION_TRIGGERS) | set(REENTRY_TRIGGERS)))
             + "。")
-    base = {"schema": ADMISSION_SCHEMA, "risk": risk_value,
+    base = {"schema": ADMISSION_SCHEMA, "risk": risk_value, "tier": tier,
             "triggers": requested, "reason": _text(reason)[:1000]}
-    if risk_value == "high":
+    if tier == "high":
         return {**base, "decision": "required", "scope": "g4",
                 "detail": "高风险任务收口需要 G4 原生独立只读复核（原有门禁不变）。"}
     if requested:
         return {**base, "decision": "required", "scope": "advisory",
-                "detail": "声明了实质风险或重入触发因素，建议派发一次定向只读复核。"}
+                "detail": "声明了实质风险或重入触发因素，建议派发一次定向只读复核；"
+                          "针对性调查本身不等于正式复核。"}
+    if tier == "low":
+        return {**base, "decision": "not_required", "scope": "none",
+                "detail": "低风险任务（文档/文案/样式/简单修复/小范围既有模式改动）："
+                          "由主代理自检、diff 与必要测试闭环，不派发 Reviewer。"}
     return {**base, "decision": "not_required", "scope": "none",
-            "detail": "普通风险且未声明实质触发因素：以自检与确定性测试为准，"
-                      "不派发 Reviewer；文案/格式/纯文档调整同样不需要。"}
+            "detail": "中风险普通开发任务：由主代理完成开发与验证，只在声明实质"
+                      "触发因素时才派发一次定向只读复核；不强制完整复核。"}
 
 
 def last_stop(state: dict, *, g4_only: bool = False) -> dict | None:

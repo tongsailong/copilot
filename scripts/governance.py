@@ -33,7 +33,9 @@ import review_policy as RP
 SCHEMA = "copilot-governance/v1"
 VERSION = 1
 
-RISKS = ("normal", "high")
+# 风险层级与复核策略一致：low/medium 默认不派 Reviewer，high 恒走 G4。
+# `normal` 是历史标签，start 时归一化为 medium；读取旧状态时按 non-high 处理。
+RISKS = ("low", "medium", "high", "normal")
 BACKENDS = ("legacy", "native")
 # 新计划只允许 zcode（主代理直接执行）与 deepseek（主代理派发原生子代理）。
 # reasonix 仅用于读取历史状态，不再接受为新工作项执行方。
@@ -209,7 +211,7 @@ def _default_state() -> dict:
         "goal_sha256": "",
         "mode": "",
         "note": "",
-        "risk": "normal",
+        "risk": "medium",
         "execution_backend": "legacy",
         "workspace": "",
         "workspace_source": "",
@@ -642,7 +644,7 @@ def set_task_workspace(path: str, workspace: str, *, source: str = "zcode") -> d
 
 
 def start_state(path: str, goal: str, *, contract: str = "", criteria: object = None,
-                risk: str = "normal", execution_backend: str = "legacy",
+                risk: str = "medium", execution_backend: str = "legacy",
                 task_id: str = "", mode: str = "", note: str = "",
                 contract_source: str = "", workspace: str = "",
                 test_policy: dict | None = None) -> dict:
@@ -655,9 +657,12 @@ def start_state(path: str, goal: str, *, contract: str = "", criteria: object = 
     if not TASK_ID_RE.match(task_id):
         raise GovernanceError(
             f"task_id={task_id!r} 非法：只允许字母、数字、点、下划线、连字符（≤64）。")
-    risk = str(risk or "normal").strip().lower()
+    risk = str(risk or "medium").strip().lower()
     if risk not in RISKS:
         raise GovernanceError(f"risk={risk!r} 非法；只能是 {' / '.join(RISKS)}。")
+    if risk == "normal":
+        # 历史标签等价于 medium；新状态只保存三级风险。
+        risk = "medium"
     backend = str(execution_backend or "legacy").strip().lower()
     if backend not in BACKENDS:
         raise GovernanceError(
@@ -3485,11 +3490,11 @@ def review_admission(state: dict, *, triggers: list[str] | None = None,
                      scope: str = "full") -> dict:
     """复核风险准入与停止/重入判断（只读，不写状态）。
 
-    高风险仍然需要 G4；普通风险默认 `not_required`，只有声明实质触发因素
-    才建议派发。已有 PASS 覆盖当前目标与代码范围时返回 `review_not_needed`，
-    不因 Reviewer“还能提建议”而重新打开完整复核。
+    `low`/`medium`（含历史 `normal`）默认 `not_required`，只有声明实质触发因素
+    才建议派发；`high` 仍然需要 G4。已有 PASS 覆盖当前目标与代码范围时返回
+    `review_not_needed`，不因 Reviewer“还能提建议”而重新打开完整复核。
     """
-    risk = str(state.get("risk") or "normal")
+    risk = str(state.get("risk") or "")
     base = RP.admission(risk=risk, triggers=triggers, reason=reason)
     target = str(target_sha256 or final_evidence_digest(state))
     reentry_state, _stop, _stop_valid = _effective_reentry_state(state, target)
@@ -3497,8 +3502,8 @@ def review_admission(state: dict, *, triggers: list[str] | None = None,
         reentry_state, target=target, code_scope_sha256=code_scope_sha256,
         scope=scope, triggers=triggers, reason=reason, files=files)
     decision = base.get("decision")
-    if not reentry.get("allowed") and decision == "required" and \
-            risk.strip().lower() != "high":
+    if not reentry.get("allowed") and risk.strip().lower() != "high":
+        # 已有 PASS 覆盖当前目标/代码范围：停止标记优先于“是否建议派发”。
         decision = "not_needed"
     return {
         **base,
@@ -3534,6 +3539,7 @@ def record_review_admission(path: str, *, decision: dict, work_item_id: str = ""
         "base": str(base or ""),
         "decision": str(decision.get("decision") or "unknown"),
         "risk": str(decision.get("risk") or state.get("risk") or ""),
+        "tier": str(decision.get("tier") or ""),
         "triggers": list(decision.get("triggers") or []),
         "reason": str(decision.get("reason") or "")[:1000],
         "reentry_stop_id": str((decision.get("reentry") or {}).get("stop_id") or ""),
@@ -3604,6 +3610,7 @@ def _record_admission(state: dict, *, decision: dict, reentry: dict,
         "base": str(base or ""),
         "decision": "admitted",
         "risk": str(decision.get("risk") or ""),
+        "tier": str(decision.get("tier") or ""),
         "triggers": list(decision.get("triggers") or []),
         "reason": str(decision.get("reason") or "")[:1000],
         "reentry_stop_id": str((reentry or {}).get("stop_id") or ""),
@@ -3743,12 +3750,16 @@ def create_review_attempt(path: str, *, work_item_id: str,
             })
             save_state(path, state)
             return existing
-    # 风险准入 + 停止/重入判断：普通风险默认不派发，但 ZCode 对复杂非高风险
-    # 任务仍可自主选择一次只读复核；高风险必须有 admissions 记录。已有 PASS
-    # 覆盖当前快照时直接拒绝，避免重复派发。
-    decision = RP.admission(
-        risk=str(state.get("risk") or "normal"),
-        triggers=triggers, reason=reason)
+    # 风险准入 + 停止/重入判断：low/medium 默认不派发，但 ZCode 对复杂非高风险
+    # 任务仍可自主选择一次只读复核（该 attempt 属于自愿定向复核，正式 G4 路径仍
+    # 只对 risk=high 放行）；高风险必须有 admissions 记录。已有 PASS 覆盖当前快照
+    # 时直接拒绝，避免重复派发。
+    try:
+        decision = RP.admission(
+            risk=str(state.get("risk") or ""),
+            triggers=triggers, reason=reason)
+    except RP.ReviewPolicyError as exc:
+        raise GovernanceError(f"[review_admission_invalid] {exc}") from None
     reentry = RP.reentry_decision(
         reentry_state, target=target, code_scope_sha256=code_digest, scope=scope,
         triggers=triggers, reason=reason,
@@ -3782,6 +3793,7 @@ def create_review_attempt(path: str, *, work_item_id: str,
         "review_admission_id": admission["admission_id"],
         "review_admission": {
             "risk": decision.get("risk"),
+            "tier": decision.get("tier"),
             "triggers": list(decision.get("triggers") or []),
             "reason": str(decision.get("reason") or "")[:1000],
             "reentry_stop_id": reentry.get("stop_id") or "",
@@ -4356,7 +4368,7 @@ def _review_reason_detail(review: dict, state: dict, code: str) -> str:
 
 def _gate_review(state: dict) -> dict:
     risk = str(state.get("risk") or "").strip().lower()
-    if risk == "normal":
+    if risk in ("low", "medium", "normal"):
         return {"passed": True, "reasons": []}
     if risk != "high":
         return {"passed": False, "reasons": [{
@@ -4705,7 +4717,11 @@ def review_metrics(state: dict, *, task_dir: str = "") -> dict:
     admissions = [item for item in state.get("review_admissions") or []
                   if isinstance(item, dict)]
     admission_triggers: dict[str, int] = {}
+    admission_tiers: dict[str, int] = {}
     for item in admissions:
+        tier = str(item.get("tier") or "")
+        if tier:
+            admission_tiers[tier] = admission_tiers.get(tier, 0) + 1
         for trigger in item.get("triggers") or []:
             value = str(trigger or "")
             if value:
@@ -4726,6 +4742,7 @@ def review_metrics(state: dict, *, task_dir: str = "") -> dict:
         "full_reviews": scope_counts.get("full", 0),
         "incremental_reviews": scope_counts.get("incremental", 0),
         "review_admissions_total": len(admissions),
+        "review_admission_tiers": dict(sorted(admission_tiers.items())),
         "review_admission_triggers": dict(sorted(admission_triggers.items())),
         "review_stops_total": len(stops),
         "formal_reviews_total": len(formal_records),

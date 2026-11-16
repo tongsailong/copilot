@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -391,6 +392,53 @@ class CapabilityCLITests(unittest.TestCase):
         payload = self.run_capability(readonly_snapshot(), db)
         self.assertEqual(payload["host_evidence"]["unclassified_calls"], 1)
         self.assertIn("observed_unclassified_calls", payload["warnings"])
+
+    def _add_tool_usage_rows(self, db: str, rows: list[tuple]) -> None:
+        con = sqlite3.connect(db)
+        columns = {row[1] for row in
+                   con.execute("pragma table_info(tool_usage)")}
+        for name in ("error_type", "duration_ms", "output_bytes"):
+            if name not in columns:
+                con.execute(f"alter table tool_usage add column {name} text")
+        for tool, status, error_type, duration in rows:
+            con.execute(
+                "insert into tool_usage (session_id, tool_name, read_only,"
+                " status, error_type, duration_ms, output_bytes)"
+                " values (?,?,?,?,?,?,?)",
+                ("c1", tool, 0, status, error_type, duration, 0))
+        con.commit()
+        con.close()
+
+    def test_capability_cli_denied_bash_is_not_write_capability(self):
+        db = self.make_host_db([("Read", 1, "completed", 1)])
+        self._add_tool_usage_rows(db, [
+            ("Bash", "error", "permission_denied", 0)])
+        payload = self.run_capability(readonly_snapshot(), db)
+        evidence = payload["host_evidence"]
+        self.assertEqual(evidence["total_calls"], 2)
+        self.assertEqual(evidence["executed_calls"], 1)
+        self.assertEqual(evidence["denied_calls"], 1)
+        self.assertEqual(evidence["denied_tools"], {"Bash": 1})
+        self.assertEqual(evidence["write_capable_calls"], 0)
+        self.assertNotIn("observed_write_capable_calls", payload["warnings"])
+
+    def test_capability_cli_flags_repeated_denied_calls(self):
+        db = self.make_host_db([("Read", 1, "completed", 1)])
+        self._add_tool_usage_rows(db, [
+            ("Bash", "error", "permission_denied", 0)] * 3)
+        payload = self.run_capability(readonly_snapshot(), db)
+        self.assertEqual(payload["host_evidence"]["denied_calls"], 3)
+        self.assertEqual(payload["host_evidence"]["repeated_denied_tools"],
+                         ["Bash"])
+        self.assertIn("repeated_denied_calls", payload["warnings"])
+
+    def test_capability_cli_executed_bash_still_warns(self):
+        db = self.make_host_db([("Read", 1, "completed", 1)])
+        self._add_tool_usage_rows(db, [
+            ("Bash", "error", "tool_execution_failed", 12)])
+        payload = self.run_capability(readonly_snapshot(), db)
+        self.assertEqual(payload["host_evidence"]["write_capable_calls"], 1)
+        self.assertIn("observed_write_capable_calls", payload["warnings"])
 
     def test_capability_cli_reports_missing_session(self):
         db = self.make_host_db([], with_session=False)

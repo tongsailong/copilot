@@ -2,6 +2,87 @@
 
 更新：2026-11-16 CST。本文件只记录现场可核实的事实；规划与未完成事项单独标注。
 
+## 复核频率与工具执行判定（2026-11-16，v6.10.0）
+
+基线：HEAD `92a1105`（v6.9.0，工作区 clean）。**本轮未提交、未推送。**
+
+### 现场证据
+
+- **宿主拒绝 Bash 的真实形态**：`~/.zcode/cli/db/db.sqlite` 中 `task_type=subagent_child`
+  的 `Bash status=error` 有 4 条 `error_type=permission_denied`：
+  `duration_ms=0`、`output_bytes=0`、`exit_code=NULL`，错误消息
+  `Plan mode only allows read-only, non-destructive tools`；对应 `part` 的
+  `state.status=error`、`metadata={}`、时间起止相同、无 output。这是可证明“拒绝且未执行”
+  的记录，不是 Bash 实际运行失败。
+- **旧判定把请求当执行**：v6.9.0 的 `g4_attest` 用全部 `tool_usage.tool_name` 做
+  `host_tool_not_allowed`，并对 `status=error, read_only=0` 触发
+  `host_tool_not_readonly`；`native_agent._db_review_tool_calls` 也在生成信封时直接以
+  `review_tool_not_allowed` 拒绝。结果是：Reviewer 一次被宿主拒绝的 Bash 请求，会让整份
+  复核在新链取证/信封阶段失效，尽管该会话随后仍用 Read/Grep/Glob 完成了复核。
+
+### 已实施
+
+- `review_policy.REVIEW_TIERS` / `tier_for()`：`low|medium|high` 三级；历史 `normal`
+  归一化为 `medium`。`admission()` 返回 `tier`；低/中风险无触发因素时
+  `not_required`，显式触发因素优先，`high` 恒 `required/g4`。
+- `governance.RISKS` 接受 `low|medium|high|normal`，`start_state` 把 `normal` 存为
+  `medium`；`_gate_review` 把 `low/medium/normal` 视为非高风险，G4 只对 `high` 生效。
+  `copilot_dispatch start --risk` 默认 `medium`；`review-admission` 输出 `tier`；
+  admission 记录与 metrics 增加 `tier` / `review_admission_tiers`。
+- `host_records.tool_execution_state()`：统一分类 `completed` / `denied_not_executed` /
+  `executed_failed` / `execution_unknown`；只有策略/权限/工具缺失错误码、诊断列
+  （`duration_ms`/`output_bytes`）存在且显式为 0、无退出码才认定未执行；诊断列缺失或
+  为 NULL 按 `execution_unknown` fail-closed。`table_columns()` 兼容缺少可选诊断列的
+  旧宿主夹具。
+- `g4_attest`：白名单 / 只读 / 副作用检查只作用于实际执行或状态未知的调用；被拒绝调用
+  写入 `denied_tool_calls` / `denied_tool_counts` / `repeated_denied_tools` 并进入
+  `residual`；同一工具拒绝 ≥3 次记录重复拒绝告警。实际执行 Bash/Write/Edit 仍失败；
+  `running`/`cancelled`/证据缺失仍 fail-closed。
+- `native_agent._db_review_tool_calls`：拒绝记录计入 `totalToolUseCount` 但不进入
+  `calls`、不触发 `review_tool_not_allowed`；实际执行或状态未知的非只读工具仍拒绝。
+  `_host_tool_summary` / `capability`：`denied_calls` / `denied_tools` /
+  `repeated_denied_tools` 单独统计，被拒绝调用不计入 `write_capable_calls`。
+- 文档：`SKILL.md`、`references/review.md`、`README.md` 增加三级策略与“工具请求 ≠ 执行”
+  契约；版本 `6.10.0`。
+
+### 验证
+
+- 定向：`tests.test_g4_attest` 180（含新增 9 个拒绝/执行状态用例）、
+  `tests.test_agent_policy` 45、`tests.test_native_agent_v6` 19、
+  `tests.test_review_efficiency` 49、`tests.test_host_records` 12（含 7 个分类矩阵），
+  合计 305 OK。
+- 回归：活动全量 `discover -s tests` 786 OK；`legacy/tests` 853 OK（skip 32）；
+  `tests/t4_acceptance.py` 全部场景通过。
+- **未验证**：尚未用真实 ZCode 会话重跑“Reviewer 被 plan 模式拒绝 Bash 后完成复核”的
+  端到端链路；当前证据来自真实宿主 DB 的历史行与合成夹具。
+
+### 独立只读复核（2026-11-16）
+
+- 执行者：原生子代理 `agent_73135720-487e-42cc-8f53-f7199ffe84e4`，类型
+  `independent-readonly`（`Read/Grep/Glob`，无 Bash/写入）。复核对象是本轮未提交的工作区
+  文件与关键函数；结论 **pass**，无 blocking/major。
+- 已处理 findings：
+  - minor（fail-closed 缺口）：`tool_execution_state` 原先在缺少 `duration_ms`/
+    `output_bytes` 列时仍可能判 denied；已改为诊断列缺失即 `execution_unknown`。
+  - minor（文档不一致）：`references/workflow.md` 的 `--risk normal|high` 改为
+    `low|medium|high`；`references/agent-bridge.md` 改为“实际执行调用只读，denied 请求
+    允许并计入请求数”；新增 `tools/tool_counts` 为请求计数的审计口径说明。
+  - minor（语义不一致）：`tier_for` 对空/缺失风险改为失败关闭；`review_admission` 的
+    `not_needed` 改为只要非高风险且停止标记覆盖当前快照就返回。
+  - minor（测试空洞/覆盖）：新增 `tests/test_host_records.py` 分类矩阵（含诊断列缺失）、
+    denied 行与 part completed 不一致被拒、`not_needed` 顶层决策断言；保留
+    `attest()` 不消费 attempt 的说明（消费只发生在 ingest）。
+  - info（阈值重复）：统一使用 `host_records.REPEATED_DENIAL_THRESHOLD`。
+- **未验证**：复核方未运行测试（只读约束），测试结果由主代理执行；真实 ZCode E2E 仍未跑。
+
+### 运行时同步
+
+- `scripts-sync/sync_runtime.py --apply` 分发 28 个文件，写入 8 个变更（SKILL.md、
+  references/review.md、copilot_dispatch.py、g4_attest.py、governance.py、
+  host_records.py、native_agent.py、review_policy.py）；`--check` 缺失 0、不同 0。
+- 运行时保留 8 个未受管理历史文件（legacy 脚本与旧测试），默认不清理。
+- `manifests/source-baseline.sha256` 已按当前源码刷新（28 个文件，8 个哈希变化）。
+
 ## Agent 调度与原生子代理机制（2026-11-16，v6.9.0）
 
 针对“Copilot 与 ZCode 原生 Agent 协作效率”的专项优化。基线核实：HEAD `4f0fb33`
