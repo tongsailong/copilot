@@ -232,6 +232,7 @@ def _default_state() -> dict:
         "native_dispatch": None,
         "native_results": [],
         "native_reviews": [],
+        "sol_reviews": [],
         "review_attempts": [],
         "review_admissions": [],
         "review_stops": [],
@@ -3505,31 +3506,103 @@ def review_admission(state: dict, *, triggers: list[str] | None = None,
                      code_scope_sha256: str = "",
                      files: list[dict] | None = None,
                      scope: str = "full") -> dict:
-    """复核风险准入与停止/重入判断（只读，不写状态）。
+    """SOL 复核准入建议（只读，不写状态）。
 
-    `low`/`medium`（含历史 `normal`）默认 `not_required`，只有声明实质触发因素
-    才建议派发；`high` 仍然需要 G4。已有 PASS 覆盖当前目标与代码范围时返回
-    `review_not_needed`，不因 Reviewer“还能提建议”而重新打开完整复核。
+    v7 起普通复核只走 SOL 零工具单轮复核：`low` 默认不需要；`medium` 按需；
+    `high` 建议一次，但 G4 仍是独立的宿主只读复核，SOL 不能替代。`target` /
+    `code_scope` 参数保留用于兼容调用方，不再参与自动多轮判断。
     """
+    import sol_review as SR
+
     risk = str(state.get("risk") or "")
-    base = RP.admission(risk=risk, triggers=triggers, reason=reason)
+    decision = SR.admission(risk=risk, triggers=triggers, reason=reason)
+    sol = [item for item in state.get("sol_reviews") or []
+           if isinstance(item, dict) and item.get("status") == "completed"]
     target = str(target_sha256 or final_evidence_digest(state))
-    reentry_state, _stop, _stop_valid = _effective_reentry_state(state, target)
-    reentry = RP.reentry_decision(
-        reentry_state, target=target, code_scope_sha256=code_scope_sha256,
-        scope=scope, triggers=triggers, reason=reason, files=files)
-    decision = base.get("decision")
-    if not reentry.get("allowed") and risk.strip().lower() != "high":
-        # 已有 PASS 覆盖当前目标/代码范围：停止标记优先于“是否建议派发”。
-        decision = "not_needed"
     return {
-        **base,
-        "decision": decision,
+        **decision,
         "target_sha256": target,
-        "reentry": reentry,
+        "sol_reviews_total": len(sol),
+        "last_sol_review": ({
+            "review_id": sol[-1].get("review_id"),
+            "verdict": sol[-1].get("verdict"),
+            "materials_sha256": sol[-1].get("materials_sha256"),
+            "created_at": sol[-1].get("created_at"),
+        } if sol else None),
         "ledger": RP.ledger_summary(state),
         "code_scope_checked": bool(code_scope_sha256 or files),
     }
+
+
+def list_sol_reviews(state: dict) -> list[dict]:
+    """只读返回本任务的 SOL 复核记录（含失败记录）。"""
+    return [item for item in state.get("sol_reviews") or []
+            if isinstance(item, dict)]
+
+
+def record_sol_review(path: str, review: dict, *,
+                      materials_sha256: str = "",
+                      trigger: str = "", reason: str = "") -> dict:
+    """登记一次成功的 SOL 复核，并把其 findings 作为建议合并进台账。
+
+    SOL 是 advisory：它不能把已有问题标成 verified，也不能替代 G4；但它的
+    blocking/major 会进入 Finding 台账，主代理修复并定向验证，或在给出反证后
+    `finding --status dropped --note ...` 明确驳回。
+    """
+    state = load_state(path)
+    _assert_open(state, "登记 SOL 复核", allow_blocked=True)
+    record = {**review}
+    record["status"] = "completed"
+    # 用回复摘要作为台账去重键：同一份 SOL 输出重复合并时只计一次 occurrence。
+    if not record.get("result_sha256"):
+        record["result_sha256"] = str(review.get("reply_sha256") or "")
+    if not record.get("received"):
+        record["received"] = str(review.get("completed_at") or now_iso())
+    record["materials_sha256"] = (materials_sha256
+                                  or str(review.get("materials_sha256") or ""))
+    record["trigger"] = str(trigger or "")
+    record["reason"] = str(reason or "")[:1000]
+    record["created_at"] = str(review.get("completed_at") or now_iso())
+    merge = RP.merge_review(state, record, authoritative=False)
+    record["finding_refs"] = merge.get("refs") or []
+    state.setdefault("sol_reviews", []).append(record)
+    _history(state, "sol_review_completed", {
+        "review_id": record.get("review_id") or "",
+        "verdict": record.get("verdict") or "",
+        "materials_sha256": record["materials_sha256"],
+        "findings": record.get("findings_count") or {},
+        "merged": {"created": merge.get("created") or [],
+                   "matched": merge.get("matched") or []},
+        "trigger": record["trigger"],
+    })
+    save_state(path, state)
+    return record
+
+
+def record_sol_review_failure(path: str, *, error_code: str, detail: str = "",
+                              materials_sha256: str = "",
+                              model: str = "") -> dict:
+    """登记一次失败的 SOL 调用；失败不改变任务阶段，也不阻断主代理继续。"""
+    state = load_state(path)
+    record = {
+        "schema": "copilot-sol-review-failure/v1",
+        "review_id": "SR" + secrets.token_hex(12),
+        "task_id": str(state.get("task_id") or ""),
+        "status": "failed",
+        "error": str(error_code or "sol_error"),
+        "detail": str(detail or "")[:2000],
+        "materials_sha256": str(materials_sha256 or ""),
+        "model": model,
+        "created_at": now_iso(),
+    }
+    state.setdefault("sol_reviews", []).append(record)
+    _history(state, "sol_review_failed", {
+        "review_id": record["review_id"],
+        "error": record["error"],
+        "materials_sha256": record["materials_sha256"],
+    })
+    save_state(path, state)
+    return record
 
 
 def list_findings(state: dict) -> dict:
@@ -3670,6 +3743,11 @@ def create_review_attempt(path: str, *, work_item_id: str,
     """
     state = load_state(path)
     _assert_open(state, "创建复核 attempt")
+    if str(state.get("risk") or "").lower() != "high":
+        raise GovernanceError(
+            "[native_review_retired] 普通复核已由 SOL 零工具单轮复核取代"
+            "（copilot_dispatch.py sol-review）；原生只读复核只保留给高风险 "
+            "G4（risk=high），且宿主没有合规只读载体时仍 fail-closed。")
     wid = str(work_item_id or "").strip()
     exec_sha = str(execution_result_sha256 or "").strip().lower()
     execution = None
@@ -4582,6 +4660,8 @@ def review_metrics(state: dict, *, task_dir: str = "") -> dict:
     """
     reviews = [r for r in state.get("native_reviews") or [] if isinstance(r, dict)]
     reviews.sort(key=lambda r: str(r.get("received") or ""))
+    sol_reviews = [r for r in state.get("sol_reviews") or []
+                   if isinstance(r, dict)]
     by_item: dict[str, list[dict]] = {}
     for review in reviews:
         wid = str(review.get("work_item_id") or "")
@@ -4815,9 +4895,28 @@ def review_metrics(state: dict, *, task_dir: str = "") -> dict:
         "task_seconds": _seconds_between(
             state.get("created"), closure.get("closed_at") or state.get("updated")),
         "reopen_count": len(closure.get("reopen_history") or []),
-        "note": "有效复核按 native_reviews 统计；被拒信封按 review-attempts.jsonl "
-                "统计。正式 REVIEW、G4 与原生复核分别计数，不互相替代；"
-                "正式 REVIEW 的 amendment 与 supersede 单独统计，不重复计为新的 PASS。",
+        "sol": {
+            "total": len(sol_reviews),
+            "completed": len([r for r in sol_reviews
+                              if r.get("status") == "completed"]),
+            "failed": len([r for r in sol_reviews
+                           if r.get("status") == "failed"]),
+            "verdicts": {
+                verdict: len([r for r in sol_reviews
+                              if r.get("status") == "completed"
+                              and r.get("verdict") == verdict])
+                for verdict in ("pass", "partial", "blocked")},
+            "findings": {
+                severity: sum(int((r.get("findings_count") or {}).get(severity)
+                                  or 0)
+                              for r in sol_reviews
+                              if r.get("status") == "completed")
+                for severity in ("blocking", "major", "minor", "info")},
+            "single_round": True,
+        },
+        "note": "有效复核按 native_reviews（仅高风险 G4）统计；SOL 单轮复核单独按 "
+                "sol_reviews 统计，一次调用只发一次请求。正式 REVIEW、G4 与 SOL "
+                "分别计数，不互相替代。",
     }
 
 
@@ -5001,6 +5100,46 @@ def _derive_id(state: dict, base: str) -> str:
         if candidate not in used:
             return candidate
     raise GovernanceError(f"派生工作项 id 已用尽：{base}")
+
+
+def _latest_capability_rejections(state: dict) -> list[str]:
+    """最近一次 G4 取证里的“宿主/Profile 能力缺口”拒绝码。
+
+    只看最近一次记录：环境或 Profile 修复后，历史缺口不应继续阻断；反过来，
+    同一条能力缺口也不会被当成“再派一个 Reviewer 就会好”而反复派发。
+    """
+    attestations = state.get("g4_attestations")
+    if isinstance(attestations, list) and attestations:
+        latest = attestations[-1]
+        if isinstance(latest, dict):
+            # g4_shadow 记录把拒绝码放在 attestation.rejections（持久化摘要）与
+            # new_reason（扁平码列表）；顶层只有影子层自身字段。三者都读，兼容
+            # 早期/手工构造的记录。
+            codes: set[str] = set()
+            for item in latest.get("rejections") or []:
+                if isinstance(item, dict):
+                    codes.add(str(item.get("code") or ""))
+            attestation = latest.get("attestation")
+            if isinstance(attestation, dict):
+                for item in attestation.get("rejections") or []:
+                    if isinstance(item, dict):
+                        codes.add(str(item.get("code") or ""))
+            for item in latest.get("new_reason") or []:
+                codes.add(str(item))
+            hits = sorted(code for code in codes
+                          if code in RP.CAPABILITY_REJECTION_CODES)
+            if hits:
+                return hits
+    reviews = state.get("native_reviews")
+    if isinstance(reviews, list) and reviews:
+        latest = reviews[-1]
+        if isinstance(latest, dict):
+            reasons = {str(item) for item in latest.get("g4_reasons") or []}
+            hits = sorted(reason for reason in reasons
+                          if reason in RP.CAPABILITY_REJECTION_CODES)
+            if hits:
+                return hits
+    return []
 
 
 def derive_work(state: dict, *, reason: str = "partial",
@@ -5224,7 +5363,23 @@ def derive_work(state: dict, *, reason: str = "partial",
         done_g4 = [a for a in state.get("actions") or []
                    if str(a.get("origin") or "") == "g4-review"
                    and str(a.get("status") or "") == "done"]
-        if done_g4:
+        capability_codes = _latest_capability_rejections(state)
+        if capability_codes:
+            # 同一宿主/Profile 能力缺口不会因为再派一次相同的只读会话而消失；
+            # 先让主代理诊断并修正环境（Profile 工具集/会话模式/宿主记录），
+            # 确实无法在授权内修复时如实 block，而不是反复无效派发。
+            add("AUTO-G4-CAPABILITY", "处理 G4 宿主/Profile 能力缺口",
+                "最近一次 G4 取证给出的拒绝码属于能力缺口而非复核质量问题："
+                + ", ".join(capability_codes) + "。先运行 "
+                "`native_agent.py capability --metadata <metadata.json>` 复核实际权限与"
+                "子会话执行模式；能修的（Profile tools/disallowedTools、会话 profile "
+                "加载、plan 模式下的 Bash 注入）在主代理侧修复后重新派发新的只读会话与 "
+                "attempt；确属宿主能力缺失（例如 plan 模式无法退出）时用 block 记录原因"
+                "与解除条件。不要原样重复同一个无效派发。",
+                "capability 诊断输出、修正后的 Profile/会话证据与新 attempt，或明确的 "
+                "block 记录（含宿主版本、能力探测结果与解除条件）",
+                origin="g4-review")
+        elif done_g4:
             # 复核做过但 G4 仍未通过：多半是信封未回填、绑定过期或被拒绝。
             add("AUTO-G4-INGEST", "回填或重新生成 G4 复核信封",
                 "已有标记完成的 G4 复核工作项，但门禁仍缺可用复核记录。请检查："

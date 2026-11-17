@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""Copilot v6 持续推进器：本地阶段机 + 工作单 + 原生信封回填。
+"""Copilot v7 持续推进器：本地阶段机 + 工作单 + 原生信封回填（G4）。
 
 它**不调用任何模型**，也不等待外部判断：
 
 * `drive`：读取状态 → 本地求值 → 命中 PASS 就收口；命中 BLOCKED/CLOSED 就停下
   报告；有可领取工作项就输出工作单并以 EXIT_EXECUTE 退出；PARTIAL 则本地派生
   下一步工作项后继续（不是任务终点）。
-* `ingest`：把 `native_agent.py` 生成的执行/复核信封校验后回填状态，包括证据
-  登记、工作项结果、原生复核记录。
+* `ingest`：把 `native_agent.py` 生成的执行/复核信封校验后回填状态。原生复核
+  信封只用于高风险 G4（`risk=high`）；普通复核由 `sol_review.py` 的 SOL 零工具
+  单轮复核承担，不经过本模块。
 
 退出码
 ------
@@ -441,6 +442,10 @@ def _finalize_candidate(path: str, state: dict, normalized: dict,
 
 def _ingest_review(path: str, envelope: dict) -> int:
     state = G.load_state(path)
+    if str(state.get("risk") or "").lower() != "high":
+        raise AutoError(
+            "[native_review_retired] 普通复核已由 SOL 零工具单轮复核取代；"
+            "原生复核信封只用于高风险 G4。")
     dispatch = state.get("native_dispatch")
     bound = str(envelope.get("execution_result_sha256") or "")
     execution = _existing_result(state, bound)

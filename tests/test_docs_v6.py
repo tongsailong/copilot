@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""v6 文档契约：Skill 入口、references、Reviewer 与项目文档与代码一致。
+"""v7 文档契约：Skill 入口、references、SOL 单轮复核与项目文档与代码一致。
 
-这些断言保护“文档不会把 SOL 重新写回活动路径”，以及 v6 的关键运行契约
-（本地治理、PARTIAL 持续推进、正式 REVIEW opt-in、G4 fail-closed、v2 信封）
-没有在文档中被静默删除或放宽。
+这些断言保护“SOL 只做一次性 REVIEW、不是决策通道”，以及 v7 的关键运行契约
+（本地治理、PARTIAL 持续推进、正式 REVIEW opt-in、单轮复核、G4 fail-closed）。
 """
 from __future__ import annotations
 
@@ -66,16 +65,19 @@ class SkillEntryTests(unittest.TestCase):
         self.assertLessEqual(len(re.search(r"when_to_use: >\n(.*?)\n---", self.doc, re.S)
                                  .group(1)), 1024)
 
-    def test_version_and_retirement(self):
+    def test_version_and_sol_review_only(self):
         self.assertIn(f"v{current_version()}", self.doc)
         self.assertIn(f"# copilot：轻量协作治理（v{current_version()}）", self.doc)
-        self.assertIn("SOL 已退役", self.doc)
+        self.assertIn("SOL 零工具单轮复核", self.doc)
         self.assertIn("legacy-status", self.doc)
         self.assertNotIn("唯一正式 GPT/SOL 入口", self.doc)
-        # 不得再把 SOl 写成可调用入口：只有在“退役/历史”语境下允许出现模型名。
+        # SOL 只做 REVIEW：不得在文档里恢复 CONSULT/PLAN 远程职责或决策门禁。
+        self.assertNotIn("SOL 决策通道已退役。", self.doc)
         for line in self.doc.splitlines():
             if "gpt-6.1-sol" in line:
-                self.assertIn("退役", line)
+                self.assertNotIn("决策通道", line)
+                self.assertNotIn("CONSULT", line)
+                self.assertNotIn("PLAN", line)
 
     def test_lightweight_governance_and_partial_persistence(self):
         self.assertIn("不替代技术决策", self.doc)
@@ -107,6 +109,11 @@ class SkillEntryTests(unittest.TestCase):
         self.assertIn("review_attempt_id", self.doc)
         self.assertIn("代码范围快照", self.doc)
         self.assertIn("--workspace", self.doc)
+        # SOL 单轮复核必须写进入口，且明确不是 G4。
+        self.assertIn("sol-review", self.doc)
+        self.assertIn("单轮", self.doc)
+        self.assertIn("零工具", self.doc)
+        self.assertIn("不是 G4", self.doc)
         # 高风险与 native 后端的绑定必须写进入口，否则会留下无法收口的任务。
         self.assertIn("--risk high", self.doc)
         self.assertIn("--backend native", self.doc)
@@ -121,6 +128,11 @@ class ReferenceTests(unittest.TestCase):
         o = {name: text(os.path.join(REFERENCES, name)) for name in ACTIVE_REFS}
         self.assertIn("legacy-status", o["workflow.md"])
         self.assertIn("evidence_tampered", o["workflow.md"])
+        self.assertIn("sol-review", o["workflow.md"])
+        self.assertIn("sol_reviews", o["review.md"])
+        self.assertIn("单轮", o["review.md"])
+        self.assertIn("零工具", o["review.md"])
+        self.assertIn("不是 G4", o["review.md"])
         self.assertIn("MAX_DRIVE_STEPS", o["runtime.md"])
         self.assertIn("PARTIAL 不是终点", o["runtime.md"])
         self.assertIn("G4", o["review.md"])
@@ -143,8 +155,8 @@ class ReferenceTests(unittest.TestCase):
         self.assertIn("review_attempt_created_at", o["agent-bridge.md"])
         self.assertIn("--create-attempt", o["workflow.md"])
         for name, doc in o.items():
-            self.assertNotIn("gpt-6.1-sol", doc, f"{name} 不应把 SOL 写成活动路径")
             self.assertNotIn("call_gpt.py --", doc, name)
+        self.assertIn("native_review_retired", o["agent-bridge.md"])
 
     def test_historical_references_are_marked_retired(self):
         for name in HISTORICAL_REFS:
@@ -152,10 +164,12 @@ class ReferenceTests(unittest.TestCase):
             self.assertIn("历史文档", doc, f"{name} 缺少退役横幅")
             self.assertIn("退役", doc, f"{name} 未说明退役")
 
-    def test_history_records_v6_retirement(self):
+    def test_history_records_v6_and_v7(self):
         doc = text(os.path.join(REFERENCES, "history.md"))
         self.assertIn("v6.0.0（2026-11-12）", doc)
         self.assertIn("SOL 决策通道已于 v6.0.0", doc)
+        self.assertIn("v7.0.0（2026-11-17）", doc)
+        self.assertIn("SOL 零工具单轮复核", doc)
         self.assertIn("legacy/", doc)
 
 
@@ -181,31 +195,34 @@ class ReadonlyProfileTests(unittest.TestCase):
 
 
 class ProjectDocTests(unittest.TestCase):
-    def test_agents_md_points_to_v6_architecture(self):
+    def test_agents_md_points_to_v7_architecture(self):
         doc = text(os.path.join(ROOT, "AGENTS.md"))
-        self.assertIn("SOL 决策通道退役", doc)
+        self.assertIn("唯一远程调用是 SOL REVIEW", doc)
         self.assertIn("PARTIAL 不是终点", doc)
         self.assertIn("legacy/tests", doc)
+        self.assertIn("native_review_retired", doc)
         self.assertNotIn("SOL 固定", doc)
         self.assertNotIn("唯一正式 GPT/SOL 入口", doc)
 
-    def test_charter_and_roadmap_mark_sol_retired(self):
+    def test_charter_and_roadmap_mark_sol_review_only(self):
         charter = text(os.path.join(ROOT, "docs", "PROJECT-CHARTER.md"))
         roadmap = text(os.path.join(ROOT, "docs", "ROADMAP.md"))
-        self.assertIn("SOL 已于 v6.0.0 退役", charter)
+        self.assertIn("只恢复 REVIEW", charter)
         self.assertIn("唯一工程执行与技术决策主体", charter)
-        self.assertIn("已退役", roadmap)
+        self.assertIn("v7.0", roadmap)
 
-    def test_status_and_decisions_record_v6(self):
+    def test_status_and_decisions_record_v7(self):
         status = text(os.path.join(ROOT, "docs", "STATUS.md"))
         decisions = text(os.path.join(ROOT, "docs", "DECISIONS.md"))
         self.assertIn("v6.0.0", status)
         self.assertIn("SOL 决策通道退役", decisions)
         self.assertIn("本地治理引擎", decisions)
+        self.assertIn("v7.0.0", decisions)
+        self.assertIn("SOL 零工具单轮", decisions)
 
-    def test_readme_does_not_present_sol_as_active(self):
+    def test_readme_presents_sol_review_as_active(self):
         doc = text(os.path.join(ROOT, "README.md"))
-        self.assertIn("退役", doc)
+        self.assertIn("SOL 零工具单轮复核", doc)
         self.assertIn("governance.py", doc)
         self.assertIn("legacy/", doc)
 

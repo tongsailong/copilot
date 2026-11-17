@@ -31,8 +31,8 @@ import v6_support as F  # noqa: E402
 
 def readonly_snapshot(**overrides) -> dict:
     snapshot = {
-        "name": "independent-readonly",
-        "source": "project",
+        "name": "reviewer",
+        "source": "built-in",
         "path": "/repo/.zcode/agents/independent-readonly.md",
         "tools": ["Read", "Grep", "Glob"],
         "disallowedTools": ["Write", "Edit", "Bash", "WebFetch", "WebSearch",
@@ -76,11 +76,23 @@ class ClassifyProfileTests(unittest.TestCase):
         self.assertFalse(result["can_write"])
         self.assertEqual(result["codes"], ["g4_ready"])
 
-    def test_name_source_path_are_not_gating(self):
+    def test_name_and_path_are_not_gating_for_builtin(self):
         result = AP.classify_profile(readonly_snapshot(
-            name="any-name", source="user", path="/outside/any.md"))
+            name="any-name", path="/outside/any.md"))
         self.assertTrue(result["g4_executor"])
         self.assertEqual(result["builtin"], "")
+        self.assertEqual(result["carrier"], "built-in")
+        self.assertTrue(result["architecture_compliant"])
+
+    def test_source_must_be_builtin(self):
+        # 原定架构只允许 ZCode 内置子代理；项目/用户 Profile 不是 G4 载体。
+        for source in ("project", "user", "plugin"):
+            with self.subTest(source=source):
+                result = AP.classify_profile(readonly_snapshot(source=source))
+                self.assertFalse(result["g4_executor"])
+                self.assertFalse(result["architecture_compliant"])
+                self.assertIn("profile_source_not_builtin", result["codes"])
+                self.assertIn("BLOCKED", result["remedy"])
 
     def test_explore_has_bash_and_is_not_g4(self):
         result = AP.classify_profile(explore_snapshot())
@@ -169,15 +181,68 @@ class ClassifyProfileTests(unittest.TestCase):
 class CapabilityReportTests(unittest.TestCase):
     def test_report_marks_g4_capability_and_note(self):
         metadata = {"agentId": "a1", "childSessionId": "c1",
-                    "profileId": "independent-readonly", "status": "completed",
+                    "profileId": "reviewer", "status": "completed",
                     "profileSnapshot": readonly_snapshot()}
-        report = AP.capability_report(metadata, metadata_path="/tmp/m.json")
+        report = AP.capability_report(
+            metadata, metadata_path="/tmp/m.json",
+            execution_state={"found": True, "mode": "yolo",
+                             "plan_enabled": False})
         self.assertEqual(report["schema"], "copilot-agent-capability/v1")
         self.assertTrue(report["g4"]["executor"])
         self.assertTrue(report["g4"]["precheck_only"])
         self.assertEqual(report["warnings"], [])
+        self.assertEqual(report["session_execution"]["plan_enabled"], False)
         self.assertIn("不代表 G4 已通过", report["note"])
         self.assertIn("g4_attest", report["note"])
+
+    def test_plan_mode_disqualifies_g4_executor(self):
+        # plan 模式会给子代理注入 Bash：即使 Profile 策略精确只读也不能算 G4 载体。
+        report = AP.capability_report(
+            {"profileId": "reviewer", "status": "completed",
+             "profileSnapshot": readonly_snapshot()},
+            execution_state={"found": True, "mode": "build",
+                             "plan_enabled": True})
+        self.assertFalse(report["g4"]["executor"])
+        self.assertIn("host_session_plan_mode", report["g4"]["codes"])
+        self.assertIn("plan", report["g4"]["remedy"])
+        self.assertIn("host_session_plan_mode", report["warnings"])
+
+    def test_missing_session_state_fails_closed(self):
+        report = AP.capability_report(
+            {"profileId": "reviewer", "status": "completed",
+             "profileSnapshot": readonly_snapshot()},
+            execution_state={"found": False, "mode": "", "plan_enabled": None})
+        self.assertFalse(report["g4"]["executor"])
+        self.assertIn("host_session_state_missing", report["g4"]["codes"])
+
+    def test_unknown_plan_flag_fails_closed(self):
+        report = AP.capability_report(
+            {"profileId": "reviewer", "status": "completed",
+             "profileSnapshot": readonly_snapshot()},
+            execution_state={"found": True, "mode": "yolo",
+                             "plan_enabled": None})
+        self.assertFalse(report["g4"]["executor"])
+        self.assertIn("host_session_state_unknown", report["g4"]["codes"])
+
+    def test_unchecked_session_state_is_reported(self):
+        report = AP.capability_report({
+            "profileId": "reviewer", "status": "completed",
+            "profileSnapshot": readonly_snapshot()})
+        self.assertIn("session_state_unchecked", report["warnings"])
+        self.assertFalse(report["g4"]["executor"])
+        self.assertIn("session_state_unchecked", report["g4"]["codes"])
+        self.assertIsNone(report["session_execution"])
+
+    def test_host_version_prefers_probed_value(self):
+        report = AP.capability_report(
+            {"profileId": "reviewer", "status": "completed",
+             "profileSnapshot": readonly_snapshot()},
+            execution_state={"found": True, "mode": "yolo",
+                             "plan_enabled": False},
+            host_info={"version": "9.9.9", "source": "test"})
+        self.assertEqual(report["host_version"], "9.9.9")
+        self.assertEqual(report["host_baseline"], AP.HOST_VERSION)
+        self.assertEqual(report["host"]["source"], "test")
 
     def test_report_flags_profile_mismatch_and_incomplete(self):
         metadata = {"agentId": "a1", "childSessionId": "c1",
@@ -189,7 +254,7 @@ class CapabilityReportTests(unittest.TestCase):
 
     def test_report_flags_permission_mode_whitespace(self):
         report = AP.capability_report({
-            "profileId": "independent-readonly", "status": "completed",
+            "profileId": "reviewer", "status": "completed",
             "profileSnapshot": readonly_snapshot(permissionMode="default ")})
         self.assertIn("permission_mode_whitespace", report["warnings"])
 
@@ -267,6 +332,16 @@ class DispatchAdviceTests(unittest.TestCase):
         self.assertIn("主代理继续", result["reason"])
         self.assertIn("不原样重派", result["reason"])
 
+    def test_g4_in_plan_mode_is_not_dispatchable(self):
+        result = AP.dispatch_advice(g4_required=True, plan_mode=True)
+        self.assertEqual(result["executor"], "unavailable")
+        self.assertIn("plan", result["reason"])
+        self.assertIn("Bash", result["reason"])
+
+    def test_g4_outside_plan_mode_keeps_normal_advice(self):
+        result = AP.dispatch_advice(g4_required=True, plan_mode=False)
+        self.assertEqual(result["executor"], "main")
+
 
 class ToolCallClassificationTests(unittest.TestCase):
     def test_host_write_and_execution_tools(self):
@@ -329,7 +404,7 @@ class CapabilityCLITests(unittest.TestCase):
         return path
 
     def make_host_db(self, calls, *, with_session=True) -> str:
-        """最小宿主夹具：session + tool_usage（与宿主 3.18.2 列名一致）。"""
+        """最小宿主夹具：session + tool_usage + execution_state（与宿主 3.18.2 列名一致）。"""
         import sqlite3
         path = os.path.join(self.tmp.name, "host.sqlite")
         con = sqlite3.connect(path)
@@ -337,8 +412,14 @@ class CapabilityCLITests(unittest.TestCase):
         con.execute("create table tool_usage (id integer primary key, "
                     "session_id text, tool_name text, read_only integer, "
                     "status text)")
+        con.execute("create table session_entry (session_id text, type text, "
+                    "data text, time_created integer)")
         if with_session:
             con.execute("insert into session (id) values (?)", ("c1",))
+            con.execute(
+                "insert into session_entry values (?,?,?,?)",
+                ("c1", "runtime/execution_state",
+                 json.dumps({"mode": "yolo", "planEnabled": False}), 1))
         for tool, read_only, status, count in calls:
             for _ in range(count):
                 con.execute(
@@ -376,6 +457,22 @@ class CapabilityCLITests(unittest.TestCase):
         self.assertEqual(evidence["total_calls"], 5)
         self.assertEqual(evidence["write_capable_calls"], 0)
         self.assertEqual(payload["warnings"], [])
+
+    def test_capability_cli_rejects_plan_mode(self):
+        db = self.make_host_db([("Read", 1, "completed", 2)])
+        con = sqlite3.connect(db)
+        con.execute(
+            "update session_entry set data=? "
+            "where type='runtime/execution_state'",
+            (json.dumps({"mode": "build", "planEnabled": True}),))
+        con.commit()
+        con.close()
+        payload = self.run_capability(readonly_snapshot(), db)
+        self.assertFalse(payload["g4"]["executor"])
+        self.assertIn("host_session_plan_mode", payload["g4"]["codes"])
+        self.assertEqual(payload["session_execution"]["plan_enabled"], True)
+        if payload["host"].get("version"):
+            self.assertEqual(payload["host_version"], payload["host"]["version"])
 
     def test_capability_cli_warns_on_observed_write_calls(self):
         # 快照是只读，但宿主记录出现 ApplyPatch 调用：必须告警。

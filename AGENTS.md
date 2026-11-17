@@ -11,16 +11,19 @@ Copilot 是运行于 ZCode 内的**轻量协作治理 Skill**：负责任务承�
 决策主体；用户侧 ChatGPT 负责需求与产品层目标、交接与验收；高风险 G4 由宿主可证明只读的
 子代理承担独立复核。
 
-- **v6.0.0 起 SOL 决策通道退役**：活动路径不得调用任何远程模型，不得把其他远程大模型设为
-  强制决策节点，也不得设置等待远程返回的状态门禁。历史实现归档在 `legacy/`，历史审计、
-  裁决、台账与证据只读保留。
+- **v7.0.0 起普通复核只走 SOL 零工具单轮复核**：`scripts/sol_review.py` 是唯一允许访问
+  网络与读取本机 CPA 凭据的活动模块，只提供 REVIEW、只读材料、一次请求；不恢复 CONSULT/
+  PLAN 远程职责，不把 SOL 当 G4，不设等待远程返回的状态门禁。原生多轮 Reviewer 已退役，
+  `native_agent.py review` / `review-context` / 原生复核 ingest 只保留给高风险 G4
+  （其他风险返回 `native_review_retired`）。
+  历史实现归档在 `legacy/`，历史审计、裁决、台账与证据只读保留。
 - 本仓库是**唯一源码**。`~/.zcode/skills/copilot` 是构建产物，只能由
   `scripts-sync/sync_runtime.py` 单向下发，不得直接编辑。旧 Reviewer 全局 Profile
   已退役；工作区 `.zcode/agents/independent-readonly.md` 是通用只读能力载体（只声明
-  宿主权限，不定义 Reviewer 角色或流程）。普通任务不强制使用它；但宿主 3.18.2 没有
-  派发期工具白名单，**需要 G4 时它是本工作区唯一可被宿主验证的只读载体，不得删除**
-  （删除后 G4 只能 fail-closed）。G4 按 `profileSnapshot` 的有效策略判定（名称/来源/
-  路径不参与），该文件不属于同步分发范围。
+  宿主权限，不定义 Reviewer 角色或流程），普通任务不强制使用。按 v6.12 的载体来源约束，
+  它是 project 级自定义 Agent，**不是正式 G4 载体**；G4 要求内置 `source=built-in` +
+  精确 `Read/Grep/Glob`，当前宿主没有合规载体，正式 G4 继续 fail-closed/BLOCKED。
+  该文件不属于同步分发范围。
 - 运行时临时修复必须先回迁本仓库，再同步下发；不使用符号链接替代副本。
 - 源码与运行时的分工见 `docs/DECISIONS.md`。
 
@@ -35,7 +38,8 @@ Agent、G4 只读复核、DesignWise。Executor / Reviewer 是 ZCode 工程执�
 | ZCode 主代理 | 默认执行主体：现场调查、工程规划、技术选型、实现、调试、测试、集成与交付；按需派发子代理 | 不擅自改变产品目标、业务规则或授权范围；不为体现协作强制调用子代理 |
 | 内置 `Explore` | 独立只读调查：跨模块/调用链/改动前风险/独立上下文检查 | 工具集含 `Bash`，不是只读代理；不注入 AGENTS.md，主代理必须提供范围与项目背景；不修改工程文件，不能作为 G4 执行者 |
 | 内置 `general-purpose` | 边界清晰、可独立交付、并行收益明显的子任务 | `tools=["*"]` 并继承 MCP；主代理负责拆分、冲突检查、集成与验收；不能当作只读复核者 |
-| Copilot 状态层 | 合同、条件、状态、证据登记、四门、PARTIAL 派生、收口、审计 | 是本地脚本与状态，不是模型；不调用模型、不实施工程、不替代技术决策、门禁不得绕过 |
+| Copilot 状态层 | 合同、条件、状态、证据登记、四门、PARTIAL 派生、收口、审计 | 是本地脚本与状态，不是模型；除显式 `sol-review` 外不调用模型、不实施工程、不替代技术决策、门禁不得绕过 |
+| SOL REVIEW | 一次性零工具独立审查；结论写入 `sol_reviews` 与 Finding 台账（advisory） | 只做 REVIEW；不执行工程、不做技术决策、不自动二审、不替代 G4；结论只是建议 |
 | 正式 REVIEW | 用户明确要求时的治理记录 | 不是普通开发前置门禁；不能替代 G4；无授权不得伪造 |
 | G4 复核 | 高风险任务收口所需的技术复核 | 宿主有效策略必须精确 `Read/Grep/Glob` 且禁用 `Write/Edit/Bash`、无 skills/MCP；内置 Explore/general-purpose 均不合格；fail-closed，无可证明只读能力时报告能力缺口 |
 
@@ -47,9 +51,12 @@ Agent、G4 只读复核、DesignWise。Executor / Reviewer 是 ZCode 工程执�
 
 ## 3. 模型路由规则
 
-- **活动路径无远程决策模型**：`governance.py`、`copilot_dispatch.py`、`copilot_auto.py`、
-  `native_bridge.py`、`native_agent.py` 不得导入网络客户端或已退役的 SOL 模块
-  （`call_gpt` / `review_ledger` / `reply_protocol`）。
+- **唯一远程调用是 SOL REVIEW**：只有 `scripts/sol_review.py` 可以导入网络客户端、读取本机
+  CPA 凭据与包含 `gpt-6.1-sol` 模型名；`governance.py`、`copilot_dispatch.py`、
+  `copilot_auto.py`、`native_bridge.py`、`native_agent.py` 不得导入网络客户端或已退役的
+  SOL 模块（`call_gpt` / `review_ledger` / `reply_protocol`）。SOL 只接收主代理材料、
+  一次请求、零工具（请求体无 `tools`/`functions`，`tool_choice="none"`），不自动重试、
+  不换 Provider、不自动二审。
 - **Executor / Reviewer 继承主代理**：Profile 中省略 `model` 或写 `model: inherit`，
   Provider/模型/推理级别跟随主代理当前会话。不得写死官方 DeepSeek 直连模型或任何
   固定 Provider；`thoughtLevel` 只在钉死具体模型时生效，`inherit` 下忽略。
@@ -104,14 +111,19 @@ Agent、G4 只读复核、DesignWise。Executor / Reviewer 是 ZCode 工程执�
   均不满足精确只读要求。G4 仍要求宿主 `Read/Grep/Glob` + 禁用 `Write/Edit/Bash`；
   无可证明只读能力时 fail-closed 并报告能力缺口，不伪造 PASS、不新建自定义只读子代理补位。
 - G1–G4 保持 fail-closed：证据不足、绑定不符、门禁未过时必须失败关闭，不得用
-  “看起来合理”替代验证；普通 Reviewer PASS **不等于** G4，`g4_eligible` 由宿主记录计算。
+  “看起来合理”替代验证；SOL 复核与原生 Reviewer PASS **都不等于** G4，`g4_eligible`
+  由宿主记录计算。
 - 执行/复核必须绑定 task / contract / plan / dispatch / work_item /
   `execution_result_sha256`；证据须先登记且属于本任务，文件型证据会重读校验摘要。
-- Reviewer 只读、独立取证、独立报告；不得继承执行方判断，不得因执行方自述而放弃核查。
+- G4 复核方只读、独立取证、独立报告；不得继承执行方判断，不得因执行方自述而放弃核查。
+  SOL 复核只提供建议，由主代理核实、修复并做定向验证。
 - 正式 REVIEW 仅在用户明确授权时登记；授权在同一任务合同内持续有效，不得成为普通开发
   门禁，也不得用自检冒充。G4 不依赖正式 REVIEW。
+- SOL 一次复核只发一次请求：失败（429/超时/网络/截断/格式/身份）如实记录后由主代理继续，
+  不自动重试、不换 Provider、不派原生 Reviewer 顶替；只有用户明确要求完成独立复核时才按
+  BLOCKED 报告。
 - 不跳过四门、收口与证据校验；未过门不得标记 CLOSED 或 PASS。测试默认使用本地夹具，
-  不发起真实外部调用。
+  只有显式真实 E2E 才调用既有授权配置。
 - 不重做状态机、四门、自动驱动或证据协议；需要变更时先说明影响并取得授权。
 
 ## 6. 修改与交付纪律

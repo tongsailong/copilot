@@ -21,6 +21,7 @@
 """
 from __future__ import annotations
 
+import host_records
 import native_bridge as NB
 
 # 宿主版本与内置能力基线。升级 ZCode 后必须用真实 metadata/DB 重新核对，不能假设不变。
@@ -121,6 +122,10 @@ def _remedy_for_codes(codes: list[str]) -> str:
         "profile_permission_mode": "permissionMode 只能是 default/plan 或留空。",
         "profile_skills_not_allowed": "Profile 启用了 skills，G4 要求无 skills。",
         "profile_mcp_servers": "Profile 启用了 MCP，G4 要求无 MCP。",
+        "profile_source_not_builtin": (
+            "G4 只接受 ZCode 内置子代理（source=built-in）；项目/用户/插件自定义 "
+            "Profile 不是原定架构的载体。宿主当前内置 Explore 含 Bash、"
+            "general-purpose 为全工具，没有精确只读载体，G4 应保持 BLOCKED。"),
     }
     parts = [remedies.get(code, code) for code in codes]
     if not parts:
@@ -147,6 +152,9 @@ def classify_profile(snapshot: object) -> dict:
     policy = NB.normalize_profile_policy(snapshot)
     tools = _tool_names(policy.get("tools"))
     problems = NB.reviewer_policy_problems(policy)
+    # 原定架构只允许 ZCode 内置子代理；项目/用户自定义 Profile 即使工具集精确，
+    # 也不能作为正式 G4 载体（宿主内置 Explore 含 Bash、general-purpose 为全工具）。
+    problems = problems + NB.g4_carrier_problems(policy)
     codes = [code for code, _detail in problems]
     reasons = [f"{code}: {detail}" for code, detail in problems]
     can_write = _can_write(tools, policy)
@@ -199,6 +207,11 @@ def classify_profile(snapshot: object) -> dict:
     return {
         "name": name,
         "source": source,
+        "carrier": ("built-in" if source == "built-in"
+                    else "project-profile" if source == "project"
+                    else "user-profile" if source == "user"
+                    else "unknown"),
+        "architecture_compliant": source == NB.G4_CARRIER_SOURCE,
         "path": str(policy.get("path") or "").strip(),
         "tools": tools,
         "disallowed_tools": _tool_names(policy.get("disallowedTools")),
@@ -213,8 +226,16 @@ def classify_profile(snapshot: object) -> dict:
     }
 
 
-def capability_report(metadata: object, metadata_path: str = "") -> dict:
-    """从宿主 metadata 生成只读能力报告（不派发、不改状态）。"""
+def capability_report(metadata: object, metadata_path: str = "",
+                      execution_state: object = None,
+                      host_info: object = None) -> dict:
+    """从宿主 metadata 生成只读能力报告（不派发、不改状态）。
+
+    `execution_state` 是子会话的 `runtime/execution_state`（由
+    `host_records.session_execution_state` 读取）。宿主在 plan 模式下会给子代理
+    注入 Bash（真实记录：planEnabled=true 的独立只读子会话执行过 `git status`），
+    所以“Profile 策略只读”还不够；plan 模式或状态未知都必须让 `g4.executor` 为假。
+    """
     data = metadata if isinstance(metadata, dict) else {}
     snapshot = data.get("profileSnapshot")
     classification = (classify_profile(snapshot) if isinstance(snapshot, dict)
@@ -235,25 +256,71 @@ def capability_report(metadata: object, metadata_path: str = "") -> dict:
     status = str(data.get("status") or "").strip()
     if status and status != "completed":
         warnings.append("agent_not_completed")
+    session_state = execution_state if isinstance(execution_state, dict) else {}
+    unchecked = execution_state is None
+    session_problems = host_records.execution_state_problems(session_state) \
+        if not unchecked else []
+    if unchecked:
+        # 调用方没有提供子会话执行状态：无法排除 plan 模式注入 Bash，不能只凭
+        # Profile 策略判定可执行 G4（fail-closed）。
+        warnings.append("session_state_unchecked")
+    elif session_problems:
+        warnings.extend(code for code, _detail in session_problems)
+    g4_executor = bool(classification.get("g4_executor")) \
+        and not unchecked and not session_problems
+    codes = list(classification.get("codes") or [])
+    if unchecked:
+        codes = ["session_state_unchecked"]
+    elif session_problems:
+        codes = [code for code, _detail in session_problems]
+    remedy = str(classification.get("remedy") or "")
+    if unchecked:
+        remedy = ("调用方没有提供子会话 runtime/execution_state；先用 "
+                  "host_records.session_execution_state 读取并确认 planEnabled=false，"
+                  "否则保持 fail-closed。")
+    elif session_problems:
+        code = session_problems[0][0]
+        if code == host_records.HOST_SESSION_PLAN_MODE:
+            remedy = ("子会话继承了 plan 模式，宿主会给子代理注入 Bash；"
+                      "先退出 plan 模式（planEnabled=false）再重新派发只读复核。")
+        elif code == host_records.HOST_SESSION_STATE_MISSING:
+            remedy = ("宿主没有子会话 runtime/execution_state 记录，无法排除 plan "
+                      "模式注入 Bash；保持 fail-closed 并如实报告能力缺口。")
+        else:
+            remedy = ("runtime/execution_state 缺少可判定的 mode/planEnabled；"
+                      "无法证明非 plan 模式时保持 fail-closed。")
+    detected_version = ""
+    if isinstance(host_info, dict):
+        detected_version = str(host_info.get("version") or "").strip()
     return {
         "schema": "copilot-agent-capability/v1",
-        "host_version": HOST_VERSION,
+        # host_version 优先使用本次真实探测值；探测失败时回退到代码基线常量，
+        # 同时用 host_baseline 明确区分“当前宿主”与“实现基线”。
+        "host_version": detected_version or HOST_VERSION,
+        "host_baseline": HOST_VERSION,
+        "host": host_info if isinstance(host_info, dict) else {},
         "metadata_path": str(metadata_path or ""),
         "agent_id": str(data.get("agentId") or "").strip(),
         "child_session_id": str(data.get("childSessionId") or "").strip(),
         "profile_id": profile_id,
         "status": status,
+        "session_execution": {
+            "found": bool(session_state.get("found")),
+            "mode": str(session_state.get("mode") or ""),
+            "plan_enabled": session_state.get("plan_enabled"),
+            "source": str(session_state.get("source") or ""),
+        } if execution_state is not None else None,
         "classification": classification,
         "warnings": warnings,
         "g4": {
-            "executor": bool(classification.get("g4_executor")),
+            "executor": g4_executor,
             "precheck_only": True,
-            "codes": list(classification.get("codes") or []),
-            "remedy": str(classification.get("remedy") or ""),
+            "codes": codes,
+            "remedy": remedy,
         },
         "note": ("只读诊断：本报告不代表 G4 已通过。`g4.executor` 只是宿主 Profile "
-                 "策略预检；Profile 文件存在性/正文一致性、会话与 prompt 绑定、"
-                 "工具调用与原始输出仍由 g4_attest 独立核验。"),
+                 "策略 + 子会话执行模式的预检；Profile 文件存在性/正文一致性、"
+                 "会话与 prompt 绑定、工具调用与原始输出仍由 g4_attest 独立核验。"),
     }
 
 
@@ -263,7 +330,9 @@ def dispatch_advice(*, needs_independent_context: bool = False,
                     write_conflict: bool = False,
                     saves_time: bool = False,
                     research_only: bool = False,
-                    subagent_unavailable: bool = False) -> dict:
+                    subagent_unavailable: bool = False,
+                    g4_required: bool = False,
+                    plan_mode: bool = False) -> dict:
     """按五问给出调度建议：主代理默认执行，子代理按需。
 
     参数对应五问：1 独立上下文 → `needs_independent_context`；2 真正并行 →
@@ -271,14 +340,27 @@ def dispatch_advice(*, needs_independent_context: bool = False,
     `saves_time`；5 是否值得多一次调用与核对 → `saves_time`（并受
     `write_conflict`/`subagent_unavailable` 直接否决）。
 
-    判定顺序（先否决、后选择）：子代理不可用 → 主代理；写入冲突 → 主代理；
-    只读调查 → 内置 `Explore`（绝不交给全工具代理）；独立交付物 → 内置
-    `general-purpose`（需并发且有收益，否则主代理）；其余 → 主代理。
+    两个宿主能力开关：`plan_mode`（父会话 planEnabled）会让宿主给子代理注入
+    Bash；`g4_required` 表示这次需要的是 G4 只读复核。二者同时为真时不能派发，
+    必须先退出 plan 模式，否则会得到一个“看起来只读、实际可执行 Bash”的会话。
+
+    判定顺序（先否决、后选择）：G4 + plan 模式 → 不可派发；子代理不可用 →
+    主代理；写入冲突 → 主代理；只读调查 → 内置 `Explore`（绝不交给全工具代理）；
+    独立交付物 → 内置 `general-purpose`（需并发且有收益，否则主代理）；其余 →
+    主代理。
 
     这是**建议**，不是调度器：不创建任务、不派发 Agent、不设调用比例或预算。
     主代理可以结合现场证据否决，但否决理由应是不值得独立上下文，而不是为了
     “体现 Agent 协作”。
     """
+    if g4_required and plan_mode:
+        return {
+            "executor": "unavailable",
+            "reason": ("plan 模式会给子代理注入 Bash，有效工具策略不再是精确 "
+                       "Read/Grep/Glob；G4 不能在该模式下派发。先退出 plan 模式"
+                       "（planEnabled=false）再新建只读复核会话"),
+            "prompt_requirements": [],
+        }
     if subagent_unavailable:
         return {
             "executor": "main",

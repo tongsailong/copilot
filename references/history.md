@@ -1,8 +1,26 @@
 # Copilot Skill 版本与历史（历史记录）
 
-> 本文件记录版本沿革与 SOL 通道退役过程，供追溯，**不是当前规则来源**。现行规则见
+> 本文件记录版本沿革与 SOL 通道变化过程，供追溯，**不是当前规则来源**。现行规则见
 > `SKILL.md`、`references/workflow.md`、`runtime.md`、`review.md`、`agent-bridge.md`。
-> **SOL 决策通道已于 v6.0.0（2026-11-12）退役**；下文涉及 SOL 的段落全部是历史事实描述。
+> **SOL 决策通道已于 v6.0.0（2026-11-12）退役；v7.0.0（2026-11-17）只恢复一次性 REVIEW
+> （零工具、单轮、建议性）**，不恢复 CONSULT/PLAN 或状态门禁。下文涉及 SOL 的段落按时间
+> 标注是否为历史事实描述。
+
+## v7.0.0（2026-11-17）SOL Review Edition
+
+- **原生多轮 Reviewer 退役**：普通复核不再派发只读子代理、不再创建 review attempt、
+  不做多轮重入；`native_agent.py review`、`review-context` 与原生复核 ingest 只接受
+  `risk=high`（G4），其他风险返回 `native_review_retired`。
+- **SOL 零工具单轮复核恢复**：新增 `scripts/sol_review.py` 与
+  `copilot_dispatch.py sol-review`。复用既有本机 CPA `127` 出口与 `gpt-6.1-sol`
+  （`reasoning.effort=high`），不新增 Provider/账户/密钥/付费方案；请求体不含工具定义，
+  `tool_choice="none"`；一次调用只发一次请求，失败不重试、不换 Provider、不自动二审。
+- **建议性 findings**：SOL findings 以 `advisory` 进入 Finding 台账；主代理修复并定向
+  验证，误报可用 `finding --status dropped --note` 驳回；G4 的 `authoritative` findings
+  仍不可被驳回。`sol_reviews` 与 `native_reviews` 严格分开，SOL 不会产生 `g4_eligible`。
+- **`review-admission` 改为 SOL 建议**（not_needed/optional/recommended）；普通任务的
+  `review_stops`/多轮重入不再参与。G4 链路与 fail-closed 条件不变。
+- **G4 仍 BLOCKED**：当前 ZCode 3.18.2 没有内置精确只读载体，正式 G4 结论不变。
 
 ## v6.0.0（2026-11-12）ZCode Autonomous Development Edition
 

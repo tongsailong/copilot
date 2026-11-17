@@ -229,10 +229,12 @@ class SnapshotBindingTests(unittest.TestCase):
         state = G.load_state(self.state_path)
         state["risk"] = "normal"
         G.save_state(self.state_path, state)
-        self.ingest_with(self.envelope(self.attempt()), self.shadow())
+        with self.assertRaises(G.GovernanceError) as ctx:
+            self.attempt()
+        self.assertIn("native_review_retired", str(ctx.exception))
         state = G.load_state(self.state_path)
-        self.assertFalse(state["native_reviews"][0]["g4_eligible"])
-        self.assertEqual(state["native_reviews"][0]["g4_source"], "")
+        self.assertEqual(state["native_reviews"], [])
+        self.assertEqual(state["review_attempts"], [])
 
     def test_legacy_g4_source_is_rejected_by_gate(self):
         attempt = self.attempt()

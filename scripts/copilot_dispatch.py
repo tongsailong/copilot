@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Copilot v6 任务治理 CLI（ZCode Autonomous Development Edition）。
+"""Copilot v7 任务治理 CLI（ZCode Autonomous Development Edition）。
 
-Copilot 只做轻量协作治理：任务合同、工作项、证据、审计与本地四门。它**不调用
-任何模型**，也不把任何远程判断当作前进条件。所有判定由 `governance.py` 在本地
-机械计算；ZCode 原生 Agent 负责调查、计划、实施、测试与修复。
+Copilot 做轻量协作治理：任务合同、工作项、证据、审计与本地四门。除
+`sol-review`（一次性 SOL 零工具复核）外，所有命令只读写任务状态，不调用模型；
+SOL 的结论只是建议，工程执行与技术决策始终由 ZCode 主代理完成。
 
 常用命令::
 
@@ -15,15 +15,17 @@ Copilot 只做轻量协作治理：任务合同、工作项、证据、审计与
     copilot_dispatch.py criterion --state S --id C1 --status met --evidence E1
     copilot_dispatch.py closure-check --state S
     copilot_dispatch.py closure --state S --close
+    copilot_dispatch.py sol-review --state S --materials M.md
     copilot_dispatch.py legacy-status --state old.json --audit-log old.jsonl --ledger ledger.json
 
-历史 v1/v2 SOL 状态与审计只能通过 `legacy-status` 只读查看，v6 不会驱动它们。
+历史 v1/v2 SOL 状态与审计只能通过 `legacy-status` 只读查看，v7 不会驱动它们。
 """
 from __future__ import annotations
 
 import argparse
 import json
 import os
+import secrets
 import subprocess
 import sys
 
@@ -34,8 +36,9 @@ if HERE not in sys.path:
 import governance as G  # noqa: E402
 import agent_policy as AP  # noqa: E402
 import review_policy as RP  # noqa: E402
+import sol_review as SR  # noqa: E402
 
-__version__ = "6.11.0"
+__version__ = "7.0.0"
 
 
 class CLIError(Exception):
@@ -487,48 +490,181 @@ def cmd_finding(args) -> int:
 
 
 def cmd_review_admission(args) -> int:
+    """SOL 复核准入建议（只读，不是门禁）。"""
     path = _state_path(args)
     state = G.load_state(path)
-    files = None
-    digest = ""
-    if args.workspace:
-        excludes = G.governance_paths(path) + G.CS.safe_evidence_excludes(
-            state, args.workspace, args.base)
-        snapshot = G.capture_code_snapshot(
-            args.workspace, exclude_paths=excludes, base=args.base)
-        if not snapshot.get("available"):
-            raise CLIError(
-                f"workspace 不是可读取的 git 仓库：{args.workspace}"
-                f"（{snapshot.get('reason') or 'unknown'}）")
-        files = [item for item in snapshot.get("files") or []
-                 if isinstance(item, dict)]
-        digest = str(snapshot.get("digest") or "")
     try:
         decision = G.review_admission(
-            state, triggers=args.trigger, reason=args.reason,
-            code_scope_sha256=digest, files=files, scope=args.scope)
-    except RP.ReviewPolicyError as exc:
+            state, triggers=args.trigger, reason=args.reason)
+    except (RP.ReviewPolicyError, SR.SolUsageError) as exc:
         raise CLIError(str(exc)) from None
-    if args.record:
-        G.record_review_admission(
-            path, decision=decision, target_sha256=decision.get(
-                "target_sha256") or "",
-            code_scope_sha256=digest, scope=args.scope, base=args.base)
-        decision["recorded"] = True
     if args.json:
         _print(decision)
     else:
-        print(f"复核准入：{decision['decision']}"
+        print(f"SOL 复核准入：{decision['decision']}"
               f"（tier={decision.get('tier') or decision['risk']}）")
         print(decision.get("detail") or "")
-        reentry = decision.get("reentry") or {}
-        if reentry.get("detail"):
-            print(f"停止/重入：{reentry.get('detail')}")
         if decision.get("triggers"):
             print("触发因素：" + ", ".join(decision["triggers"]))
-        if not decision.get("code_scope_checked"):
-            print("提示：未提供 --workspace，未比较当前代码范围；"
-                  "same-snapshot/docs-only 判断不可用。")
+        print("说明：SOL 是建议性独立审查，不是 G4；单轮调用，不自动二审。")
+    return 0
+
+
+def _write_atomic(path: str, text: str) -> str:
+    path = os.path.abspath(path)
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = f"{path}.tmp-{os.getpid()}"
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except OSError as exc:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise CLIError(f"无法写入 {path}：{exc}") from None
+    return path
+
+
+def cmd_sol_review(args) -> int:
+    """SOL 零工具单轮复核：材料 → 一次请求 → 结构化结果 → 建议性 findings。"""
+    path = _state_path(args)
+    state = G.load_state(path)
+    if G.is_legacy_state(state):
+        raise CLIError("v1/v2 SOL 历史状态只读；请为新任务创建 v7 状态。")
+    if args.list:
+        records = G.list_sol_reviews(state)
+        if args.json:
+            _print({"task_id": state.get("task_id"), "sol_reviews": records})
+        else:
+            print(f"SOL 复核记录：{len(records)} 条")
+            for item in records:
+                print(f"- {item.get('review_id')} [{item.get('status')}] "
+                      f"verdict={item.get('verdict') or '-'} "
+                      f"{item.get('created_at') or ''}")
+        return 0
+    if not args.materials:
+        raise CLIError("sol-review 需要 --materials（或 --list）。")
+    materials = _read_text(args.materials)
+    if not materials.strip():
+        raise CLIError("审查材料为空。")
+    prompt = SR.build_materials(state, materials)
+    if len(prompt) > SR.WARN_MATERIALS_CHARS:
+        print(f"提示：审查材料 {len(prompt)} 字符，较大；"
+              f"上限 {SR.MAX_MATERIALS_CHARS}，超限会拒绝而不是静默截断。",
+              file=sys.stderr)
+    digest = SR.review_subject_sha256(state, materials)
+    context_sha = SR.review_digest(prompt)
+    decision = SR.single_round_decision(
+        state, digest, force=bool(args.force),
+        reason=args.reason, trigger=args.trigger)
+    if decision["action"] == "refuse":
+        raise CLIError(f"[{decision['code']}] {decision['note']}")
+    if decision["action"] == "reuse":
+        existing = decision["review"]
+        if args.json:
+            _print(existing)
+        else:
+            print(f"SOL 复核已完成：{existing.get('review_id')} "
+                  f"verdict={existing.get('verdict')}")
+            print(decision["note"])
+        return 0
+    payload = SR.build_payload(
+        prompt, max_output_tokens=args.max_output_tokens)
+    if args.dry_run:
+        info = {
+            "schema": "copilot-sol-review-dry-run/v1",
+            "model": SR.MODEL,
+            "endpoint": SR.resolve_base_url() + SR.ENDPOINT,
+            "materials_sha256": digest,
+            "materials_chars": len(prompt),
+            "zero_tool": True,
+            "payload_keys": sorted(payload),
+            "tool_keys_present": [key for key in payload
+                                  if key in SR.TOOL_KEYS],
+            "max_output_tokens": payload.get("max_output_tokens"),
+        }
+        if args.json:
+            _print(info)
+        else:
+            print(f"SOL 复核预检：model={info['model']} "
+                  f"materials={info['materials_chars']} 字符 sha={digest[:16]}…")
+            print("零工具：请求体不含 tools/functions；tool_choice=none")
+        return 0
+    if (state.get("closure") or {}).get("closed"):
+        raise CLIError("任务已收口；新复核需先由用户授权 reopen（--list 仍可只读查看）。")
+    task_dir = os.path.dirname(os.path.abspath(path))
+    audit_log = args.audit_log or os.path.join(
+        task_dir, "sol-review-audit.jsonl")
+    try:
+        result = SR.run_review(
+            prompt, audit_log=audit_log,
+            max_output_tokens=args.max_output_tokens, timeout=args.timeout)
+    except SR.SolError as exc:
+        G.record_sol_review_failure(
+            path, error_code=exc.code, detail=exc.detail,
+            materials_sha256=digest, model=SR.MODEL)
+        print(f"SOL 复核失败 [{exc.code}]：{exc.detail or ''}", file=sys.stderr)
+        print("已记录真实失败原因，未自动重试、未切换 Provider；"
+              "主代理可继续开发，或按需人工重新发起。", file=sys.stderr)
+        return exc.exit_code
+    reply_text = result.pop("reply_text", "")
+    result["reply_sha256"] = result.get("reply_sha256") or ""
+    output_dir = args.output_dir or os.path.join(task_dir, "sol-reviews")
+    review_id = "SR" + secrets.token_hex(12)
+    raw_path = _write_atomic(
+        os.path.join(output_dir, f"{review_id}.raw.txt"), reply_text + "\n")
+    record = {
+        "schema": SR.REVIEW_SCHEMA,
+        "review_id": review_id,
+        "task_id": state.get("task_id") or "",
+        "contract_sha256": state.get("contract_sha256") or "",
+        "work_item_id": "",
+        "status": "completed",
+        "model": result["model"],
+        "model_resolved": result.get("model_resolved"),
+        "reasoning_effort": result.get("reasoning_effort"),
+        "endpoint": SR.resolve_base_url() + SR.ENDPOINT,
+        "materials_sha256": result["materials_sha256"],
+        "context_sha256": context_sha,
+        "materials_chars": result["materials_chars"],
+        "request_sha256": result.get("request_sha256"),
+        "reply_sha256": result.get("reply_sha256"),
+        "reply_chars": result.get("reply_chars"),
+        "reply_path": raw_path,
+        "usage": result.get("usage"),
+        "usage_available": result.get("usage_available"),
+        "latency_ms": result.get("latency_ms"),
+        "verdict": result["verdict"],
+        "summary": result.get("summary"),
+        "findings": result.get("findings") or [],
+        "findings_count": result.get("findings_count") or {},
+        "unverified": result.get("unverified") or [],
+        "materials_reviewed": result.get("materials_reviewed") or [],
+        "verdict_adjusted": result.get("verdict_adjusted") or [],
+        "zero_tool": True,
+        "attempts": 1,
+        "completed_at": result.get("completed_at"),
+    }
+    record = G.record_sol_review(
+        path, record, materials_sha256=digest,
+        trigger=decision.get("trigger") or "", reason=decision.get("reason") or "")
+    if args.json:
+        _print(record)
+    else:
+        counts = record.get("findings_count") or {}
+        print(f"SOL 复核完成：{review_id} verdict={record['verdict']}")
+        print("findings：" + "，".join(
+            f"{key}={counts.get(key, 0)}"
+            for key in ("blocking", "major", "minor", "info")))
+        if record.get("unverified"):
+            print(f"未验证事项：{len(record['unverified'])} 条（见结果 JSON）")
+        print(f"原始输出：{raw_path}")
+        print("说明：SOL 只提供建议；主代理核实、修复并用定向测试验证，"
+              "不自动发起第二轮复核。")
     return 0
 
 
@@ -545,6 +681,8 @@ def cmd_agent_policy(args) -> int:
         saves_time=bool(args.saves_time),
         research_only=bool(args.research_only),
         subagent_unavailable=bool(args.subagent_unavailable),
+        g4_required=bool(getattr(args, "g4_required", False)),
+        plan_mode=bool(getattr(args, "plan_mode", False)),
     )
     decision["schema"] = "copilot-agent-dispatch-advice/v1"
     decision["note"] = (
@@ -1065,20 +1203,39 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_review_metrics)
 
     p = sub.add_parser("review-admission",
-                       help="复核风险准入与停止/重入判断（只读）")
+                       help="SOL 复核准入建议（只读；不是门禁、不写状态）")
     p.add_argument("--state", required=True)
     p.add_argument("--trigger", action="append", default=[],
-                   help="实质触发因素；普通风险任务显式声明才建议派发复核")
-    p.add_argument("--reason", default="", help="准入/重入原因")
-    p.add_argument("--scope", default="full", choices=("full", "incremental"))
-    p.add_argument("--workspace", default="",
-                   help="任务 git 工作区；提供后比较当前代码范围（停止/文档变化判断）")
-    p.add_argument("--base", default="",
-                   help="可选：任务开始 commit，与 review-context --base 一致")
-    p.add_argument("--record", action="store_true",
-                   help="把本次准入判断写入 review_admissions（普通风险也留痕）")
+                   help="实质风险触发因素（如 security/core-logic/data-integrity）")
+    p.add_argument("--reason", default="", help="准入原因")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_review_admission)
+
+    p = sub.add_parser(
+        "sol-review",
+        help="SOL 零工具单轮复核：一次调用、不自动重试、不自动二审")
+    p.add_argument("--state", required=True)
+    p.add_argument("--materials", default="",
+                   help="主代理整理的审查材料文件（- 表示 stdin）；--list 时可省略")
+    p.add_argument("--reason", default="", help="再次复核的具体原因")
+    p.add_argument("--trigger", default="",
+                   choices=("", *sorted(SR.RETRY_TRIGGERS)),
+                   help="再次复核的实质原因类型")
+    p.add_argument("--force", action="store_true",
+                   help="已有结论且材料不同时，允许按 --trigger/--reason 再调用一次")
+    p.add_argument("--dry-run", action="store_true",
+                   help="只构建并校验请求（零工具/材料大小），不发请求、不写状态")
+    p.add_argument("--list", action="store_true", help="只读列出生效的 SOL 复核记录")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--timeout", type=float, default=SR.DEFAULT_TIMEOUT,
+                   help="单次请求超时秒数（不重试）")
+    p.add_argument("--max-output-tokens", type=int,
+                   default=SR.DEFAULT_MAX_OUTPUT_TOKENS)
+    p.add_argument("--audit-log", default="",
+                   help="审计日志路径；默认任务目录 sol-review-audit.jsonl")
+    p.add_argument("--output-dir", default="",
+                   help="原始输出目录；默认任务目录 sol-reviews/")
+    p.set_defaults(func=cmd_sol_review)
 
     p = sub.add_parser("agent-policy",
                        help="只读调度建议：主代理默认，Explore/general-purpose 按需")
@@ -1096,6 +1253,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="只读调查，不修改工程文件；只建议 Explore，不交给全工具代理")
     p.add_argument("--subagent-unavailable", action="store_true",
                    help="Profile/类型不可用或权限不满足；建议主代理继续")
+    p.add_argument("--g4-required", action="store_true",
+                   help="本次需要 G4 只读复核（要求精确 Read/Grep/Glob）")
+    p.add_argument("--plan-mode", action="store_true",
+                   help="父会话处于 plan 模式（planEnabled）：宿主会给子代理注入 Bash")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_agent_policy)
 

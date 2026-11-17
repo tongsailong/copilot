@@ -26,11 +26,12 @@ CONTRACT = """## 完成条件
 def readonly_profile_policy(**overrides) -> dict:
     """宿主只读复核 Profile 的有效权限策略（与 profileSnapshot 派生字段同构）。
 
-    G4 只认这份策略：名称/来源/路径可以任意变化，工具集与禁用项不能。
+    正式 G4 只接受宿主内置 Agent（`source=built-in`）；名称/路径仍不参与判定，
+    工具集与禁用项不能变。
     """
     policy = {
         "name": "reviewer",
-        "source": "project",
+        "source": "built-in",
         "path": "",
         "tools": ["Read", "Grep", "Glob"],
         "disallowedTools": ["Write", "Edit", "Bash", "WebFetch", "WebSearch",
@@ -339,6 +340,7 @@ def make_fake_review_host(directory: str, *, execution: dict, dispatch: dict,
         "profileId": "reviewer",
         "profileSnapshot": {
             "name": "reviewer",
+            "source": "built-in",
             "tools": ["Read", "Grep", "Glob"],
             "disallowedTools": ["Write", "Edit", "Bash", "WebFetch",
                                 "WebSearch", "Agent", "Task", "TodoWrite",

@@ -963,6 +963,35 @@
       Reviewer/Bash 白名单，不同步运行时。
 
 
+57. **v7.0.0：退役原生多轮 Reviewer，恢复 SOL 零工具单轮复核（2026-11-17，用户决策）。**
+    依据：用户《Copilot Reviewer 退役与 SOL 零工具单轮复核恢复》任务书；本机既有 CPA
+    `127` 通道与 `gpt-6.1-sol` 路由实测可用（`/v1/models` 返回该 ID）；`legacy/call_gpt.py`
+    的零工具与身份校验实现；v6.12.0 工作区与测试基线。
+    - **唯一普通复核通道**：`scripts/sol_review.py` + `copilot_dispatch.py sol-review`。
+      复用既有本机 CPA `127` 出口与 `gpt-6.1-sol`（`reasoning.effort=high`），不新增
+      Provider、账户、密钥或付费方案；凭据按环境变量 → `~/.reasonix/.env` → ZCode
+      `provider_config.json` 的既有链读取，只用于请求，不回显、不写日志。
+    - **零工具是能力级约束**：请求体不包含 `tools`/`functions`/`parallel_tool_calls` 等
+      工具定义，显式 `tool_choice="none"`；上游只要返回 `message`/`reasoning` 之外的
+      output 条目即按安全事件拒绝（退出码 5），不代执行。
+    - **单轮**：一次调用只发一次 HTTP 请求；同一材料摘要再次调用直接复用已有结论；再次
+      复核必须 `--force --trigger <user-request|scope-changed|new-risk|materials-omitted>
+      --reason ...`。超时、429、网络、截断、格式、模型身份不符都如实记录后退出，不自动
+      重试、不换 Provider、不派原生 Reviewer 顶替，也不阻断主代理继续开发。
+    - **输出消费**：`copilot-sol-review/v1`（verdict + findings + unverified）；
+      PASS 与 blocking/major/未验证项冲突时降级 PARTIAL；findings 以 `advisory` 进入
+      Finding 台账，主代理修复并定向验证，误报可用 `finding --status dropped --note`
+      驳回；G4 的 `authoritative` findings 仍不可被执行方驳回。
+    - **Reviewer 退役**：`create_review_attempt`、`native_agent.py review`、
+      `review-context` 与原生复核 ingest 对 `risk!=high` 返回 `native_review_retired`；
+      `review-admission` 改为 SOL 建议（not_needed/optional/recommended）；普通任务的
+      `review_stops`/多轮回调不再参与。G4 链路（attempt/attest/shadow/test_execution）保留。
+    - **G4 边界不变**：SOL 没有工具、不能核验宿主权限，不能替代 G4；高风险 G4 仍要求内置
+      精确只读载体，当前宿主没有，继续 BLOCKED。`sol_reviews` 与 `native_reviews` 严格分开，
+      SOL 记录不会产生 `g4_eligible`。
+    - **未放宽**：G1–G4、fail-closed、证据/代码范围绑定、PWW 接受、授权与安全边界不变；
+      SOL 结论只是建议，工程执行与技术决策仍由 ZCode 主代理承担。
+
 ## 建议（未采纳）
 
 > 以下为 v5 时期记录，保留原文；其中涉及 `call_gpt.py`、SOL 预算或远程 REVIEW 的建议
@@ -1348,3 +1377,68 @@
       字节码）。活动测试 799 条 63.0s（升级前 786 条 78.5s）、legacy 853 条 98.3s
       （升级前 93.7s）、T4 34/34 场景通过。没有远程模型调用、没有新增依赖、
       没有状态字段变化。
+
+55. **G4 只读能力按宿主“有效会话状态”准入；plan 模式注入 Bash（2026-11-17，v6.12.0）。**
+    依据：ZCode 3.18.2 宿主源码、532 个原生子代理 metadata、`db.sqlite` 真实记录与本轮
+    一次只读子代理实测。
+    - **现场结论（不是沿用历史结论）**：工作区 Profile `.zcode/agents/independent-readonly.md`
+      在当前会话真实加载：宿主 `profileSnapshot` 记录 `tools=[Read,Grep,Glob]`、
+      `disallowedTools` 含 `Write/Edit/Bash`；44 个 `independent-readonly` 子会话的真实
+      `tool_usage` 只出现 `Read/Grep/Glob`（`read_only=1`）；普通模式请求 `Bash` 返回
+      `tool_not_found`（工具未注册），不是“请求但未执行”。因此 G4 只读载体可用，本轮
+      实测 `capability` 输出 `g4.executor=true`。
+    - **新发现：plan 模式会放宽有效工具策略**。父会话 `planEnabled=true` 时子会话继承
+      plan 模式；一个 `independent-readonly` 子会话在 `planEnabled=true` 下真实执行了
+      `git status --short`（`status=completed, read_only=0, side_effect_scope` 非只读），
+      而同一 Profile 在 `yolo`/`build`（非 plan）下 `Bash` 不可用。因此“精确
+      `Read/Grep/Glob`”不能只看 `profileSnapshot`：宿主给子代理注入的 `Bash` 不在
+      Profile 里，却真实可执行。
+    - **决策**：G4 准入增加子会话运行模式校验，只看宿主记录、不看 Profile 名称/路径：
+      `host_records.session_execution_state()` 读取 `session_entry(runtime/execution_state)`；
+      `planEnabled=false` 才继续。`planEnabled=true`、记录缺失、字段缺失/非布尔分别给出
+      `host_session_plan_mode` / `host_session_state_missing` /
+      `host_session_state_unknown`，`g4_attest`、`native_agent review` 与 `capability`
+      一律 fail-closed；`agent-policy --g4-required --plan-mode` 直接返回“不可派发”。
+    - **能力探测可复验**：`capability` 每次重新探测宿主版本（`app.asar package.json`，
+      读不到时 `source=unavailable`，不缓存旧结论），并输出 `session_execution`；宿主升级或
+      Profile/会话模式变化后重跑即可得到新结论。
+    - **不重复无效派发**：最近一次 `g4_attestations`/`native_reviews` 的拒绝码属于
+      `review_policy.CAPABILITY_REJECTION_CODES` 时，`derive_work` 派生
+      `AUTO-G4-CAPABILITY`（先诊断/修正 Profile 或会话模式，仍不可修复时如实 block），
+      而不是再派一个相同的只读会话；只看最近一次，环境修复后不会长期阻断。
+    - **未放宽**：G1–G4、`fail-closed`、attempt/宿主记录/证据绑定、工具白名单、PWW 接受
+      规则均不变；新增校验只会让原先“Profile 只读但 plan 模式可写”的场景失败关闭。
+      不新增自定义子代理、不修改宿主安全策略、不扩大子代理写入权限。
+
+56. **G4 载体架构合规：只接受 ZCode 内置子代理；当前宿主无精确只读载体 → G4 BLOCKED（2026-11-17，用户复核）。**
+    依据：用户《Copilot v6.12.0 G4 最终合规核验》要求；ZCode 3.18.2 宿主源码
+    `rCi`/`aTe`/`brc`/`x3n` 与真实 metadata/DB；本机 `.zcode/agents/independent-readonly.md`。
+    - **身份结论**：宿主加载器 `rCi` 把 `~/.zcode/agents` 标为 `source:"user"`、
+      `<会话工作目录>/.zcode/agents` 标为 `source:"project"`；内置注册表 `aTe` 只有
+      `general-purpose`（`tools=["*"]`）与 `Explore`
+      （`tools=[Bash,Glob,Grep,Read,WebFetch,WebSearch,TodoWrite]`），二者
+      `source:"built-in"`。`independent-readonly` 的真实快照为 `source:"project"`、
+      `path=/media/vdb/projects/copilot/.zcode/agents/independent-readonly.md`，是
+      **项目级自定义 Agent 定义**，不是内置 Agent，也不只是内置 Agent 的权限配置。
+    - **原生隔离能力结论**：`Agent` 工具参数只有 `description/prompt/subagent_type/
+      run_in_background`，没有派发期 `tools`/`allowedTools`；子代理工具集来自 Profile
+      `tools`（经父会话 `toolDisallowlist` 与 Profile `disallowedTools` 过滤）。会话级
+      `--disallowedTools`/`permission.disallowedTools` 是**会话范围**，会同时限制主代理，
+      不能作为只读复核的按派发隔离。宿主没有内置精确只读 Agent。
+    - **RespondToCoordinator**：宿主给所有子代理无条件注入
+      `RespondToCoordinator`（`agent.message.respond`、`sideEffectScope="session"`，
+      只向父运行时队列发消息，不能读写文件或执行命令）；`x3n` 即使 Profile 禁用也会重新
+      加入。按“工具集字面精确等于 Read/Grep/Glob”的口径，任何子代理都无法满足字面精确；
+      按“无额外文件/命令能力”的口径不影响只读性。不得擅自把它加入白名单。
+    - **决策**：正式 G4 载体必须是 `source="built-in"` 的内置子代理；项目/用户/插件
+      Profile 即使工具集精确也只给出 `profile_source_not_builtin`，`capability`
+      `g4.executor=false`、`architecture_compliant=false`，`native_agent review`
+      （attempt 或 `risk=high`）与 `g4_attest` 直接拒绝。当前宿主没有内置精确只读载体，
+      因此正式 G4 结论是 **BLOCKED**（`host_capability_missing`），不得用自定义 Agent
+      或放宽权限制造 PASS。
+    - **保留**：`.zcode/agents/independent-readonly.md` 作为通用只读排查辅助保留，不再
+      作为 G4 载体；v6.12.0 的 plan 模式校验、execution_state 准入、能力探测与能力缺口
+      派生继续有效。v6.12.0 的真实 G4 E2E 仅作为“技术只读链验证”，不作为合规 G4 证据；
+      收口快照按本决策重新判定为不符合原定架构。
+    - **后续条件**：宿主提供内置精确只读 Agent（或派发期工具白名单）后，重新运行
+      `capability` 与真实 G4 E2E；在此之前 G4 保持 fail-closed / BLOCKED。

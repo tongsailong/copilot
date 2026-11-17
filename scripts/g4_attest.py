@@ -32,6 +32,7 @@ from urllib.parse import quote
 
 import code_scope
 import host_records
+import native_bridge as NB
 import review_output
 from lib_common import is_sensitive_path, sha256_file, sha256_text
 
@@ -395,6 +396,10 @@ def attest(*, metadata: str, attempt: str, task_id: str, workspace: str,
     source = str(snap.get("source") or "")
     profile_name = str(snap.get("name") or "")
     profile_path = str(snap.get("path") or "")
+    # 原定架构只允许 ZCode 内置子代理；项目/用户自定义 Profile 即使工具集精确
+    # 也不是正式 G4 载体（source 由宿主按加载目录赋值，不是 frontmatter 可改字段）。
+    check("profile_source_not_builtin", source == NB.G4_CARRIER_SOURCE,
+          f"source={source!r}；G4 只接受宿主内置 Agent")
     profile_real = _resolve(profile_path, workspace)
     profile_sha = ""
     if check("profile_path_missing",
@@ -646,6 +651,24 @@ def attest(*, metadata: str, attempt: str, task_id: str, workspace: str,
             check("host_model_selection_missing",
                   bool(model.get("providerId") and model.get("modelId")),
                   "session_entry 缺少 runtime/model_selection")
+        # plan 模式会让宿主给子代理注入 Bash（真实记录：planEnabled=true 的独立
+        # 只读子会话执行过 `git status`）。有效工具策略因此不再精确等于
+        # Read/Grep/Glob；必须在准入阶段证明子会话不是 plan 模式，而不是只在
+        # 事后检查有没有实际调用 Bash。
+        exec_rows = _db_rows(
+            con, "select data from session_entry where session_id=? "
+                 "and type='runtime/execution_state' "
+                 "order by time_created desc limit 1", (child,))
+        exec_state: dict = {"found": False, "mode": "", "plan_enabled": None,
+                            "source": "session_entry/runtime/execution_state"}
+        if exec_rows:
+            # 与 capability 使用同一归一化：行存在但 JSON 非法/非对象时是
+            # host_session_state_unknown，而不是“记录缺失”。
+            exec_state = host_records.classify_execution_payload(exec_rows[0][0])
+        observed["session_mode"] = exec_state.get("mode")
+        observed["session_plan_enabled"] = exec_state.get("plan_enabled")
+        for code, detail in host_records.execution_state_problems(exec_state):
+            check(code, False, detail)
     except AttestError as exc:
         check(exc.code, False, exc.detail)
         return _finish(checks, residual, meta, att, observed, evidence_paths,
@@ -1107,6 +1130,8 @@ def attest(*, metadata: str, attempt: str, task_id: str, workspace: str,
                    eligible=True, extra={
                        "model_selection": model,
                        "session_trace": session_trace,
+                       "session_mode": exec_state.get("mode"),
+                       "session_plan_enabled": exec_state.get("plan_enabled"),
                        "tool_counts": {name: names.count(name)
                                        for name in sorted(set(names))},
                        "tools": sorted(set(names)),

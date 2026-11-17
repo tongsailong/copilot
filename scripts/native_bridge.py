@@ -55,6 +55,11 @@ EXECUTOR_KINDS = ("main", "subagent")
 REVIEWER_TOOLS = ("Read", "Grep", "Glob")
 REVIEWER_DISALLOWED = ("Write", "Edit", "Bash")
 REVIEWER_PERMISSION_MODES = ("default", "plan")
+# G4 的载体来源：原定架构只允许 ZCode 内置子代理。宿主 `rCi` 把
+# `~/.zcode/agents` 标为 user、`<cwd>/.zcode/agents` 标为 project，内置只有
+# `Explore`（含 Bash）与 `general-purpose`（全工具）。项目/用户/插件自定义
+# Profile 即使工具集精确，也不属于“内置子代理”，不能作为正式 G4 载体。
+G4_CARRIER_SOURCE = "built-in"
 
 EVIDENCE_ID_RE = re.compile(r"^E[1-9][0-9]{0,3}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -131,6 +136,21 @@ def reviewer_policy_problems(policy: object) -> list[tuple[str, str]]:
         problems.append(("profile_mcp_servers",
                          f"mcpServers={data['mcpServers']}"))
     return problems
+
+
+def g4_carrier_problems(policy: object) -> list[tuple[str, str]]:
+    """G4 载体来源约束：只接受宿主内置 Agent。
+
+    `source` 由宿主按加载目录赋值（user/project/built-in），不是 frontmatter
+    可伪造字段。项目/用户/插件 Profile 即便工具集精确只读，也不是原定架构的
+    “内置子代理”，不能作为正式 G4 载体。
+    """
+    data = normalize_profile_policy(policy)
+    source = str(data.get("source") or "").strip()
+    if source != G4_CARRIER_SOURCE:
+        return [("profile_source_not_builtin",
+                 f"source={source or '<missing>'!r} 不是宿主内置 Agent")]
+    return []
 
 
 def _profile_policy_or_none(obj: dict) -> dict | None:

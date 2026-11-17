@@ -15,7 +15,16 @@ import hashlib
 import json
 import os
 import sqlite3
+import struct
 from urllib.parse import quote
+
+# 子会话 runtime/execution_state 的准入结论。plan 模式会让宿主给子代理注入
+# Bash（真实记录：planEnabled=true 的独立只读子会话执行过 `git status`），
+# 因此“精确 Read/Grep/Glob”不能只看 profileSnapshot —— 必须同时证明子会话不是
+# plan 模式。未知/缺失一律 fail-closed。
+HOST_SESSION_STATE_MISSING = "host_session_state_missing"
+HOST_SESSION_STATE_UNKNOWN = "host_session_state_unknown"
+HOST_SESSION_PLAN_MODE = "host_session_plan_mode"
 
 
 def connect_ro(db: str) -> sqlite3.Connection:
@@ -209,3 +218,130 @@ def assistant_output(db: str, session_id: str) -> dict | None:
     finally:
         con.close()
     return None
+
+
+def session_execution_state(db: str, session_id: str) -> dict:
+    """读取子会话的 `runtime/execution_state`（mode / planEnabled）。
+
+    宿主在会话启动时写入该行；`planEnabled=true` 意味着父会话处于 plan 模式，
+    宿主会给子代理注入 Bash（`git status` 等只读命令可真实执行）。G4 要求精确
+    `Read/Grep/Glob`，所以必须在工具执行前用该记录排除 plan 模式，而不能只在
+    事后看有没有调用 Bash。
+
+    返回 `found=False` 表示没有记录/库不可读；`plan_enabled=None` 表示字段缺失
+    或不是布尔值。两者都不能证明“非 plan 模式”，调用方必须 fail-closed。
+    """
+    session_id = str(session_id or "").strip()
+    base = {"found": False, "mode": "", "plan_enabled": None,
+            "source": "session_entry/runtime/execution_state"}
+    if not session_id:
+        base["reason"] = "session_missing"
+        return base
+    try:
+        con = connect_ro(db)
+    except (OSError, sqlite3.Error) as exc:
+        base["reason"] = f"host_db_unavailable: {exc}"
+        return base
+    try:
+        try:
+            rows = con.execute(
+                "select data from session_entry where session_id=? "
+                "and type='runtime/execution_state' "
+                "order by time_created desc limit 1",
+                (session_id,)).fetchall()
+        except sqlite3.Error as exc:
+            base["reason"] = f"session_entry_unavailable: {exc}"
+            return base
+    finally:
+        con.close()
+    if not rows:
+        base["reason"] = "execution_state_missing"
+        return base
+    return classify_execution_payload(rows[0][0])
+
+
+def classify_execution_payload(raw: object) -> dict:
+    """把一条 `runtime/execution_state` 原始 data 归一化为准入输入。
+
+    供 `g4_attest`（已持有只读连接）与 `session_execution_state` 共用，避免两处
+    对“行存在但 JSON 非法/不是对象”给出不同结论。
+    """
+    data = _json(raw)
+    plan = data.get("planEnabled")
+    return {
+        "found": True,
+        "mode": str(data.get("mode") or ""),
+        "plan_enabled": plan if isinstance(plan, bool) else None,
+        "source": "session_entry/runtime/execution_state",
+    }
+
+
+def execution_state_problems(state: object) -> list[tuple[str, str]]:
+    """把 execution_state 归类为 G4 准入偏离项；空列表表示可继续核验。
+
+    只回答“子会话是否可能被宿主动态放宽工具集”。Profile 策略、工具调用与
+    原始输出仍由 g4_attest 独立核验。
+    """
+    data = state if isinstance(state, dict) else {}
+    if not data.get("found"):
+        return [(HOST_SESSION_STATE_MISSING,
+                 "宿主没有子会话 runtime/execution_state 记录：无法证明不是 plan 模式")]
+    plan = data.get("plan_enabled")
+    if plan is True:
+        return [(HOST_SESSION_PLAN_MODE,
+                 "子会话 planEnabled=true：plan 模式会给子代理注入 Bash，"
+                 "有效工具策略不再精确等于 Read/Grep/Glob")]
+    if not isinstance(plan, bool):
+        return [(HOST_SESSION_STATE_UNKNOWN,
+                 "runtime/execution_state 缺少布尔 planEnabled：无法证明非 plan 模式")]
+    if not str(data.get("mode") or "").strip():
+        return [(HOST_SESSION_STATE_UNKNOWN,
+                 "runtime/execution_state 缺少 mode：无法证明子会话执行模式")]
+    return []
+
+
+def host_version(asar_path: str = "") -> dict:
+    """探测本机 ZCode 版本：环境变量 → app.asar package.json → 未知。
+
+    只用于能力诊断的“当前宿主”记录，不参与授权判定；每次调用都重新读取，
+    不缓存，宿主升级后再次探测即可得到新结果。
+    """
+    env = os.environ.get("ZCODE_VERSION")
+    if env and env.strip():
+        return {"version": env.strip(), "source": "env:ZCODE_VERSION"}
+    path = asar_path or "/opt/ZCode/resources/app.asar"
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(16)
+            if len(head) != 16:
+                raise OSError("asar header too short")
+            header_size = struct.unpack("<I", head[4:8])[0]
+            json_len = struct.unpack("<I", head[12:16])[0]
+            meta = json.loads(fh.read(json_len).decode("utf-8"))
+            if not isinstance(meta, dict):
+                raise OSError("asar header is not an object")
+            files = meta.get("files")
+            entry = files.get("package.json") \
+                if isinstance(files, dict) else None
+            if not isinstance(entry, dict):
+                raise OSError("asar package.json entry missing")
+            # 不同 Electron/asar 版本把 offset 写成整数或十进制字符串；合法的
+            # 整数 0 不能因为 `0 or -1` 被当成缺失。
+            raw_offset = entry.get("offset")
+            raw_size = entry.get("size")
+            offset = int(raw_offset) if raw_offset not in (None, "") else -1
+            size = int(raw_size) if raw_size not in (None, "") else -1
+            if offset < 0 or size <= 0:
+                raise OSError("asar package.json entry missing")
+            fh.seek(8 + header_size + offset)
+            payload = json.loads(fh.read(size).decode("utf-8"))
+    except (OSError, ValueError, TypeError, AttributeError, struct.error,
+            json.JSONDecodeError):
+        return {"version": "", "source": "unavailable", "path": path}
+    if not isinstance(payload, dict):
+        return {"version": "", "source": "unavailable", "path": path}
+    version = str(payload.get("version") or "").strip()
+    if not version:
+        return {"version": "", "source": "unavailable", "path": path}
+    return {"version": version, "source": "app.asar:package.json",
+            "path": path, "name": str(payload.get("name") or "")}

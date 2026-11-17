@@ -1,14 +1,19 @@
-# agent-bridge：原生执行与复核信封（v2）
+# agent-bridge：原生执行与 G4 复核信封（v2）
 
-本文件说明 v6 的 Native Bridge：**ZCode 原生 Agent 执行 / Reviewer 复核 → Copilot 校验回填**。
+本文件说明 Native Bridge：**ZCode 原生 Agent 执行 / G4 Reviewer 复核 → Copilot 校验回填**。
 v1 信封（SOL 通道时代）已退役，出现即 `schema_retired`。
+
+> **v7.0.0 起普通复核已由 SOL 零工具单轮复核接管**（`copilot_dispatch.py sol-review`）；
+> 本文件的原生复核信封只用于高风险 G4。`review-context`、`native_agent.py review` 与
+> 原生复核 ingest 对 `risk!=high` 返回 `native_review_retired`。SOL 不是 G4，不能替代下面的
+> 宿主只读证据链。
 
 ## 1. 角色与边界
 
 | 角色 | 职责 | 约束 |
 |---|---|---|
 | Executor | 执行单个工作项，产出结果与原始证据 | 必须是原生子代理（`kind=subagent`），带 Agent/Child Session 身份；有效工具策略不得等价于只读复核 |
-| Reviewer | 独立只读复核，给出 verdict/findings | 必须是 `kind=subagent`，`reviewer.profile` 有效工具策略为 `tools=[Read,Grep,Glob]`、禁用 `Write/Edit/Bash`、无 skills/MCP；Profile 名称/来源/路径不参与判定；不得修改文件、不得与执行方共用 Agent/Child Session |
+| Reviewer | 独立只读复核，给出 verdict/findings | 必须是 `kind=subagent` 且 `source=built-in`（项目/用户/插件 Profile 不是原定架构载体），`reviewer.profile` 有效工具策略为 `tools=[Read,Grep,Glob]`、禁用 `Write/Edit/Bash`、无 skills/MCP；Profile 名称/路径不参与判定；不得修改文件、不得与执行方共用 Agent/Child Session |
 
 Copilot 不派发 Agent、不调用模型、不写别人的会话。它只校验宿主已产生的记录并回填状态。
 `native_agent.py` 从真实 `metadata.json`、宿主 SQLite（`tool_usage`/`part`/`session_entry`）
@@ -67,11 +72,41 @@ usage），**不返回** status/childSessionId/totalToolUseCount；后三者与�
   启动（沿用启动期缓存）、或 Desktop runtime config 回退为 built-in-only。新会话应先确认
   `metadata.profileId`/`profileSnapshot.source` 与可用类型，再决定是否需要重新派发。
 
+**plan 模式会让有效工具策略变宽（真实记录）**：父会话 `planEnabled=true` 时，子会话
+`runtime/execution_state` 记录 `planEnabled=true`，宿主会给子代理注入 `Bash` 并可真实执行
+（一个 `independent-readonly` 子会话执行过 `git status --short`，`status=completed,
+read_only=0`）。因此“精确 Read/Grep/Glob”不能只看 `profileSnapshot`：`capability` 与
+`g4_attest` 都读取子会话 `runtime/execution_state`，要求 `planEnabled=false`；记录缺失、
+字段缺失或非布尔一律 fail-closed（`host_session_state_missing` /
+`host_session_state_unknown` / `host_session_plan_mode`）。普通 `yolo`/`build` 模式（非
+plan）下 Profile 白名单仍生效：真实子会话请求 `Bash` 返回 `tool_not_found`。
+
+**Profile 来源（宿主加载器 `rCi`）**：`~/.zcode/agents` → `source:"user"`，
+`<会话工作目录>/.zcode/agents` → `source:"project"`，additionalDirectories 下同名目录也
+是 `project`（带 namespace）；内置只有 `general-purpose`（`tools=["*"]`）与 `Explore`
+（`tools=[Bash,Glob,Grep,Read,WebFetch,WebSearch,TodoWrite]`），两者 `source:"built-in"`。
+`source` 由加载目录赋值，不是 frontmatter 可改字段。`.zcode/agents/independent-readonly.md`
+因此是**项目级自定义 Agent**，不是内置子代理。
+
+**RespondToCoordinator（宿主控制平面工具）**：宿主给所有子代理无条件注入
+`RespondToCoordinator`（`sj`），schema 只有 `{summary, message}`，handler 要求
+`runtimeScope="subagent"` 并通过 `coordinatorResponsePort.respond` 写入父运行时队列；
+权限 `agent.message.respond`、`sideEffectScope="session"`、`riskLevel="low"`、
+`needsApproval=false`。它不能读写文件或执行命令。`brc` 最后用 `x3n` 无条件追加它，
+即使 Profile 的 `disallowedTools` 也无法移除。它不在声明白名单内，代码不把它加入
+G4 白名单；按“实际工具集字面精确等于 Read/Grep/Glob”的口径，任何子代理都无法满足
+字面精确，按“无额外文件/命令能力”的口径不影响只读性。
+
 **G4 结论**：内置 `Explore` 与 `general-purpose` 都不满足 G4；不放宽为“实际没调用 Bash
 就当作只读”，因为要求是**不存在** `Write/Edit/Bash` 能力。没有宿主强制只读的能力载体时，
 G4 必须 fail-closed，并如实报告为治理能力缺口，不能伪造 PASS 或把 general-purpose 当
-Reviewer。派发前后可用 `native_agent.py capability --metadata <metadata.json>` 只读诊断
-（输出 `classification`、`g4.executor`/`precheck_only`/`codes`/`remedy`），并只读汇总该
+Reviewer。**原定架构只允许 ZCode 内置子代理**：项目/用户/插件自定义 Profile 即使工具集
+精确只读，也不是正式 G4 载体（`profile_source_not_builtin`）。宿主没有内置精确只读
+Agent、`Agent` 工具也没有派发期 `tools` 参数，因此当前宿主的正式 G4 结论是 **BLOCKED**；
+不得用项目自定义 Agent 制造 PASS。派发前后可用
+`native_agent.py capability --metadata <metadata.json>` 只读诊断（输出
+`classification`、`carrier`、`architecture_compliant`、`host_version`、
+`session_execution`、`g4.executor`/`precheck_only`/`codes`/`remedy`），并只读汇总该
 子会话的 `tool_usage` 为 `host_evidence`：
 
 - 先确认会话存在于宿主 `session` 表；不存在返回 `reason=session_not_found`，只有
@@ -82,9 +117,9 @@ Reviewer。派发前后可用 `native_agent.py capability --metadata <metadata.j
 - Profile 级“能不能写”用 `KNOWN_READ_ONLY_TOOLS` 反向判定：**任何未知工具都按可能写入
   处理**，不依赖手工维护的写工具清单。
 
-它不派发、不写状态；`g4.executor` 只是宿主 Profile 策略预检（`precheck_only=true`），
-Profile 文件存在性/正文一致性、会话与 prompt 绑定、工具调用与原始输出仍由 `g4_attest`
-独立核验，`host_evidence` 也不改变权限判定。
+它不派发、不写状态；`g4.executor` 只是宿主 Profile 策略与子会话执行模式的预检
+（`precheck_only=true`），Profile 文件存在性/正文一致性、会话与 prompt 绑定、工具调用与
+原始输出仍由 `g4_attest` 独立核验，`host_evidence` 也不改变权限判定。
 
 ## 2. 信封 v2
 

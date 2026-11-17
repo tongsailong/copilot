@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""v6 架构约束回归：活动路径不调用远程模型、不依赖 SOL、状态机收敛。"""
+"""v7 架构约束回归：SOL 是唯一远程复核通道，且零工具、单轮、与 G4 分离。"""
 from __future__ import annotations
 
 import ast
@@ -18,7 +18,12 @@ import governance as G  # noqa: E402
 
 ACTIVE = ("governance.py", "copilot_dispatch.py", "copilot_auto.py",
           "agent_policy.py", "native_bridge.py", "native_agent.py",
-          "bridge_evidence.py", "lib_common.py")
+          "bridge_evidence.py", "lib_common.py", "review_policy.py",
+          "review_output.py", "host_records.py", "g4_attest.py",
+          "g4_shadow.py", "test_execution.py", "code_scope.py",
+          "code_scope_capture.py", "sol_review.py")
+# v7 唯一允许访问网络与凭据的活动模块。其他模块只能通过它间接复核。
+NETWORK_MODULE = "sol_review.py"
 
 
 def _read_bytes(path: str) -> bytes:
@@ -31,52 +36,60 @@ def source(name: str) -> str:
         return fh.read()
 
 
-class NoRemoteDecisionPathTests(unittest.TestCase):
-    def test_active_scripts_do_not_import_sol_channel_modules(self):
+def _imports(name: str) -> set[str]:
+    """返回完整模块名：`urllib.parse` 与 `urllib.request` 必须区分。"""
+    tree = ast.parse(source(name), filename=name)
+    imported: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imported.add(node.module)
+    return imported
+
+
+class RemoteReviewBoundaryTests(unittest.TestCase):
+    def test_active_scripts_do_not_import_legacy_sol_modules(self):
         for name in ACTIVE:
-            tree = ast.parse(source(name), filename=name)
-            imported: set[str] = set()
-            for node in ast.walk(tree):
-                if isinstance(node, ast.Import):
-                    imported.update(alias.name.split(".")[0] for alias in node.names)
-                elif isinstance(node, ast.ImportFrom) and node.module:
-                    imported.add(node.module.split(".")[0])
+            imported = _imports(name)
             for banned in ("call_gpt", "review_ledger", "reply_protocol"):
                 self.assertNotIn(banned, imported,
                                  f"{name} 仍导入已退役的 SOL 模块 {banned}")
 
-    def test_active_scripts_have_no_network_clients(self):
-        banned = ("urllib", "requests", "http", "socket", "aiohttp", "httpx")
+    def test_only_sol_review_has_network_clients(self):
+        # urllib.parse 不是网络客户端；真正发起请求的是 urllib.request / socket。
+        banned = ("urllib.request", "urllib.error", "http.client",
+                  "requests", "aiohttp", "httpx", "socket")
         for name in ACTIVE:
-            tree = ast.parse(source(name), filename=name)
-            imported: set[str] = set()
-            for node in ast.walk(tree):
-                if isinstance(node, ast.Import):
-                    imported.update(alias.name.split(".")[0] for alias in node.names)
-                elif isinstance(node, ast.ImportFrom) and node.module:
-                    imported.add(node.module.split(".")[0])
+            if name == NETWORK_MODULE:
+                continue
+            imported = _imports(name)
             for module in banned:
-                self.assertNotIn(module, imported,
-                                 f"{name} 不应包含网络客户端 {module}")
+                self.assertFalse(
+                    any(item == module or item.startswith(module + ".")
+                        for item in imported),
+                    f"{name} 不应包含网络客户端 {module}")
 
-    def test_no_sol_model_or_endpoint_in_active_scripts(self):
-        # 活动 scripts/ 不得出现已退役的模型 ID、上游端点或凭据读取；
+    def test_only_sol_review_has_model_endpoint_and_credentials(self):
+        # 除 sol_review.py 外，活动模块不得出现模型 ID、上游端点或凭据读取；
         # 历史实测事实只保留在 references/history.md 与 legacy/。
         for name in ACTIVE:
+            if name == NETWORK_MODULE:
+                continue
             text = source(name)
-            self.assertNotIn("gpt-6.1-sol", text, name)
-            self.assertNotIn("/v1/responses", text, name)
-            self.assertNotIn("CPA_", text, name)
-
-    def test_active_scripts_do_not_read_credentials(self):
-        for name in ACTIVE:
-            text = source(name)
-            for needle in ("provider_config.json", "resolve_api_key",
+            for needle in ("gpt-6.1-sol", "/v1/responses", "CPA_",
+                           "provider_config.json", "resolve_api_key",
                            "read_zcode_provider_key"):
-                self.assertNotIn(needle, text, f"{name} 不应读取 Provider 凭据")
-        self.assertTrue(os.path.isfile(
-            os.path.join(ROOT, "legacy", "lib_common_legacy.py")),
-            "v5 的凭据解析链应保留在 legacy/ 供历史回归使用")
+                self.assertNotIn(needle, text, f"{name} 不应包含 {needle}")
+
+    def test_sol_review_is_review_only(self):
+        text = source(NETWORK_MODULE)
+        self.assertIn("tool_choice", text)
+        self.assertIn("gpt-6.1-sol", text)
+        # 不恢复 CONSULT/PLAN 模式；只有 REVIEW 通道。
+        self.assertNotIn("MODE_ROUTES", text)
+        self.assertNotIn("def consult", text)
+        self.assertNotIn("def plan_", text)
 
     def test_retired_sol_implementations_are_archived(self):
         for name in ("call_gpt.py", "review_ledger.py", "reply_protocol.py"):

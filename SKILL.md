@@ -1,14 +1,14 @@
 ---
 name: copilot
-description: "Copilot v6 轻量协作治理：任务承接、合同与完成条件、状态与证据登记、PARTIAL 持续推进、原生只读复核与 G1–G4 收口。本地脚本不调用任何远程模型，不替代 ZCode 的技术决策与工程执行；SOL 决策通道已退役，历史台账只读保留。"
+description: "Copilot v7 轻量协作治理：任务承接、合同与完成条件、状态与证据登记、PARTIAL 持续推进、SOL 零工具单轮复核与 G1–G4 收口。SOL 只做一次性独立审查，不替代 ZCode 的技术决策与工程执行；原生多轮 Reviewer 已退役，历史台账只读保留。"
 when_to_use: >
   需要把多步骤工程任务纳入可追踪治理时：任务合同/完成条件需要固定、证据与审计需要绑定、
-  长任务需要 PARTIAL 持续推进与上下文恢复、高风险任务需要 G4 独立只读复核、用户要求正式
-  REVIEW、或需要只读查看历史 SOL 调用与 REVIEW 台账。简单、单步、低风险任务直接由 ZCode
-  原生完成，不进入本 Skill。
+  长任务需要 PARTIAL 持续推进与上下文恢复、需要一次 SOL 零工具独立复核、高风险任务需要
+  G4 独立只读复核、用户要求正式 REVIEW、或需要只读查看历史 SOL 调用与 REVIEW 台账。简单、
+  单步、低风险任务直接由 ZCode 原生完成，不进入本 Skill。
 ---
 
-# copilot：轻量协作治理（v6.11.0）
+# copilot：轻量协作治理（v7.0.0）
 
 Copilot 是运行在 ZCode 内的**协作治理层**，不是决策模型，也不是执行体。它负责把任务变成可
 追踪的合同、状态、证据与收口条件，并在任务没有真正完成时继续推进。
@@ -20,6 +20,9 @@ Copilot 是运行在 ZCode 内的**协作治理层**，不是决策模型，也�
   体现协作而强制调用子代理。
 - **内置子代理（按需）**：`Explore` 只做独立只读调查；`general-purpose` 只承担边界清晰、
   可独立交付且并行收益明显的工作。二者都由主代理拆分、控制范围并集成结果。
+- **SOL（一次性独立复核）**：经既有本机 CPA `127` 通道调用 `gpt-6.1-sol`，**零工具、单轮**
+  地阅读主代理提交的完整材料，返回结构化问题清单。它只提供意见，不执行工程、不做技术决策，
+  也不自动进入第二轮。
 - **Copilot（本 Skill）**：任务承接、合同与完成条件、状态机、证据桥接、审计、PARTIAL 推进、
   收口门禁。**不做工程实施，不替代技术决策，不设置无意义的审批门。**
 - **G4 只读复核**：高风险任务收口所需的独立复核，要求宿主强制 `Read/Grep/Glob`、禁用
@@ -28,10 +31,12 @@ Copilot 是运行在 ZCode 内的**协作治理层**，不是决策模型，也�
   宿主能力缺口，不伪造 PASS。
 - **DesignWise**：设计方法与设计质量规范；具体设计执行仍由 ZCode 完成，Copilot 不另建流程。
 
-**SOL 已退役。** `gpt-6.1-sol` 决策通道、轮次/预算状态机、`call_gpt.py`、`review_ledger.py`、
-`reply_protocol.py` 不再出现在活动执行路径中，实现存档在仓库 `legacy/`，历史调用记录、REVIEW
-裁决、任务台账、证据与 SHA-256 仍可通过 `copilot_dispatch.py legacy-status` 只读查看。不得用
-另一个远程大模型替代 SOL 承担强制决策职责。
+**原生 Reviewer 多轮复核已退役。** v7 起普通复核由 `copilot_dispatch.py sol-review` 的
+SOL 零工具单轮复核承担；`native_agent.py review`、`review-context`、review attempt 与
+G4 信封只保留给高风险 G4。历史 `call_gpt.py`、`review_ledger.py`、`reply_protocol.py`
+实现存档在 `legacy/`，历史调用记录、REVIEW 裁决、任务台账、证据与 SHA-256 仍可通过
+`copilot_dispatch.py legacy-status` 只读查看。**SOL 不是 G4**：它没有工具、不能核验宿主
+权限，不能替代高风险 G4 的 fail-closed 判定。
 
 ## 何时使用
 
@@ -40,9 +45,10 @@ Copilot 是运行在 ZCode 内的**协作治理层**，不是决策模型，也�
 1. 任务需要固定合同与完成条件，并在多轮之间保持状态（长任务、跨会话续跑）。
 2. 需要证据登记、SHA-256 完整性、审计留痕与可追溯收口。
 3. 任务处于 PARTIAL（还有工作要做），需要本地派生下一步而不是等待外部判断。
-4. 高风险任务（生产数据、权限/安全策略、关键链路、不可逆操作）需要 G4 独立只读复核。
-5. 用户明确要求正式 REVIEW。
-6. 用户要求只读查看历史 SOL 调用、REVIEW 台账或旧任务状态。
+4. 多模块改造、数据链路、安全或生产高风险变更，需要一次 SOL 独立复核。
+5. 高风险任务（生产数据、权限/安全策略、关键链路、不可逆操作）需要 G4 独立只读复核。
+6. 用户明确要求正式 REVIEW。
+7. 用户要求只读查看历史 SOL 调用、REVIEW 台账或旧任务状态。
 
 不适用：单步查询、单文件小改、纯问答、简单命令确认——直接由 ZCode 完成，不建立任务状态。
 
@@ -54,11 +60,13 @@ start（合同 + 完成条件 + 风险 + 后端）
   → drive（本地求值：PASS 收口 / BLOCKED 停下 / 打印工作单）
   → ZCode 执行（主代理或原生子代理）
   → ingest / record / criterion / evidence（回填真实结果与原始证据）
+  → [按需] sol-review（一次性零工具独立复核）→ 主代理核实/修复/定向验证
   → drive（继续直到 PASS 或真实 BLOCKED）
 ```
 
-所有命令都只读写任务状态文件，**不发起任何网络或模型调用**。完整命令矩阵见
-`references/workflow.md`；阶段机与驱动语义见 `references/runtime.md`。
+除 `sol-review` 外，所有命令只读写任务状态文件，不发起网络或模型调用。`sol-review` 一次
+调用只发一次请求，不自动重试、不自动二审。完整命令矩阵见 `references/workflow.md`；阶段机
+与驱动语义见 `references/runtime.md`。
 
 ## 模式
 
@@ -69,9 +77,12 @@ CONSULT / PLAN / REVIEW 是**本地工作模式**，不是审批节点，也不�
 | CONSULT | 本地问题分析、方案比较、风险识别；结论写入 `judgments` 仅作审计 | 否 | 主代理直接分析；需要留痕时 `judgment` |
 | PLAN | ZCode 的技术计划登记为工作项与依赖，供驱动与派发使用 | 否 | `plan` |
 | REVIEW | 正式复核结论登记；**仅在用户明确授权时进行** | 否（不是普通开发前置门） | `authorize-review` → `formal-review` |
+| SOL REVIEW | 一次性零工具独立审查；意见进入 Finding 台账供主代理核实 | 否 | `sol-review` |
 
 - **PLAN 由 ZCode 决定**：计划内容、拆分粒度、依赖与执行顺序都是 ZCode 的技术决策；Copilot
   只负责记录与校验（例如拒绝依赖环），不批准也不否决。
+- **SOL 只做 REVIEW**：不恢复 CONSULT / PLAN 远程职责，不让 SOL 接管工程执行、技术选型或
+  收口判断；SOL 的 material 由主代理一次性准备，结论只作为建议。
 - **正式 REVIEW 不是门禁**：普通开发不需要正式 REVIEW，也不需要等待任何模型裁决。用户明确
   要求后，授权在同一任务合同内持续有效；范围或风险实质变化时重新确认。没有用户授权时不得
   伪造正式 REVIEW，也不得用自检冒充。
@@ -80,9 +91,9 @@ CONSULT / PLAN / REVIEW 是**本地工作模式**，不是审批节点，也不�
   amendment 要求目标摘要未变；证据实质变化时拒绝 amendment，必须用
   `--supersedes <review_id>` 登记新结论并说明旧结论为何失效。原始记录、授权快照与结论不被
   覆盖。
-- **G4 与正式 REVIEW 不同**：G4 是高风险任务收口所需的技术复核，要求原生只读 Reviewer 在
-  隔离证据与独立上下文下给出 `g4_eligible=true` 的结论；formal review 是用户要求的治理记录。
-  两者互不替代，任何模型判断都不等于 G4 证据。
+- **G4 与正式 REVIEW、SOL 都不同**：G4 是高风险任务收口所需的技术复核，要求原生只读
+  Reviewer 在隔离证据与独立上下文下给出 `g4_eligible=true` 的结论；formal review 是用户
+  要求的治理记录；SOL 是建议性独立审查。三者互不替代，任何模型判断都不等于 G4 证据。
 
 ## Agent 调度（v6.9.0）
 
@@ -213,6 +224,10 @@ BLOCKED 表示**不能正常收口或继续受阻动作**，不表示无法记�
   历史事件；被拒信封（含生成阶段：输出漏绑定字段、实际命令未通过只读校验）追加到任务目录
   `review-attempts.jsonl`（只记错误码与绑定值，不记正文），供复盘统计“无效信封”而不必依赖
   终端输出。
+- **SOL 复核审计**：`sol-review` 成功时把结构化结果写入状态 `sol_reviews`、原始输出存入任务
+  目录 `sol-reviews/<review_id>.raw.txt`，失败把真实错误码与材料摘要写入 `sol_reviews`
+  （`status=failed`）与 `history`；`sol-review-audit.jsonl` 只记脱敏元数据（材料/请求/回复
+  摘要、模型、usage、耗时、错误码），不记正文与凭据。相同材料再次调用直接复用，不重复请求。
 
 ## 四门与收口
 
@@ -283,19 +298,28 @@ verify 的结构化质量报告（`copilot-verify-result/v1`）走报告接入�
 
 ## 原生执行与 G4 复核
 
+**普通复核已由 SOL 接管。** 以下原生信封链路只用于高风险 G4：`review`、`review-context`
+与 `copilot_auto.py ingest` 对 `risk!=high` 会返回 `native_review_retired`，不再承担普通
+开发的多轮复核。低/中风险需要独立意见时使用 `sol-review`。
+
 `execution_backend=native` 时才生成原生派发：
 
 - `drive` 生成 `copilot-native-dispatch/v2`（绑定 task / contract / plan / iteration），工作项
   带稳定 `dispatch_id` 与 `idempotency_key`。
 - 执行方用 `native_agent.py execution` 生成 `copilot-native-result/v2`，绑定计划与执行方身份。
-- 复核方用 ZCode 原生只读子代理派发：宿主 `profileSnapshot` 的有效工具策略必须是
-  `tools=[Read,Grep,Glob]` 且禁用 `Write/Edit/Bash`、无 skills/MCP；Profile 名称、来源与
-  路径不参与判定（`reviewer.profile`），无宿主策略时失败关闭。内置 `Explore` 含 Bash、
-  `general-purpose` 为 `tools=["*"]`，均不满足；宿主也没有按派发覆盖工具的参数。
+- 复核方必须是 **ZCode 内置子代理**：宿主 `profileSnapshot.source` 必须是
+  `built-in`（项目/用户/插件自定义 Profile 不是原定架构载体），有效工具策略必须是
+  `tools=[Read,Grep,Glob]` 且禁用 `Write/Edit/Bash`、无 skills/MCP；Profile 名称与路径
+  不参与判定（`reviewer.profile`），无宿主策略时失败关闭。**子会话还必须不是 plan
+  模式**：`runtime/execution_state.planEnabled` 必须为 `false`，因为 plan 模式会让宿主
+  给子代理注入 Bash（真实记录）；缺失或未知按 fail-closed 处理。宿主内置只有
+  `Explore`（含 Bash）与 `general-purpose`（全工具），**没有精确只读载体**；宿主也没有
+  按派发覆盖工具的参数。因此当前 ZCode 3.18.2 上正式 G4 只能是 **BLOCKED**，不能用
+  项目自定义 Profile 或放宽权限制造 PASS。
   派发前后可用 `native_agent.py capability --metadata <metadata.json>` 只读诊断实际权限与
-  G4 资格（`g4.executor`/`precheck_only`/`codes`/`remedy`，并从宿主 `tool_usage` 汇总
-  `host_evidence`：先确认会话存在，再按工具名/`read_only=0` 统计写能力与未分类调用），它
-  不派发、不写状态；`g4.executor` 只是策略预检，不代表 G4 已通过。
+  G4 资格（`g4.executor`/`precheck_only`/`codes`/`remedy`/`carrier`/
+  `architecture_compliant`，并从宿主 `tool_usage` 汇总 `host_evidence`），它不派发、
+  不写状态；`g4.executor` 只是策略预检，不代表 G4 已通过。
   再用 `native_agent.py review` 生成 `copilot-native-review/v2`；`g4_eligible` 只是结构预检，
   正式资格由 `g4_attest` 读取宿主 DB（`tool_usage`/`part`/`session_entry`）独立核验
   有效权限策略、会话/prompt/工作区、工具调用与原始输出，再由 `test_execution` 与
@@ -326,76 +350,77 @@ verify 的结构化质量报告（`copilot-verify-result/v1`）走报告接入�
   `bind-execution` 都会拒绝没有 captured 策略的高风险任务；合同策略进入合同指纹，
   `required=false` 才允许测试层 N/A，调用方只能加严，不能删除或放宽合同要求。
 
-## 复核策略与收敛
+## 复核策略与收敛（v7）
 
-复核是风险控制手段，不是开发流程的必经节点：
+复核是风险控制手段，不是开发流程的必经节点。普通复核只有一条活动通道：
+**SOL 零工具单轮复核**（`copilot_dispatch.py sol-review`）。
 
-- **低风险（`risk=low`）**：README/文档/项目规则、文案与样式、普通 UI 布局、简单 bug 修复、
-  普通测试代码、小范围既有模式改动。主代理自检（diff、定向测试、完成条件核对）闭环，
-  默认不派 Reviewer。
-- **中风险（`risk=medium`，历史 `normal` 等价）**：普通功能开发、多页面 UI、常规流程/
-  性能优化、普通模块重构。主代理完成开发与验证；存在特定技术不确定性时可按需用内置子代理
-  做针对性调查/咨询，但**不自动**创建 review attempt、G4 任务或复核台账。只有声明实质
-  触发因素、且独立视角确实能显著降低风险时，才派发一次定向只读复核。
-- **高风险（`risk=high`）**：权限/安全、计费/归因、迁移/一致性、共享基础设施/核心状态机、
-  关键业务链路、生产发布。G1–G4 不变：主代理先自检与测试，再按剩余风险完成一次 G4，
-  独立上下文、宿主精确只读约束、宿主记录与最终证据绑定，fail-closed。
-- **正式 REVIEW**：仅用户明确要求时登记（见 `references/review.md`），不因风险等级推定授权。
+### 风险驱动，不强制
 
-### 三级复核策略（v6.10.0）
+| 任务类型 | SOL 调用策略 |
+|---|---|
+| 简单文案、小 Bug、简单 UI | 不调用 |
+| 普通功能开发 | 按需调用 |
+| 多模块重大改造 | 建议调用一次 |
+| 广告、归因、数据链路 | 建议调用一次 |
+| 安全及生产高风险变更 | 按风险调用一次 |
+| 用户明确要求 REVIEW | 调用一次 |
 
-- **不做复杂评分**：只看任务风险标签与已声明的实质触发因素，不新建评分模型、决策 Agent
-  或层层审批。`review-admission` 返回 `tier=low|medium|high` 与
-  `required`/`not_required`/`not_needed`；低/中风险无触发因素时直接执行，不建立复核计划。
-- **低风险不自动复核**；**中风险不强制完整复核**；**高风险按真实剩余风险做 G4**。风险标签
-  与触发因素冲突时以显式触发因素为准（低风险声明 `security` 会升级为一次定向复核）。
-- **避免过度复核**：不要求每个开发任务启动 Reviewer；不把主代理自检转成正式 REVIEW；
-  不把普通子 Agent 调查转成 G4；没有新证据/源码变化不重复复核；不为凑复核轮次重复派发。
-- **PASS 即停止**：首次有效复核覆盖约定风险、无未解决 blocking/major、证据满足要求、
-  基线与目标一致时立即结束；局部修复只验证受影响部分，只有架构/关键契约/风险范围实质
-  变化才重新完整复核。
-- **针对性调查不是正式复核**：子代理咨询、`Explore` 调查不消耗复核 attempt，也不进入
-  G4 台账。
+- `review-admission` 只返回建议（`not_needed` / `optional` / `recommended`），不写状态、
+  不是门禁。主代理按风险、复杂度与潜在收益自主决定。
+- **高风险 G4 与 SOL 分离**：`risk=high` 的 G4 门禁不变；SOL 没有工具、无法核验宿主权限，
+  不能替代 G4。当前宿主没有合规只读载体时，G4 仍如实 BLOCKED。
+- 正式 REVIEW 仍只在用户明确授权时登记，不因风险等级推定授权。
 
-### 工具请求不等于工具执行（v6.10.0）
+### 单轮原则（硬约束）
+
+- **一次复核只发起一次 SOL 请求**。同一材料摘要再次调用直接复用已有结论，不重复付费。
+- **不自动二审**：修复后由主代理核实、修复并做受影响的定向测试；不因 Minor/Info 新建
+  第二轮，不与 SOL 反复辩论，不把 PASS 当“再跑一轮”的理由。
+- 只有用户明确要求、变更范围实质变化、出现新的关键风险、或首次材料存在重大遗漏时，才用
+  `--force --trigger <user-request|scope-changed|new-risk|materials-omitted> --reason ...`
+  再调用一次；必须换新材料并写明原因。
+- **失败收敛**：429、超时、网络错误、截断、响应格式异常、模型身份不符都记录真实原因并退出，
+  不自动重试、不切换 Provider、不派原生 Reviewer 顶替，也不阻断主代理继续开发。用户要求
+  必须完成独立复核而 SOL 不可用时，如实报告 BLOCKED，不伪造 PASS。
+
+### 审查材料（由主代理一次性准备）
+
+必须包含：任务目标与完成条件、相关项目规则/关键决策、完整变更 Diff、必要的关键文件内容、
+关键调用链与数据流、已执行测试及结果、尚未解决的问题、需要重点关注的风险。不得只给简短摘要
+让 SOL 猜测。`sol-review` 自动注入合同/完成条件/目标，并把材料拼成一次完整上下文；超过
+400,000 字符直接拒绝（提示主代理整理），不静默截断。
+
+SOL 输出契约：总体结论 `verdict=pass|partial|blocked`；`findings` 按
+`blocking/major/minor/info` 分级，每项带文件、位置、材料依据与建议；`unverified` 列出无法
+从材料确认的事项。PASS 与 blocking/major 或未验证项冲突时自动降级为 PARTIAL 并记录
+`verdict_adjusted`。
+
+### 输出消费与 Finding 台账
+
+- SOL 的结论是**建议**，不是任务 PASS，也不是 G4。`sol_reviews` 与 `native_reviews` 严格
+  分开；任何 SOL 记录都不会产生 `g4_eligible`。
+- SOL findings 以 `advisory` 身份进入 Finding 台账，与 G4 的 `authoritative` findings 区分：
+  主代理逐条核实后，修复并登记 `fixed`/`verified`；确认是误报的，可用
+  `finding --status dropped --note <反证>` 驳回（仅 advisory 的 blocking/major 允许）。
+  正式 G4/authoritative 的 blocking/major 仍只能修复并定向验证。
+- 未闭合的 blocking/major 继续阻断 G2；minor/info 不阻断、不派发新复核。
+- 原始输出保存在任务目录 `sol-reviews/`，审计 `sol-review-audit.jsonl` 只记脱敏元数据
+  （材料/请求/回复摘要、模型、usage、耗时、失败原因），不记正文与凭据。
+
+### 工具请求不等于工具执行（G4 复核细节）
 
 - 宿主 `tool_usage` 记录区分 `completed`、`denied_not_executed`、`executed_failed` 与
   `execution_unknown`。只有错误类型明确为策略/权限/工具缺失
   （`permission_denied`/`policy_denied`/`tool_not_allowed`/`tool_not_found`）、诊断列
   （`duration_ms`/`output_bytes`）存在且为零、无退出码时，才认定为“拒绝且未执行”。
-- **被拒绝且确认未执行的** `Bash`/`Write`/`Edit` 请求不使复核会话失效、不算 G4 工具违规、
-  不消耗有效 attempt；Reviewer 继续用 `Read/Grep/Glob` 完成复核，一次拒绝不触发重新派发。
-- **实际执行** `Bash`/`Write`/`Edit` 仍不符合当前 G4 工具策略；执行状态未知
+- **被拒绝且确认未执行的** `Bash`/`Write`/`Edit` 请求不使 G4 复核会话失效、不算工具违规、
+  不消耗有效 attempt；一次拒绝不触发重新派发。
+- **实际执行** `Bash`/`Write`/`Edit` 不符合 G4 工具策略；执行状态未知
   （`running`/`cancelled`/证据缺失）保持 fail-closed。同一越权工具被反复拒绝时记录
-  `repeated_denied_calls`，Reviewer 应停止无效重试，必要时由主代理终止该会话并新建只读复核。
-- **G4 权限不变**：仍是 `Read/Grep/Glob` + 禁用 `Write/Edit/Bash`；本次不建设新沙箱、
+  `repeated_denied_calls`，主代理应终止该会话并按真实能力缺口处理。
+- **G4 权限不变**：仍是 `Read/Grep/Glob` + 禁用 `Write/Edit/Bash`；不建设新沙箱、
   不修改宿主安全策略、不扩大子代理写入权限。
-
-### 风险准入与停止（v6.8.0）
-
-- **先判断要不要复核**：`copilot_dispatch.py review-admission --state … [--trigger …]
-  --reason …` 返回 `required` / `not_required` / `not_needed`，并给出
-  `tier=low|medium|high`。`risk=high` 恒为 `required`（G4 原有门禁不变）；`low`/`medium`
-  默认 `not_required`，只有声明实质触发因素（`security`、`permissions`、`core-logic`、
-  `data-integrity`、`architecture`、`global-execution`、`production`、`release`）才建议
-  派发。文案/格式/纯文档调整、仅注释改动、已被确定性测试覆盖的局部修改不派 Reviewer。
-  高风险 G4 例外：G4 代码范围包含 tracked 文档，PASS 后文档变化同样使旧快照失效，需要
-  重新 G4（这是代码范围绑定，不是文案复核）。
-- **一次完整复核**：代码与证据稳定后才派发。`review-context` 输出 `review_admission`、
-  `finding_ledger`、`execution_evidence_unbound` 与 `scope_reason`；存在未核销条件、
-  证据漂移或台账未闭合 finding 时先解决，不要让 Reviewer 基于即将过期的快照工作。
-- **停止标记**：PASS 回填时自动写入 `review_stops`（目标摘要、代码范围、findings 计数）。
-  同一目标与代码范围的再次 attempt 直接拒绝（`review_not_needed`）；上轮 PASS 之后只有
-  文档/格式文件变化时返回 `review_not_needed_docs_only`。不为 minor/info 建议改代码再重开
-  完整复核；把 minor 记录为 findings、把已核实非缺陷风险记录为 `residual_risks`。
-- **重入必须有实质原因**：代码/目标/证据变化后再次完整复核，需要 `--trigger`
-  （`blocking-fix` / `major-fix` / `code-changed` / `scope-expanded` / `evidence-changed` /
-  `risk-changed` / `security-fix` / `concurrency-fix`）与 `--reason`，写入
-  `review_admissions`。增量复核（`--based-on`，代码范围未变）不需要重入触发，但基线与覆盖
-  仍按原规则 fail-closed。
-- **派发幂等**：同一工作项、执行结果、目标与代码范围的未消费 attempt 直接复用；重复调用
-  `review-context --create-attempt` 不会生成第二个派发快照。派发失败/超时/上下文恢复时，
-  attempt 未被消费即可继续使用；已消费的 attempt 不能重放另一份输出。
 
 ### Finding 台账与定向复验
 
@@ -472,17 +497,72 @@ severity）→ 集中修复 → 针对性复核（只验证修复、新问题、
 |---|---|
 | 命令矩阵、证据登记、收口操作、只读交付清单、历史只读 | `references/workflow.md` |
 | 阶段机、`drive`/`ingest`、PARTIAL 派生、退出码 | `references/runtime.md` |
-| 正式 REVIEW、缺陷分级、G4 收口细则 | `references/review.md` |
+| SOL 单轮复核、正式 REVIEW、缺陷分级、G4 收口细则 | `references/review.md` |
 | 原生 Bridge v2 信封、宿主记录、错误码 | `references/agent-bridge.md` |
 | Agent 调度、内置 Explore/general-purpose 能力与 Profile 发现、G4 能力诊断 | `references/agent-bridge.md` 第 1.1 节；`native_agent.py capability`；`copilot_dispatch.py agent-policy` |
 | 历史 REVIEW 台账与旧审计（只读） | `references/review-ledger.md` |
-| 版本沿革与 SOL 退役记录 | `references/history.md` |
+| 版本沿革、SOL 退役与 v7 恢复记录 | `references/history.md` |
 | 角色与历史 SOL 指令（只作历史） | `references/role.md`、`role-consult.md` / `role-plan.md` / `role-review.md` / `role-map.md` |
 
 ## 版本
 
-当前版本 **v6.11.0（ZCode Autonomous Development Edition）**。v6.11.0 是效率与性能专项，
-只减少重复开销，不改判定规则：
+当前版本 **v7.0.0（SOL Review Edition）**。v7.0.0 用 SOL 零工具单轮复核取代原生 Reviewer
+多轮复核：
+
+- **唯一远程复核通道**：`scripts/sol_review.py` + `copilot_dispatch.py sol-review`。复用既有
+  本机 CPA `127` 出口与 `gpt-6.1-sol`（`reasoning.effort=high`），不新增 Provider、账户、
+  密钥或付费方案。
+- **能力级零工具**：请求体不含 `tools`/`functions`/`parallel_tool_calls`，显式
+  `tool_choice="none"`；上游出现 `message`/`reasoning` 之外的 output 条目即按安全事件拒绝。
+- **单轮**：一次调用只发一次请求；同一材料摘要直接复用结论；再次复核必须
+  `--force --trigger <原因> --reason <说明>`。失败不重试、不换 Provider、不派原生 Reviewer。
+- **输出契约**：`copilot-sol-review/v1`，verdict + blocking/major/minor/info + unverified；
+  PASS 与 blocking/major/未验证项冲突时降级为 PARTIAL。
+- **Finding 建议化**：SOL findings 以 `advisory` 进入台账；主代理修复并定向验证，误报可用
+  `finding --status dropped --note <反证>` 驳回；G4 的 authoritative findings 不可被驳回。
+- **Reviewer 退役**：普通 `native_agent.py review`、`review-context` 与原生复核 ingest 只接受
+  `risk=high`；`review-admission` 改为 SOL 建议（not_needed/optional/recommended），
+  `review_stops`/多轮重入不再参与普通任务。
+- **G4 不变**：高风险 G4 仍要求宿主内置精确只读载体；当前 ZCode 3.18.2 没有合规载体，
+  正式 G4 继续 BLOCKED，SOL 不能替代、也不能制造 PASS。
+- **未放宽**：G1–G4、fail-closed、证据/代码范围绑定、PWW 接受、授权与安全边界不变。
+
+v6.12.0 是 G4 宿主能力校验与调度收敛专项：
+
+- **宿主现场复核（ZCode 3.18.2）**：工作区只读 Profile 真实加载并生效——`profileSnapshot`
+  记录 `tools=[Read,Grep,Glob]`、`disallowedTools` 含 `Write/Edit/Bash`，44 个真实
+  `independent-readonly` 子会话只出现 `Read/Grep/Glob`；普通模式请求 Bash 返回
+  `tool_not_found`。但该 Profile 是 **project 级自定义 Agent**（宿主 `rCi` 把
+  `<cwd>/.zcode/agents` 标为 `source:"project"`），不是内置子代理。
+- **G4 架构合规（BLOCKED）**：原定架构只允许 ZCode 内置子代理。宿主内置只有
+  `Explore`（含 Bash）与 `general-purpose`（全工具），没有精确只读载体；`Agent` 工具
+  没有派发期 `tools` 参数。项目自定义 Profile 即使工具集精确，也不作为正式 G4 方案；
+  `profileSnapshot.source` 必须是 `built-in`，否则 `profile_source_not_builtin`。
+  因此当前宿主的正式 G4 只能是 **BLOCKED**，不能用自定义 Agent 或放宽权限制造 PASS。
+- **plan 模式 Bash 注入（新发现）**：父会话 `planEnabled=true` 时子会话继承 plan 模式，
+  宿主会给子代理注入 Bash 并可真实执行（真实记录：`independent-readonly` 子会话执行了
+  `git status --short`）。因此“精确只读”不能只看 `profileSnapshot`：`g4_attest`、
+  `native_agent review` 与 `capability` 都读取子会话 `runtime/execution_state`，要求
+  `planEnabled=false`；缺失/未知一律 fail-closed（`host_session_state_missing` /
+  `host_session_state_unknown` / `host_session_plan_mode`）。
+- **控制平面工具**：宿主对所有子代理无条件注入 `RespondToCoordinator`
+  （`agent.message.respond`、`sideEffectScope=session`，只向父运行时队列发消息，不能读写
+  文件或执行命令）；它不在声明白名单内，`x3n` 即使 Profile 禁用也会重新加入。按“工具集
+  字面精确等于 Read/Grep/Glob”的口径，它使任何子代理都无法满足字面精确；按“无额外
+  文件/命令能力”的口径不影响只读性。代码不把它加入白名单，G4 仍按声明策略与内置来源判定。
+- **能力探测可复验**：`capability` 的 `host_version` 是本次真实探测值（读
+  `app.asar package.json`，每次重新探测、不缓存；探测失败才回退常量并标
+  `source=unavailable`），`host_baseline` 固定为代码基线版本；同时输出
+  `session_execution`（mode/planEnabled）、`classification.carrier` /
+  `architecture_compliant`，并保留 `host_evidence` 逐调用统计。
+  `agent-policy --g4-required --plan-mode` 在 plan 模式下直接给出“不可派发”。
+- **能力缺口不反复派发**：最近一次 G4 取证的拒绝码属于宿主/Profile 能力缺口时，
+  `drive` 派生 `AUTO-G4-CAPABILITY`（诊断/修正/如实 block），而不是再派一个相同的
+  只读会话；环境修复后新取证会正常回到 `AUTO-G4`。
+- **未放宽**：G1–G4、fail-closed、attempt/宿主记录/证据绑定、PWW 接受与工具白名单不变；
+  plan 模式与来源约束只会让更多场景 fail-closed，不会放行。
+
+v6.11.0 是效率与性能专项，只减少重复开销，不改判定规则：
 
 - **字节码预编译**：文档命令统一用 `python3 -B`，`-B` 只禁止写 `.pyc`、不禁止读取。
   `sync_runtime.py --apply` 在同步后编译运行时字节码，单次命令不再重复编译约

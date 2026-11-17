@@ -73,6 +73,7 @@ import review_output  # noqa: E402
 import agent_policy as AP  # noqa: E402
 import native_bridge as NB  # noqa: E402
 import review_policy as RP  # noqa: E402
+import sol_review as SR  # noqa: E402
 
 EXIT_OK, EXIT_USAGE = 0, 2
 MAX_JSON_BYTES = 4 << 20
@@ -358,11 +359,15 @@ def _host_tool_summary(child: str, db: str) -> dict:
     child = str(child or "").strip()
     db = db or os.path.expanduser("~/.zcode/cli/db/db.sqlite")
     if not child:
-        return {"available": False, "reason": "child_session_missing"}
+        return {"available": False, "reason": "child_session_missing",
+                "session_execution": host_records.session_execution_state(
+                    db, child)}
+    execution = host_records.session_execution_state(db, child)
     try:
         con = host_records.connect_ro(db)
     except (OSError, sqlite3.Error) as exc:
-        return {"available": False, "reason": f"host_db_unavailable: {exc}"}
+        return {"available": False, "reason": f"host_db_unavailable: {exc}",
+                "session_execution": execution}
     try:
         try:
             found = con.execute("select 1 from session where id=?",
@@ -373,6 +378,7 @@ def _host_tool_summary(child: str, db: str) -> dict:
         if session_state == "missing":
             return {"available": False, "reason": "session_not_found",
                     "session_state": session_state,
+                    "session_execution": execution,
                     "db": os.path.abspath(os.path.expanduser(db))}
         try:
             available = host_records.table_columns(con, "tool_usage")
@@ -386,7 +392,8 @@ def _host_tool_summary(child: str, db: str) -> dict:
         except sqlite3.Error as exc:
             return {"available": False,
                     "reason": f"tool_usage_query_failed: {exc}",
-                    "session_state": session_state}
+                    "session_state": session_state,
+                    "session_execution": execution}
     finally:
         con.close()
     calls: list[dict] = []
@@ -431,6 +438,7 @@ def _host_tool_summary(child: str, db: str) -> dict:
     return {
         "available": True,
         "session_state": session_state,
+        "session_execution": execution,
         "db": os.path.abspath(os.path.expanduser(db)),
         "total_calls": total,
         "executed_calls": total - denied,
@@ -455,11 +463,15 @@ def build_capability(args) -> dict:
     data = _load_json(path)
     if not isinstance(data, dict):
         raise AgentRecordError(f"Agent metadata 顶层必须是对象：{path}")
-    report = AP.capability_report(data, metadata_path=path)
-    report["host_evidence"] = _host_tool_summary(
-        report.get("child_session_id"),
+    host_evidence = _host_tool_summary(
+        str(data.get("childSessionId") or ""),
         str(getattr(args, "db", "") or "")
         or os.path.expanduser("~/.zcode/cli/db/db.sqlite"))
+    report = AP.capability_report(
+        data, metadata_path=path,
+        execution_state=host_evidence.get("session_execution"),
+        host_info=host_records.host_version())
+    report["host_evidence"] = host_evidence
     evidence = report["host_evidence"]
     if report["g4"].get("executor"):
         # 宿主快照是只读、但实际记录出现写入/执行调用或无法分类的调用：
@@ -1016,6 +1028,10 @@ def build_review(args) -> dict:
             f"execution 工作项 {execution.get('work_item_id')!r} 与 "
             f"--work-item {args.work_item!r} 不一致。")
     risk = str(state.get("risk") or "").strip().lower()
+    if risk != "high":
+        raise AgentRecordError(
+            "[native_review_retired] 普通复核已由 SOL 零工具单轮复核取代"
+            "（copilot_dispatch.py sol-review）；原生复核信封只用于高风险 G4。")
     attempt_id = str(getattr(args, "attempt", "") or "").strip()
     attempt: dict | None = None
     if attempt_id:
@@ -1068,12 +1084,34 @@ def build_review(args) -> dict:
             f"不满足只读复核：{detail}。{diagnosis.get('remedy') or ''}"
             "独立复核必须由宿主只读子代理完成，不能用 Profile 名称或 Prompt 声明"
             "代替权限证据。")
+    if attempt_id or risk == "high":
+        # 原定架构只允许内置子代理；项目/用户自定义 Profile 即使只读也不合格。
+        carrier_problems = NB.g4_carrier_problems(reviewer_policy)
+        if carrier_problems:
+            code, detail = carrier_problems[0]
+            raise AgentRecordError(
+                f"[{code}] {detail}。G4 只能使用 ZCode 内置子代理；当前宿主内置 "
+                "Explore 含 Bash、general-purpose 为全工具，没有精确只读载体，"
+                "G4 应保持 BLOCKED，不能用项目自定义 Profile 制造 PASS。")
     if meta["status"] != "completed":
         raise AgentRecordError(
             f"Reviewer metadata.status={meta['status']!r}，不是 completed；"
             "不得把未完成的复核记录当作正式结论。")
     db_path = str(getattr(args, "db", "") or "") or os.path.expanduser(
         "~/.zcode/cli/db/db.sqlite")
+    # plan 模式会让宿主给子代理注入 Bash（真实记录），有效工具策略不再精确等于
+    # Read/Grep/Glob；G4（高风险/带 attempt）必须在生成信封前排除，而不是只在
+    # 事后看有没有调用 Bash。普通风险的定向复核不主张 G4 资格，不强制该门。
+    execution_state = host_records.session_execution_state(
+        db_path, str(meta["child_session_id"] or ""))
+    if attempt is not None or risk == "high":
+        state_problems = host_records.execution_state_problems(execution_state)
+        if state_problems:
+            code, detail = state_problems[0]
+            raise AgentRecordError(
+                f"[{code}] {detail}。G4 复核必须在非 plan 模式的独立只读会话中完成："
+                "先退出 plan 模式（planEnabled=false）再新建复核会话并重新生成 attempt，"
+                "不能把 plan 模式会话当作精确只读。")
     # 新链只从持久化宿主 DB 取证；rollout 不再是 G4 依赖。
     model_info = _db_model(meta, db_path)
     model = f"{model_info['provider_id']}/{model_info['model_id']}"
@@ -1148,6 +1186,8 @@ def build_review(args) -> dict:
             or meta["data"].get("updatedAt") or "").strip(),
         "prompt_sha256": NB.sha256_text(
             str(meta["data"].get("prompt") or "")),
+        "session_mode": str(execution_state.get("mode") or ""),
+        "session_plan_enabled": execution_state.get("plan_enabled"),
     }
     env = {
         "schema": NB.REVIEW_SCHEMA,
@@ -1222,6 +1262,10 @@ def build_review_context(args) -> dict:
     哪些问题还没闭合」交给 Reviewer，减少因上下文缺失造成的重复取证。
     """
     state = G.load_state(os.path.abspath(args.state))
+    if str(state.get("risk") or "").strip().lower() != "high":
+        raise AgentRecordError(
+            "[native_review_retired] 普通复核已由 SOL 零工具单轮复核取代；"
+            "review-context 只用于高风险 G4。")
     dispatch_env, _native = _dispatch_for_state(state, args.dispatch)
     execution = _load_json(args.execution)
     if not isinstance(execution, dict):
@@ -1372,7 +1416,7 @@ def build_review_context(args) -> dict:
             files=[item for item in code_snapshot.get("files") or []
                    if isinstance(item, dict)],
             scope=scope)
-    except RP.ReviewPolicyError as exc:
+    except (RP.ReviewPolicyError, SR.SolUsageError) as exc:
         raise AgentRecordError(f"[review_admission_invalid] {exc}") from None
     if ledger.get("blocking"):
         warnings.append(
@@ -1380,14 +1424,9 @@ def build_review_context(args) -> dict:
             + ", ".join(ledger["blocking"])
             + "；先修复并用定向测试/证据验证（finding --status fixed/verified），"
               "不要直接重跑完整复核。")
-    if not admission.get("reentry", {}).get("allowed"):
-        warnings.append(
-            "复核准入拒绝：" + str(admission["reentry"].get("detail") or "")
-            + "（如需重入，显式给出 --trigger 与 --reason）。")
-    if admission.get("decision") == "not_required":
-        warnings.append(
-            "低/中风险且未声明实质触发因素：默认不派发 Reviewer；"
-            "自检、diff 与确定性测试足以覆盖时直接停止。")
+    warnings.append(
+        "SOL 复核（copilot_dispatch.py sol-review）不能替代 G4；本次 attempt 只用于"
+        "高风险任务的宿主只读复核，且没有合规 readonly 载体时仍 fail-closed。")
     if previous and not previous.get("trust_problems") and \
             previous.get("g4_eligible") and previous_target and \
             previous_target != current_target:

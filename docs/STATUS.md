@@ -1,6 +1,155 @@
 # STATUS
 
-更新：2026-11-16 CST。本文件只记录现场可核实的事实；规划与未完成事项单独标注。
+更新：2026-11-17 CST。本文件只记录现场可核实的事实；规划与未完成事项单独标注。
+
+## SOL 单轮复核与 Reviewer 退役（2026-11-17，v7.0.0）
+
+基线：HEAD `f68fafa`（v6.11.0）+ 工作区 v6.12.0 未提交改动。**本轮继续未提交、未推送。**
+
+### 已实施
+
+- 新增 `scripts/sol_review.py`：复用既有本机 CPA `127` 出口与 `gpt-6.1-sol`
+  （`reasoning.effort=high`）；请求体无 `tools`/`functions`/`parallel_tool_calls`，
+  显式 `tool_choice="none"`；非 `message`/`reasoning` output 即安全事件；模型身份回显
+  必须一致；一次调用只发一次请求，不自动重试、不换 Provider。
+- `copilot_dispatch.py sol-review`：材料 + 合同/目标/条件拼成一次上下文；单轮判定
+  （同主体复用、再次复核需 `--force --trigger --reason`）；结果写入 `sol_reviews`、
+  原始输出写入任务目录 `sol-reviews/`、审计写 `sol-review-audit.jsonl`（仅脱敏元数据）；
+  失败写入 `sol_reviews`（`status=failed`）与 history，不阻断主代理。
+- `review-admission` 改为 SOL 建议：`low→not_needed`、`medium→optional`、
+  `high→recommended`（`g4_separate=true`），不写状态、不阻塞。
+- Reviewer 退役：`create_review_attempt`、`native_agent.py review`、`review-context`
+  与 `copilot_auto._ingest_review` 对 `risk!=high` 返回 `native_review_retired`；
+  G4 链路（attempt/attest/shadow/test_execution）保留。
+- Finding 台账：SOL findings 以 `authority=advisory` 进入台账；主代理修复并
+  `fixed→verified`，误报可用 `dropped --note` 驳回；G4 的 `authoritative` 仍不可驳回。
+- 安全加固（由本次真实 SOL 复核发现并修复）：
+  - 参考性合并不再把无 `authority` 的历史正式 finding 降级为 advisory；
+  - 禁用 HTTP 重定向，3xx 一律失败，避免 `Authorization` 被转发；
+  - `unverified`/`materials_reviewed` 与 finding 字段严格类型校验，非法元素拒绝消费；
+  - 响应读取中断/连接异常统一映射为 `SolUpstreamError`，进入失败审计与状态登记；
+  - Provider 凭据只接受严格 `http(s)://127.0.0.1:8317`（无 userinfo），拒绝远端
+    8317 或描述含 "cpa" 的规则；
+  - 单轮主体摘要不含条件状态（pending→met 不会导致重复付费），材料/目标/合同变化
+    才改变摘要。
+- 版本 `7.0.0`；`SKILL.md`、`README.md`、`docs/DECISIONS.md` 第 57 条、
+  `docs/PROJECT-CHARTER.md`、`docs/ROADMAP.md`、`references/*`、`AGENTS.md` 同步。
+
+### 真实验证
+
+- **路由**：CPA `/v1/models` 返回 `gpt-6.1-sol`；使用既有 `CUSTOM_127_API_KEY`
+  （`~/.reasonix/.env` / ZCode 127 Provider）调用成功，未新增 Provider/账户/密钥。
+- **真实 SOL 调用（一次）**：`model=gpt-6.1-sol`、`model_resolved=gpt-6.1-sol`、
+  `zero_tool=true`、`attempts=1`、`latency_ms=155612`、usage `input=39318 /
+  output=6319 / total=45637`（reasoning 4660）、`verdict=partial`、findings
+  `4 major + 1 minor`、`unverified=6`。原始输出与审计见任务目录。
+- **结果消费**：5 条 finding 全部逐条核实；4 major + 1 minor 均确认为真实问题并修复，
+  以修复 diff 与全量测试证据标记 `fixed→verified`；E2E 任务四门 PASS 并收口。
+- **E2E 任务目录**：`/tmp/copilot-v7-e2e-auBj`（临时目录；系统清理后不可用，仅证明
+  本次运行）。真实调用使用主代理整理的 139k 字符材料（v7 diff + 新模块 + 测试结果）。
+- **零工具/单轮失败路径**：mock 传输覆盖 429、超时、身份不符、非良性 output、
+  截断、响应读取中断、重定向、格式异常；均只调用一次且进入失败审计。
+
+### 已验证 / 未验证
+
+- 活动测试（最终代码）：**863 条 OK，82.2s**；legacy 历史回归 **853 条 OK（skip 32），
+  94.9s**。
+- 运行时同步（最终代码）：`sync_runtime.py --apply` 后 `--check` 缺失 0 / 不同 0；
+  运行时 `copilot_dispatch.py --version` = `7.0.0`。
+- **未验证**：真实 G4（宿主 3.18.2 没有内置精确只读载体，正式 G4 仍 BLOCKED）；
+  真实网络故障注入（429/断连）未做，只用异常/mock 注入；SOL 长期输出稳定性未做
+  多任务统计。
+
+## G4 宿主能力校验与调度收敛（2026-11-17，v6.12.0）
+
+基线：HEAD `f68fafa`（v6.11.0，工作区 clean）。**本轮未提交、未推送。**
+
+### 现场证据（真实宿主）
+
+- 宿主版本：`dpkg` 记录 `zcode 3.18.2-10443`；`capability` 从
+  `/opt/ZCode/resources/app.asar` 的 `package.json` 读到 `version=3.18.2`
+  (`name=@zcode/desktop`)。`host_version()` 每次重新探测，不缓存。
+- 工作区只读 Profile 在当前会话真实加载：系统提供的 Agent 列表包含
+  `independent-readonly (Tools: Read, Grep, Glob)`；一次实测派发的
+  `metadata.profileSnapshot` 为 `tools=[Read,Grep,Glob]`、
+  `disallowedTools=[Write,Edit,Bash,WebFetch,WebSearch,Agent,Task,TodoWrite,NotebookEdit]`、
+  `source=project`、`workspaceRoot=/media/vdb/projects/copilot`。
+- 实测子会话（`sess_subagent_agent_3de333ee-…`）：宿主工具列表实际只有
+  `Read/Grep/Glob/RespondToCoordinator`；`totalToolUseCount=2`，`tool_usage` 只有
+  `Read`、`Glob`（`read_only=1`），无 Bash/Write/Edit；子会话自述与宿主记录一致。
+- 历史 44 个 `independent-readonly` 子会话的 `tool_usage` 聚合只有
+  `Read/Grep/Glob`（另有 2 次 `Bash` 为 `tool_not_found`，即工具未注册）。
+- **plan 模式缺口**：8 个 `planEnabled=true` 的子会话中，1 个
+  `independent-readonly` 会话真实执行了 `git status --short`
+  （`status=completed`、`read_only=0`、`duration_ms=102`、输出 ` M src/calc.py`），
+  说明 plan 模式会给子代理注入 Bash；同一 Profile 在非 plan 模式下 Bash 不可用。
+- 宿主 `RespondToCoordinator` 会注入到所有子代理（`sideEffectScope=session`、
+  `permission=agent.message.respond`）；历史复核会话未使用它。
+
+### 已实施
+
+- `host_records.session_execution_state(db, session_id)` 读取
+  `session_entry(runtime/execution_state)`；`execution_state_problems()` 归类为
+  `host_session_plan_mode` / `host_session_state_missing` /
+  `host_session_state_unknown`。
+- `g4_attest.attest` 增加子会话模式准入：plan 模式或状态未知 fail-closed；取证记录写入
+  `session_mode` / `session_plan_enabled` 与对应 check 码。
+- `native_agent.build_review` 在生成信封前做同一准入（`[host_session_*]`），
+  `host` 字段记录 `session_mode` / `session_plan_enabled`。
+- `native_agent.build_capability` 输出 `host_version`（本次真实探测值，失败回退常量）、
+  `host_baseline`（代码基线）、`session_execution` 与
+  `host_evidence.session_execution`；`agent_policy.capability_report` 接受
+  `execution_state`/`host_info`，plan 模式、状态未知或调用方未提供状态时
+  `g4.executor=false`。
+- `agent_policy.dispatch_advice(g4_required, plan_mode)`：plan 模式下 G4 返回
+  `executor=unavailable`；CLI 增加 `--g4-required` / `--plan-mode`。
+- `review_policy.CAPABILITY_REJECTION_CODES` +
+  `governance._latest_capability_rejections`：最近一次 G4 取证是能力缺口时派生
+  `AUTO-G4-CAPABILITY`，不再机械重派。
+- **G4 载体来源约束**：`native_bridge.G4_CARRIER_SOURCE="built-in"` +
+  `g4_carrier_problems()`；`agent_policy.classify_profile` 增加
+  `profile_source_not_builtin`、`carrier`、`architecture_compliant`；
+  `native_agent.build_review`（attempt 或 `risk=high`）与 `g4_attest` 拒绝
+  `source!=built-in` 的 Profile。项目级 `independent-readonly` 不再是正式 G4 载体。
+- 版本 `6.12.0`；`SKILL.md`、`README.md`、`DECISIONS.md` 第 55/56 条、
+  `references/agent-bridge.md` 同步记录。
+
+### 已验证 / 未验证
+
+- 活动测试（最终代码）：**820 条 OK，64.9s**；legacy 历史回归 **853 条 OK（skip 32），
+  91.0s**。新增 plan 模式、能力缺口、execution_state、asar offset=0/畸形 header 等用例。
+- 运行时同步（最终代码）：`sync_runtime.py --apply` 后 `--check` 缺失 0 / 不同 0；
+  运行时 `copilot_dispatch.py --version` = `6.12.0`；8 个未受管理历史文件保留。
+- 真实 `capability`（最终代码）：项目级 `independent-readonly` 子会话
+  `g4.executor=false (profile_source_not_builtin)`、`carrier=project-profile`、
+  `architecture_compliant=false`；历史 plan 模式会话仍是
+  `host_session_plan_mode`。此前“`g4.executor=true`”的记录来自来源校验加入之前，
+  不再作为当前结论。
+- **真实 G4 技术 E2E（PASS/CLOSED，仅技术验证）**：在
+  `.copilot-tasks/task-v612-g4-final4` 以 `risk=high, backend=native` 跑通
+  Executor → 820 条测试 → attempt `RAdf146916cfc2dd2c470b285b` →
+  `independent-readonly` Reviewer（81 次调用，仅 Read/Grep/Glob）→
+  `g4_attest` 74 项检查 0 拒绝 → `g4_source=candidate` → `drive` PASS/CLOSED。
+  **该 E2E 使用项目级自定义 Profile，按原定架构不属于合规 G4 载体**；它只证明
+  技术只读链可用，不作为正式 G4 PASS 证据。证据保留在
+  `/media/vdb/projects/copilot/.copilot-tasks/task-v612-g4-final4/`。
+- **架构合规结论（2026-11-17 复核）**：
+  - `independent-readonly` 是 project 级自定义 Agent（`source:"project"`），不是内置
+    Agent；宿主内置只有 `Explore`（含 Bash）与 `general-purpose`（全工具）。
+  - 宿主没有派发期工具白名单；会话级 `--disallowedTools`/`permission.disallowedTools`
+    会同时限制主代理，不能作为按派发的只读隔离。
+  - `RespondToCoordinator` 是宿主无条件注入的控制平面消息工具
+    （`agent.message.respond`、session 范围），不能读写文件/执行命令，但使任何子代理
+    的“字面精确 {Read,Grep,Glob}”都不可能成立；代码不把它加入白名单。
+  - **正式 G4 = BLOCKED（`host_capability_missing`）**：当前宿主没有内置精确只读
+    载体；不得用项目自定义 Agent 或放宽权限制造 PASS。
+- 代码约束：`source!=built-in` 的 Profile 在 `capability` 为
+  `g4.executor=false`，`native_agent review`（attempt 或 `risk=high`）与
+  `g4_attest` 直接拒绝（`profile_source_not_builtin`）；`.zcode/agents/
+  independent-readonly.md` 仅保留为通用只读排查辅助。
+- **未验证**：宿主后续版本是否提供内置精确只读 Agent 或派发期工具白名单；在此之前
+  G4 保持 BLOCKED。
+
 
 ## 效率与性能专项（2026-11-16，v6.11.0）
 

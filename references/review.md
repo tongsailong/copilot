@@ -1,12 +1,61 @@
-# review：v6 复核、正式 REVIEW 与 G4
+# review：v7 SOL 单轮复核、正式 REVIEW 与 G4
 
-本文说明 v6 中三类容易混淆的“复核”，以及各自的触发条件、证据要求与失败处理。
+本文说明 v7 中容易混淆的几类“复核”，以及各自的触发条件、证据要求与失败处理。
 
 **一句话区分：**
 
 - **普通自检**：ZCode 自己做，不登记为复核，不构成任何门禁依据。
+- **SOL 复核**：按需一次性调用 `gpt-6.1-sol`（零工具、单轮）；结论是建议，不是门禁。
 - **正式 REVIEW**：用户明确要求时才做，是一个治理记录，**不是普通开发的强制前置门**。
 - **G4 复核**：高风险任务收口必需的原生独立只读复核，fail-closed，任何模型判断都不能替代。
+
+## 0. SOL 零工具单轮复核（v7 普通复核的唯一通道）
+
+### 触发
+
+风险驱动，不强制：简单任务不调用；普通功能按需；多模块改造、广告/归因/数据链路、安全与
+生产高风险建议调用一次；用户明确要求 REVIEW 时调用一次。`review-admission` 只给建议
+（`not_needed` / `optional` / `recommended`），不写状态、不阻塞。
+
+### 调用
+
+```bash
+python3 -B scripts/copilot_dispatch.py sol-review --state <state.json> \
+  --materials <materials.md>
+```
+
+- `--materials` 由主代理一次性准备：目标、完成条件、相关规则/决策、完整 Diff、关键文件、
+  调用链、测试结果、未解决问题与风险点。命令会自动注入合同/目标/条件；超过 400,000 字符
+  拒绝而不是静默截断。
+- 请求发往既有本机 CPA `127` 出口的 `gpt-6.1-sol`，`reasoning.effort=high`；不新增
+  Provider、账户或密钥。
+- **零工具**：请求体不含 `tools`/`functions`/`parallel_tool_calls`，`tool_choice="none"`；
+  上游出现 `message`/`reasoning` 之外的 output 条目即判安全事件并拒绝。
+- `--dry-run` 只构建并校验请求（零工具、材料大小），不发请求、不写状态。
+
+### 单轮与失败
+
+- 一次调用只发一次请求。相同材料摘要再次调用直接复用已有结论，不重复付费。
+- 再次复核必须 `--force --trigger <user-request|scope-changed|new-risk|materials-omitted>
+  --reason <说明>`，并换新材料。
+- 超时、429、网络、截断、响应格式、模型身份不符：记录真实原因与 `sol_reviews`
+  失败记录，返回非零退出码；不自动重试、不换 Provider、不派原生 Reviewer 顶替。
+  主代理继续开发；只有用户明确要求必须完成独立复核时才按 BLOCKED 报告。
+
+### 输出
+
+- `copilot-sol-review/v1`：`verdict`（pass/partial/blocked）、`findings`
+  （blocking/major/minor/info，含文件/行/依据/建议）、`unverified`、
+  `materials_reviewed`。PASS 与 blocking/major 或未验证项冲突时降级 PARTIAL。
+- findings 以 `advisory` 进入 Finding 台账：主代理修复后 `finding --status fixed`，
+  运行定向测试后 `--status verified`；确认误报时 `--status dropped --note <反证>`。
+- 原始输出存任务目录 `sol-reviews/`，审计 `sol-review-audit.jsonl` 仅脱敏元数据。
+
+### 与 G4 的关系
+
+SOL 没有工具、不能核验宿主权限，**不是 G4**。SOL 的 PASS 不会写入 `native_reviews`，
+不会产生 `g4_eligible`；高风险任务仍按第 3 节走 G4，当前宿主没有合规只读载体时保持
+BLOCKED。
 
 ## 1. 正式 REVIEW（opt-in）
 
@@ -74,54 +123,35 @@ copilot_dispatch.py formal-review --state <state> --verdict pass \
 不同 Child Session、只读工具集、独立取证与独立报告、不继承执行方判断。无法保证独立性时，
 如实说明是“主代理自检”或“同一上下文复核”，不得标记为正式 REVIEW。
 
-## 2. 原生独立复核（按需）
+## 2. 原生复核（仅高风险 G4）
 
-复核是**按需工具**，不是每个任务的必经流程。默认策略：
+**v7 起普通任务不再走原生 Reviewer。** 普通任务的独立意见使用第 0 节 SOL 单轮复核；
+`create_review_attempt`、`native_agent.py review`、`review-context` 与原生复核 ingest
+只接受 `risk=high`，其他风险返回 `native_review_retired`。
 
 | 任务类型 | 默认做法 |
 |---|---|
 | 普通任务（单文件/小改动、能本地测试） | ZCode 主代理自检：读 diff、跑针对性测试、核对完成条件；不派子代理 |
-| 复杂但非高风险（跨模块、行为变化、需要第二意见） | 主代理自检 + 必要时一个内置 `Explore` 做独立只读调查；聚焦目标符合性、关键改动、测试结果与真实风险，不要求 G4 信封 |
+| 复杂但非高风险（跨模块、行为变化、需要第二意见） | 主代理自检 + 按需一次 SOL 单轮复核（第 0 节） |
 | 高风险（安全、权限、关键业务链路、全局机制） | G1–G4：独立上下文、宿主精确只读约束、宿主记录与最终证据绑定；内置 Explore 含 Bash，不能充当 G4 执行者 |
 | 用户明确要求正式 REVIEW | 另按第 1 节登记，与风险分级无关 |
 
-不因“改了很多文件”“任务复杂”“有审核模式”机械派 Reviewer，也不要求每个复核都
-生成完整 G4 信封。普通复核的价值是发现 ZCode 自检看不到的问题，不是重复一遍自检。
-是否派发子代理按 `SKILL.md` 的五问清单判断；0–2 个是常见起点，不是配额。
+不因“改了很多文件”“任务复杂”“有审核模式”机械派 Reviewer；普通复核的价值是发现 ZCode
+自检看不到的问题，不是重复一遍自检。是否派发子代理按 `SKILL.md` 的五问清单判断；0–2 个是
+常见起点，不是配额。
 
-### 风险准入与停止（v6.8.0；三级策略 v6.10.0）
-
-派发前先做一次本地准入判断：
+### 风险建议（SOL）
 
 ```bash
 copilot_dispatch.py review-admission --state <state> [--trigger security \
   --trigger core-logic] --reason "为什么需要独立复核"
 ```
 
-- 决策附带 `tier=low|medium|high`：`low`（文档/文案/样式/简单修复/小范围既有模式改动）
-  与 `medium`（普通开发/多页面 UI/常规重构；历史 `normal` 等价）默认 `not_required`；
-  `high` 恒为 `required`（G4）。低/中风险任务由主代理完成实现、自检与测试，不建立复核
-  计划。只有声明 `security` / `permissions` / `core-logic` / `data-integrity` /
-  `architecture` / `global-execution` / `production` / `release` 之一且独立视角确有
-  收益时，才派发一次定向只读复核；显式触发因素优先于风险标签（低风险声明 `security`
-  会升级为一次定向复核）。
-- 针对性调查、`Explore` 咨询不是正式复核：不创建 attempt、G4 任务或台账。
-- 文案、格式、纯文档、注释与已被确定性测试覆盖的局部修改不派 Reviewer。高风险 G4 的
-  代码范围包含 tracked 文档：G4 PASS 之后文档变化同样使旧快照失效，需要重新完整复核；
-  这是代码范围绑定，不表示低风险文案任务也必须复核。
-- `--trigger` 可以使用准入词汇（`security`/`core-logic`…）或重入词汇
-  （`blocking-fix`/`major-fix`/`code-changed`…），两者都会进入同一准入记录。
-- PASS 回填时写入 `review_stops`。同一目标摘要与代码范围再次创建 attempt 会被拒绝
-  （`review_not_needed`）；上轮 PASS 后只有文档/格式文件变化时返回
-  `review_not_needed_docs_only`。这两条是停止条件，不是“不允许复核”——确有实质风险时
-  用 `--trigger` 显式重入。
-- 代码/目标/证据变化后重入：`--trigger blocking-fix|major-fix|code-changed|
-  scope-expanded|evidence-changed|risk-changed|security-fix|concurrency-fix`
-  并给出 `--reason`；准入记录写入 `review_admissions`，可审计。
-- 同一工作项、执行结果、目标、代码范围、scope 与证据清单的未消费 attempt 直接复用；
-  重复运行 `review-context --create-attempt` 不会产生第二个派发快照。
-- 不重复检查未变化的代码/证据，不为凑轮次重新派发；局部修复只验证受影响部分，只有整体
-  架构、关键契约或风险范围实质变化时才重新完整复核。
+- 只返回建议：`low` → `not_needed`；`medium`（历史 `normal` 等价）→ `optional`；
+  `high` → `recommended` 且 `g4_separate=true`。不写状态、不阻塞。
+- 声明 `security` / `permissions` / `core-logic` / `data-integrity` / `architecture` /
+  `global-execution` / `production` / `release` 等触发因素时升级为 `recommended`。
+- 高风险 G4 的准入、停止与 attempt 幂等逻辑仍按第 3 节执行；它不再服务于普通任务。
 
 ### Finding 台账与定向复验
 
@@ -256,8 +286,8 @@ finding 必须有可达的缺陷机制、实际影响与可核实证据（文件
 可以用 `native_agent.py review --based-on <基线复核.json>` 做增量复核：
 
 - 基线必须是已回填的 PASS 复核，`g4_eligible=true`，且记录里带覆盖快照；
-  因此增量复核只适用于**高风险 G4 链路**（普通风险复核不产生 `g4_eligible=true`
-  的基线，按需做一次完整复核即可，不需要增量）；
+  因此增量复核只适用于**高风险 G4 链路**（普通任务已改由 SOL 单轮复核承担，不产生
+  `g4_eligible=true` 的基线，也不需要增量）；
 - 只要求检查基线之后新增/变更的证据（`evidence_manifest`）；证据被归档也算变化；
 - 完成条件、合同或其他工作项的结论不得在基线之后变化，否则拒绝增量、要求完整复核；
 - 收口时 `governance` 会重算覆盖，确认变化量全部被增量复核覆盖。

@@ -39,6 +39,30 @@ SEVERITY_ORDER = {"blocking": 0, "major": 1, "minor": 2, "info": 3}
 REVIEW_TIERS = ("low", "medium", "high")
 RISK_TIER = {"low": "low", "medium": "medium", "normal": "medium", "high": "high"}
 
+# 这些拒绝码表示“当前宿主/Profile 能力不满足 G4”，而不是这次复核质量不好。
+# 命中时不应盲目重新派发同一个只读会话（同一环境会得到同样结果），而应先在
+# 主代理侧修正 Profile/会话模式，或如实 BLOCKED 并报告能力缺口。
+CAPABILITY_REJECTION_CODES = frozenset({
+    "profile_source_not_builtin",
+    "profile_tools_empty",
+    "profile_tools_not_exact",
+    "profile_disallowed_missing",
+    "profile_permission_mode",
+    "profile_skills_not_allowed",
+    "profile_mcp_servers",
+    "profile_path_missing",
+    "profile_system_prompt_missing",
+    "profile_content_mismatch",
+    "host_session_missing",
+    "host_session_parent_mismatch",
+    "host_session_kind_mismatch",
+    "host_session_state_missing",
+    "host_session_state_unknown",
+    "host_session_plan_mode",
+    "host_model_selection_missing",
+    "host_tool_usage_missing",
+})
+
 # 中风险任务按需复核的触发因素；没有触发因素时默认不派 Reviewer。
 ADMISSION_TRIGGERS = {
     "security": "安全/隐私/凭据处理",
@@ -281,6 +305,10 @@ def merge_review(state: dict, review: dict, *, at: str = "",
                 "line": finding.get("line"),
                 "summary": _text(finding.get("summary")),
                 "status": "open",
+                # SOL 复核只提供建议（advisory），G4 复核是正式结论（authoritative）。
+                # advisory 的 blocking/major 可以由主代理在给出反证后 dismiss；
+                # authoritative 的 blocking/major 仍只能修复并定向验证。
+                "authority": "authoritative" if authoritative else "advisory",
                 "first_review_sha256": review_sha,
                 "last_review_sha256": review_sha,
                 "occurrences": 0,
@@ -309,6 +337,15 @@ def merge_review(state: dict, review: dict, *, at: str = "",
             else:
                 item["reported_ids"].append(reported)
         previous_evidence = _text(item.get("last_evidence"))
+        if authoritative:
+            # 正式 G4 复核把同一 finding 升级为 authoritative，之后不再允许
+            # 仅凭执行方一句说明 dismiss。
+            item["authority"] = "authoritative"
+        else:
+            # 参考性（SOL）复核不能降低已有条目的保护级别。v7 之前的台账条目
+            # 没有 authority 字段，它们来自正式复核，必须保守按 authoritative
+            # 处理；只有本模块新建的 advisory 条目才带 advisory。
+            item.setdefault("authority", "authoritative")
         item["severity"] = _max_severity(item.get("severity"),
                                         finding.get("severity"))
         if finding.get("file"):
@@ -457,9 +494,11 @@ def transition(state: dict, finding_id: str, status: str, *,
                 f"{finding_id} 标记 regressed 需要证据与原因说明。")
     elif value == "dropped":
         severity = _text(item.get("severity")).lower()
-        if severity in BLOCKING_SEVERITIES:
-            # 执行方不能用一句 note 把 blocking/major 从台账里删掉：那等于绕过
-            # G4/G2。必须先修复并定向验证，或由新的独立复核标记 resolved。
+        authority = _text(item.get("authority")) or "authoritative"
+        if severity in BLOCKING_SEVERITIES and authority != "advisory":
+            # 执行方不能用一句 note 把正式复核（G4）的 blocking/major 从台账里
+            # 删掉：那等于绕过 G4/G2。必须先修复并定向验证，或由新的独立复核
+            # 标记 resolved。
             raise ReviewPolicyError(
                 f"{finding_id} 是 {severity}，不能由执行方直接标记 dropped；"
                 "修复后用证据标记 verified，或由新的独立复核标记 resolved。"

@@ -108,7 +108,7 @@ class Fixture:
             "prompt": f"你是 attempt {self.attempt_id} 的只读复核方。",
             "profileSnapshot": {
                 "name": "readonly-probe",
-                "source": "project",
+                "source": "built-in",
                 "path": self.profile,
                 "systemPrompt": "read only",
                 "tools": ["Read", "Grep", "Glob"],
@@ -179,6 +179,11 @@ class Fixture:
                                         "modelId": "model",
                                         "options": {"reasoningLevel": "max"}}
                  }, ensure_ascii=False), 1))
+        # G4 要求子会话不是 plan 模式：plan 模式会让宿主给子代理注入 Bash。
+        self.sql("insert into session_entry values (?,?,?,?)",
+                 (CHILD, "runtime/execution_state", json.dumps({
+                     "mode": "yolo", "planEnabled": False
+                 }, ensure_ascii=False), 2))
 
     # ── 行构造 ──────────────────────────────────────────────────────────
     def sql(self, statement: str, params: tuple = ()) -> None:
@@ -518,18 +523,22 @@ class ProfileBoundaryTests(AttestTestCase):
         self.f.set_profile(mcpServers=["playwright"])
         self.assertCode(self.f.run(), "profile_mcp_servers")
 
-    def test_profile_source_and_path_are_not_gating(self) -> None:
-        # 只读边界由有效工具策略决定：来源任意（project/user/…）、路径在工作区
-        # 外也照样合格；G4 不再要求固定来源或固定目录。
+    def test_profile_path_is_not_gating_for_builtin(self) -> None:
+        # 只读边界由有效工具策略决定；内置 Agent 的路径在工作区外也照样合格。
         outside = os.path.join(self.f.tmp, "outside-profile.md")
         with open(outside, "w", encoding="utf-8") as fh:
             fh.write("read only\n")
-        for source in ("user", "built-in", "plugin"):
+        self.f.set_profile(source="built-in", path=outside,
+                           permissionMode="default")
+        record = self.f.run()
+        self.assertTrue(record["eligible"], record["rejections"])
+
+    def test_profile_source_must_be_builtin(self) -> None:
+        # 原定架构只允许 ZCode 内置子代理；项目/用户/插件 Profile 不是 G4 载体。
+        for source in ("project", "user", "plugin"):
             with self.subTest(source=source):
-                self.f.set_profile(source=source, path=outside,
-                                   permissionMode="default")
-                record = self.f.run()
-                self.assertTrue(record["eligible"], record["rejections"])
+                self.f.set_profile(source=source, permissionMode="default")
+                self.assertCode(self.f.run(), "profile_source_not_builtin")
 
     def test_profile_name_is_not_gating(self) -> None:
         # Profile 名称改变（含完全无关的名字）不影响合法复核。
@@ -769,8 +778,27 @@ class HostRecordTests(AttestTestCase):
         self.assertCode(self.f.run(), "host_model_selection_missing")
 
     def test_model_selection_optional(self) -> None:
-        self.f.sql("delete from session_entry")
+        # 只删模型选择；execution_state 仍须存在（G4 要求排除 plan 模式）。
+        self.f.sql("delete from session_entry where type='runtime/model_selection'")
         self.assertTrue(self.f.run(require_model_selection=False)["eligible"])
+
+    def test_plan_mode_session_is_rejected(self) -> None:
+        # plan 模式会让宿主给子代理注入 Bash（真实记录），有效策略不再精确只读。
+        self.f.sql(
+            "update session_entry set data=? where type='runtime/execution_state'",
+            (json.dumps({"mode": "build", "planEnabled": True}),))
+        self.assertCode(self.f.run(), "host_session_plan_mode")
+
+    def test_missing_execution_state_fails_closed(self) -> None:
+        self.f.sql(
+            "delete from session_entry where type='runtime/execution_state'")
+        self.assertCode(self.f.run(), "host_session_state_missing")
+
+    def test_unknown_plan_flag_fails_closed(self) -> None:
+        self.f.sql(
+            "update session_entry set data=? where type='runtime/execution_state'",
+            (json.dumps({"mode": "yolo"}),))
+        self.assertCode(self.f.run(), "host_session_state_unknown")
 
     def test_db_missing(self) -> None:
         os.remove(self.f.db)

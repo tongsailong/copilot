@@ -44,70 +44,69 @@ def review(findings, *, sha="a" * 64, verdict="pass", scope="full",
 
 
 class AdmissionTests(unittest.TestCase):
-    def test_plain_normal_task_does_not_require_review(self):
-        state = {"risk": "normal", "review_stops": []}
+    def test_plain_normal_task_is_optional_not_forced(self):
+        state = {"risk": "normal", "sol_reviews": []}
         decision = G.review_admission(state)
-        self.assertEqual(decision["decision"], "not_required")
-        self.assertEqual(decision["scope"], "none")
+        self.assertEqual(decision["decision"], "optional")
+        self.assertEqual(decision["scope"], "normal")
         self.assertEqual(decision["tier"], "medium")
-        self.assertIn("主代理", decision["detail"])
+        self.assertTrue(decision["single_round"])
+        self.assertTrue(decision["g4_separate"])
 
-    def test_low_risk_task_never_dispatches_reviewer(self):
-        decision = G.review_admission({"risk": "low", "review_stops": []})
-        self.assertEqual(decision["decision"], "not_required")
+    def test_low_risk_task_does_not_need_sol(self):
+        decision = G.review_admission({"risk": "low", "sol_reviews": []})
+        self.assertEqual(decision["decision"], "not_needed")
         self.assertEqual(decision["scope"], "none")
         self.assertEqual(decision["tier"], "low")
         self.assertIn("低风险", decision["detail"])
 
-    def test_medium_risk_task_does_not_force_full_review(self):
-        decision = G.review_admission({"risk": "medium", "review_stops": []})
-        self.assertEqual(decision["decision"], "not_required")
+    def test_medium_risk_task_is_optional(self):
+        decision = G.review_admission({"risk": "medium", "sol_reviews": []})
+        self.assertEqual(decision["decision"], "optional")
         self.assertEqual(decision["tier"], "medium")
 
-    def test_low_risk_explicit_trigger_escalates_to_advisory(self):
+    def test_low_risk_explicit_trigger_recommends_once(self):
         decision = G.review_admission(
-            {"risk": "low", "review_stops": []},
+            {"risk": "low", "sol_reviews": []},
             triggers=["security"], reason="意外涉及凭据读取")
-        self.assertEqual(decision["decision"], "required")
-        self.assertEqual(decision["scope"], "advisory")
+        self.assertEqual(decision["decision"], "recommended")
+        self.assertEqual(decision["scope"], "triggered")
 
     def test_unknown_risk_fails_closed(self):
-        with self.assertRaises(RP.ReviewPolicyError):
-            RP.admission(risk="whatever")
-        with self.assertRaises(RP.ReviewPolicyError):
-            RP.admission(risk="")
+        import sol_review as SR
+        with self.assertRaises(SR.SolUsageError):
+            G.review_admission({"risk": "whatever", "sol_reviews": []})
+        with self.assertRaises(SR.SolUsageError):
+            G.review_admission({"risk": "", "sol_reviews": []})
 
-    def test_stop_marker_maps_to_not_needed_for_non_high(self):
-        state = {"task_id": "t", "risk": "medium", "review_stops": []}
-        blocked = {"allowed": False, "code": "review_not_needed",
-                   "detail": "same snapshot"}
-        with mock.patch.object(G.RP, "reentry_decision",
-                               return_value=blocked):
-            decision = G.review_admission(state)
-        self.assertEqual(decision["decision"], "not_needed")
-        state["risk"] = "high"
-        with mock.patch.object(G.RP, "reentry_decision",
-                               return_value=blocked):
-            decision = G.review_admission(state)
-        self.assertEqual(decision["decision"], "required")
-        self.assertEqual(decision["scope"], "g4")
+    def test_high_risk_recommends_sol_but_keeps_g4_separate(self):
+        decision = G.review_admission({"risk": "high", "sol_reviews": []})
+        self.assertEqual(decision["decision"], "recommended")
+        self.assertEqual(decision["scope"], "high-risk")
+        self.assertTrue(decision["g4_separate"])
+        self.assertIn("不能替代 G4", decision["detail"])
 
-    def test_high_risk_always_requires_g4(self):
-        decision = G.review_admission({"risk": "high", "review_stops": []})
-        self.assertEqual(decision["decision"], "required")
-        self.assertEqual(decision["scope"], "g4")
-
-    def test_declared_trigger_requires_advisory_review(self):
+    def test_declared_trigger_recommends_sol(self):
         decision = G.review_admission(
-            {"risk": "normal", "review_stops": []},
+            {"risk": "normal", "sol_reviews": []},
             triggers=["security"], reason="凭据处理")
-        self.assertEqual(decision["decision"], "required")
-        self.assertEqual(decision["scope"], "advisory")
+        self.assertEqual(decision["decision"], "recommended")
+        self.assertEqual(decision["scope"], "triggered")
         self.assertEqual(decision["triggers"], ["security"])
 
     def test_unknown_trigger_is_rejected(self):
-        with self.assertRaises(RP.ReviewPolicyError):
-            RP.admission(risk="normal", triggers=["looks-complex"])
+        import sol_review as SR
+        with self.assertRaises(SR.SolUsageError):
+            G.review_admission({"risk": "normal", "sol_reviews": []},
+                               triggers=["looks-complex"])
+
+    def test_baseline_sol_review_is_visible(self):
+        state = {"risk": "medium", "sol_reviews": [{
+            "status": "completed", "review_id": "SR1", "verdict": "partial",
+            "materials_sha256": "a" * 64, "created_at": "now"}]}
+        decision = G.review_admission(state)
+        self.assertEqual(decision["sol_reviews_total"], 1)
+        self.assertEqual(decision["last_sol_review"]["verdict"], "partial")
 
 
 class FindingLedgerTests(unittest.TestCase):
@@ -534,7 +533,7 @@ class CliEfficiencyTests(unittest.TestCase):
                          "--state", self.state, "--json")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         payload = json.loads(proc.stdout)
-        self.assertEqual(payload["decision"], "not_required")
+        self.assertEqual(payload["decision"], "optional")
         self.assertEqual(payload["tier"], "medium")
 
     def test_admission_cli_reports_low_tier_without_review(self):
@@ -545,7 +544,7 @@ class CliEfficiencyTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         payload = json.loads(proc.stdout)
         self.assertEqual(payload["tier"], "low")
-        self.assertEqual(payload["decision"], "not_required")
+        self.assertEqual(payload["decision"], "not_needed")
 
     def test_legacy_normal_risk_is_stored_as_medium(self):
         path = os.path.join(self.tmp.name, "normal.json")
@@ -558,52 +557,21 @@ class CliEfficiencyTests(unittest.TestCase):
             G.start_state(path, goal="目标", contract=F.CONTRACT, risk=risk)
             self.assertEqual(G.load_state(path)["risk"], risk)
 
-    def test_admission_cli_reports_required_for_security_trigger(self):
+    def test_admission_cli_recommends_sol_for_security_trigger(self):
         proc = F.run_cli("copilot_dispatch.py", "review-admission",
                          "--state", self.state, "--trigger", "security",
                          "--reason", "凭据处理", "--json")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         payload = json.loads(proc.stdout)
-        self.assertEqual(payload["decision"], "required")
-        self.assertEqual(payload["scope"], "advisory")
+        self.assertEqual(payload["decision"], "recommended")
+        self.assertEqual(payload["scope"], "triggered")
+        self.assertTrue(payload["g4_separate"])
 
-    def test_admission_workspace_uses_same_evidence_exclusions(self):
-        repo = tempfile.mkdtemp(prefix="adm-ws-")
-        self.addCleanup(__import__("shutil").rmtree, repo, True)
-        F.init_git_workspace(repo)
-        evidence = os.path.join(repo, "evidence.txt")
-        with open(evidence, "w", encoding="utf-8") as fh:
-            fh.write("untracked evidence\n")
-        state_path = os.path.join(repo, "state.json")
-        G.start_state(state_path, goal="目标", contract=F.CONTRACT,
-                      workspace=repo)
-        state = G.load_state(state_path)
-        G.register_evidence(state, "E1", file_path=evidence)
-        G.save_state(state_path, state)
-        state = G.load_state(state_path)
-        target = G.final_evidence_digest(state)
-        excludes = G.governance_paths(state_path) + \
-            G.CS.safe_evidence_excludes(state, repo)
-        snapshot = G.capture_code_snapshot(repo, exclude_paths=excludes)
-        state["review_stops"] = [{
-            "schema": RP.STOP_SCHEMA, "stop_id": "RST1",
-            "review_sha256": "r" * 64, "target_sha256": target,
-            "code_scope_sha256": snapshot["digest"], "verdict": "pass",
-            "g4_eligible": False, "findings": {},
-            "created_at": G.now_iso(),
-        }]
-        state["native_reviews"] = [{
-            "result_sha256": "r" * 64, "verdict": "pass",
-            "target_sha256": target, "findings": [], "unverified": [],
-            "g4_eligible": False, "candidate_g4": {},
-        }]
-        G.save_state(state_path, state)
+    def test_admission_cli_rejects_retired_workspace_flag(self):
         proc = F.run_cli("copilot_dispatch.py", "review-admission",
-                         "--state", state_path, "--workspace", repo, "--json")
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        payload = json.loads(proc.stdout)
-        self.assertTrue(payload["code_scope_checked"])
-        self.assertEqual(payload["reentry"]["code"], "review_not_needed")
+                         "--state", self.state, "--workspace", self.tmp.name)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("unrecognized arguments", proc.stderr)
 
     def test_finding_file_evidence_is_rechecked(self):
         repo = tempfile.mkdtemp(prefix="finding-ev-")
@@ -660,19 +628,30 @@ class CliEfficiencyTests(unittest.TestCase):
         self.assertEqual(payload["items"][0]["status"], "verified")
 
 
-class NormalRiskStopTests(F.BridgeBase):
-    def test_pass_records_advisory_stop(self):
+class NativeReviewRetiredTests(F.BridgeBase):
+    def test_normal_risk_native_review_is_retired(self):
         state = G.load_state(self.state_path)
         state["risk"] = "normal"
         G.save_state(self.state_path, state)
         execution = self.execution()
         AC._ingest_execution(self.state_path, execution)
         env = self.review(execution, g4_eligible=False, target_sha256="")
-        AC._ingest_review(self.state_path, env)
+        with self.assertRaises(AC.AutoError) as ctx:
+            AC._ingest_review(self.state_path, env)
+        self.assertIn("native_review_retired", str(ctx.exception))
         state = G.load_state(self.state_path)
-        self.assertEqual(len(state["review_stops"]), 1)
-        self.assertIs(state["review_stops"][0]["g4_eligible"], False)
-        self.assertIs(state["review_stops"][0]["authoritative"], False)
+        self.assertEqual(state["native_reviews"], [])
+        self.assertEqual(state["review_stops"], [])
+
+    def test_medium_risk_review_attempt_is_retired(self):
+        state = G.load_state(self.state_path)
+        state["risk"] = "medium"
+        G.save_state(self.state_path, state)
+        with self.assertRaises(G.GovernanceError) as ctx:
+            G.create_review_attempt(
+                self.state_path, work_item_id="A1",
+                execution_result_sha256="0" * 64)
+        self.assertIn("native_review_retired", str(ctx.exception))
 
 
 class MetricsEfficiencyTests(unittest.TestCase):

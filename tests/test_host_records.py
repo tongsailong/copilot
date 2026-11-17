@@ -142,5 +142,108 @@ class ToolExecutionStateTests(unittest.TestCase):
                              "execution_unknown")
 
 
+class ExecutionStateTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.db = os.path.join(self.tmp.name, "db.sqlite")
+        con = sqlite3.connect(self.db)
+        con.execute("create table session_entry (session_id text, type text,"
+                    " data text, time_created integer)")
+        con.commit()
+        con.close()
+
+    def _sql(self, statement, params=()):
+        con = sqlite3.connect(self.db)
+        con.execute(statement, params)
+        con.commit()
+        con.close()
+
+    def test_execution_state_plan_mode_and_unknown(self):
+        self._sql("insert into session_entry values (?,?,?,?)",
+                  (SESSION, "runtime/execution_state", json.dumps(
+                      {"mode": "build", "planEnabled": True}), 1))
+        state = H.session_execution_state(self.db, SESSION)
+        self.assertTrue(state["found"])
+        self.assertTrue(state["plan_enabled"])
+        self.assertEqual([code for code, _d in H.execution_state_problems(state)],
+                         ["host_session_plan_mode"])
+
+        self._sql("update session_entry set data=? "
+                  "where type='runtime/execution_state'",
+                  (json.dumps({"mode": "yolo"}),))
+        state = H.session_execution_state(self.db, SESSION)
+        self.assertEqual([code for code, _d in H.execution_state_problems(state)],
+                         ["host_session_state_unknown"])
+
+    def test_execution_state_missing_and_malformed(self):
+        self.assertEqual(
+            [code for code, _d in H.execution_state_problems(
+                H.session_execution_state(self.db, SESSION))],
+            ["host_session_state_missing"])
+        self._sql("insert into session_entry values (?,?,?,?)",
+                  (SESSION, "runtime/execution_state", "{bad json", 1))
+        state = H.session_execution_state(self.db, SESSION)
+        self.assertTrue(state["found"])
+        self.assertEqual([code for code, _d in H.execution_state_problems(state)],
+                         ["host_session_state_unknown"])
+
+    def test_execution_state_non_plan_is_clean(self):
+        self._sql("insert into session_entry values (?,?,?,?)",
+                  (SESSION, "runtime/execution_state", json.dumps(
+                      {"mode": "yolo", "planEnabled": False}), 1))
+        state = H.session_execution_state(self.db, SESSION)
+        self.assertFalse(state["plan_enabled"])
+        self.assertEqual(H.execution_state_problems(state), [])
+
+    def test_host_version_is_probed_not_cached(self):
+        report = H.host_version(asar_path=os.path.join(self.tmp.name,
+                                                       "missing.asar"))
+        self.assertEqual(report["source"], "unavailable")
+        self.assertEqual(report["version"], "")
+
+    def test_host_version_accepts_integer_offset_zero(self):
+        import struct
+        payload = json.dumps({"name": "@zcode/desktop",
+                              "version": "3.19.0"}).encode("utf-8")
+        header = json.dumps({"files": {"package.json": {
+            "offset": 0, "size": len(payload)}}}).encode("utf-8")
+        header_size = len(header) + 9
+        blob = b"".join([
+            struct.pack("<I", 4),
+            struct.pack("<I", header_size),
+            struct.pack("<I", header_size - 4),
+            struct.pack("<I", len(header)),
+            header,
+        ])
+        blob += b"\0" * (8 + header_size - len(blob))
+        blob += payload
+        path = os.path.join(self.tmp.name, "fake.asar")
+        with open(path, "wb") as fh:
+            fh.write(blob)
+        report = H.host_version(asar_path=path)
+        self.assertEqual(report["version"], "3.19.0")
+        self.assertEqual(report["source"], "app.asar:package.json")
+
+    def test_host_version_malformed_header_is_unavailable(self):
+        import struct
+        header = json.dumps({"files": "not-an-object"}).encode("utf-8")
+        header_size = len(header) + 9
+        blob = b"".join([
+            struct.pack("<I", 4),
+            struct.pack("<I", header_size),
+            struct.pack("<I", header_size - 4),
+            struct.pack("<I", len(header)),
+            header,
+        ])
+        blob += b"\0" * (8 + header_size - len(blob))
+        path = os.path.join(self.tmp.name, "bad.asar")
+        with open(path, "wb") as fh:
+            fh.write(blob)
+        report = H.host_version(asar_path=path)
+        self.assertEqual(report["source"], "unavailable")
+        self.assertEqual(report["version"], "")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -142,6 +142,9 @@ class BuildReviewTests(unittest.TestCase):
                     (child, "runtime/model_selection", json.dumps({
                         "modelSelection": {"providerId": "fake",
                                            "modelId": "reviewer-model"}}), 1))
+        con.execute("insert into session_entry values (?,?,?,?)",
+                    (child, "runtime/execution_state", json.dumps({
+                        "mode": "yolo", "planEnabled": False}), 2))
         if calls is None:
             calls = [("c1", "Read", {"file_path": self.evidence}),
                      ("c2", "Grep", {"pattern": "done", "path": self.evidence})]
@@ -211,6 +214,40 @@ class BuildReviewTests(unittest.TestCase):
         self.assertEqual([c["name"] for c in env["host"]["tool_calls"]],
                          ["Grep", "Read"])
         self.assertEqual(env["files_inspected"], [self.evidence])
+
+    def test_project_profile_source_is_not_a_g4_carrier(self):
+        path = self.host["metadata_path"]
+        with open(path, encoding="utf-8") as fh:
+            meta = json.load(fh)
+        meta["profileSnapshot"]["source"] = "project"
+        write_json(path, meta)
+        with self.assertRaises(NA.AgentRecordError) as ctx:
+            NA.build_review(self._args())
+        self.assertIn("profile_source_not_builtin", str(ctx.exception))
+
+    def test_plan_mode_session_is_rejected(self):
+        db = self._db()
+        con = sqlite3.connect(db)
+        con.execute(
+            "update session_entry set data=? "
+            "where type='runtime/execution_state'",
+            (json.dumps({"mode": "build", "planEnabled": True}),))
+        con.commit()
+        con.close()
+        with self.assertRaises(NA.AgentRecordError) as ctx:
+            NA.build_review(self._args(db=db))
+        self.assertIn("host_session_plan_mode", str(ctx.exception))
+
+    def test_missing_execution_state_is_rejected(self):
+        db = self._db()
+        con = sqlite3.connect(db)
+        con.execute(
+            "delete from session_entry where type='runtime/execution_state'")
+        con.commit()
+        con.close()
+        with self.assertRaises(NA.AgentRecordError) as ctx:
+            NA.build_review(self._args(db=db))
+        self.assertIn("host_session_state_missing", str(ctx.exception))
 
     def test_executed_bash_request_still_rejected(self):
         db = self._db()
@@ -408,6 +445,62 @@ class DriveGuardTests(unittest.TestCase):
 
 
 class RepeatedGapTests(unittest.TestCase):
+    def test_capability_gap_derives_capability_work_not_review(self):
+        # 最近一次取证是“宿主/Profile 能力缺口”时，不应继续派生普通 G4 派发。
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "state.json")
+            G.start_state(path, goal="目标", contract=CONTRACT,
+                          execution_backend="native", risk="high",
+                          test_policy={"required": False})
+            G.plan_state(path, PLAN)
+            state = G.load_state(path)
+            state.setdefault("actions", []).append({
+                "id": "A1", "title": "实现", "origin": "zcode-plan",
+                "status": "done", "result": "完成", "evidence_ids": [],
+            })
+            state["g4_attestations"] = [{
+                "status": "attested",
+                "new_reason": ["host_session_plan_mode"],
+                "attestation": {"rejections": [
+                    {"code": "host_session_plan_mode", "detail": "plan mode"}]},
+            }]
+            G.save_state(path, state)
+            state = G.load_state(path)
+            created = G.derive_work(state)
+            ids = [a["id"] for a in created]
+            self.assertTrue(any(item.startswith("AUTO-G4-CAPABILITY")
+                                for item in ids), ids)
+            self.assertFalse(any(item == "AUTO-G4" or item.startswith("AUTO-G4-INGEST")
+                                 for item in ids), ids)
+
+    def test_recent_capability_gap_does_not_block_after_fix(self):
+        # 更早的能力缺口不应长期阻断：只看最近一次取证。
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "state.json")
+            G.start_state(path, goal="目标", contract=CONTRACT,
+                          execution_backend="native", risk="high",
+                          test_policy={"required": False})
+            G.plan_state(path, PLAN)
+            state = G.load_state(path)
+            state.setdefault("actions", []).append({
+                "id": "A1", "title": "实现", "origin": "zcode-plan",
+                "status": "done", "result": "完成", "evidence_ids": [],
+            })
+            state["g4_attestations"] = [
+                {"status": "attested", "new_reason": ["host_session_plan_mode"],
+                 "attestation": {"rejections": [
+                     {"code": "host_session_plan_mode", "detail": ""}]}},
+                {"status": "attested", "new_reason": ["host_tool_not_allowed"],
+                 "attestation": {"rejections": [
+                     {"code": "host_tool_not_allowed", "detail": ""}]}},
+            ]
+            G.save_state(path, state)
+            state = G.load_state(path)
+            created = G.derive_work(state)
+            ids = [a["id"] for a in created]
+            self.assertFalse(any(item.startswith("AUTO-G4-CAPABILITY")
+                                 for item in ids), ids)
+
     def test_repeated_g4_gap_derives_replan(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "state.json")
