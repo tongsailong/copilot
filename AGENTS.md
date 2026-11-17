@@ -7,47 +7,48 @@
 ## 1. 项目定位
 
 Copilot 是运行于 ZCode 内的**轻量协作治理 Skill**：负责任务承接、合同与完成条件、状态机、
-证据桥接、审计、PARTIAL 持续推进与 G1–G4 收口。ZCode 原生 Agent 是唯一的工程执行与技术
-决策主体；用户侧 ChatGPT 负责需求与产品层目标、交接与验收；高风险 G4 由宿主可证明只读的
-子代理承担独立复核。
+证据桥接、审计、PARTIAL 持续推进与 G1–G3 收口。ZCode 原生 Agent 是唯一的工程执行与技术
+决策主体；用户侧 ChatGPT 负责需求与产品层目标、交接与验收；独立质量审查由 SOL 零工具
+单轮复核按风险提供。
 
-- **v7.0.0 起普通复核只走 SOL 零工具单轮复核**：`scripts/sol_review.py` 是唯一允许访问
-  网络与读取本机 CPA 凭据的活动模块，只提供 REVIEW、只读材料、一次请求；不恢复 CONSULT/
-  PLAN 远程职责，不把 SOL 当 G4，不设等待远程返回的状态门禁。原生多轮 Reviewer 已退役，
-  `native_agent.py review` / `review-context` / 原生复核 ingest 只保留给高风险 G4
-  （其他风险返回 `native_review_retired`）。
-  历史实现归档在 `legacy/`，历史审计、裁决、台账与证据只读保留。
+- **v8.0.0 起 G4 原生只读复核正式退役**：删除 `g4_attest.py`、`g4_shadow.py`、
+  `test_execution.py`、原生复核信封与 `native_agent.py review/review-context/capability`。
+  不再产生 `g4_eligible`、G4 PASS、G4 BLOCKED、`AUTO-G4*` 或 `host_capability_missing`；
+  高风险任务不再绑定 native 后端。历史 `native_reviews` / `review_attempts` /
+  `g4_attestations` 只读保留用于审计，不参与新任务准入、派生或收口；原生复核信封
+  出现时返回 `native_review_retired`。
+- **v7.0.0 起独立模型复核只走 SOL 零工具单轮复核**：`scripts/sol_review.py` 是唯一允许
+  访问网络与读取本机 CPA 凭据的活动模块，只提供 REVIEW、只读材料、一次请求；不恢复
+  CONSULT/PLAN 远程职责，不设等待远程返回的状态门禁。SOL 是 advisory，不构成收口门禁，
+  也不证明宿主只读权限。历史实现归档在 `legacy/`，历史审计、裁决、台账与证据只读保留。
 - 本仓库是**唯一源码**。`~/.zcode/skills/copilot` 是构建产物，只能由
   `scripts-sync/sync_runtime.py` 单向下发，不得直接编辑。旧 Reviewer 全局 Profile
   已退役；工作区 `.zcode/agents/independent-readonly.md` 是通用只读能力载体（只声明
-  宿主权限，不定义 Reviewer 角色或流程），普通任务不强制使用。按 v6.12 的载体来源约束，
-  它是 project 级自定义 Agent，**不是正式 G4 载体**；G4 要求内置 `source=built-in` +
-  精确 `Read/Grep/Glob`，当前宿主没有合规载体，正式 G4 继续 fail-closed/BLOCKED。
-  该文件不属于同步分发范围。
+  宿主权限，不定义 Reviewer 角色或流程），供主代理按需做独立只读调查，普通任务不强制使用，
+  不参与收口门禁。该文件不属于同步分发范围。
 - 运行时临时修复必须先回迁本仓库，再同步下发；不使用符号链接替代副本。
 - 源码与运行时的分工见 `docs/DECISIONS.md`。
 
 ## 2. 角色职责
 
 顶层协作角色按 `docs/PROJECT-CHARTER.md`：用户、ChatGPT（用户侧）、Copilot、ZCode 原生
-Agent、G4 只读复核、DesignWise。Executor / Reviewer 是 ZCode 工程执行体系内的子角色，
-不是与顶层角色并列的职责。
+Agent、SOL REVIEW、DesignWise。Executor 是 ZCode 工程执行体系内的子角色，不是与顶层角色
+并列的职责；G4 只读复核已退役。
 
 | 角色 | 职责 | 关键限制 |
 |---|---|---|
 | ZCode 主代理 | 默认执行主体：现场调查、工程规划、技术选型、实现、调试、测试、集成与交付；按需派发子代理 | 不擅自改变产品目标、业务规则或授权范围；不为体现协作强制调用子代理 |
-| 内置 `Explore` | 独立只读调查：跨模块/调用链/改动前风险/独立上下文检查 | 工具集含 `Bash`，不是只读代理；不注入 AGENTS.md，主代理必须提供范围与项目背景；不修改工程文件，不能作为 G4 执行者 |
+| 内置 `Explore` | 独立只读调查：跨模块/调用链/改动前风险/独立上下文检查 | 工具集含 `Bash`，不是只读沙箱；不注入 AGENTS.md，主代理必须提供范围与项目背景；不修改工程文件 |
 | 内置 `general-purpose` | 边界清晰、可独立交付、并行收益明显的子任务 | `tools=["*"]` 并继承 MCP；主代理负责拆分、冲突检查、集成与验收；不能当作只读复核者 |
-| Copilot 状态层 | 合同、条件、状态、证据登记、四门、PARTIAL 派生、收口、审计 | 是本地脚本与状态，不是模型；除显式 `sol-review` 外不调用模型、不实施工程、不替代技术决策、门禁不得绕过 |
-| SOL REVIEW | 一次性零工具独立审查；结论写入 `sol_reviews` 与 Finding 台账（advisory） | 只做 REVIEW；不执行工程、不做技术决策、不自动二审、不替代 G4；结论只是建议 |
-| 正式 REVIEW | 用户明确要求时的治理记录 | 不是普通开发前置门禁；不能替代 G4；无授权不得伪造 |
-| G4 复核 | 高风险任务收口所需的技术复核 | 宿主有效策略必须精确 `Read/Grep/Glob` 且禁用 `Write/Edit/Bash`、无 skills/MCP；内置 Explore/general-purpose 均不合格；fail-closed，无可证明只读能力时报告能力缺口 |
+| Copilot 状态层 | 合同、条件、状态、证据登记、G1–G3、PARTIAL 派生、收口、审计 | 是本地脚本与状态，不是模型；除显式 `sol-review` 外不调用模型、不实施工程、不替代技术决策、门禁不得绕过 |
+| SOL REVIEW | 一次性零工具独立审查；结论写入 `sol_reviews` 与 Finding 台账（advisory） | 只做 REVIEW；不执行工程、不做技术决策、不自动二审；结论只是建议，不构成收口门禁 |
+| 正式 REVIEW | 用户明确要求时的治理记录 | 不是普通开发前置门禁；无授权不得伪造 |
+| ~~G4 复核~~ | **v8.0.0 已正式退役**；历史记录只读保留 | 不再参与准入、派生或收口；不得把历史 BLOCKED 改写成 PASS |
 
 **模型独立 ≠ Agent 独立。** 共享同一 Provider/模型不等于共享上下文、会话或判断。
-复核方与执行方必须是不同的 Agent ID / Child Session / 上下文；独立性由独立上下文、宿主
-只读策略、独立取证与独立报告保证，不由模型名或 Profile 名称保证。工作区
-`.zcode/agents/independent-readonly.md` 只是通用只读能力载体（不作为普通任务的前置条件，
-也不是 G4 的必经路径）。
+子代理与执行方必须是不同的 Agent ID / Child Session / 上下文；独立性由独立上下文与独立
+取证保证，不由模型名或 Profile 名称保证。工作区 `.zcode/agents/independent-readonly.md`
+只是通用只读能力载体（不作为普通任务的前置条件，也不参与收口门禁）。
 
 ## 3. 模型路由规则
 
@@ -100,31 +101,30 @@ Agent、G4 只读复核、DesignWise。Executor / Reviewer 是 ZCode 工程执�
 
 - 状态机收敛为 `RUNNING` / `PARTIAL` / `PASS` / `BLOCKED` / `CLOSED`；不得恢复
   `pending_call`、`quota`、`round_seq`、`budget`、`pass_pending` 等远程判定字段。
-- **PARTIAL 不是终点**：必须本地派生工作项（`AUTO-C<n>` / `AUTO-R-<id>` / `AUTO-G4` /
-  `AUTO-REPLAN` / `AUTO-NEXT`）并继续推进，直到 PASS 或真实 BLOCKED。禁止因轮次、Token、
-  内部费用、等待模型、重复评审、子 Agent PARTIAL、首次方案失败或普通测试失败停止。
+- **PARTIAL 不是终点**：必须本地派生工作项（`AUTO-C<n>` / `AUTO-R-<id>` / `AUTO-FIX-<F>` /
+  `AUTO-VERIFY-<F>` / `AUTO-REPLAN` / `AUTO-NEXT`）并继续推进，直到 PASS 或真实 BLOCKED。
+  G4 退役后不再派生 `AUTO-G4*`；SOL 复核由主代理按风险决定，不是阻塞性工作项。禁止因轮次、
+  Token、内部费用、等待模型、重复评审、子 Agent PARTIAL、首次方案失败或普通测试失败停止。
 - `execution_backend` 默认 `legacy`，native 为显式 opt-in；既有协议决定不得擅改。
 - **Agent 调度按 `SKILL.md`**：主代理直接执行为默认；`Explore` 只做独立只读调查（不注入
   AGENTS.md，必须提供范围与背景）；`general-purpose` 只承担边界清晰的独立交付物。
   不设调用比例或预算；子代理不可用/PARTIAL 时主代理继续，不原样重复失败派发。
-- **内置子代理不是 G4 执行者**：`Explore` 含 Bash、`general-purpose` 为 `tools=["*"]`，
-  均不满足精确只读要求。G4 仍要求宿主 `Read/Grep/Glob` + 禁用 `Write/Edit/Bash`；
-  无可证明只读能力时 fail-closed 并报告能力缺口，不伪造 PASS、不新建自定义只读子代理补位。
-- G1–G4 保持 fail-closed：证据不足、绑定不符、门禁未过时必须失败关闭，不得用
-  “看起来合理”替代验证；SOL 复核与原生 Reviewer PASS **都不等于** G4，`g4_eligible`
-  由宿主记录计算。
+- **G4 已退役**：不再有宿主只读载体要求、权限探测或独立取证门禁；`Explore` 含 Bash、
+  `general-purpose` 为 `tools=["*"]`，都只能按普通子代理使用。
+- G1–G3 保持 fail-closed：证据不足、绑定不符、门禁未过时必须失败关闭，不得用
+  “看起来合理”替代验证；SOL 复核 PASS 也不等于证据、测试或授权判断。
 - 执行/复核必须绑定 task / contract / plan / dispatch / work_item /
   `execution_result_sha256`；证据须先登记且属于本任务，文件型证据会重读校验摘要。
-- G4 复核方只读、独立取证、独立报告；不得继承执行方判断，不得因执行方自述而放弃核查。
-  SOL 复核只提供建议，由主代理核实、修复并做定向验证。
+- SOL 复核只提供建议（advisory），由主代理核实、修复并做定向验证；不得把 SOL 结论当作
+  文件读取证明、宿主权限审计或收口依据。
 - 正式 REVIEW 仅在用户明确授权时登记；授权在同一任务合同内持续有效，不得成为普通开发
-  门禁，也不得用自检冒充。G4 不依赖正式 REVIEW。
+  门禁，也不得用自检冒充。
 - SOL 一次复核只发一次请求：失败（429/超时/网络/截断/格式/身份）如实记录后由主代理继续，
   不自动重试、不换 Provider、不派原生 Reviewer 顶替；只有用户明确要求完成独立复核时才按
   BLOCKED 报告。
-- 不跳过四门、收口与证据校验；未过门不得标记 CLOSED 或 PASS。测试默认使用本地夹具，
+- 不跳过 G1–G3、收口与证据校验；未过门不得标记 CLOSED 或 PASS。测试默认使用本地夹具，
   只有显式真实 E2E 才调用既有授权配置。
-- 不重做状态机、四门、自动驱动或证据协议；需要变更时先说明影响并取得授权。
+- 不重做状态机、门禁、自动驱动或证据协议；需要变更时先说明影响并取得授权。
 
 ## 6. 修改与交付纪律
 
@@ -150,5 +150,5 @@ Agent、G4 只读复核、DesignWise。Executor / Reviewer 是 ZCode 工程执�
 - Skill 入口与运行契约：`SKILL.md`
 - 操作命令：`references/workflow.md`
 - 阶段机与持续推进：`references/runtime.md`
-- 复核与 G4：`references/review.md`
+- 复核与历史 G4：`references/review.md`
 - 原生信封：`references/agent-bridge.md`

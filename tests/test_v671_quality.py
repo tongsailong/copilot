@@ -853,7 +853,7 @@ class CodeScopeTests(BaseFixture):
         self.assertTrue(any(str(item.get("id") or "").startswith("AUTO-QUALITY")
                             for item in actions))
 
-    def test_g4_evidence_excludes_only_untracked_artifacts(self):
+    def test_evidence_scope_excludes_only_untracked_artifacts(self):
         with open(self.app, "w", encoding="utf-8") as fh:
             fh.write("value = 2\n")
         artifact = os.path.join(self.workspace, "run.log")
@@ -869,16 +869,6 @@ class CodeScopeTests(BaseFixture):
         self.assertNotIn(os.path.realpath(self.app), direct)
         self.assertIn(os.path.realpath(artifact), direct)
 
-    def test_review_snapshot_ignores_tracked_path_in_envelope_excludes(self):
-        with open(self.app, "w", encoding="utf-8") as fh:
-            fh.write("value = 2\n")
-        snap = self.snapshot()
-        state = G.load_state(self.state_path)
-        result = G._review_code_snapshot_for_execution(
-            self.workspace, state, self.state_path, "",
-            snap["digest"], [self.app, self.state_path])
-        self.assertIn("src/app.py",
-                      [entry["path"] for entry in result["files"]])
 
     def test_tracked_detection_handles_glob_and_head_only(self):
         special = os.path.join(self.workspace, "src", "app[1].py")

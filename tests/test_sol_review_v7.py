@@ -272,14 +272,14 @@ class StateIntegrationTests(unittest.TestCase):
             G.record_finding_status(self.state_path, "F1", "dropped",
                                     note="想绕过")
 
-    def test_sol_review_never_satisfies_g4(self):
+    def test_sol_review_is_advisory_not_a_closure_gate(self):
         self.record([], verdict="pass")
         state = G.load_state(self.state_path)
         state["risk"] = "high"
-        state["native_reviews"] = []
-        gate = G._gate_review(state)
-        self.assertFalse(gate["passed"])
-        self.assertEqual(gate["reasons"][0]["code"], "native_review_missing")
+        check = G.closure_check(state)
+        # G4 退役：门禁只有 G1–G3，SOL 记录不改变门禁集合。
+        self.assertEqual(set(check["gates"]), {"G1", "G2", "G3"})
+        self.assertNotIn("G4", check["gates"])
         self.assertEqual(state["sol_reviews"][0]["status"], "completed")
 
     def test_duplicate_sol_record_does_not_double_count(self):
@@ -324,7 +324,7 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual(SR.admission(risk="low")["decision"], "not_needed")
         self.assertEqual(SR.admission(risk="medium")["decision"], "optional")
         self.assertEqual(SR.admission(risk="high")["decision"], "recommended")
-        self.assertTrue(SR.admission(risk="high")["g4_separate"])
+        self.assertNotIn("g4_separate", SR.admission(risk="high"))
 
     def test_trigger_validation(self):
         self.assertEqual(SR.admission(risk="low",

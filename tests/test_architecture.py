@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""v7 架构约束回归：SOL 是唯一远程复核通道，且零工具、单轮、与 G4 分离。"""
+"""v8 架构约束回归：SOL 是唯一远程复核通道，且零工具、单轮。"""
 from __future__ import annotations
 
 import ast
@@ -19,11 +19,13 @@ import governance as G  # noqa: E402
 ACTIVE = ("governance.py", "copilot_dispatch.py", "copilot_auto.py",
           "agent_policy.py", "native_bridge.py", "native_agent.py",
           "bridge_evidence.py", "lib_common.py", "review_policy.py",
-          "review_output.py", "host_records.py", "g4_attest.py",
-          "g4_shadow.py", "test_execution.py", "code_scope.py",
-          "code_scope_capture.py", "sol_review.py")
-# v7 唯一允许访问网络与凭据的活动模块。其他模块只能通过它间接复核。
+          "host_records.py", "code_scope.py", "code_scope_capture.py",
+          "sol_review.py")
+# v8 唯一允许访问网络与凭据的活动模块。其他模块只能通过它间接复核。
 NETWORK_MODULE = "sol_review.py"
+# v8 起 G4 活动机制已退役；这些模块不得重新出现在活动 scripts/。
+RETIRED_MODULES = ("g4_attest.py", "g4_shadow.py", "test_execution.py",
+                   "review_output.py")
 
 
 def _read_bytes(path: str) -> bytes:
@@ -97,6 +99,11 @@ class RemoteReviewBoundaryTests(unittest.TestCase):
                              f"{name} 不应继续出现在活动 scripts/")
             self.assertTrue(os.path.isfile(os.path.join(ROOT, "legacy", name)),
                             f"{name} 的历史实现应保留在 legacy/")
+
+    def test_g4_modules_are_removed_from_active_scripts(self):
+        for name in RETIRED_MODULES:
+            self.assertFalse(os.path.exists(os.path.join(SCRIPTS, name)),
+                             f"{name} 属已退役 G4 机制，不应继续出现在活动 scripts/")
 
     def test_governance_engine_is_pure_local(self):
         text = source("governance.py")

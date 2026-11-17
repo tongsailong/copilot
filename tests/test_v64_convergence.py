@@ -206,65 +206,11 @@ class FormalReviewAmendmentTests(unittest.TestCase):
         self.assertEqual(metrics["active_formal_reviews_total"], 1)
 
 
-class ReviewContextWarningTests(F.BridgeBase):
-    def setUp(self):
-        super().setUp()
-        state = G.load_state(self.state_path)
-        state["native_dispatch"] = self.dispatch
-        G.save_state(self.state_path, state)
-        self.execution_env = self.execution()
-        self.execution_path = os.path.join(self.dir, "execution.json")
-        with open(self.execution_path, "w", encoding="utf-8") as fh:
-            json.dump(self.execution_env, fh, ensure_ascii=False)
-        self.dispatch_path = os.path.join(self.dir, "dispatch.json")
-        with open(self.dispatch_path, "w", encoding="utf-8") as fh:
-            json.dump(self.dispatch, fh, ensure_ascii=False)
-        AC._ingest_execution(self.state_path, self.execution_env)
-
-    def args(self, **overrides):
-        base = {"state": self.state_path, "dispatch": self.dispatch_path,
-                "execution": self.execution_path, "work_item": "A1",
-                "previous_review": "", "workspace": self.dir}
-        base.update(overrides)
-        return argparse.Namespace(**base)
-
-    def test_previous_pass_target_change_warns_but_does_not_auto_reuse(self):
-        attempt = self.create_attempt(self.execution_env)
-        host = F.make_fake_review_host(
-            self.dir, execution=self.execution_env, dispatch=self.dispatch,
-            evidence=self.evidence, task_id=self.state["task_id"],
-            attempt_id=attempt["review_attempt_id"],
-            session_created_at=attempt["created_at"])
-        env = self.review(self.execution_env, attempt=attempt, host=host)
-        AC._ingest_review(self.state_path, env)
-        # 阶段九：旧 PASS 必须来自新链才进入“目标摘要变化”诊断。
-        state = G.load_state(self.state_path)
-        record = state["native_reviews"][-1]
-        record["g4_eligible"] = True
-        record["g4_source"] = "candidate"
-        record["candidate_g4"] = {"eligible": True, "reasons": []}
-        bound = G.find_review_attempt(state, attempt["review_attempt_id"])
-        bound["consumed"] = True
-        bound["consumed_by_result_sha256"] = record["result_sha256"]
-        G.save_state(self.state_path, state)
-        review_path = os.path.join(self.dir, "previous.json")
-        with open(review_path, "w", encoding="utf-8") as fh:
-            json.dump(env, fh, ensure_ascii=False)
-        state = G.load_state(self.state_path)
-        G.register_evidence(state, "E2", text="post-pass evidence")
-        G.save_state(self.state_path, state)
-        payload = NA.build_review_context(
-            self.args(previous_review=review_path))
-        self.assertTrue(any("上轮 PASS 绑定的是旧目标摘要" in w
-                            for w in payload["warnings"]))
-        self.assertTrue(any("minor/info" in w for w in payload["warnings"]))
-        # 只提示，不擅自把旧 PASS 当成新摘要的结论。
-        self.assertNotEqual(payload["target_sha256"],
-                            env["target_sha256"])
 
 
 class ReviewOrderTests(unittest.TestCase):
-    def test_auto_g4_work_order_requires_final_evidence_before_review(self):
+    def test_high_risk_task_does_not_derive_g4_work_after_evidence(self):
+        # v8：G4 退役后，证据/条件齐备的高风险任务不再派生 AUTO-G4 复核工作项。
         with tempfile.TemporaryDirectory() as tmp:
             state = os.path.join(tmp, "state.json")
             G.start_state(state, goal="目标", contract=CONTRACT,
@@ -284,12 +230,14 @@ class ReviewOrderTests(unittest.TestCase):
                             evidence_ids=["E1"])
             G.record_criterion(state, "C1", "met", evidence_ids=["E1"])
             created = G.derive_work(G.load_state(state))
-            g4 = next(a for a in created if a["id"].startswith("AUTO-G4"))
-            self.assertIn("先", g4["goal"])
-            self.assertIn("最终", g4["goal"])
-            self.assertIn("review-context", g4["goal"])
-            self.assertIn("PASS 后", g4["goal"])
-            self.assertIn("residual_risks", g4["goal"])
+            self.assertFalse([a for a in created
+                              if str(a["id"]).startswith("AUTO-G4")])
+            check = G.closure_check(G.load_state(state))
+            self.assertTrue(check["passed"], check["reasons"])
+
+
+if __name__ == "__main__":
+    unittest.main()
 
 
 if __name__ == "__main__":

@@ -992,6 +992,28 @@
     - **未放宽**：G1–G4、fail-closed、证据/代码范围绑定、PWW 接受、授权与安全边界不变；
       SOL 结论只是建议，工程执行与技术决策仍由 ZCode 主代理承担。
 
+58. **v8.0.0：正式退役 G4 原生只读复核，统一由 SOL 承接独立审查（2026-11-17，用户决策）。**
+    依据：用户《Copilot G4 正式退役与 SOL 零工具复核统一》任务书；v7.0.0 基线
+    （`873112d`）与宿主 ZCode 3.18.2 始终没有内置精确只读载体；G4 的宿主兼容、权限派发与
+    独立取证维护成本持续高于收益。
+    - **G4 退役**：删除 `g4_attest.py`、`g4_shadow.py`、`test_execution.py`、
+      `review_output.py`，以及 `native_agent.py` 的 `review` / `review-context` /
+      `capability` 子命令、`native_bridge` 的复核信封校验与 `copilot_auto` 的复核 ingest。
+      不再产生 `g4_eligible`、G4 PASS、G4 BLOCKED、`AUTO-G4*` 或 `host_capability_missing`。
+    - **门禁收敛为 G1–G3**：G1 工作项终态；G2 合同/条件/证据 + Finding 台账（对所有风险
+      等级生效）；G3 无停摆。原 G4 的“未闭合 blocking/major 阻断收口”职责保留在 G2；G4
+      不再有独立门禁。不得把历史 G4 BLOCKED 改写为 PASS，也不得因历史记录阻止新任务。
+    - **高风险不再绑定 native**：`risk=high` 可用 `legacy` 或 `native`；合同 `test_policy`
+      仍必须在 start/amend 时声明（通用工程约束：执行前确定测试命令）。
+    - **SOL 承接**：安全/权限逻辑、数据迁移与完整性、归因/关键数据链路、复杂核心业务、
+      重大架构调整、用户明确要求时，建议执行一次 SOL 零工具单轮复核。SOL 保持 advisory、
+      零工具、单轮、不自动二审、不自动切换 Provider；失败如实记录，不阻断普通任务推进；
+      用户明确要求必须完成的独立复核失败时如实报告。SOL 不证明宿主文件读取或权限。
+    - **历史只读**：`native_reviews` / `review_attempts` / `g4_attestations` 与历史
+      `authority=authoritative` 字段原样保留，只用于审计追溯与台账保护级别；不做批量改写。
+    - **未放宽**：G1–G3、fail-closed、证据完整性、PWW 接受、授权与安全边界不变。G4 退役
+      不取消生产数据、凭据、权限、部署等独立授权约束。
+
 ## 建议（未采纳）
 
 > 以下为 v5 时期记录，保留原文；其中涉及 `call_gpt.py`、SOL 预算或远程 REVIEW 的建议

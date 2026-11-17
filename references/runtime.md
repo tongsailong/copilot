@@ -30,8 +30,8 @@
 | 4 | 存在可领取工作项 | RUNNING | 输出工作单，退出码 10 |
 | 5 | 仍有未闭合条件 | PARTIAL | 派生 `AUTO-C<n>` |
 | 6 | 存在停摆工作项 | PARTIAL | 派生恢复项 |
-| 7 | 四门全部通过 | PASS | 收口为 CLOSED |
-| 8 | 其他四门未过 | PARTIAL | 按缺口派生（含 `AUTO-G4`） |
+| 7 | G1–G3 全部通过 | PASS | 收口为 CLOSED |
+| 8 | 其他门禁未过 | PARTIAL | 按缺口派生 |
 
 - **可领取（ready）**：`status=pending` 且所有 `depends_on` 已完成。
 - **停摆（stalled）**：`running`/`failed`/`blocked` 的遗留项；或 `pending` 但依赖不存在、
@@ -53,17 +53,14 @@
 | 停摆工作项 `A1` | `AUTO-R-A1` | 分析失败根因并重试/调整/记录真实阻塞 |
 | Finding 台账有 `open`/`regressed` 的 blocking/major | `AUTO-FIX-<F>` | 修根因、登记修复证据并标记 fixed，不直接重跑完整复核 |
 | Finding 已 `fixed` 但未验证 | `AUTO-VERIFY-<F>` | 只跑对应定向测试/检查，登记证据并标记 verified |
-| 高风险缺 G4 | `AUTO-G4` | 组织一次独立只读复核并回填 |
-| 已有 G4 标记完成但门禁仍缺 | `AUTO-G4-INGEST` | 检查回填/绑定/拒绝原因，必要时重做复核 |
-| `AUTO-C*` / `AUTO-R-*` / `AUTO-G4*` 已派生 ≥3 次仍不闭合 | `AUTO-REPLAN` | 根因分析 + 实质不同的替代路线 |
+| `AUTO-C*` / `AUTO-R-*` 已派生 ≥3 次仍不闭合 | `AUTO-REPLAN` | 根因分析 + 实质不同的替代路线 |
 | 无其他缺口 | `AUTO-NEXT` | 明确下一步最小可执行动作 |
 | 存在连续失败工作项 | `AUTO-REPLAN` | 同上 |
 
 - 重名时用 `-R2`、`-R3` 递增（`_derive_id`），不覆盖已有工作项。
 - 同一缺口已有 `pending`/`running` 工作项时不再派生第二条；重复调用 `drive` 或多个入口
-  同时求值不会把 `AUTO-C1` / `AUTO-G4` 复制成 `-R2`/`-R3`。
-- 存在未闭合 finding 时优先生成 `AUTO-FIX-*` / `AUTO-VERIFY-*`，不派生 `AUTO-G4`；定向
-  验证完成、台账清零后才重新进入 G4 派发。
+  同时求值不会把 `AUTO-C1` 复制成 `-R2`/`-R3`。
+- G4 退役后不再派生 `AUTO-G4*`；SOL 复核由主代理按风险决定，不是阻塞性工作项。
 - 失败/停摆的 `AUTO-C*` 项不再额外派生恢复项，避免同一缺口两份工作单。
 - 派生项带通用约束：不得越过原始授权范围、不得改目标/条件/业务规则、只做缺口需要的最小
   改动；若合同写有 `boundaries`，原样带入。
@@ -84,21 +81,22 @@
 
 **进展摘要 `progress_digest`**：由工作项状态/结果摘要/证据引用、条件状态/证据引用、
 证据 id 与摘要、收口状态计算。派生前后摘要不变且没有 `AUTO-NEXT` 时输出警告；同一缺口
-反复派生（`AUTO-C*` / `AUTO-R-*` / `AUTO-G4*` 各自累计 ≥3 次）会附带 `AUTO-REPLAN`，
+反复派生（`AUTO-C*` / `AUTO-R-*` 各自累计 ≥3 次）会附带 `AUTO-REPLAN`，
 要求换路线而不是重复执行。
 
 ## 5. 收口与重开
 
-- `closure_check` 依次检查 G1–G4，全部通过才 `passed=true`。
-- `closure --close` 需要四门通过，写入 `closure`（时间、`by`、`iteration_id`、门禁快照）
+- `closure_check` 依次检查 G1–G3（工作项终态、合同/条件/证据/台账、无停摆），全部通过才
+  `passed=true`；G4 已退役，不再参与。
+- `closure --close` 需要 G1–G3 通过，写入 `closure`（时间、`by`、`iteration_id`、门禁快照）
   并把阶段固定为 CLOSED；未结束的迭代同时标记为 `CLOSED` 并补 `ended`，之后的修改一律拒绝。
 - `reopen --reason ... --authorized-by user` 需要显式用户授权声明；它保存旧 closure 快照到
   `reopen_history`（含授权声明），清理收口状态，任务回到 RUNNING/PARTIAL，并开一条新迭代
   承接后续工作（已收口的旧迭代保持 `CLOSED`，不改写历史）。旧快照在写入前做深拷贝，避免
   自引用。
-- `final_evidence_digest` 是 G4 的复核目标：它绑定合同指纹、条件与证据、工作项结果与证据，
-  **排除 `origin=g4-review` 的工作项**——否则复核完成后自身状态变化会让合法结论永久“过期”；
-  其他任何变化仍会使旧复核失效（fail-closed）。
+- `final_evidence_digest` 绑定合同指纹、条件与证据、工作项结果与证据；它仍用于证明目标摘要
+  稳定与历史复核的过期判断。**排除历史 `origin=g4-review` 工作项**以保持旧状态摘要稳定；
+  新任务不再产生该类工作项。
 
 ## 6. 状态保真与恢复
 
@@ -131,24 +129,21 @@
 
 - **主代理继续**：子代理不可用、派发失败或返回 PARTIAL 只影响该工作项。主代理分析剩余工作，
   继续可直接完成的调查、修复、测试与集成；普通任务不因 Agent Profile 加载失败而 BLOCKED。
-- **不原样重派**：`UNKNOWN_AGENT_TYPE` 先确认工作区/会话启动时机/可用类型；`profile_tools_not_exact`
-  说明该 Profile 含 Bash/Write/MCP 或工具集不精确，不能作为 G4 执行者；宿主记录不完整时新建
-  复核会话与 attempt。同一缺口已有 `pending`/`running` 工作项时不再创建相同子代理任务；
-  连续失败派生 `AUTO-REPLAN`，要求换实质不同的路线。
-- **G4 能力缺口**：高风险任务缺少宿主可证明的只读能力载体时，G4 保持 fail-closed；把原因
-  写成治理/宿主能力缺口，不误报为业务源码缺陷，也不伪造 PASS。
+- **不原样重派**：`UNKNOWN_AGENT_TYPE` 先确认工作区/会话启动时机/可用类型；执行信封被拒时
+  按错误码修正元数据或证据后重新生成。同一缺口已有 `pending`/`running` 工作项时不再创建
+  相同子代理任务；连续失败派生 `AUTO-REPLAN`，要求换实质不同的路线。
 
 ### BLOCKED 下的受控写入
 
 BLOCKED 阻止的是收口和受阻动作，不是事实记录。允许 `record`、`rerun`、`evidence --add`、
 `criterion`、`report`、`judgment`、额外的 `block`、以及已授权的 `authorize-review` /
 `formal-review`（含 amendment）。这些写入不会解除阻塞、不会改变合同/授权、也不会让
-`close_task` 提前通过；G1–G4 仍按当前状态重算。
+`close_task` 提前通过；G1–G3 仍按当前状态重算。
 
 继续拒绝：`plan`（改变计划范围）、`decide`（可能改变优先级/范围）、`evidence --drop`
 （破坏性归档）。多个真实阻塞可以并存；存在多条未解除阻塞时，`unblock` 必须用
 `--block-id` 逐条解除，不能用一条理由把不同阻塞一起清除。合同修订使用单独的
-`contract --amend`：BLOCKED 下允许，但会更新合同指纹并使旧正式 REVIEW 授权/G4 绑定失效，
+`contract --amend`：BLOCKED 下允许，但会更新合同指纹并使旧正式 REVIEW 授权失效，
 不属于上述受控写入白名单。
 
 ## 8. 恢复清单
@@ -160,10 +155,8 @@ BLOCKED 阻止的是收口和受阻动作，不是事实记录。允许 `record`
 3. 已尝试方案与失败原因（工作项 `result`、`fail_streak`、`AUTO-REPLAN` 记录）；
 4. 是否存在真实 block（`needs` 是否已满足）；
 5. 下一步：`drive` 输出工作单 → 执行 → `record`/`criterion` → 再次 `drive`。
-6. **重新核实工具权限**：恢复后不继承历史权限声明。G4 只认宿主本次会话
-   `profileSnapshot` 派生的有效策略（精确 `Read/Grep/Glob`、禁用 `Write/Edit/Bash`）；
-   会话不可用或策略无法证明时先用 `native_agent.py capability --metadata ...` 诊断，
-   仍无法证明则新建 attempt 重做复核，不把旧权限声明当作本次能力。
-7. **复用仍有效的证据与 attempt**：已完成且摘要未变的证据直接引用；未被消费、目标与代码
-   范围仍未漂移的 review attempt 可以继续使用；已消费、漂移或宿主记录变化的一律重建，
-   “恢复”不复活旧结论，也不因恢复而重复已完成的工作。
+6. **重新核实执行方身份**：恢复后不继承历史权限声明；执行信封必须用本次会话的真实
+   `metadata.json` 生成，不接受自报身份。
+7. **复用仍有效的证据**：已完成且摘要未变的证据直接引用；漂移或宿主记录变化的一律重新
+   登记。“恢复”不复活旧结论，也不因恢复而重复已完成的工作。历史 review attempt 只读，
+   不再复用或重建。

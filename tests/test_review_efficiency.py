@@ -51,7 +51,7 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual(decision["scope"], "normal")
         self.assertEqual(decision["tier"], "medium")
         self.assertTrue(decision["single_round"])
-        self.assertTrue(decision["g4_separate"])
+        self.assertNotIn("g4_separate", decision)
 
     def test_low_risk_task_does_not_need_sol(self):
         decision = G.review_admission({"risk": "low", "sol_reviews": []})
@@ -79,12 +79,12 @@ class AdmissionTests(unittest.TestCase):
         with self.assertRaises(SR.SolUsageError):
             G.review_admission({"risk": "", "sol_reviews": []})
 
-    def test_high_risk_recommends_sol_but_keeps_g4_separate(self):
+    def test_high_risk_recommends_sol_advisory(self):
         decision = G.review_admission({"risk": "high", "sol_reviews": []})
         self.assertEqual(decision["decision"], "recommended")
         self.assertEqual(decision["scope"], "high-risk")
-        self.assertTrue(decision["g4_separate"])
-        self.assertIn("不能替代 G4", decision["detail"])
+        self.assertNotIn("g4_separate", decision)
+        self.assertIn("不构成收口门禁", decision["detail"])
 
     def test_declared_trigger_recommends_sol(self):
         decision = G.review_admission(
@@ -281,105 +281,41 @@ class FindingLedgerTests(unittest.TestCase):
 
 
 class ReentryStopTests(unittest.TestCase):
-    def _state(self, *, files, target="t" * 64, code="c" * 64,
-               g4=True, attempt_files=None):
-        state = {
+    def _state(self, target="t" * 64):
+        return {
             "risk": "high",
             "review_stops": [{
                 "schema": RP.STOP_SCHEMA, "stop_id": "RST1",
                 "review_sha256": "r" * 64,
-                "review_attempt_id": "RA" + "a" * 24,
-                "target_sha256": target, "code_scope_sha256": code,
-                "verdict": "pass", "g4_eligible": g4,
+                "target_sha256": target,
+                "verdict": "pass",
                 "findings": {"blocking": 0, "major": 0, "minor": 1, "info": 0},
                 "created_at": G.now_iso(),
             }],
-            "review_attempts": [{
-                "review_attempt_id": "RA" + "a" * 24,
-                "code_snapshot": {"files": attempt_files if attempt_files
-                                  is not None else files},
-            }],
         }
-        return state
 
-    def test_same_snapshot_is_not_reviewed_again(self):
-        files = [{"path": "src/a.py", "sha256": "1", "status": " M"}]
-        state = self._state(files=files, attempt_files=files)
-        decision = RP.reentry_decision(
-            state, target="t" * 64, code_scope_sha256="c" * 64, files=files)
+    def test_same_target_is_not_reviewed_again(self):
+        decision = RP.reentry_decision(self._state(), target="t" * 64)
         self.assertFalse(decision["allowed"])
         self.assertEqual(decision["code"], "review_not_needed")
 
-    def test_docs_only_change_does_not_require_review(self):
-        before = [{"path": "src/a.py", "sha256": "1", "status": " M"},
-                  {"path": "README.md", "sha256": "old", "status": " M"}]
-        after = [{"path": "src/a.py", "sha256": "1", "status": " M"},
-                 {"path": "README.md", "sha256": "new", "status": " M"}]
-        state = self._state(files=after, attempt_files=before, g4=False)
-        state["risk"] = "normal"
-        decision = RP.reentry_decision(
-            state, target="t" * 64, code_scope_sha256="d" * 64, files=after)
-        self.assertFalse(decision["allowed"])
-        self.assertEqual(decision["code"], "review_not_needed_docs_only")
-
-    def test_g4_docs_change_requires_new_review(self):
-        before = [{"path": "src/a.py", "sha256": "1", "status": " M"},
-                  {"path": "README.md", "sha256": "old", "status": " M"}]
-        after = [{"path": "src/a.py", "sha256": "1", "status": " M"},
-                 {"path": "README.md", "sha256": "new", "status": " M"}]
-        state = self._state(files=after, attempt_files=before, g4=True)
-        decision = RP.reentry_decision(
-            state, target="t" * 64, code_scope_sha256="d" * 64, files=after)
-        self.assertTrue(decision["allowed"])
-        self.assertIn("G4", decision["detail"])
-
-    def test_code_change_requires_declared_trigger(self):
-        before = [{"path": "src/a.py", "sha256": "1", "status": " M"}]
-        after = [{"path": "src/a.py", "sha256": "2", "status": " M"}]
-        state = self._state(files=after, attempt_files=before)
-        denied = RP.reentry_decision(
-            state, target="t" * 64, code_scope_sha256="d" * 64, files=after)
+    def test_target_change_requires_declared_trigger(self):
+        denied = RP.reentry_decision(self._state(), target="u" * 64)
         self.assertFalse(denied["allowed"])
         self.assertEqual(denied["code"], "review_reentry_requires_trigger")
-        allowed = RP.reentry_decision(
-            state, target="t" * 64, code_scope_sha256="d" * 64, files=after,
-            triggers=["code-changed"], reason="修复后代码变化")
+        allowed = RP.reentry_decision(self._state(), target="u" * 64,
+                                      triggers=["code-changed"],
+                                      reason="修复后代码变化")
         self.assertTrue(allowed["allowed"])
 
-    def test_incremental_reentry_is_allowed(self):
-        files = [{"path": "src/a.py", "sha256": "1", "status": " M"}]
-        state = self._state(files=files, attempt_files=files)
-        decision = RP.reentry_decision(
-            state, target="u" * 64, code_scope_sha256="c" * 64,
-            scope="incremental", files=files)
+    def test_unknown_trigger_is_rejected(self):
+        decision = RP.reentry_decision(self._state(), target="u" * 64,
+                                       triggers=["looks-complex"])
+        self.assertEqual(decision["code"], "review_reentry_trigger_invalid")
+
+    def test_first_review_needs_no_trigger(self):
+        decision = RP.reentry_decision({"review_stops": []}, target="t" * 64)
         self.assertTrue(decision["allowed"])
-
-    def test_target_change_keeps_stop_as_reentry_signal(self):
-        files = [{"path": "src/a.py", "sha256": "1", "status": " M"}]
-        state = self._state(files=files, attempt_files=files)
-        state["native_reviews"] = [{
-            "result_sha256": "r" * 64, "verdict": "pass",
-            "target_sha256": "t" * 64, "findings": [], "unverified": [],
-            "g4_eligible": True, "candidate_g4": {"eligible": True},
-        }]
-        reentry_state, stop, valid = G._effective_reentry_state(
-            state, "u" * 64)
-        self.assertIsNotNone(stop)
-        self.assertFalse(valid)
-        decision = RP.reentry_decision(
-            reentry_state, target="u" * 64, code_scope_sha256="c" * 64,
-            files=files)
-        self.assertFalse(decision["allowed"])
-        self.assertEqual(decision["code"], "review_reentry_requires_trigger")
-
-    def test_csv_is_not_treated_as_docs(self):
-        before = [{"path": "data.csv", "sha256": "old", "status": " M"}]
-        after = [{"path": "data.csv", "sha256": "new", "status": " M"}]
-        state = self._state(files=after, attempt_files=before, g4=False)
-        state["risk"] = "normal"
-        decision = RP.reentry_decision(
-            state, target="t" * 64, code_scope_sha256="d" * 64, files=after)
-        self.assertEqual(decision["code"], "review_reentry_requires_trigger")
 
     def test_record_stop_is_idempotent_and_skips_non_pass(self):
         state = {}
@@ -388,6 +324,7 @@ class ReentryStopTests(unittest.TestCase):
         second = RP.record_stop(state, entry, code_scope_sha256="c" * 64)
         self.assertEqual(first["stop_id"], second["stop_id"])
         self.assertEqual(len(state["review_stops"]), 1)
+        self.assertNotIn("g4_eligible", first)
         self.assertIsNone(RP.record_stop(state, review([], verdict="partial",
                                                        sha="2" * 64)))
 
@@ -446,79 +383,64 @@ class DeriveWorkEfficiencyTests(unittest.TestCase):
         self.assertFalse(any("F1" in item["id"] for item in actions))
 
 
-class AttemptReuseTests(F.BridgeBase):
-    def test_same_snapshot_attempt_is_reused(self):
-        execution = self.execution()
-        AC._ingest_execution(self.state_path, execution)
-        first = self.create_attempt(execution)
-        second = self.create_attempt(execution)
-        self.assertEqual(first["review_attempt_id"],
-                         second["review_attempt_id"])
-        state = G.load_state(self.state_path)
-        self.assertEqual(len(state["review_attempts"]), 1)
-        self.assertEqual(len(state["review_admissions"]), 1)
-
-    def test_stop_marker_blocks_reentry_without_trigger(self):
-        execution = self.execution()
-        AC._ingest_execution(self.state_path, execution)
-        attempt = self.create_attempt(execution)
-        state = G.load_state(self.state_path)
-        entry = review([], sha="r" * 64,
-                       target=str(attempt["target_sha256"]),
-                       attempt=attempt["review_attempt_id"])
-        RP.record_stop(state, entry,
-                       code_scope_sha256=str(attempt["code_scope_sha256"]))
-        state.setdefault("native_reviews", []).append(entry)
-        # PASS 之后该 attempt 已被消费；再次创建必须命中停止标记而不是复用旧快照。
-        state["review_attempts"][0]["consumed"] = True
-        G.save_state(self.state_path, state)
-        with self.assertRaises(G.GovernanceError) as ctx:
-            self.create_attempt(execution)
-        self.assertIn("review_not_needed", str(ctx.exception))
 
 
-class IngestLedgerTests(F.BridgeBase):
-    def test_ingest_populates_ledger_and_is_idempotent(self):
-        execution = self.execution()
-        AC._ingest_execution(self.state_path, execution)
-        env = self.review(
-            execution, g4_eligible=False, target_sha256="",
-            verdict="pass",
-            findings=[{
-                "id": "F1", "severity": "major", "file": self.evidence,
-                "line": 1, "summary": "问题", "root_cause": "rc",
-                "evidence": "证据"}])
-        AC._ingest_review(self.state_path, env)
-        state = G.load_state(self.state_path)
+class IngestLedgerTests(unittest.TestCase):
+    def _state(self):
+        tmp = tempfile.mkdtemp(prefix="sol-ledger-")
+        path = os.path.join(tmp, "state.json")
+        G.start_state(path, goal="目标", contract=F.CONTRACT)
+        return path
+
+    def _record(self, findings, sha="s" * 64):
+        return {
+            "review_id": "SR" + sha[:10], "task_id": "task-1",
+            "verdict": "pass", "findings": findings,
+            "findings_count": {"blocking": 0, "major": len(findings),
+                               "minor": 0, "info": 0},
+            "unverified": [], "reply_sha256": sha,
+            "completed_at": G.now_iso(),
+        }
+
+    def test_sol_ingest_populates_ledger_as_advisory(self):
+        path = self._state()
+        entry = self._record([{
+            "id": "F1", "severity": "major", "file": "src/a.py", "line": 1,
+            "summary": "问题", "root_cause": "rc", "evidence": "证据"}])
+        G.record_sol_review(path, entry, materials_sha256="m" * 64)
+        state = G.load_state(path)
         self.assertEqual(len(state["finding_ledger"]["items"]), 1)
-        self.assertEqual(state["native_reviews"][-1]["finding_refs"][0]
-                         ["finding_id"], "F1")
-        # 高风险任务的 g4_eligible=false 复核只是参考，不产生停止标记。
+        item = state["finding_ledger"]["items"][0]
+        self.assertEqual(item["authority"], "advisory")
+        self.assertEqual(item["finding_id"], "F1")
+        # SOL 是 advisory：不产生停止标记。
         self.assertEqual(state.get("review_stops") or [], [])
-        AC._ingest_review(self.state_path, env)
-        state = G.load_state(self.state_path)
+
+    def test_duplicate_sol_record_does_not_double_count(self):
+        path = self._state()
+        entry = self._record([{
+            "severity": "major", "file": "src/a.py", "line": 1,
+            "summary": "问题", "root_cause": "rc", "evidence": "证据"}])
+        G.record_sol_review(path, entry, materials_sha256="m" * 64)
+        G.record_sol_review(path, entry, materials_sha256="m" * 64)
+        state = G.load_state(path)
         self.assertEqual(state["finding_ledger"]["items"][0]["occurrences"], 1)
-        self.assertEqual(state.get("review_stops") or [], [])
 
-    def test_second_review_reuses_finding_id(self):
-        execution = self.execution()
-        AC._ingest_execution(self.state_path, execution)
-        first = self.review(
-            execution, g4_eligible=False, target_sha256="",
-            findings=[{"severity": "major", "file": self.evidence,
-                       "line": 1, "summary": "问题 A", "root_cause": "rc",
-                       "evidence": "证据"}])
-        AC._ingest_review(self.state_path, first)
-        second = self.review(
-            execution, g4_eligible=False, target_sha256="",
-            findings=[{"id": "F9", "severity": "major", "file": self.evidence,
-                       "line": 1, "summary": "问题 A（换表述）",
-                       "root_cause": "rc", "evidence": "新证据"}])
-        AC._ingest_review(self.state_path, second)
-        state = G.load_state(self.state_path)
+    def test_second_sol_review_reuses_finding_id(self):
+        path = self._state()
+        first = self._record([{
+            "severity": "major", "file": "src/a.py", "line": 1,
+            "summary": "问题 A", "root_cause": "rc", "evidence": "证据"}],
+            sha="1" * 64)
+        second = self._record([{
+            "id": "F9", "severity": "major", "file": "src/a.py", "line": 1,
+            "summary": "问题 A（换表述）", "root_cause": "rc",
+            "evidence": "新证据"}], sha="2" * 64)
+        G.record_sol_review(path, first, materials_sha256="m" * 64)
+        G.record_sol_review(path, second, materials_sha256="n" * 64)
+        state = G.load_state(path)
         self.assertEqual(len(state["finding_ledger"]["items"]), 1)
-        self.assertEqual(state["native_reviews"][-1]["finding_refs"][0]
-                         ["finding_id"], "F1")
+        self.assertEqual(state["finding_ledger"]["items"][0]["finding_id"], "F1")
 
 
 class CliEfficiencyTests(unittest.TestCase):
@@ -565,7 +487,7 @@ class CliEfficiencyTests(unittest.TestCase):
         payload = json.loads(proc.stdout)
         self.assertEqual(payload["decision"], "recommended")
         self.assertEqual(payload["scope"], "triggered")
-        self.assertTrue(payload["g4_separate"])
+        self.assertNotIn("g4_separate", payload)
 
     def test_admission_cli_rejects_retired_workspace_flag(self):
         proc = F.run_cli("copilot_dispatch.py", "review-admission",
@@ -628,30 +550,18 @@ class CliEfficiencyTests(unittest.TestCase):
         self.assertEqual(payload["items"][0]["status"], "verified")
 
 
-class NativeReviewRetiredTests(F.BridgeBase):
-    def test_normal_risk_native_review_is_retired(self):
-        state = G.load_state(self.state_path)
-        state["risk"] = "normal"
-        G.save_state(self.state_path, state)
-        execution = self.execution()
-        AC._ingest_execution(self.state_path, execution)
-        env = self.review(execution, g4_eligible=False, target_sha256="")
-        with self.assertRaises(AC.AutoError) as ctx:
-            AC._ingest_review(self.state_path, env)
-        self.assertIn("native_review_retired", str(ctx.exception))
-        state = G.load_state(self.state_path)
-        self.assertEqual(state["native_reviews"], [])
-        self.assertEqual(state["review_stops"], [])
+class NativeReviewRetiredTests(unittest.TestCase):
+    def test_native_review_envelope_is_retired(self):
+        envelope = {"schema": NB.REVIEW_SCHEMA, "verdict": "pass"}
+        with self.assertRaises(NB.BridgeError) as ctx:
+            NB.classify_native_result(envelope)
+        self.assertEqual(ctx.exception.code, "native_review_retired")
 
-    def test_medium_risk_review_attempt_is_retired(self):
-        state = G.load_state(self.state_path)
-        state["risk"] = "medium"
-        G.save_state(self.state_path, state)
-        with self.assertRaises(G.GovernanceError) as ctx:
-            G.create_review_attempt(
-                self.state_path, work_item_id="A1",
-                execution_result_sha256="0" * 64)
-        self.assertIn("native_review_retired", str(ctx.exception))
+    def test_legacy_review_envelope_is_retired(self):
+        envelope = {"schema": "copilot-native-review/v1"}
+        with self.assertRaises(NB.BridgeError) as ctx:
+            NB.classify_native_result(envelope)
+        self.assertEqual(ctx.exception.code, "schema_retired")
 
 
 class MetricsEfficiencyTests(unittest.TestCase):
@@ -659,21 +569,11 @@ class MetricsEfficiencyTests(unittest.TestCase):
         state = {
             "task_id": "task-1", "risk": "high", "created": G.now_iso(),
             "closure": {},
-            "review_attempts": [{
-                "review_attempt_id": "RA" + "a" * 24,
-                "created_at": "2026-01-01T00:00:00+00:00",
-            }],
-            "native_reviews": [{
-                "work_item_id": "A1", "verdict": "pass",
-                "review_scope": "incremental", "g4_eligible": True,
-                "review_attempt_id": "RA" + "a" * 24,
-                "received": "2026-01-01T00:00:10+00:00",
-                "findings": [{"severity": "major", "summary": "新问题"}],
-                "based_on_review_sha256": "b" * 64,
-                "evidence_manifest": ["E1"],
-            }],
-            "review_admissions": [{"triggers": ["major-fix"]}],
-            "review_stops": [{"g4_eligible": True}],
+            "native_reviews": [{"work_item_id": "A1", "g4_eligible": True}],
+            "sol_reviews": [{"status": "completed", "verdict": "partial",
+                             "findings_count": {"major": 1}}],
+            "review_admissions": [{"triggers": ["major-fix"], "tier": "high"}],
+            "review_stops": [{"stop_id": "RST1"}],
             "finding_ledger": {
                 "schema": RP.LEDGER_SCHEMA, "next_id": 2,
                 "items": [{
@@ -683,14 +583,17 @@ class MetricsEfficiencyTests(unittest.TestCase):
             },
         }
         metrics = G.review_metrics(state)
-        self.assertEqual(metrics["full_reviews"], 0)
-        self.assertEqual(metrics["incremental_reviews"], 1)
         self.assertEqual(metrics["review_admissions_total"], 1)
+        self.assertEqual(metrics["review_admission_tiers"], {"high": 1})
         self.assertEqual(metrics["review_stops_total"], 1)
         self.assertEqual(metrics["rereported_findings"], 1)
-        self.assertEqual(metrics["incremental_new_major"], 1)
-        self.assertEqual(metrics["avg_first_full_review_seconds"], None)
-        self.assertEqual(metrics["avg_review_seconds"], 10.0)
+        self.assertEqual(metrics["sol"]["completed"], 1)
+        self.assertEqual(metrics["sol"]["verdicts"]["partial"], 1)
+        self.assertTrue(metrics["g4"]["retired"])
+        self.assertEqual(metrics["g4"]["historical_native_reviews"], 1)
+        self.assertNotIn("mean_review_seconds", metrics)
+
+
 
 
 if __name__ == "__main__":

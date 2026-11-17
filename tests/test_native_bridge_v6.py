@@ -108,28 +108,8 @@ class ExecutionTests(F.BridgeBase):
         self.assert_code("executor_identity_missing", NB.validate_execution_result,
                          self.execution(executor={"kind": "subagent"}),
                          self.dispatch, self.state)
-        # 只读 Profile 不得承担执行：判定按宿主有效策略，与 Profile 名称无关。
-        self.assert_code("executor_profile_readonly",
-                         NB.validate_execution_result,
-                         self.execution(executor={
-                             "kind": "subagent", "agent_id": "a",
-                             "child_session_id": "c",
-                             "profile_id": "any-name",
-                             "profile": F.readonly_profile_policy(
-                                 name="any-name")}),
-                         self.dispatch, self.state)
-        self.assert_code("executor_profile_readonly",
-                         NB.validate_execution_result,
-                         self.execution(executor={
-                             "kind": "subagent", "agent_id": "a",
-                             "child_session_id": "c",
-                             "profile_id": "another-name",
-                             "profile": F.readonly_profile_policy(
-                                 name="another-name")}),
-                         self.dispatch, self.state)
-
     def test_executor_policy_is_required(self):
-        # 没有有效策略就不能证明执行方不是只读 Profile：失败关闭。
+        # 执行方身份必须带 profile 快照；缺失失败关闭（G4 退役不等于放弃身份记录）。
         self.assert_code("executor_profile_invalid",
                          NB.validate_execution_result,
                          self.execution(executor={
@@ -142,90 +122,8 @@ class ExecutionTests(F.BridgeBase):
                          self.execution(evidence=[]), self.dispatch, self.state)
 
 
-class ReviewProfilePolicyTests(F.BridgeBase):
-    """复核方只读边界只认宿主有效策略：名称/来源/路径改变不影响合法复核。"""
-
-    def _check(self, **overrides) -> dict:
-        execution = self.execution()
-        env = self.review(execution=execution, **overrides)
-        return NB.validate_review_result(env, self.dispatch, execution, self.state)
-
-    def test_profile_name_is_not_gating(self):
-        env = self._check(reviewer={
-            "kind": "subagent", "agent_id": "agent-review",
-            "child_session_id": "child-review",
-            "profile_id": "generic-readonly",
-            "profile": F.readonly_profile_policy(name="generic-readonly",
-                                                 source="user",
-                                                 path="/tmp/any/readonly.md"),
-            "model_reported": "some-model",
-        })
-        self.assertEqual(env["reviewer"]["profile_id"], "generic-readonly")
-        self.assertEqual(env["reviewer"]["profile"]["tools"],
-                         ["Read", "Grep", "Glob"])
-
-    def test_profile_with_bash_is_rejected(self):
-        self.assert_code("reviewer_profile_not_readonly", self._check, reviewer={
-            "kind": "subagent", "agent_id": "agent-review",
-            "child_session_id": "child-review", "profile_id": "reviewer",
-            "profile": F.readonly_profile_policy(
-                tools=["Read", "Grep", "Glob", "Bash"]),
-            "model_reported": "some-model",
-        })
-
-    def test_profile_with_mcp_is_rejected(self):
-        self.assert_code("reviewer_profile_not_readonly", self._check, reviewer={
-            "kind": "subagent", "agent_id": "agent-review",
-            "child_session_id": "child-review", "profile_id": "reviewer",
-            "profile": F.readonly_profile_policy(mcpServers=["playwright"]),
-            "model_reported": "some-model",
-        })
-
-    def test_profile_skills_wrong_type_is_rejected(self):
-        # 非空但类型错误的 skills 不能被归一化成“没有启用”。
-        self.assert_code("reviewer_profile_not_readonly", self._check, reviewer={
-            "kind": "subagent", "agent_id": "agent-review",
-            "child_session_id": "child-review", "profile_id": "reviewer",
-            "profile": F.readonly_profile_policy(skills="app-testing"),
-            "model_reported": "some-model",
-        })
-
-    def test_profile_mcp_wrong_type_is_rejected(self):
-        self.assert_code("reviewer_profile_not_readonly", self._check, reviewer={
-            "kind": "subagent", "agent_id": "agent-review",
-            "child_session_id": "child-review", "profile_id": "reviewer",
-            "profile": F.readonly_profile_policy(mcpServers={"x": 1}),
-            "model_reported": "some-model",
-        })
-
-    def test_profile_missing_is_rejected(self):
-        # 只有 Profile 名称、没有有效权限策略：不能作为只读证据。
-        self.assert_code("reviewer_profile_invalid", self._check, reviewer={
-            "kind": "subagent", "agent_id": "agent-review",
-            "child_session_id": "child-review", "profile_id": "reviewer",
-            "model_reported": "some-model",
-        })
 
 
-class HostRecordTests(unittest.TestCase):
-    def test_g4_requires_absolute_existing_host_files(self):
-        with self.assertRaises(NB.BridgeError) as ctx:
-            NB._validate_host_record({"metadata_path": "relative.json"}, required=True)
-        self.assertEqual(ctx.exception.code, "g4_host_record_invalid")
-
-    def test_non_g4_review_can_omit_host(self):
-        self.assertEqual(NB._validate_host_record(None, required=False), {})
-
-    def test_classify_rejects_unknown_and_retired(self):
-        self.assertEqual(NB.classify_native_result({"schema": NB.RESULT_SCHEMA}),
-                         "execution")
-        self.assertEqual(NB.classify_native_result({"schema": NB.REVIEW_SCHEMA}),
-                         "review")
-        with self.assertRaises(NB.BridgeError) as ctx:
-            NB.classify_native_result({"schema": "copilot-native-result/v1"})
-        self.assertEqual(ctx.exception.code, "schema_retired")
-        with self.assertRaises(NB.BridgeError):
-            NB.classify_native_result({"schema": "unknown/v9"})
 
 
 if __name__ == "__main__":

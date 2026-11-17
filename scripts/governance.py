@@ -10,7 +10,7 @@ Copilot 不再是「远程模型决策通道」，而是运行于 ZCode 内的**
 * 证据：登记、SHA-256、文件重读、脱敏由 `bridge_evidence.py` 负责；
 * 审计：状态文件保存任务、轮次式迭代、决策、报告与历史；历史 v1/v2 SOL
   状态只读展示，不再驱动任何调用；
-* 判定：**完全本地**。PASS 由完成条件 + 证据 + G1–G4 机械核销；PARTIAL 表示
+* 判定：**完全本地**。PASS 由完成条件 + 证据 + G1–G3 机械核销；PARTIAL 表示
   仍有可执行工作；BLOCKED 只表示缺少授权、用户决策、资源或真实外部限制。
 
 本模块不调用任何模型、不发起 HTTP 请求、不读取 Provider/凭据配置。工作项不是
@@ -33,7 +33,8 @@ import review_policy as RP
 SCHEMA = "copilot-governance/v1"
 VERSION = 1
 
-# 风险层级与复核策略一致：low/medium 默认不派 Reviewer，high 恒走 G4。
+# 风险层级与复核策略一致：low/medium 默认不派 Reviewer；high 建议一次
+# SOL 零工具单轮复核（advisory，不是收口门禁）。
 # `normal` 是历史标签，start 时归一化为 medium；读取旧状态时按 non-high 处理。
 RISKS = ("low", "medium", "high", "normal")
 BACKENDS = ("legacy", "native")
@@ -187,7 +188,6 @@ def _normalize_test_policy(raw: object) -> dict:
     }
 
 
-
 def _default_closure() -> dict:
     return {
         "closed": False,
@@ -231,9 +231,7 @@ def _default_state() -> dict:
         "contract": _default_contract(),
         "native_dispatch": None,
         "native_results": [],
-        "native_reviews": [],
         "sol_reviews": [],
-        "review_attempts": [],
         "review_admissions": [],
         "review_stops": [],
         "finding_ledger": {
@@ -241,7 +239,6 @@ def _default_state() -> dict:
             "next_id": 1,
             "items": [],
         },
-        "g4_attestations": [],
         "execution_bindings": [],
         "formal_reviews": [],
         "formal_review_authorization": None,
@@ -414,10 +411,10 @@ def log_attempt(state_path: str, kind: str, code: str, message: str,
                 envelope: dict | None = None) -> str:
     """把被拒/无法生成的信封尝试追加到任务目录 `review-attempts.jsonl`。
 
-    无效信封是复盘“为什么多轮”的关键证据，但过去只打印到终端。这里只记定位
+    无效信封是复盘“为什么返工”的关键证据，但过去只打印到终端。这里只记定位
     字段（时间、类型、错误码、工作项、摘要），不写信封正文或证据内容；失败时
-    只打印警告，不影响原流程。生成阶段（`native_agent.py review`）被拒也走同一
-    通道，`review-metrics` 的无效信封计数才完整。
+    只打印警告，不影响原流程。执行信封生成/回填被拒也走同一通道，
+    `review-metrics` 的无效信封计数才完整。
     """
     envelope = envelope if isinstance(envelope, dict) else {}
     entry = {
@@ -668,13 +665,6 @@ def start_state(path: str, goal: str, *, contract: str = "", criteria: object = 
     if backend not in BACKENDS:
         raise GovernanceError(
             f"execution_backend={execution_backend!r} 非法；只能是 {' / '.join(BACKENDS)}。")
-    if risk == "high" and backend != "native":
-        # G4 需要的复核信封只能由原生派发链路产生（复核绑定 dispatch 与执行结果）。
-        # legacy 后端没有 dispatch，永远无法回填复核，会让高风险任务停在 PARTIAL
-        # 直到派生上限。与其留下必然无法收口的任务，不如在 start 时失败关闭。
-        raise GovernanceError(
-            "risk=high 需要绑定的原生只读复核（G4），而复核信封只能通过 native "
-            "派发链路产生；请用 --backend native 创建高风险任务。")
     raw_criteria = criteria if criteria else _criteria_from_text(contract)
     items = _normalize_criteria(raw_criteria)
     policy = _normalize_test_policy(test_policy)
@@ -3226,51 +3216,6 @@ def _gate_stalled(state: dict) -> dict:
     return {"passed": not reasons, "reasons": reasons}
 
 
-def _gate_code_scope(state: dict, *, cache: dict | None = None) -> dict:
-    """G2 的代码范围检查：高风险任务的最终 G4 attempt 必须覆盖当前工作区。
-
-    G2 原本只核销合同/条件/证据；未登记为 evidence 的源码变化不会进入
-    `final_evidence_digest`。这里把最近一次已消费 attempt 的代码快照纳入 G2，
-    保证“G2 看到的范围”与 Reviewer 派发范围、G4 验收范围一致。
-    """
-    if str(state.get("risk") or "").strip().lower() != "high":
-        return {"passed": True, "reasons": []}
-    reviews = [r for r in state.get("native_reviews") or []
-               if isinstance(r, dict)]
-    candidate = None
-    for review in reviews:
-        # 使用与 G4 相同的“首条合格复核”，而不是无关的最近 attempt。
-        ok, _code = _eligible_review(review, state, cache=cache)
-        if ok:
-            candidate = review
-            break
-    if candidate is None and reviews:
-        # 没有合格复核时仍检查最近一份复核的 attempt，让代码漂移在 G2 可见。
-        candidate = max(enumerate(reviews), key=lambda pair: (
-            str(pair[1].get("received") or ""), pair[0]))[1]
-    attempt = find_review_attempt(
-        state, str((candidate or {}).get("review_attempt_id") or ""))
-    if attempt is None or not attempt.get("consumed"):
-        # 没有可检查的已消费 attempt 时由 G4 报 native_review_missing；这里不重复。
-        return {"passed": True, "reasons": []}
-    reasons = []
-    for code in code_scope_problems(attempt, state, check_current=True,
-                                    cache=cache):
-        detail = {
-            "native_review_code_scope_missing":
-                "G4 attempt 没有冻结代码变更范围；无法证明 Reviewer 看过未登记"
-                "为证据的源码。请用 review-context --create-attempt 重新派发。",
-            "native_review_code_scope_unavailable":
-                "无法重新读取 G4 attempt 的工作区（不是 git 仓库或 git 不可用）；"
-                "代码范围不可证明，按 fail-closed 拒绝。",
-            "native_review_code_scope_drift":
-                "G4 之后工作区源码/未跟踪文件发生了变化；原复核不再覆盖当前代码。"
-                "必须新建 attempt 重做完整复核。",
-        }.get(code, code)
-        reasons.append({"code": code, "detail": detail})
-    return {"passed": not reasons, "reasons": reasons}
-
-
 def final_evidence_digest(state: dict) -> str:
     """最终证据摘要：把合同、条件、工作项与证据绑定成一个复核目标。"""
     return _sha256_text(canonical_json({
@@ -3284,221 +3229,18 @@ def final_evidence_digest(state: dict) -> str:
                             _sha256_text(str(a.get("result") or "")),
                             sorted(a.get("evidence_ids") or [])]
                            for a in state.get("actions") or []
-                           # G4 复核工作项本身不进入目标摘要：复核开始时它还处于
-                           # pending，结论回填后变 done；若算进去，合法复核会因自身
-                           # 状态变化而永远“过期”。其他工作项/证据/条件变化仍会
-                           # 改变摘要，使旧复核失效（fail-closed）。
+                           # 历史兼容：v7 及更早的高风险任务可能留有
+                           # origin=g4-review 的工作项。排除它们可以保持旧状态
+                           # 的摘要稳定；新任务不再产生该类工作项。
                            if str(a.get("origin") or "") != "g4-review"]),
         "evidence": sorted([[e.get("id"), e.get("sha256"), bool(e.get("dropped"))]
                             for e in state.get("evidence") or []]),
     }))
 
 
-def _execution_current_problems(state: dict, execution_sha: str,
-                               work_item_id: str) -> list[str]:
-    """复核绑定的执行结果必须是该工作项当前生效的最近一次结果。
-
-    只看 `execution_result_sha256` 会允许 rerun 前的旧执行结果：旧结果文本与
-    当前 action 结果不同，但 `final_evidence_digest` 仍只绑定当前 action，
-    Reviewer 实际看到的却是旧结果。这里要求执行记录是最近一次、action 为 done、
-    且 action.result 与 execution.summary/result 一致。
-    """
-    exec_sha = str(execution_sha or "").strip().lower()
-    if not exec_sha:
-        return []
-    records = [r for r in state.get("native_results") or []
-               if isinstance(r, dict)
-               and str(r.get("work_item_id") or "") == work_item_id]
-    if not records:
-        return ["native_review_execution_missing"]
-    if str(records[-1].get("result_sha256") or "") != exec_sha:
-        return ["native_review_execution_superseded"]
-    action = next((a for a in state.get("actions") or []
-                   if isinstance(a, dict)
-                   and str(a.get("id") or "") == work_item_id), None)
-    if action is None or str(action.get("status") or "") != "done":
-        return ["native_review_execution_not_current"]
-    execution = next((r for r in records
-                      if str(r.get("result_sha256") or "") == exec_sha), None)
-    if execution is None:
-        return ["native_review_execution_missing"]
-    expected = (str(execution.get("summary") or "") + "\n\n"
-                + str(execution.get("result") or "")).strip()[:MAX_RESULT_CHARS]
-    if str(action.get("result") or "").strip() != expected:
-        return ["native_review_execution_not_current"]
-    return []
-
-
-def _review_criteria_state_digest(state: dict) -> str:
-    """复核 attempt 冻结的条件状态：条件 id、状态与证据引用。"""
-    return _sha256_text(canonical_json(sorted([
-        [c.get("criterion_id"), c.get("status"),
-         sorted([[r.get("id"), r.get("sha256")]
-                 for r in c.get("evidence_refs") or []])]
-        for c in (state.get("contract") or {}).get("criteria") or []
-        if isinstance(c, dict)
-    ])))
-
-
-def find_review_attempt(state: dict, attempt_id: str) -> dict | None:
-    """按 attempt id 查找已登记的复核派发记录。"""
-    target = str(attempt_id or "").strip()
-    if not target:
-        return None
-    for attempt in state.get("review_attempts") or []:
-        if isinstance(attempt, dict) and \
-                str(attempt.get("review_attempt_id") or "") == target:
-            return attempt
-    return None
-
-
 capture_code_snapshot = CS.capture_code_snapshot
-code_scope_problems = CS.code_scope_problems
 governance_paths = CS.governance_paths
 _evidence_paths = CS.evidence_paths
-
-
-def _review_evidence_snapshot(state: dict) -> list[dict]:
-    """派发前固化文件证据内容：复核期间证据文件被改动时必须失败关闭。
-
-    `final_evidence_digest` 绑定的是登记时的摘要；文件在派发后、ingest 前被改写
-    不会改变摘要，却会让 Reviewer 实际读到的内容与快照不一致。这里在 attempt
-    创建时重读每条 live 文件证据，既要求它仍与登记摘要一致，也把实际摘要写入
-    attempt；ingest 与 G4 收口都会再次核对。
-    """
-    snapshot: list[dict] = []
-    for entry in state.get("evidence") or []:
-        if not isinstance(entry, dict) or entry.get("dropped"):
-            continue
-        hint = str(entry.get("path_hint") or "").strip()
-        if not hint or hint == "<inline>" or not os.path.isabs(hint):
-            continue
-        eid = str(entry.get("id") or "")
-        registered = str(entry.get("sha256") or "").lower()
-        try:
-            actual = _sha256_file(hint)
-        except OSError as exc:
-            raise GovernanceError(
-                f"证据 {eid} 无法重读（{hint}）：{exc}；不能创建复核 attempt。") from None
-        if registered and actual != registered:
-            raise GovernanceError(
-                f"证据 {eid} 的文件内容已与登记摘要不一致：{hint}；"
-                "先重新登记证据或修正文件，再创建复核 attempt。")
-        snapshot.append({"id": eid, "path": hint, "sha256": actual})
-    return snapshot
-
-
-def _review_code_snapshot_for_execution(workspace: str, state: dict,
-                                        state_path: str, base: str,
-                                        execution_sha256: str,
-                                        excluded_paths: object = None) -> dict:
-    """复核快照必须与执行信封绑定的代码范围一致。
-
-    新版执行信封固化 `code_scope_excluded_paths`，复核直接复用同一排除集；旧信封
-    没有该字段时，先按“只排除未跟踪证据”计算，再按“不排除证据”计算，任一与执行
-    摘要一致即可，否则 fail-closed。
-    """
-    execution_sha = str(execution_sha256 or "").strip().lower()
-    if isinstance(excluded_paths, list) and excluded_paths:
-        governance = {os.path.abspath(item)
-                      for item in governance_paths(state_path)}
-        evidence = {os.path.abspath(item) for item in CS.evidence_paths(state)}
-        requested = {os.path.abspath(os.path.expanduser(str(item)))
-                     for item in excluded_paths if str(item or "").strip()}
-        # 不信任信封自报的排除集：只保留治理路径与“已登记且未跟踪的证据”。
-        # 任意未跟踪目录、工作区外路径或尚不存在的路径都不能被排除，避免手工
-        # 信封借排除集隐藏后续新增文件。
-        allowed = set()
-        for item in sorted(requested):
-            if item in governance or any(
-                    item == g or item.startswith(g + os.sep)
-                    for g in governance):
-                allowed.add(item)
-                continue
-            if item in evidence and os.path.exists(item) and \
-                    CS.safe_path_excludes([item], workspace, base):
-                allowed.add(item)
-        snapshot = capture_code_snapshot(
-            workspace, exclude_paths=sorted(allowed), base=base)
-        if not execution_sha or str(snapshot.get("digest") or "") == execution_sha:
-            return snapshot
-        raise GovernanceError(
-            "[native_review_code_scope_mismatch] 当前工作区代码范围与执行结果绑定的"
-            "快照不一致；执行后新增/修改的文件改变了范围。请重新执行后再复核。")
-    governance = governance_paths(state_path)
-    safe = capture_code_snapshot(
-        workspace,
-        exclude_paths=CS.safe_evidence_excludes(state, workspace, base)
-        + governance,
-        base=base)
-    if not execution_sha or str(safe.get("digest") or "") == execution_sha:
-        return safe
-    plain = capture_code_snapshot(
-        workspace, exclude_paths=governance, base=base)
-    if str(plain.get("digest") or "") == execution_sha:
-        return plain
-    raise GovernanceError(
-        "[native_review_code_scope_mismatch] 当前工作区代码范围与执行结果绑定的"
-        "快照不一致；执行后新增/修改的文件（包括后登记证据或工作区内输出）改变了"
-        "范围。请重新执行，或把输出/证据放到工作区外后再复核。")
-
-
-def _stop_review(state: dict, stop: dict) -> dict | None:
-    target = str(stop.get("review_sha256") or "")
-    if not target:
-        return None
-    for review in state.get("native_reviews") or []:
-        if isinstance(review, dict) and \
-                str(review.get("result_sha256") or "") == target:
-            return review
-    return None
-
-
-def _valid_stop(state: dict, stop: dict | None) -> bool:
-    """停止标记对应的复核必须仍然可用；失效的 PASS 不能继续阻止重入。
-
-    这里只检查复核本身（存在、PASS、无 blocking/unverified、高风险
-    g4_eligible/candidate 可用），不比较目标摘要：目标变化时 stop 仍应作为
-    “曾有 PASS”的信号保留，让重入必须声明 trigger，而不是退回“首次复核”。
-    """
-    if not isinstance(stop, dict):
-        return False
-    review = _stop_review(state, stop)
-    if review is None:
-        return False
-    if str(review.get("verdict") or "").strip().lower() != "pass":
-        return False
-    if review.get("unverified"):
-        return False
-    if any(isinstance(item, dict)
-           and str(item.get("severity") or "") == "blocking"
-           for item in review.get("findings") or []):
-        return False
-    if str(state.get("risk") or "").lower() == "high":
-        if review.get("g4_eligible") is not True:
-            return False
-        candidate = review.get("candidate_g4")
-        if isinstance(candidate, dict) and candidate.get("eligible") is not True:
-            return False
-    return True
-
-
-def _effective_reentry_state(state: dict, target: str) -> tuple[dict, dict | None, bool]:
-    stop = RP.last_stop(
-        state, g4_only=str(state.get("risk") or "").lower() == "high")
-    if stop is None:
-        return state, None, False
-    same_target = str(stop.get("target_sha256") or "") == str(target or "")
-    if same_target:
-        if _valid_stop(state, stop):
-            return state, stop, True
-        # 目标没变但复核已失效（证据文件漂移、candidate 不可用等）：旧 PASS
-        # 不能继续挡住重做，按“没有可用 stop”处理。
-        filtered = [item for item in state.get("review_stops") or []
-                    if item is not stop]
-        return {**state, "review_stops": filtered}, None, False
-    # 目标已变化：保留 stop 作为“曾有 PASS”的信号，让重入仍要求 trigger。
-    return state, stop, False
 
 
 def review_admission(state: dict, *, triggers: list[str] | None = None,
@@ -3508,9 +3250,10 @@ def review_admission(state: dict, *, triggers: list[str] | None = None,
                      scope: str = "full") -> dict:
     """SOL 复核准入建议（只读，不写状态）。
 
-    v7 起普通复核只走 SOL 零工具单轮复核：`low` 默认不需要；`medium` 按需；
-    `high` 建议一次，但 G4 仍是独立的宿主只读复核，SOL 不能替代。`target` /
-    `code_scope` 参数保留用于兼容调用方，不再参与自动多轮判断。
+    v8 起 G4 已退役，独立模型复核只走 SOL 零工具单轮复核：`low` 默认不需要；
+    `medium` 按需；`high` 建议一次。SOL 是 advisory，不构成收口门禁，也不
+    证明宿主只读权限。`target` / `code_scope` 参数保留用于兼容调用方，不参与
+    自动多轮判断。
     """
     import sol_review as SR
 
@@ -3545,8 +3288,8 @@ def record_sol_review(path: str, review: dict, *,
                       trigger: str = "", reason: str = "") -> dict:
     """登记一次成功的 SOL 复核，并把其 findings 作为建议合并进台账。
 
-    SOL 是 advisory：它不能把已有问题标成 verified，也不能替代 G4；但它的
-    blocking/major 会进入 Finding 台账，主代理修复并定向验证，或在给出反证后
+    SOL 是 advisory：它不能把已有问题标成 verified；但它的 blocking/major
+    会进入 Finding 台账，主代理修复并定向验证，或在给出反证后
     `finding --status dropped --note ...` 明确驳回。
     """
     state = load_state(path)
@@ -3683,278 +3426,6 @@ def record_finding_status(path: str, finding_id: str, status: str, *,
     return item
 
 
-def _record_admission(state: dict, *, decision: dict, reentry: dict,
-                      work_item_id: str, execution_sha256: str,
-                      target_sha256: str, code_scope_sha256: str,
-                      scope: str, base: str = "") -> dict:
-    now = now_iso()
-    record = {
-        "schema": RP.ADMISSION_SCHEMA,
-        "admission_id": "RVA" + secrets.token_hex(12),
-        "task_id": str(state.get("task_id") or ""),
-        "work_item_id": str(work_item_id or ""),
-        "execution_result_sha256": str(execution_sha256 or ""),
-        "target_sha256": str(target_sha256 or ""),
-        "code_scope_sha256": str(code_scope_sha256 or ""),
-        "review_scope": str(scope or "full"),
-        "base": str(base or ""),
-        "decision": "admitted",
-        "risk": str(decision.get("risk") or ""),
-        "tier": str(decision.get("tier") or ""),
-        "triggers": list(decision.get("triggers") or []),
-        "reason": str(decision.get("reason") or "")[:1000],
-        "reentry_stop_id": str((reentry or {}).get("stop_id") or ""),
-        "reentry_allowed": bool((reentry or {}).get("allowed")),
-        "reentry_code": str((reentry or {}).get("code") or ""),
-        "reentry_changed_paths": list(
-            (reentry or {}).get("changed_paths") or [])[:50],
-        "created_at": now,
-        "created_by": "zcode-native",
-    }
-    state.setdefault("review_admissions", []).append(record)
-    _history(state, "review_admission_recorded", {
-        "admission_id": record["admission_id"],
-        "work_item_id": record["work_item_id"],
-        "review_scope": record["review_scope"],
-        "triggers": record["triggers"],
-        "target_sha256": record["target_sha256"],
-    })
-    return record
-
-
-def create_review_attempt(path: str, *, work_item_id: str,
-                          execution_result_sha256: str,
-                          dispatch_id: str = "", plan_id: str = "",
-                          plan_sha256: str = "", review_scope: str = "full",
-                          based_on_review_sha256: str = "",
-                          evidence_manifest: list[str] | None = None,
-                          triggers: list[str] | None = None,
-                          reason: str = "",
-                          workspace: str = "", base: str = "") -> dict:
-    """在派发 Reviewer 前固化一次不可变的复核 attempt 快照。
-
-    快照由宿主（本函数）按当前状态生成：target 是 `final_evidence_digest`，
-    并绑定 task/contract/plan/dispatch/work item/execution result。Reviewer
-    会话和信封只能声明该 attempt；旧 session 或旧输出不能创建新的快照。
-
-    创建前先做幂等复用与风险准入：同一快照的未消费 attempt 直接复用；已有
-    PASS 覆盖当前目标/代码范围时拒绝重新派发；普通风险任务默认不派发，声明
-    `triggers` 时按实质风险记录准入。
-    """
-    state = load_state(path)
-    _assert_open(state, "创建复核 attempt")
-    if str(state.get("risk") or "").lower() != "high":
-        raise GovernanceError(
-            "[native_review_retired] 普通复核已由 SOL 零工具单轮复核取代"
-            "（copilot_dispatch.py sol-review）；原生只读复核只保留给高风险 "
-            "G4（risk=high），且宿主没有合规只读载体时仍 fail-closed。")
-    wid = str(work_item_id or "").strip()
-    exec_sha = str(execution_result_sha256 or "").strip().lower()
-    execution = None
-    for record in state.get("native_results") or []:
-        if isinstance(record, dict) and \
-                str(record.get("result_sha256") or "") == exec_sha:
-            execution = record
-            break
-    if execution is None:
-        raise GovernanceError(
-            f"复核 attempt 绑定的执行结果 {exec_sha[:16] or '-'}… 尚未入账。")
-    if str(execution.get("work_item_id") or "") != wid:
-        raise GovernanceError("复核 attempt 的 work_item 与执行结果不一致。")
-    dispatch = state.get("native_dispatch")
-    if not isinstance(dispatch, dict):
-        raise GovernanceError("状态没有 native_dispatch；不能创建复核 attempt。")
-    did = str(dispatch_id or execution.get("dispatch_id") or "").strip()
-    if did != str(execution.get("dispatch_id") or ""):
-        raise GovernanceError("复核 attempt 的 dispatch_id 与执行结果不一致。")
-    pid = str(plan_id or execution.get("plan_id") or "").strip()
-    psha = str(plan_sha256 or execution.get("plan_sha256") or "").strip().lower()
-    if pid != str(execution.get("plan_id") or "") or \
-            psha != str(execution.get("plan_sha256") or "").lower():
-        raise GovernanceError("复核 attempt 的 plan 绑定与执行结果不一致。")
-    if pid != str(dispatch.get("plan_id") or "") or \
-            psha != str(dispatch.get("plan_sha256") or "").lower():
-        raise GovernanceError("复核 attempt 的 plan 绑定与当前 dispatch 不一致。")
-    action = next((a for a in dispatch.get("actions") or []
-                   if isinstance(a, dict)
-                   and str(a.get("work_item_id") or "") == wid), None)
-    if action is None or str(action.get("dispatch_id") or "") != did:
-        raise GovernanceError("复核 attempt 的 dispatch 工作项不存在或已漂移。")
-    execution_problems = _execution_current_problems(state, exec_sha, wid)
-    if execution_problems:
-        raise GovernanceError(
-            "复核 attempt 绑定的执行结果不是该工作项当前生效结果（"
-            + ", ".join(execution_problems)
-            + "）；请绑定最近一次回填的 execution，不能用 rerun 前的旧结果。")
-    scope = str(review_scope or "full").strip().lower()
-    if scope not in ("full", "incremental"):
-        raise GovernanceError(f"review_scope={scope!r} 非法；只能是 full / incremental。")
-    based_on = str(based_on_review_sha256 or "").strip().lower()
-    if scope == "incremental" and not based_on:
-        raise GovernanceError("incremental 复核 attempt 必须绑定基线复核。")
-    manifest = [str(eid).strip() for eid in (evidence_manifest or [])
-                if str(eid).strip()]
-    code_snapshot = _review_code_snapshot_for_execution(
-        workspace, state, path, base,
-        str(execution.get("code_scope_sha256") or ""),
-        execution.get("code_scope_excluded_paths"))
-    evidence_roots = CS.evidence_roots(state)
-    if evidence_roots and code_snapshot.get("git_root") and \
-            code_snapshot.get("git_root") not in evidence_roots:
-        raise GovernanceError(
-            "复核 attempt 的 workspace 与任务证据所属仓库不一致：workspace="
-            f"{code_snapshot.get('git_root')!r}，证据仓库={evidence_roots}。"
-            "请把 --workspace 指向实际任务仓库，避免对错误仓库做 G4。")
-    if not code_snapshot.get("available") and str(
-            state.get("risk") or "").lower() == "high":
-        raise GovernanceError(
-            "高风险 G4 复核需要有 git 工作区来证明 Reviewer 审查的代码范围；"
-            f"当前 workspace={code_snapshot.get('workspace')!r} 原因 "
-            f"{code_snapshot.get('reason') or 'unknown'}。请在任务仓库内运行，"
-            "或用 review-context --workspace 指定仓库根。")
-    target = final_evidence_digest(state)
-    code_digest = str(code_snapshot.get("digest") or "")
-    reentry_state, stop, stop_valid = _effective_reentry_state(state, target)
-    stop_covers = bool(stop_valid and stop is not None
-                       and str(stop.get("target_sha256") or "") == target
-                       and str(stop.get("code_scope_sha256") or "") == code_digest)
-    # 幂等：同一工作项、同一执行结果、同一目标/代码范围/scope 的未消费 attempt
-    # 直接复用。重复调用 review-context 不应生成第二个派发快照，否则同一个复核
-    # 目标会出现多条 attempt，既浪费派发也污染审计。已有 PASS 覆盖当前快照时
-    # 不复用，交给下面的停止判断直接拒绝。
-    for existing in ([] if stop_covers else
-                     reversed(state.get("review_attempts") or [])):
-        if not isinstance(existing, dict) or existing.get("consumed"):
-            continue
-        if (str(existing.get("task_id") or "") == str(state.get("task_id") or "")
-                and str(existing.get("contract_sha256") or "")
-                == str(state.get("contract_sha256") or "")
-                and str(existing.get("work_item_id") or "") == wid
-                and str(existing.get("execution_result_sha256") or "") == exec_sha
-                and str(existing.get("target_sha256") or "") == target
-                and str(existing.get("code_scope_sha256") or "") == code_digest
-                and str(existing.get("review_scope") or "") == scope
-                and str(existing.get("based_on_review_sha256") or "") == based_on
-                and sorted(str(x) for x in existing.get("evidence_manifest") or [])
-                == sorted(manifest)):
-            _history(state, "review_attempt_reused", {
-                "review_attempt_id": existing.get("review_attempt_id") or "",
-                "work_item_id": wid,
-                "target_sha256": target,
-                "review_scope": scope,
-            })
-            save_state(path, state)
-            return existing
-    # 风险准入 + 停止/重入判断：low/medium 默认不派发，但 ZCode 对复杂非高风险
-    # 任务仍可自主选择一次只读复核（该 attempt 属于自愿定向复核，正式 G4 路径仍
-    # 只对 risk=high 放行）；高风险必须有 admissions 记录。已有 PASS 覆盖当前快照
-    # 时直接拒绝，避免重复派发。
-    try:
-        decision = RP.admission(
-            risk=str(state.get("risk") or ""),
-            triggers=triggers, reason=reason)
-    except RP.ReviewPolicyError as exc:
-        raise GovernanceError(f"[review_admission_invalid] {exc}") from None
-    reentry = RP.reentry_decision(
-        reentry_state, target=target, code_scope_sha256=code_digest, scope=scope,
-        triggers=triggers, reason=reason,
-        files=[item for item in code_snapshot.get("files") or []
-               if isinstance(item, dict)])
-    if not reentry.get("allowed"):
-        raise GovernanceError(
-            f"[{reentry.get('code') or 'review_reentry_blocked'}] "
-            f"{reentry.get('detail') or ''}")
-    admission = _record_admission(
-        state, decision=decision, reentry=reentry, work_item_id=wid,
-        execution_sha256=exec_sha, target_sha256=target,
-        code_scope_sha256=code_digest, scope=scope, base=base)
-    attempt = {
-        "review_attempt_id": "RA" + secrets.token_hex(12),
-        "task_id": str(state.get("task_id") or ""),
-        "contract_sha256": str(state.get("contract_sha256") or ""),
-        "plan_id": pid,
-        "plan_sha256": psha,
-        "dispatch_id": did,
-        "work_item_id": wid,
-        "execution_result_sha256": exec_sha,
-        "target_sha256": target,
-        "criteria_sha256": _review_criteria_state_digest(state),
-        "code_snapshot": code_snapshot,
-        "code_scope_sha256": code_digest,
-        "evidence_snapshot": _review_evidence_snapshot(state),
-        "review_scope": scope,
-        "based_on_review_sha256": based_on,
-        "evidence_manifest": manifest,
-        "review_admission_id": admission["admission_id"],
-        "review_admission": {
-            "risk": decision.get("risk"),
-            "tier": decision.get("tier"),
-            "triggers": list(decision.get("triggers") or []),
-            "reason": str(decision.get("reason") or "")[:1000],
-            "reentry_stop_id": reentry.get("stop_id") or "",
-            "reentry_changed_paths": list(
-                reentry.get("changed_paths") or [])[:50],
-        },
-        "created_at": now_iso(),
-        "created_by": "zcode-native",
-        "consumed": False,
-        "consumed_by_result_sha256": "",
-        "consumed_at": "",
-        "reviewer": {},
-    }
-    state.setdefault("review_attempts", []).append(attempt)
-    _history(state, "review_attempt_created", {
-        "review_attempt_id": attempt["review_attempt_id"],
-        "work_item_id": wid,
-        "dispatch_id": did,
-        "target_sha256": target,
-        "review_scope": scope,
-    })
-    save_state(path, state)
-    return attempt
-
-
-def store_review_output(path: str, raw: bytes, sha256: str) -> dict:
-    """把 Reviewer 原始输出原子写入任务目录，供 Session 清理后独立复核。
-
-    返回 {path, sha256, bytes}；写入后回读校验 SHA，失败抛 GovernanceError。
-    这不改变任务目标摘要：目录在 governance_paths 中排除。
-    """
-    if not re.fullmatch(r"[0-9a-f]{64}", str(sha256 or "")):
-        raise GovernanceError("复核原始输出 SHA-256 格式非法。")
-    task_dir = os.path.dirname(os.path.abspath(path))
-    out_dir = os.path.join(task_dir, "review-outputs")
-    os.makedirs(out_dir, exist_ok=True)
-    target = os.path.join(out_dir, f"{sha256}.txt")
-    if os.path.isfile(target):
-        with open(target, "rb") as fh:
-            if _sha256_bytes(fh.read()) == sha256:
-                return {"path": target, "sha256": sha256,
-                        "bytes": len(raw)}
-    fd, tmp = tempfile.mkstemp(prefix=".review-output-", dir=out_dir)
-    try:
-        with os.fdopen(fd, "wb") as fh:
-            fh.write(raw)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp, target)
-    except BaseException:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
-    with open(target, "rb") as fh:
-        stored = fh.read()
-    if _sha256_bytes(stored) != sha256:
-        raise GovernanceError("复核原始输出写入后 SHA 不一致。")
-    return {"path": target, "sha256": sha256, "bytes": len(stored)}
-
-
-def _sha256_bytes(raw: bytes) -> str:
-    return hashlib.sha256(raw).hexdigest()
-
-
 EXECUTION_BINDING_SCHEMA = "copilot-execution-binding/v1"
 
 
@@ -4042,44 +3513,6 @@ def create_execution_binding(path: str, *, work_item_id: str,
     return binding
 
 
-def contract_no_test_binding(binding: object, state: dict | None = None) -> bool:
-    """binding 是否来自“合同显式不要求测试”的策略；仅此情形允许 TE N/A。
-
-    传入 state 时还要求 binding 仍对应当前合同、且当前合同确实显式不要求测试，
-    防止 amend 后旧 binding 或伪造的 contract-source binding 继续放行 N/A。
-    """
-    if not isinstance(binding, dict):
-        return False
-    policy = binding.get("contract_test_policy") or {}
-    base = bool(binding.get("requirement_source") == "contract"
-                and policy and policy.get("required") is False
-                and not binding.get("test_commands")
-                and not binding.get("contract_artifacts")
-                and not binding.get("contract_report"))
-    if not base:
-        return False
-    if state is None:
-        # 合同来源的 N/A 必须由当前状态复核；缺少 state 时 fail-closed。
-        return False
-    contract = state.get("contract") or {}
-    current = contract.get("test_policy") or {}
-    if not current.get("captured") or current.get("required") is not False:
-        return False
-    if str(binding.get("contract_sha256") or "") != str(
-            state.get("contract_sha256") or ""):
-        return False
-    expected = {key: current.get(key) for key in
-                ("required", "commands", "report", "artifacts",
-                 "require_test_result", "require_artifact_integrity")}
-    if canonical_json(policy) != canonical_json(expected):
-        return False
-    return (str(binding.get("contract_report") or "")
-            == str(current.get("report") or "")
-            and sorted(str(item) for item in
-                       binding.get("contract_artifacts") or [])
-            == sorted(str(item) for item in current.get("artifacts") or []))
-
-
 def find_execution_binding(state: dict, binding_id: str) -> dict | None:
     for binding in state.get("execution_bindings") or []:
         if isinstance(binding, dict) and \
@@ -4119,401 +3552,6 @@ def execution_binding_problems(state: dict, binding_id: str,
             ws != str(binding.get("workspace") or ""):
         problems.append("execution_binding_workspace_mismatch")
     return problems
-
-
-def review_attempt_problems(review: dict, state: dict, *,
-                            check_current: bool = True,
-                            cache: dict | None = None) -> list[str]:
-    """检查复核记录是否属于当前有效 attempt，且快照仍与当前状态一致。"""
-    aid = str((review or {}).get("review_attempt_id") or "").strip()
-    if not aid:
-        return ["native_review_attempt_missing"]
-    attempt = find_review_attempt(state, aid)
-    if attempt is None:
-        return ["native_review_attempt_foreign"]
-    problems: list[str] = []
-    for field in ("task_id", "contract_sha256", "plan_id", "plan_sha256",
-                  "dispatch_id", "work_item_id", "execution_result_sha256"):
-        if str(review.get(field) or "") != str(attempt.get(field) or ""):
-            problems.append("native_review_attempt_binding_mismatch")
-            break
-    if str(review.get("review_attempt_created_at") or "") != str(
-            attempt.get("created_at") or ""):
-        problems.append("native_review_attempt_binding_mismatch")
-    if str(review.get("review_scope") or "full").strip().lower() != str(
-            attempt.get("review_scope") or "full"):
-        problems.append("native_review_attempt_binding_mismatch")
-    if sorted(str(x) for x in (review.get("evidence_manifest") or [])) != sorted(
-            str(x) for x in (attempt.get("evidence_manifest") or [])):
-        problems.append("native_review_attempt_binding_mismatch")
-    if str(review.get("target_sha256") or "") != str(
-            attempt.get("target_sha256") or ""):
-        problems.append("native_review_attempt_target_mismatch")
-    if check_current and str(attempt.get("target_sha256") or "") != \
-            final_evidence_digest(state):
-        problems.append("native_review_stale")
-    if check_current and str(attempt.get("criteria_sha256") or "") != \
-            _review_criteria_state_digest(state):
-        problems.append("native_review_attempt_binding_mismatch")
-    # 证据文件在派发后、ingest 前（或 ingest 后、收口前）被改动时，目标摘要
-    # 可能完全不变；必须按 attempt 固化的内容快照重新核对。
-    for item in attempt.get("evidence_snapshot") or []:
-        if not isinstance(item, dict):
-            continue
-        path = str(item.get("path") or "")
-        expected = str(item.get("sha256") or "")
-        if not path or not expected:
-            continue
-        try:
-            actual = _sha256_file(path)
-        except OSError:
-            problems.append("native_review_attempt_workspace_drift")
-            break
-        if actual != expected:
-            problems.append("native_review_attempt_workspace_drift")
-            break
-    if check_current:
-        problems.extend(code_scope_problems(attempt, state, check_current=True,
-                                            cache=cache))
-        problems.extend(_execution_current_problems(
-            state, str(attempt.get("execution_result_sha256") or ""),
-            str(attempt.get("work_item_id") or "")))
-    if attempt.get("consumed"):
-        if str(attempt.get("consumed_by_result_sha256") or "") != str(
-                review.get("result_sha256") or ""):
-            problems.append("native_review_attempt_consumed")
-    bound = attempt.get("reviewer") or {}
-    reviewer = (review.get("reviewer") or {}) if isinstance(
-        review.get("reviewer"), dict) else {}
-    for key in ("agent_id", "child_session_id"):
-        if str(bound.get(key) or "") and str(bound.get(key) or "") != str(
-                reviewer.get(key) or ""):
-            problems.append("native_review_attempt_session_mismatch")
-    snapshot = attempt.get("code_snapshot") or {}
-    expected_root = str(snapshot.get("git_root") or snapshot.get("workspace") or "")
-    host = review.get("host")
-    host_root = str((host.get("workspace_root") if isinstance(host, dict)
-                     else "") or "").strip()
-    if expected_root and isinstance(host, dict):
-        if not host_root:
-            problems.append("native_review_attempt_workspace_missing")
-        elif os.path.realpath(host_root) != os.path.realpath(expected_root):
-            problems.append("native_review_attempt_workspace_mismatch")
-    # 去重但保留首个原因，便于门禁输出稳定。
-    out: list[str] = []
-    for code in problems:
-        if code not in out:
-            out.append(code)
-    return out
-
-
-def _reviewer_policy_problems(profile: object) -> list[str]:
-    """复核方有效权限策略不满足只读边界时的原因码（空列表表示合格）。
-
-    只读边界只看宿主 `profileSnapshot` 派生的有效策略：Profile 名称、来源与
-    所在路径都不是权限证据。缺策略字段同样失败关闭，不能用“名字看起来对”
-    或 Prompt 声明代替。
-    """
-    if not isinstance(profile, dict):
-        return ["native_review_profile_invalid"]
-    import native_bridge as NB  # 延迟导入：避免状态引擎与信封层在导入期耦合
-
-    if NB.reviewer_policy_problems(profile):
-        return ["native_review_profile_not_readonly"]
-    return []
-
-
-def _review_trust_problems(review: dict, state: dict, *, check_target: bool,
-                           target: str = "",
-                           cache: dict | None = None) -> list[str]:
-    """复核记录的可信性检查（可选是否要求绑定当前最终证据）。
-
-    增量复核的基线需要“除过期以外全部可信”：它绑定的是旧的最终证据，不能
-    按当前摘要要求它；其余身份、宿主记录与结论条件必须同样成立。
-    """
-    problems: list[str] = []
-    if not isinstance(review, dict):
-        return ["native_review_invalid"]
-    if str(review.get("task_id") or "") != str(state.get("task_id") or ""):
-        problems.append("native_review_foreign")
-    if str(review.get("contract_sha256") or "") != str(state.get("contract_sha256") or ""):
-        problems.append("native_review_contract_mismatch")
-    if str(review.get("verdict") or "").strip().lower() != "pass":
-        problems.append("native_review_not_pass")
-    findings = review.get("findings") or []
-    if any(isinstance(f, dict) and str(f.get("severity") or "") == "blocking"
-           for f in findings):
-        problems.append("native_review_blocking")
-    if review.get("unverified"):
-        problems.append("native_review_unverified")
-    if review.get("changed_files"):
-        problems.append("native_review_changed_files")
-    if review.get("g4_eligible") is not True:
-        problems.append("native_review_not_g4_eligible")
-    elif str(review.get("g4_source") or "") != "candidate":
-        # 切换后只接受新链产出的 G4；旧 G4 记录没有 candidate 来源，不能放行。
-        problems.append("native_review_legacy_g4_source")
-    elif (review.get("candidate_g4") or {}).get("eligible") is not True:
-        problems.append("native_review_candidate_not_eligible")
-    else:
-        # G4 必须绑定派发前创建的 attempt；仅有一个“生成时算出的 target”
-        # 不能证明 Reviewer 实际审查的是同一快照。
-        problems.extend(review_attempt_problems(
-            review, state, check_current=check_target, cache=cache))
-        # ingest 是 attempt 的唯一消费点：未经 ingest 消费的记录不能作为门禁
-        # 依据，否则手工写入 native_reviews 就能绕过会话/时间绑定。
-        attempt = find_review_attempt(
-            state, str(review.get("review_attempt_id") or ""))
-        if attempt is not None and not attempt.get("consumed"):
-            problems.append("native_review_attempt_not_consumed")
-    if check_target:
-        expected = target or final_evidence_digest(state)
-        bound = str(review.get("target_sha256")
-                    or review.get("execution_result_sha256") or "")
-        if bound != expected:
-            problems.append("native_review_stale")
-    reviewer = review.get("reviewer") or {}
-    if not str(reviewer.get("profile_id") or "").strip():
-        problems.append("native_review_profile_invalid")
-    else:
-        problems.extend(_reviewer_policy_problems(reviewer.get("profile")))
-    if not str(reviewer.get("agent_id") or "").strip() or not str(
-            reviewer.get("child_session_id") or "").strip():
-        problems.append("native_review_profile_invalid")
-    # G4 收口重新核对宿主记录摘要，而不是只信任状态里的 g4_eligible 布尔值：
-    # 宿主事实由 ingest 时的 g4_attest 独立核验并固化，这里检测记录在 ingest 后
-    # 被改写，并核对宿主身份与 Reviewer 自报一致。
-    host = review.get("host")
-    if not isinstance(host, dict) or not host:
-        problems.append("native_review_host_missing")
-    elif str(review.get("host_sha256") or "") != _sha256_text(canonical_json(host)):
-        problems.append("native_review_host_changed")
-    else:
-        for key in ("agent_id", "child_session_id"):
-            if str(host.get(key) or "").strip() != str(reviewer.get(key) or "").strip():
-                problems.append("native_review_host_identity_mismatch")
-        if not host.get("tool_calls"):
-            problems.append("native_review_host_no_tool_calls")
-    return problems
-
-
-def _incremental_review_problems(review: dict, state: dict,
-                                 cache: dict | None = None) -> str:
-    """增量复核的覆盖复核：基线可信 + 变化量被本轮逐条覆盖。
-
-    返回空串表示通过；否则返回原因码。这里是 ingest 校验的收口期复算，
-    不依赖 Reviewer 自述：覆盖快照与实际状态都从本地记录重新计算。
-    """
-    import native_bridge as NB  # 延迟导入：避免状态引擎与信封层在导入期耦合
-
-    based_on = str(review.get("based_on_review_sha256") or "").strip()
-    if not based_on:
-        return "native_review_incremental_base_missing"
-    base = None
-    for record in state.get("native_reviews") or []:
-        if isinstance(record, dict) and str(record.get("result_sha256") or "") == based_on:
-            base = record
-            break
-    if base is None:
-        return "native_review_incremental_base_missing"
-    if _review_trust_problems(base, state, check_target=False, cache=cache):
-        return "native_review_incremental_base_invalid"
-    base_attempt = find_review_attempt(
-        state, str(base.get("review_attempt_id") or ""))
-    if code_scope_problems(base_attempt, state, check_current=True, cache=cache):
-        return "native_review_incremental_code_changed"
-    base_coverage = base.get("coverage")
-    if not isinstance(base_coverage, dict) or not base_coverage:
-        return "native_review_incremental_base_coverage_missing"
-    current = NB.review_coverage(state)
-    changed_evidence = {
-        eid for eid, sha in current["evidence"].items()
-        if (base_coverage.get("evidence") or {}).get(eid) != sha}
-    changed_actions = {
-        aid for aid, fp in current["actions"].items()
-        if (base_coverage.get("actions") or {}).get(aid) != fp}
-    changed_criteria = {
-        cid for cid, fp in current["criteria"].items()
-        if (base_coverage.get("criteria") or {}).get(cid) != fp}
-    if changed_criteria:
-        return "native_review_incremental_criteria_changed"
-    if any(aid != str(review.get("work_item_id") or "") for aid in changed_actions):
-        return "native_review_incremental_scope_too_narrow"
-    manifest = {str(eid) for eid in review.get("evidence_manifest") or []}
-    if changed_evidence - manifest:
-        return "native_review_incremental_evidence_uncovered"
-    if not changed_evidence and not changed_actions:
-        # 与 native_bridge 的增量校验保持同一口径：没有变化就没有可增量覆盖的
-        # 对象，应直接复用基线结论而不是生成一条空增量记录。
-        return "native_review_incremental_without_change"
-    return ""
-
-
-def _eligible_review(review: dict, state: dict, *,
-                     target: str = "",
-                     cache: dict | None = None) -> tuple[bool, str]:
-    """检查一条原生复核记录是否可作为 G4 依据；失败返回原因码。"""
-    problems = _review_trust_problems(review, state, check_target=True,
-                                      target=target or final_evidence_digest(state),
-                                      cache=cache)
-    if problems:
-        return False, problems[0]
-    if str(review.get("review_scope") or "full").strip().lower() == "incremental":
-        code = _incremental_review_problems(review, state, cache=cache)
-        if code:
-            return False, code
-    return True, ""
-
-
-def _coverage_drift_detail(review: dict, state: dict) -> str:
-    """比较复核记录里的覆盖快照与当前状态，列出目标摘要失效的具体来源。
-
-    只看诊断信息：真正判定仍由摘要相等决定（fail-closed）。没有快照的旧记录
-    无法判断变化项，如实说明。
-    """
-    coverage = review.get("coverage")
-    if not isinstance(coverage, dict) or not coverage:
-        return "复核记录没有覆盖快照（旧记录），无法列出变化项；请做一次完整复核"
-    import native_bridge as NB  # 延迟导入：与 review_coverage 保持同一口径
-
-    current = NB.review_coverage(state)
-    parts: list[str] = []
-    for key, label in (("criteria", "条件"), ("actions", "工作项"),
-                       ("evidence", "证据")):
-        before = coverage.get(key)
-        if not isinstance(before, dict):
-            continue
-        now = current.get(key) or {}
-        added = sorted(i for i in now if i not in before)
-        removed = sorted(i for i in before if i not in now)
-        changed = sorted(i for i in now if i in before and before[i] != now[i])
-        bits = []
-        if added:
-            bits.append("新增 " + ", ".join(added))
-        if removed:
-            bits.append("移除 " + ", ".join(removed))
-        if changed:
-            bits.append("变更 " + ", ".join(changed))
-        if bits:
-            parts.append(f"{label}：" + "；".join(bits))
-    if not parts:
-        return "覆盖快照与当前状态一致；差异来自收口动作或记录改写，请重新复核"
-    return "；".join(parts)[:400]
-
-
-def _review_reason_detail(review: dict, state: dict, code: str) -> str:
-    """G4 拒绝原因的可操作说明：说清是哪一条复核、为什么不可用、下一步做什么。"""
-    label = f"复核 {review.get('work_item_id') or '-'}"
-    if code == "native_review_stale":
-        attempt = find_review_attempt(
-            state, str(review.get("review_attempt_id") or ""))
-        if attempt is not None and str(attempt.get("target_sha256") or "") != \
-                final_evidence_digest(state):
-            return (f"{label} 不可用（attempt 快照已过期，目标摘要已过期）："
-                    f"{_coverage_drift_detail(review, state)}。"
-                    "旧 Reviewer 输出不能重新封装为新摘要结论，必须新建 attempt 重做复核。")
-        return (f"{label} 不可用（目标摘要已过期）："
-                f"{_coverage_drift_detail(review, state)}。"
-                "需要基于当前证据做完整复核，或用可用的 G4 基线做增量复核。")
-    if code == "native_review_contract_mismatch":
-        return (f"{label} 不可用（合同指纹不一致）：复核后合同目标/正文/完成条件"
-                "发生过改动，旧结论不再覆盖当前合同；请对新合同做完整复核。")
-    if code == "native_review_attempt_missing":
-        return (f"{label} 不可用（缺少 review attempt）：旧复核没有派发前快照绑定；"
-                "请用 review-context --create-attempt 重新派发并生成新信封。")
-    if code == "native_review_attempt_consumed":
-        return (f"{label} 不可用（attempt 已被消费）：该 attempt 已绑定另一份复核结果；"
-                "重试必须新建 attempt，不能复用旧输出。")
-    if code == "native_review_attempt_workspace_missing":
-        return (f"{label} 不可用（缺少 Reviewer 工作区）：宿主 metadata 没有 "
-                "workspaceRoot，无法证明 Reviewer 在 attempt 冻结的工作区运行。")
-    if code == "native_review_attempt_workspace_mismatch":
-        return (f"{label} 不可用（Reviewer 工作区不匹配）：Reviewer 实际工作区与 "
-                "attempt 冻结的代码根不一致；不能把其他工作区的结论当成本任务复核。")
-    if code == "native_review_attempt_session_mismatch":
-        return (f"{label} 不可用（session 不匹配）：复核结果不是该 attempt 绑定的 "
-                "Reviewer session 产生的；必须用原 session 或新建 attempt。")
-    if code == "native_review_execution_superseded":
-        return (f"{label} 不可用（绑定的是旧执行结果）：该工作项已 rerun 并有更新的 "
-                "execution；旧结果文本与当前 action 不一致。请绑定最近一次 execution 重新复核。")
-    if code == "native_review_execution_not_current":
-        return (f"{label} 不可用（执行结果与当前 action 不一致）：execution 的 "
-                "summary/result 无法对应当前 action.result；不能把旧执行结果当作当前代码。")
-    if code == "native_review_execution_missing":
-        return (f"{label} 不可用（找不到绑定 execution）：状态中没有该工作项的执行记录。")
-    if code == "native_review_code_scope_missing":
-        return (f"{label} 不可用（缺少代码范围快照）：旧 attempt 只绑定证据文件，"
-                "无法证明 Reviewer 看过未登记为证据的源码；请用 review-context "
-                "--create-attempt 重新派发并复核。")
-    if code == "native_review_code_scope_unavailable":
-        return (f"{label} 不可用（代码范围不可读取）：attempt 的工作区不是 git "
-                "仓库或 git 不可用；无法证明实际审查范围，按 fail-closed 拒绝。")
-    if code == "native_review_code_scope_drift":
-        return (f"{label} 不可用（代码范围已变化）：G4 attempt 之后工作区源码、"
-                "未跟踪文件或文件状态发生变化；旧结论不再覆盖当前代码，必须新建 "
-                "attempt 重做完整复核。")
-    if code == "native_review_attempt_workspace_drift":
-        return (f"{label} 不可用（证据文件在复核期间被改动）：attempt 固化的文件 "
-                "内容与当前不一致；旧结论不再覆盖当前内容，必须新建 attempt 重做复核。")
-    if code == "native_review_attempt_not_consumed":
-        return (f"{label} 不可用（attempt 未经 ingest 消费）：复核记录缺少宿主回填 "
-                "绑定；请用 copilot_auto.py ingest --review-file 正式回填。")
-    if code == "native_review_attempt_foreign":
-        return (f"{label} 不可用（attempt 不属于当前任务）：不得把其他任务/其他 "
-                "attempt 的复核输出贴到本任务；请在本任务内新建 attempt。")
-    if code.startswith("native_review_attempt_"):
-        return (f"{label} 不可用（{code}）：attempt 与信封的 task/plan/dispatch/"
-                "work item/execution/target 绑定不一致；请重新创建 attempt。")
-    return f"{label} 不可用（{code}）"
-
-
-def _gate_review(state: dict, *, cache: dict | None = None) -> dict:
-    risk = str(state.get("risk") or "").strip().lower()
-    if risk in ("low", "medium", "normal"):
-        return {"passed": True, "reasons": []}
-    if risk != "high":
-        return {"passed": False, "reasons": [{
-            "code": "native_review_missing",
-            "detail": "任务 risk 缺失或非法；G4 按 fail-closed 拒绝。"}]}
-    reviews = [r for r in state.get("native_reviews") or [] if isinstance(r, dict)]
-    target = final_evidence_digest(state)
-    if not reviews:
-        return {"passed": False, "reasons": [{
-            "code": "native_review_missing",
-            "detail": "高风险任务需要绑定的原生独立复核；当前没有复核记录。",
-            "required_target": target}]}
-    reasons = []
-    best = None
-    for review in reviews:
-        ok, code = _eligible_review(review, state, target=target, cache=cache)
-        if ok:
-            best = review
-            break
-        reasons.append({"code": code,
-                        "detail": _review_reason_detail(review, state, code),
-                        "required_target": target})
-    if best is not None:
-        # 一条“本次没有 blocking”的 PASS 不能掩盖台账里仍未解决的 blocking/major：
-        # 旧问题被遗漏、只修未验证或已复现时，G4 继续失败关闭。
-        unresolved = RP.blocking_findings(state)
-        if unresolved:
-            reasons = []
-            for item in unresolved[:10]:
-                status = str(item.get("status") or "open")
-                code = ("native_review_finding_unverified"
-                        if status == "fixed" else
-                        "native_review_finding_regressed"
-                        if status == "regressed" else
-                        "native_review_finding_open")
-                reasons.append({
-                    "code": code,
-                    "detail": _finding_reason_detail(item),
-                    "finding_id": str(item.get("finding_id") or ""),
-                    "required_target": target,
-                })
-            return {"passed": False, "reasons": reasons}
-        return {"passed": True, "reasons": [], "review": best}
-    return {"passed": False, "reasons": reasons}
 
 
 def _finding_reason_detail(item: dict) -> str:
@@ -4634,152 +3672,28 @@ def _seconds_between(start: object, end: object) -> float | None:
     return round((second - first).total_seconds(), 1)
 
 
-def _finding_keys(review: dict) -> list[tuple]:
-    keys = []
-    for finding in review.get("findings") or []:
-        if not isinstance(finding, dict):
-            continue
-        keys.append((str(review.get("work_item_id") or ""),
-                     str(finding.get("severity") or ""),
-                     str(finding.get("file") or ""),
-                     finding.get("line"),
-                     str(finding.get("summary") or "")))
-    return keys
-
 
 def review_metrics(state: dict, *, task_dir: str = "") -> dict:
-    """真实复核效率指标（只读，不改状态）。
+    """复核与台账指标（只读，不改状态）。
 
-    口径说明：
-    * 有效复核 = 已回填到 `native_reviews` 的记录；被拒信封只能从任务目录的
-      `review-attempts.jsonl` 统计，二者分开计数，不把尝试当轮次。
-    * 重复 finding 按 (工作项, severity, file, line, summary) 完全相同计；同一
-      根因的多处表现应合并成一条 finding，否则会在这里显形。
-    * 重复命令/文件按同一工作项跨复核记录出现次数计；增量复核本应减少这类重复。
-    * 正式 REVIEW、原生独立复核、G4 资格分别统计，不混为一个数字。
+    v8 起 G4 原生只读复核已退役：活动指标只统计 SOL 单轮复核、复核准入、
+    Finding 台账与正式 REVIEW。历史状态里的 `native_reviews` /
+    `review_attempts` / `g4_attestations` 只读保留，不计入活动指标。
     """
-    reviews = [r for r in state.get("native_reviews") or [] if isinstance(r, dict)]
-    reviews.sort(key=lambda r: str(r.get("received") or ""))
     sol_reviews = [r for r in state.get("sol_reviews") or []
                    if isinstance(r, dict)]
-    by_item: dict[str, list[dict]] = {}
-    for review in reviews:
-        wid = str(review.get("work_item_id") or "")
-        by_item.setdefault(wid, []).append(review)
-
-    total_findings = 0
-    finding_counts: dict[tuple, int] = {}
-    blocking_total = 0
-    rounds_with_blocking = 0
-    scope_counts: dict[str, int] = {}
-    g4_reviews = 0
-    g4_candidate_reviews = 0
-    package_chars: list[int] = []
-    command_rounds: dict[str, int] = {}
-    file_rounds: dict[str, int] = {}
-    incremental_new = {"blocking": 0, "major": 0}
-    no_information = 0
-    attempt_durations: list[float] = []
-    first_full_durations: list[float] = []
-    attempt_by_id = {str(item.get("review_attempt_id") or ""): item
-                     for item in state.get("review_attempts") or []
-                     if isinstance(item, dict)}
-    reviews_by_sha = {str(item.get("result_sha256") or ""): item
-                      for item in reviews}
-    first_full_seen: set[str] = set()
-    for review in reviews:
-        scope = str(review.get("review_scope") or "full")
-        scope_counts[scope] = scope_counts.get(scope, 0) + 1
-        if review.get("g4_eligible") is True:
-            g4_reviews += 1
-            if (review.get("candidate_g4") or {}).get("eligible") is True:
-                g4_candidate_reviews += 1
-        findings = [f for f in review.get("findings") or [] if isinstance(f, dict)]
-        total_findings += len(findings)
-        blocking = sum(1 for f in findings
-                       if str(f.get("severity") or "") == "blocking")
-        blocking_total += blocking
-        if blocking:
-            rounds_with_blocking += 1
-        for key in _finding_keys(review):
-            finding_counts[key] = finding_counts.get(key, 0) + 1
-        if scope == "incremental":
-            base = reviews_by_sha.get(
-                str(review.get("based_on_review_sha256") or ""), {})
-            base_keys = set(_finding_keys(base)) if isinstance(base, dict) else set()
-            for finding in findings:
-                severity = str(finding.get("severity") or "")
-                if severity not in ("blocking", "major"):
-                    continue
-                key = (str(review.get("work_item_id") or ""), severity,
-                       str(finding.get("file") or ""), finding.get("line"),
-                       str(finding.get("summary") or ""))
-                if key not in base_keys:
-                    incremental_new[severity] += 1
-        if str(review.get("verdict") or "").lower() == "pass" and \
-                not findings and not (review.get("unverified") or []) and \
-                not (review.get("evidence_manifest") or []):
-            no_information += 1
-        attempt = attempt_by_id.get(
-            str(review.get("review_attempt_id") or ""))
-        if attempt is not None:
-            elapsed = _seconds_between(attempt.get("created_at"),
-                                       review.get("received"))
-            if elapsed is not None and elapsed >= 0:
-                attempt_durations.append(elapsed)
-                wid = str(review.get("work_item_id") or "")
-                if scope == "full" and wid not in first_full_seen:
-                    first_full_seen.add(wid)
-                    first_full_durations.append(elapsed)
-        package_chars.append(len(canonical_json({
-            k: review.get(k) for k in (
-                "findings", "files_inspected", "commands_run", "unverified",
-                "residual_risks", "evidence_manifest")})))
-        wid = str(review.get("work_item_id") or "")
-        for command in set(str(c) for c in review.get("commands_run") or [] if c):
-            command_rounds[f"{wid}\0{command}"] = \
-                command_rounds.get(f"{wid}\0{command}", 0) + 1
-        for path in set(str(p) for p in review.get("files_inspected") or [] if p):
-            file_rounds[f"{wid}\0{path}"] = file_rounds.get(f"{wid}\0{path}", 0) + 1
-
-    duplicate_findings = sum(count - 1 for count in finding_counts.values()
-                             if count > 1)
-    repeated_commands = sorted(key.split("\0", 1)[1]
-                               for key, count in command_rounds.items() if count > 1)
-    repeated_files = sorted(key.split("\0", 1)[1]
-                            for key, count in file_rounds.items() if count > 1)
-
-    items: list[dict] = []
-    rounds_to_pass: list[int] = []
-    first_round_findings: list[int] = []
-    for wid, records in sorted(by_item.items()):
-        rounds = len(records)
-        first_findings = len(records[0].get("findings") or []) if records else 0
-        first_round_findings.append(first_findings)
-        pass_round = None
-        for idx, record in enumerate(records, 1):
-            if str(record.get("verdict") or "").lower() == "pass":
-                pass_round = idx
-                break
-        if pass_round is not None:
-            rounds_to_pass.append(pass_round)
-        empty_rounds = sum(
-            1 for record in records[1:]
-            if not (record.get("findings") or [])
-            and str(record.get("verdict") or "").lower() != "pass")
-        items.append({
-            "work_item_id": wid,
-            "rounds": rounds,
-            "first_round_findings": first_findings,
-            "pass_round": pass_round,
-            "empty_rounds": empty_rounds,
-            "verdicts": [str(r.get("verdict") or "") for r in records],
-            "time_to_pass_seconds": (
-                _seconds_between(records[0].get("received"),
-                                 records[pass_round - 1].get("received"))
-                if pass_round else None),
-        })
-
+    admissions = [item for item in state.get("review_admissions") or []
+                  if isinstance(item, dict)]
+    admission_triggers: dict[str, int] = {}
+    admission_tiers: dict[str, int] = {}
+    for item in admissions:
+        tier = str(item.get("tier") or "")
+        if tier:
+            admission_tiers[tier] = admission_tiers.get(tier, 0) + 1
+        for trigger in item.get("triggers") or []:
+            value = str(trigger or "")
+            if value:
+                admission_triggers[value] = admission_triggers.get(value, 0) + 1
     invalid_attempts: dict[str, int] = {"execution": 0, "review": 0,
                                         "review_build": 0}
     attempt_codes: dict[str, int] = {}
@@ -4806,7 +3720,6 @@ def review_metrics(state: dict, *, task_dir: str = "") -> dict:
                             attempt_codes[code] = attempt_codes.get(code, 0) + 1
             except OSError:
                 pass
-
     closure = state.get("closure") or {}
     formal_records = [r for r in state.get("formal_reviews") or []
                       if isinstance(r, dict)]
@@ -4817,18 +3730,6 @@ def review_metrics(state: dict, *, task_dir: str = "") -> dict:
     }
     formal_amendments = sum(len(r.get("amendments") or [])
                             for r in formal_records)
-    admissions = [item for item in state.get("review_admissions") or []
-                  if isinstance(item, dict)]
-    admission_triggers: dict[str, int] = {}
-    admission_tiers: dict[str, int] = {}
-    for item in admissions:
-        tier = str(item.get("tier") or "")
-        if tier:
-            admission_tiers[tier] = admission_tiers.get(tier, 0) + 1
-        for trigger in item.get("triggers") or []:
-            value = str(trigger or "")
-            if value:
-                admission_triggers[value] = admission_triggers.get(value, 0) + 1
     ledger = RP.ledger_summary(state)
     ledger.pop("items", None)
     stops = [item for item in state.get("review_stops") or []
@@ -4839,11 +3740,6 @@ def review_metrics(state: dict, *, task_dir: str = "") -> dict:
         "risk": str(state.get("risk") or ""),
         "execution_backend": str(state.get("execution_backend") or ""),
         "closed": bool(closure.get("closed")),
-        "native_reviews_total": len(reviews),
-        "g4_reviews": g4_reviews,
-        "g4_candidate_reviews": g4_candidate_reviews,
-        "full_reviews": scope_counts.get("full", 0),
-        "incremental_reviews": scope_counts.get("incremental", 0),
         "review_admissions_total": len(admissions),
         "review_admission_tiers": dict(sorted(admission_tiers.items())),
         "review_admission_triggers": dict(sorted(admission_triggers.items())),
@@ -4854,44 +3750,8 @@ def review_metrics(state: dict, *, task_dir: str = "") -> dict:
         "active_formal_reviews_total": len(formal_records) - len(superseded_ids),
         "invalid_envelopes": invalid_attempts,
         "invalid_envelope_codes": dict(sorted(attempt_codes.items())),
-        "review_scopes": dict(sorted(scope_counts.items())),
         "finding_ledger": ledger,
         "rereported_findings": len(ledger.get("rereported") or []),
-        "incremental_new_blocking": incremental_new["blocking"],
-        "incremental_new_major": incremental_new["major"],
-        "no_information_reviews": no_information,
-        "avg_review_seconds": (
-            round(sum(attempt_durations) / len(attempt_durations), 1)
-            if attempt_durations else None),
-        "avg_first_full_review_seconds": (
-            round(sum(first_full_durations) / len(first_full_durations), 1)
-            if first_full_durations else None),
-        "total_review_seconds": (
-            round(sum(attempt_durations), 1) if attempt_durations else 0),
-        "work_items": items,
-        "work_items_with_reviews": len(items),
-        "avg_review_rounds": (round(sum(i["rounds"] for i in items) / len(items), 2)
-                              if items else 0),
-        "avg_first_round_findings": (
-            round(sum(first_round_findings) / len(first_round_findings), 2)
-            if first_round_findings else 0),
-        "avg_rounds_to_pass": (
-            round(sum(rounds_to_pass) / len(rounds_to_pass), 2)
-            if rounds_to_pass else None),
-        "findings_total": total_findings,
-        "blocking_findings_total": blocking_total,
-        "rounds_with_blocking": rounds_with_blocking,
-        "duplicate_findings": duplicate_findings,
-        "duplicate_finding_ratio": (
-            round(duplicate_findings / total_findings, 3)
-            if total_findings else 0),
-        "repeated_commands": repeated_commands[:50],
-        "repeated_command_count": len(repeated_commands),
-        "repeated_files": repeated_files[:50],
-        "repeated_file_count": len(repeated_files),
-        "avg_package_chars": (
-            round(sum(package_chars) / len(package_chars)) if package_chars else 0),
-        "max_package_chars": max(package_chars) if package_chars else 0,
         "task_seconds": _seconds_between(
             state.get("created"), closure.get("closed_at") or state.get("updated")),
         "reopen_count": len(closure.get("reopen_history") or []),
@@ -4914,20 +3774,25 @@ def review_metrics(state: dict, *, task_dir: str = "") -> dict:
                 for severity in ("blocking", "major", "minor", "info")},
             "single_round": True,
         },
-        "note": "有效复核按 native_reviews（仅高风险 G4）统计；SOL 单轮复核单独按 "
-                "sol_reviews 统计，一次调用只发一次请求。正式 REVIEW、G4 与 SOL "
-                "分别计数，不互相替代。",
+        "g4": {
+            "retired": True,
+            "historical_native_reviews": len(state.get("native_reviews") or []),
+            "historical_review_attempts": len(state.get("review_attempts") or []),
+            "historical_attestations": len(state.get("g4_attestations") or []),
+        },
+        "note": "活动复核只有 SOL 单轮复核（一次请求、零工具、advisory）。G4 原生"
+                "复核已退役；历史 native_reviews/review_attempts/g4_attestations "
+                "只读保留，不参与新任务准入或收口。",
     }
 
 
 def _gate_findings(state: dict) -> dict:
-    """普通风险任务的 Finding 台账门禁：未闭合 blocking/major 阻断收口。
+    """Finding 台账门禁：未闭合 blocking/major 阻断收口（所有风险等级）。
 
-    高风险任务由 G4 统一检查台账，避免同一问题在两个门里重复出现；普通风险
-    任务没有 G4，但 major/blocking 仍不能在收口时留在台账里。
+    G4 退役后，台账不再由高风险专用复核统一检查：advisory 复核（SOL）报告
+    的 blocking/major 仍进入台账，主代理必须修复并用定向验证推进生命周期，
+    或在给出反证后显式驳回；未闭合条目在任何风险等级下都阻断收口。
     """
-    if str(state.get("risk") or "").strip().lower() == "high":
-        return {"passed": True, "reasons": []}
     reasons = []
     for item in RP.blocking_findings(state):
         status = str(item.get("status") or "open")
@@ -4944,24 +3809,22 @@ def _gate_findings(state: dict) -> dict:
 
 def closure_check(state: dict, *, task_dir: str = "",
                   cache: dict | None = None) -> dict:
-    """四门检查。`cache` 只在单次命令内复用代码快照与证据摘要。"""
+    """三道门收口检查。`cache` 只在单次命令内复用证据摘要。"""
     if cache is None:
         cache = {}
     criteria = _gate_criteria(state, cache=cache)
-    code_scope = _gate_code_scope(state, cache=cache)
     quality = _gate_quality(state, cache=cache)
     findings = _gate_findings(state)
     risks = {
         "G1": _gate_actions(state),
-        "G2": {"passed": criteria["passed"] and code_scope["passed"]
-               and quality["passed"] and findings["passed"],
-               "reasons": criteria["reasons"] + code_scope["reasons"]
-               + quality["reasons"] + findings["reasons"]},
+        "G2": {"passed": criteria["passed"] and quality["passed"]
+               and findings["passed"],
+               "reasons": criteria["reasons"] + quality["reasons"]
+               + findings["reasons"]},
         "G3": _gate_stalled(state),
-        "G4": _gate_review(state, cache=cache),
     }
     reasons = []
-    for name in ("G1", "G2", "G3", "G4"):
+    for name in ("G1", "G2", "G3"):
         for reason in risks[name]["reasons"]:
             reasons.append({"gate": name, **reason})
     return {"passed": not reasons, "iteration_id": _current_iteration_id(state),
@@ -5102,49 +3965,9 @@ def _derive_id(state: dict, base: str) -> str:
     raise GovernanceError(f"派生工作项 id 已用尽：{base}")
 
 
-def _latest_capability_rejections(state: dict) -> list[str]:
-    """最近一次 G4 取证里的“宿主/Profile 能力缺口”拒绝码。
-
-    只看最近一次记录：环境或 Profile 修复后，历史缺口不应继续阻断；反过来，
-    同一条能力缺口也不会被当成“再派一个 Reviewer 就会好”而反复派发。
-    """
-    attestations = state.get("g4_attestations")
-    if isinstance(attestations, list) and attestations:
-        latest = attestations[-1]
-        if isinstance(latest, dict):
-            # g4_shadow 记录把拒绝码放在 attestation.rejections（持久化摘要）与
-            # new_reason（扁平码列表）；顶层只有影子层自身字段。三者都读，兼容
-            # 早期/手工构造的记录。
-            codes: set[str] = set()
-            for item in latest.get("rejections") or []:
-                if isinstance(item, dict):
-                    codes.add(str(item.get("code") or ""))
-            attestation = latest.get("attestation")
-            if isinstance(attestation, dict):
-                for item in attestation.get("rejections") or []:
-                    if isinstance(item, dict):
-                        codes.add(str(item.get("code") or ""))
-            for item in latest.get("new_reason") or []:
-                codes.add(str(item))
-            hits = sorted(code for code in codes
-                          if code in RP.CAPABILITY_REJECTION_CODES)
-            if hits:
-                return hits
-    reviews = state.get("native_reviews")
-    if isinstance(reviews, list) and reviews:
-        latest = reviews[-1]
-        if isinstance(latest, dict):
-            reasons = {str(item) for item in latest.get("g4_reasons") or []}
-            hits = sorted(reason for reason in reasons
-                          if reason in RP.CAPABILITY_REJECTION_CODES)
-            if hits:
-                return hits
-    return []
-
-
 def derive_work(state: dict, *, reason: str = "partial",
                 cache: dict | None = None) -> list[dict]:
-    """按未闭合条件 / 停摆项 / G4 缺口本地派生工作项；不调用任何模型。
+    """按未闭合条件 / 停摆项 / Finding 缺口本地派生工作项；不调用任何模型。
 
     无进展保护：同一根因被反复派生仍未闭合时，额外派生 AUTO-REPLAN，要求分析根因
     并选择实质不同的替代路线；不把「再试一次同样的路径」当作推进。
@@ -5158,11 +3981,9 @@ def derive_work(state: dict, *, reason: str = "partial",
         base_constraints.insert(0, f"原合同边界：{boundaries}")
 
     def previous_attempts(base_id: str) -> list[str]:
-        # AUTO-G4 与 AUTO-G4-INGEST 是同一条 G4 缺口的两种工作项形态，累计尝试次数
-        # 时按家族合并；否则反复回填失败会一直派生 INGEST 而不升级到替代路线。
-        # AUTO-FIX-F1 / AUTO-VERIFY-F1 同样按 finding 家族累计，避免修复反复失败
-        # 时无限产生 -R2/-R3。
-        prefix = "AUTO-G4" if base_id.startswith("AUTO-G4") else base_id
+        # AUTO-FIX-F1 / AUTO-VERIFY-F1 按 finding 家族累计，避免修复反复失败时
+        # 无限产生 -R2/-R3。
+        prefix = base_id
         rows = []
         for item in state.get("actions") or []:
             aid = str(item.get("id") or "")
@@ -5176,7 +3997,7 @@ def derive_work(state: dict, *, reason: str = "partial",
         if len(created) >= MAX_DERIVED_PER_CALL:
             return
         # 同一缺口已有可领取/进行中的工作项时不再派生第二条。重复调用 drive 或
-        # 多个治理入口同时求值时，不能把 AUTO-G4 / AUTO-C1 无限复制成 -R2/-R3。
+        # 多个治理入口同时求值时，不能把 AUTO-C1 无限复制成 -R2/-R3。
         for item in state.get("actions") or []:
             if not isinstance(item, dict):
                 continue
@@ -5185,7 +4006,7 @@ def derive_work(state: dict, *, reason: str = "partial",
                     str(item.get("status") or "") in ("pending", "running"):
                 return
         attempts = previous_attempts(base_id) if base_id.startswith(
-            ("AUTO-C", "AUTO-R-", "AUTO-G4", "AUTO-FIX-", "AUTO-VERIFY-")) else []
+            ("AUTO-C", "AUTO-R-", "AUTO-FIX-", "AUTO-VERIFY-")) else []
         if len(attempts) >= 3 and not any(
                 str(a.get("id") or "") == "AUTO-REPLAN"
                 and str(a.get("status") or "") in ("pending", "running")
@@ -5329,8 +4150,9 @@ def derive_work(state: dict, *, reason: str = "partial",
             "不得自行接受 PWW，用户明确接受后才能 accept。",
             "新的 verify 报告、替代/解决声明、代码快照摘要与 G2 通过结果",
             origin="quality-gate")
-    # Finding 台账优先于“再派一次复核”：未闭合的 blocking/major 先修复，已修复
-    # 未验证的做定向测试验证。只有台账清零后，高风险任务才重新进入 G4 派发。
+    # 未闭合的 blocking/major 先修复，已修复未验证的做定向测试验证。G4 退役后
+    # 这里不再派生复核工作项：SOL 复核是 advisory，是否调用由主代理按风险决定，
+    # 不能变成一条阻塞收口的工作单。
     unresolved_findings = RP.blocking_findings(state)
     for item in unresolved_findings[:MAX_DERIVED_PER_CALL]:
         fid = str(item.get("finding_id") or "")
@@ -5356,58 +4178,6 @@ def derive_work(state: dict, *, reason: str = "partial",
             "同类问题请一并检查，不要只修表面位置。",
             "修复后的 diff、定向测试输出与 `finding` fixed/verified 回执",
             origin="finding-fix")
-
-    g4_reasons = [r for r in check.get("reasons") or [] if r.get("gate") == "G4"]
-    if g4_reasons and not unresolved_findings and \
-            str(state.get("risk") or "").lower() == "high":
-        done_g4 = [a for a in state.get("actions") or []
-                   if str(a.get("origin") or "") == "g4-review"
-                   and str(a.get("status") or "") == "done"]
-        capability_codes = _latest_capability_rejections(state)
-        if capability_codes:
-            # 同一宿主/Profile 能力缺口不会因为再派一次相同的只读会话而消失；
-            # 先让主代理诊断并修正环境（Profile 工具集/会话模式/宿主记录），
-            # 确实无法在授权内修复时如实 block，而不是反复无效派发。
-            add("AUTO-G4-CAPABILITY", "处理 G4 宿主/Profile 能力缺口",
-                "最近一次 G4 取证给出的拒绝码属于能力缺口而非复核质量问题："
-                + ", ".join(capability_codes) + "。先运行 "
-                "`native_agent.py capability --metadata <metadata.json>` 复核实际权限与"
-                "子会话执行模式；能修的（Profile tools/disallowedTools、会话 profile "
-                "加载、plan 模式下的 Bash 注入）在主代理侧修复后重新派发新的只读会话与 "
-                "attempt；确属宿主能力缺失（例如 plan 模式无法退出）时用 block 记录原因"
-                "与解除条件。不要原样重复同一个无效派发。",
-                "capability 诊断输出、修正后的 Profile/会话证据与新 attempt，或明确的 "
-                "block 记录（含宿主版本、能力探测结果与解除条件）",
-                origin="g4-review")
-        elif done_g4:
-            # 复核做过但 G4 仍未通过：多半是信封未回填、绑定过期或被拒绝。
-            add("AUTO-G4-INGEST", "回填或重新生成 G4 复核信封",
-                "已有标记完成的 G4 复核工作项，但门禁仍缺可用复核记录。请检查："
-                "复核信封是否已用 ingest 回填、是否绑定当前最终证据摘要、是否带有效的 "
-                "review_attempt_id（未消费、目标未过期、Reviewer 会话晚于 attempt "
-                "且 prompt 含该 id）、是否因 blocking/unverified/changed_files 被拒绝。"
-                "旧版无 attempt 的 PASS 不能复用；绑定过期或已消费时必须新建 attempt "
-                "并重新复核，不得把旧结论当作当前通过的证据。",
-                "回填成功的复核记录（g4_eligible=true、review_attempt_id 已消费且 "
-                "target_sha256 等于当前摘要）或新的复核信封与拒绝原因分析",
-                origin="g4-review")
-        else:
-            add("AUTO-G4", "完成高风险 G4 原生独立复核",
-                "先把所有完成条件核销、证据登记完整并确认摘要稳定，再做一次最终独立只读"
-                "复核：复核真实文件、diff、测试日志与原始证据，绑定 task/contract/"
-                "work_item/execution_result_sha256；派发前用 review-context "
-                "--create-attempt 固化快照并把 review_attempt_id 写入 Reviewer prompt，"
-                "用 native_agent.py review --attempt 生成信封，再用 ingest 回填。若已有"
-                "可用基线复核（PASS、g4_eligible、带覆盖快照且通过当前 attempt/宿主/"
-                "证据信任检查），用 --based-on <基线复核.json> 做增量复核，只覆盖基线"
-                "之后新增/变更的证据；条件、合同或基线信任变化时仍须完整复核。PASS 后"
-                "把 minor 记录为 findings、把已核实非缺陷风险记录为 residual_risks，"
-                "不要仅为清理它们修改证据并重开完整复核。",
-                "复核信封（verdict=pass、无 blocking、unverified 为空、changed_files 为空、"
-                "g4_eligible=true、review_attempt_id 有效）与最终证据摘要绑定；"
-                "review-context 中 pending criteria 与证据漂移 warnings 为空"
-                "（增量复核的旧 PASS warning 需说明处置）",
-                origin="g4-review")
 
     if not created:
         failing = [a for a in state.get("actions") or []
@@ -5493,18 +4263,26 @@ def _evaluate_core(state: dict, *, cache: dict | None = None) -> dict:
     check = closure_check(state, cache=cache)
     if check["passed"]:
         quality = quality_summary(state, cache=cache)
-        reason = "完成条件与四门全部通过"
+        reason = "完成条件与 G1–G3 全部通过"
         if quality.get("verdict") == PWW:
-            reason = ("四门通过，质量结论为已接受的 PASS_WITH_WARNINGS（"
+            reason = ("G1–G3 通过，质量结论为已接受的 PASS_WITH_WARNINGS（"
                       + "、".join(quality.get("accepted_ids") or []) + "）")
+        commands = ["copilot_auto.py drive --state <state>（收口）",
+                    "或 copilot_dispatch.py closure --state <state> --close"]
+        # 高风险任务建议一次 SOL 独立复核；advisory，不改变 PASS 判定。
+        if str(state.get("risk") or "").lower() == "high" and not [
+                item for item in state.get("sol_reviews") or []
+                if isinstance(item, dict) and item.get("status") == "completed"]:
+            commands.append(
+                "可选：copilot_dispatch.py sol-review --state <state> --materials "
+                "<materials.md>（高风险建议一次独立复核，advisory）")
         return {
             "phase": "PASS", "reason": reason,
             "actions": [], "stalled": [], "gate": check, "criteria": criteria,
-            "next_commands": ["copilot_auto.py drive --state <state>（收口）",
-                              "或 copilot_dispatch.py closure --state <state> --close"],
+            "next_commands": commands,
         }
     return {
-        "phase": "PARTIAL", "reason": "四门未通过",
+        "phase": "PARTIAL", "reason": "G1–G3 未通过",
         "actions": [], "stalled": [], "gate": check, "criteria": criteria,
         "next_commands": ["copilot_auto.py drive --state <state>（按门禁缺口派生工作项）"],
     }
@@ -5533,12 +4311,12 @@ def _assert_open(state: dict, action: str, *, allow_blocked: bool = False) -> No
     """CLOSED 一律拒绝；BLOCKED 只拒绝改变范围/授权/收口的动作。
 
     事实性进展（证据、工作项结果、条件核销、报告、判断、正式 REVIEW 登记/修订）
-    在 BLOCKED 下允许登记，因为它们不解除阻塞、不绕过 G1–G4，也不改变合同或
+    在 BLOCKED 下允许登记，因为它们不解除阻塞、不绕过 G1–G3，也不改变合同或
     授权；`close_task` 仍单独拒绝未解除的阻塞。破坏性操作（`drop_evidence`）
     与可能改变范围的操作（`plan_state`、`add_decision`）保持拒绝。
 
     `amend_contract` 是单独的显式合同修订通道，BLOCKED 下仍允许；它会更新合同
-    指纹并使旧正式 REVIEW 授权/G4 绑定失效，因此不属于本函数的普通写入白名单。
+    指纹并使旧正式 REVIEW 授权失效，因此不属于本函数的普通写入白名单。
     """
     if bool((state.get("closure") or {}).get("closed")):
         raise GovernanceError(
@@ -5587,9 +4365,9 @@ def render_status(state: dict, evaluation: dict | None = None, *,
     if ev.get("gate") is not None:
         gate = ev["gate"]
         if isinstance(gate, dict) and "gates" in gate:
-            lines.append("四门：" + " ".join(
+            lines.append("三道门：" + " ".join(
                 f"{name}={'PASS' if gate['gates'][name].get('passed') else 'FAIL'}"
-                for name in ("G1", "G2", "G3", "G4")))
+                for name in ("G1", "G2", "G3")))
             for item in gate.get("reasons") or []:
                 lines.append(f"  - {item.get('gate')}:{item.get('code')} {item.get('detail')}")
     elif reason:

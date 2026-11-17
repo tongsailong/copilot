@@ -2,7 +2,7 @@
 """任务代码范围快照：由宿主从 git 工作区生成，不依赖 Reviewer 自报。
 
 该模块只读本地 git 状态与文件内容，不调用模型、不写任务状态、不访问网络。
-`governance.py` 在创建 review attempt 与 G2/G4 复核时调用它。
+`governance.py` 在生成执行快照与质量报告代码范围时调用它。
 """
 from __future__ import annotations
 
@@ -52,7 +52,7 @@ def snapshot_digest(snapshot: dict) -> str:
 
 
 def canonical_json(value: object) -> str:
-    """确定性 JSON：G4 摘要/绑定 id 的唯一序列化口径。"""
+    """确定性 JSON：代码快照与绑定 id 的唯一序列化口径。"""
     return json.dumps(value, ensure_ascii=False, sort_keys=True,
                       separators=(",", ":"))
 
@@ -167,7 +167,7 @@ def safe_path_excludes(paths: list[str], workspace: str,
 
 def safe_evidence_excludes(state: dict, workspace: str,
                            base: str = "") -> list[str]:
-    """G4 代码快照可排除的 evidence：仅限未被 git 跟踪的证据产物。
+    """执行/质量代码快照可排除的 evidence：仅限未被 git 跟踪的证据产物。
 
     被 git 跟踪的源文件即使登记为 evidence，也不能从代码快照消失；未跟踪的
     证据文件（日志/截图/输出）仍排除，避免新增证据被误判为源码变化。
@@ -423,7 +423,7 @@ def capture_code_snapshot(workspace: str = "",
 
     覆盖 tracked 修改、untracked、删除、重命名；`.gitignore` 排除构建输出，
     治理临时目录与常见缓存目录另行排除。证据文件是否排除由调用方决定：质量报告
-    不排除已登记证据；G4 只排除未被 git 跟踪的证据产物，已跟踪源文件即使登记为
+    不排除已登记证据；只有未被 git 跟踪的证据产物才可排除，已跟踪源文件即使登记为
     证据也必须进入快照。证据内容由独立证据快照绑定。
 
     `cache` 是**单次命令内**的复用容器（同一进程内同一工作区的快照只算一次）。

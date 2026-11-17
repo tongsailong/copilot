@@ -31,59 +31,6 @@ class CodeAssertions(unittest.TestCase):
         self.assertEqual(ctx.exception.code, code, str(ctx.exception))
 
 
-class ReviewDiagnosticsTests(F.BridgeBase):
-    def _state_with_review(self, **overrides) -> dict:
-        review = self.review()
-        state = G.load_state(self.state_path)
-        target = str(overrides.get("target_sha256") or review["target_sha256"])
-        attempt = F.fake_attempt(
-            state, target=target, work_item="A1", consumed=True,
-            reviewer=review["reviewer"], workspace=self.dir)
-        attempt.update({
-            "plan_id": review["plan_id"],
-            "plan_sha256": review["plan_sha256"],
-            "dispatch_id": review["dispatch_id"],
-            "execution_result_sha256": review["execution_result_sha256"],
-        })
-        review["review_attempt_id"] = attempt["review_attempt_id"]
-        review["review_attempt_created_at"] = attempt["created_at"]
-        review["g4_source"] = "candidate"
-        review["candidate_g4"] = {"eligible": True, "reasons": []}
-        review["coverage"] = NB.review_coverage(state)
-        review.update(overrides)
-        state["native_reviews"] = [review]
-        return state
-
-    def test_stale_review_detail_names_changed_evidence(self):
-        state = self._state_with_review(target_sha256="0" * 64)
-        extra = os.path.join(self.dir, "extra.txt")
-        with open(extra, "w", encoding="utf-8") as fh:
-            fh.write("extra\n")
-        G.register_evidence(state, "E9", file_path=extra)
-        G.save_state(self.state_path, state)
-        gate = G._gate_review(G.load_state(self.state_path))
-        self.assertFalse(gate["passed"])
-        reason = gate["reasons"][0]
-        self.assertEqual(reason["code"], "native_review_stale")
-        self.assertIn("目标摘要已过期", reason["detail"])
-        self.assertIn("E9", reason["detail"])
-
-    def test_stale_review_without_coverage_says_so(self):
-        state = self._state_with_review(target_sha256="0" * 64)
-        state["native_reviews"][0].pop("coverage", None)
-        G.save_state(self.state_path, state)
-        gate = G._gate_review(G.load_state(self.state_path))
-        self.assertEqual(gate["reasons"][0]["code"], "native_review_stale")
-        self.assertIn("没有覆盖快照", gate["reasons"][0]["detail"])
-
-    def test_contract_mismatch_detail_is_actionable(self):
-        state = self._state_with_review(contract_sha256="f" * 64)
-        G.save_state(self.state_path, state)
-        gate = G._gate_review(G.load_state(self.state_path))
-        reason = gate["reasons"][0]
-        self.assertEqual(reason["code"], "native_review_contract_mismatch")
-        self.assertIn("合同指纹不一致", reason["detail"])
-        self.assertIn("完整复核", reason["detail"])
 
 
 class IterationLifecycleTests(unittest.TestCase):

@@ -3,22 +3,21 @@
 Copilot 是运行于 ZCode 内的**轻量协作治理 Skill**：用户侧 ChatGPT 负责需求与产品层目标、
 交接与验收；ZCode 原生 Agent（主代理）是工程执行与技术决策主体，负责现场调查、规划、实现、
 调试、测试与验证；Copilot 负责任务合同、完成条件、状态、证据、审计与收口门禁，并用 PARTIAL
-派生持续推进任务；高风险 G4 由宿主可证明只读的子代理承担独立复核。
+派生持续推进任务；独立质量审查由 SOL 零工具单轮复核按风险提供。
 
-**v7.0.0 起普通复核改为 SOL 零工具单轮复核**：主代理完成开发、自检与测试后，按需调用
-`copilot_dispatch.py sol-review` 一次；SOL（既有本机 CPA `127` 通道的 `gpt-6.1-sol`）只
-阅读材料并返回结构化问题清单，工具定义不会出现在请求体中（并显式 `tool_choice="none"`）。
-一次复核只发一次请求；失败不重试、不换 Provider、不派原生 Reviewer；修复与验证仍由主代理
-完成。原生多轮 Reviewer 已退役，`native_agent.py review` / `review-context` / 原生复核
-ingest 只保留给高风险 G4。SOL 不是 G4，不能替代 G4 的 fail-closed 判定。
+**v8.0.0 起 G4 原生只读复核正式退役**：删除 `g4_attest.py`、`g4_shadow.py`、
+`test_execution.py`、原生复核信封与 `native_agent.py review/review-context/capability`。
+收口门禁收敛为 G1–G3（工作项终态、合同/条件/证据与 Finding 台账、无停摆），不再产生
+`g4_eligible`、G4 PASS、G4 BLOCKED、`AUTO-G4*` 或 `host_capability_missing`；高风险任务
+不再绑定 native 后端。原 G4 的“未闭合 blocking/major 阻断收口”安全职责并入 G2，对所有
+风险等级生效。历史 `native_reviews` / `review_attempts` / `g4_attestations` 只读保留用于
+审计，不参与新任务准入或收口。
 
-**v6.12.0 起 G4 只读能力按宿主“有效会话状态”准入，并按原定架构限定载体来源**：
-ZCode 3.18.2 的内置子代理只有 `Explore`（含 Bash）与 `general-purpose`（全工具），没有
-精确只读载体；`.zcode/agents/independent-readonly.md` 是 **project 级自定义 Agent**，
-不是内置子代理，因此不作为正式 G4 方案。G4 现在要求 `profileSnapshot.source=built-in`
-且子会话 `runtime/execution_state.planEnabled=false`（plan 模式会给子代理注入 Bash）；
-项目/用户 Profile 返回 `profile_source_not_builtin`。当前宿主的正式 G4 结论为
-**BLOCKED**，技术只读链（capability/attempt/attest）保留但不冒充合规 PASS。
+**v7.0.0 起独立模型复核走 SOL 零工具单轮复核**：主代理完成开发、自检与测试后，按风险
+调用 `copilot_dispatch.py sol-review` 一次；SOL（既有本机 CPA `127` 通道的 `gpt-6.1-sol`）
+只阅读材料并返回结构化问题清单，工具定义不会出现在请求体中（并显式
+`tool_choice="none"`）。一次复核只发一次请求；失败不重试、不换 Provider。SOL 是 advisory，
+不构成收口门禁，也不证明宿主只读权限；修复与验证仍由主代理完成。
 
 **v6.11.0 起命令开销按“一次命令一次快照”收敛**：`sync_runtime.py --apply` 同步后预编译
 运行时字节码（文档命令用 `python3 -B`，只禁止写 `.pyc`），单次命令不再重复编译源码；
@@ -33,8 +32,8 @@ ZCode 3.18.2 的内置子代理只有 `Explore`（含 Bash）与 `general-purpos
 本仓库是**唯一源码**；`~/.zcode/skills/copilot` 是构建产物，只允许从本仓库单向下发。
 旧 Reviewer 全局 Profile 已退役。工作区保留一个**通用只读能力载体**
 `.zcode/agents/independent-readonly.md`（Read/Grep/Glob，无 Bash/Write/Edit），
-只提供宿主级权限，不定义 Reviewer 身份或复核流程，普通任务不强制使用。按 v6.12 的载体
-来源约束，它是 project 级自定义 Agent，**不是正式 G4 载体**；当前宿主正式 G4 仍为 BLOCKED。
+只提供宿主级权限，供主代理按需做独立只读调查；它不定义 Reviewer 身份、不参与收口门禁，
+普通任务不强制使用。
 
 ## 目录
 
@@ -43,13 +42,13 @@ copilot/
 ├── AGENTS.md                # 项目执行规则（不分发）
 ├── SKILL.md                 # Skill 入口与运行契约（分发）
 ├── scripts/                 # 运行时脚本（分发）
-│   ├── governance.py        # 本地治理引擎：合同、状态、阶段、四门、PARTIAL 派生
+│   ├── governance.py        # 本地治理引擎：合同、状态、阶段、G1–G3、PARTIAL 派生
 │   ├── copilot_dispatch.py  # CLI：任务、计划、证据、收口、正式 REVIEW、历史只读
-│   ├── copilot_auto.py      # 驱动：drive（推进/工作单/派生）与 ingest（回填信封）
+│   ├── copilot_auto.py      # 驱动：drive（推进/工作单/派生）与 ingest（执行信封回填）
 │   ├── sol_review.py        # SOL 零工具单轮复核：请求/解析/审计（唯一远程调用）
-│   ├── native_bridge.py     # Native Bridge v2 协议与信封校验（G4）
-│   ├── native_agent.py      # 从宿主运行记录生成正式执行/复核信封
-│   ├── agent_policy.py      # Agent 调度建议与宿主权限能力判定（只读纯函数）
+│   ├── native_bridge.py     # Native Bridge v2 执行信封协议与校验
+│   ├── native_agent.py      # 从宿主运行记录生成正式执行信封
+│   ├── agent_policy.py      # Agent 调度建议（只读纯函数）
 │   ├── bridge_evidence.py   # 证据采集：脱敏、截断标记、清单
 │   └── lib_common.py        # 公共工具
 ├── references/              # 协议与操作参考（分发）
@@ -104,6 +103,6 @@ copilot/
   仍须用户明确授权。
 - SOL 复核复用既有本机 CPA 配置，不新增 Provider、账户、密钥或付费方案；审计只记脱敏元数据，
   不回显凭据。
-- G4 门禁保持 fail-closed；SOL 复核与普通原生 Reviewer 的结论都不等于 G4。
+- G1–G3 门禁保持 fail-closed；SOL 复核是 advisory，不替代证据、测试或授权判断。
 - 不在源码仓库或运行时分发物中保存 API Key、凭据、真实审计日志或临时任务状态。
 - 不删除历史审计与证据；历史材料只读保留。

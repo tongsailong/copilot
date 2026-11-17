@@ -4,7 +4,7 @@
 本模块只做纯计算，不读写任务状态、不调用模型、不访问网络。治理层在
 `governance.py` 中负责加锁、持久化与门禁；`native_agent.py` 只用它生成
 派发前的准入/停止建议。所有判断都必须能从状态里的真实记录重算，不接受
-Reviewer 或调用方自述作为唯一证据。
+复核方或调用方自述作为唯一证据。
 
 设计约束
 --------
@@ -13,7 +13,8 @@ Reviewer 或调用方自述作为唯一证据。
   根因换一种说法仍是同一条，已关闭问题没有新证据不得重复登记为新问题。
 * 停止条件是状态事实：PASS 的目标/代码范围与当前一致时，不因 Reviewer 还能
   提出建议而重开；minor/info 不阻断，也不触发复核。
-* 纯文档/格式调整不需要独立复核；高风险任务原有 G4 fail-closed 不变。
+* 纯文档/格式调整不需要独立复核；高风险任务建议一次 SOL 零工具单轮复核
+  （advisory，不是收口门禁）。
 """
 from __future__ import annotations
 
@@ -38,30 +39,6 @@ SEVERITY_ORDER = {"blocking": 0, "major": 1, "minor": 2, "info": 3}
 # `normal` 是历史风险标签，语义等同于 `medium`；读取旧状态时按 medium 处理。
 REVIEW_TIERS = ("low", "medium", "high")
 RISK_TIER = {"low": "low", "medium": "medium", "normal": "medium", "high": "high"}
-
-# 这些拒绝码表示“当前宿主/Profile 能力不满足 G4”，而不是这次复核质量不好。
-# 命中时不应盲目重新派发同一个只读会话（同一环境会得到同样结果），而应先在
-# 主代理侧修正 Profile/会话模式，或如实 BLOCKED 并报告能力缺口。
-CAPABILITY_REJECTION_CODES = frozenset({
-    "profile_source_not_builtin",
-    "profile_tools_empty",
-    "profile_tools_not_exact",
-    "profile_disallowed_missing",
-    "profile_permission_mode",
-    "profile_skills_not_allowed",
-    "profile_mcp_servers",
-    "profile_path_missing",
-    "profile_system_prompt_missing",
-    "profile_content_mismatch",
-    "host_session_missing",
-    "host_session_parent_mismatch",
-    "host_session_kind_mismatch",
-    "host_session_state_missing",
-    "host_session_state_unknown",
-    "host_session_plan_mode",
-    "host_model_selection_missing",
-    "host_tool_usage_missing",
-})
 
 # 中风险任务按需复核的触发因素；没有触发因素时默认不派 Reviewer。
 ADMISSION_TRIGGERS = {
@@ -99,10 +76,6 @@ TRIGGER_ALIASES = {
     "production": "risk-changed",
     "release": "risk-changed",
 }
-
-DOC_SUFFIXES = (".md", ".markdown", ".txt", ".rst", ".adoc", ".org")
-DOC_NAMES = {"LICENSE", "NOTICE", "CHANGELOG", "AUTHORS", "CONTRIBUTORS"}
-
 
 class ReviewPolicyError(ValueError):
     """策略输入不合法；调用方必须显式报告，不得静默降级。"""
@@ -265,11 +238,12 @@ def merge_review(state: dict, review: dict, *, at: str = "",
                  authoritative: bool = True) -> dict:
     """把一条复核的 findings 合并进稳定台账。
 
-    `authoritative=False`（非正式 G4 / 只有参考价值的复核）只能新增或重复报告
-    finding，不能把已有问题改成 verified；否则一条 g4_eligible=false 的结论就能
-    清掉 blocking/major，绕过 G4/G2。若参考性复核把已关闭的 minor/info 提级为
-    blocking/major，则允许标为 regressed（重新阻断，不是清除）。真正的生命周期
-    推进必须来自正式 G4 或 ZCode 用定向测试证据执行的 `finding` 命令。
+    `authoritative=False`（advisory 复核，例如 SOL）只能新增或重复报告 finding，
+    不能把已有问题改成 verified；否则一条参考性结论就能清掉 blocking/major。
+    若参考性复核把已关闭的 minor/info 提级为 blocking/major，则允许标为
+    regressed（重新阻断，不是清除）。真正的生命周期推进必须来自 ZCode 用定向
+    测试证据执行的 `finding` 命令；v7 及更早的正式 G4 记录仍按 authoritative
+    读取，保持历史保护级别。
 
     返回 `refs` 供复核记录固化为 `finding_refs`；同一复核重复合并必须幂等
     （按 review sha 不重复累计 occurrences）。
@@ -292,7 +266,7 @@ def merge_review(state: dict, review: dict, *, at: str = "",
             review_status = "open"
         if not authoritative:
             # 参考性复核不能推进生命周期；它的 resolved/regressed 只作为观察，
-            # 由 ZCode 的定向验证或正式 G4 重新判断。
+            # 由 ZCode 的定向验证重新判断。
             review_status = "open"
         item = _match(items, finding)
         action = "matched"
@@ -305,9 +279,10 @@ def merge_review(state: dict, review: dict, *, at: str = "",
                 "line": finding.get("line"),
                 "summary": _text(finding.get("summary")),
                 "status": "open",
-                # SOL 复核只提供建议（advisory），G4 复核是正式结论（authoritative）。
-                # advisory 的 blocking/major 可以由主代理在给出反证后 dismiss；
-                # authoritative 的 blocking/major 仍只能修复并定向验证。
+                # SOL 复核只提供建议（advisory）；v7 及更早的正式复核记录
+                # （authoritative）仍按原保护级别读取。advisory 的 blocking/major
+                # 可以由主代理在给出反证后 dismiss；authoritative 的只能修复并
+                # 定向验证。
                 "authority": "authoritative" if authoritative else "advisory",
                 "first_review_sha256": review_sha,
                 "last_review_sha256": review_sha,
@@ -338,13 +313,13 @@ def merge_review(state: dict, review: dict, *, at: str = "",
                 item["reported_ids"].append(reported)
         previous_evidence = _text(item.get("last_evidence"))
         if authoritative:
-            # 正式 G4 复核把同一 finding 升级为 authoritative，之后不再允许
-            # 仅凭执行方一句说明 dismiss。
+            # 权威复核把同一 finding 升级为 authoritative，之后不再允许仅凭
+            # 执行方一句说明 dismiss（历史 G4 记录与显式权威调用仍适用）。
             item["authority"] = "authoritative"
         else:
             # 参考性（SOL）复核不能降低已有条目的保护级别。v7 之前的台账条目
             # 没有 authority 字段，它们来自正式复核，必须保守按 authoritative
-            # 处理；只有本模块新建的 advisory 条目才带 advisory。
+            # 处理；只有 advisory 复核新建的条目才带 advisory。
             item.setdefault("authority", "authoritative")
         item["severity"] = _max_severity(item.get("severity"),
                                         finding.get("severity"))
@@ -496,9 +471,9 @@ def transition(state: dict, finding_id: str, status: str, *,
         severity = _text(item.get("severity")).lower()
         authority = _text(item.get("authority")) or "authoritative"
         if severity in BLOCKING_SEVERITIES and authority != "advisory":
-            # 执行方不能用一句 note 把正式复核（G4）的 blocking/major 从台账里
-            # 删掉：那等于绕过 G4/G2。必须先修复并定向验证，或由新的独立复核
-            # 标记 resolved。
+            # 执行方不能用一句 note 把权威复核的 blocking/major 从台账里删掉：
+            # 那等于绕过台账门禁。必须先修复并定向验证，或由新的权威记录标记
+            # resolved。
             raise ReviewPolicyError(
                 f"{finding_id} 是 {severity}，不能由执行方直接标记 dropped；"
                 "修复后用证据标记 verified，或由新的独立复核标记 resolved。"
@@ -601,10 +576,11 @@ def admission(*, risk: str = "medium", triggers: list[str] | None = None,
       默认不派 Reviewer；显式声明的实质触发因素仍然优先。
     * `medium`（含历史 `normal`）：普通开发/多页面 UI/常规重构——主代理完成
       开发与验证；只有声明实质触发因素时才建议一次定向只读复核。
-    * `high`：高风险任务仍走 G4，门禁不因复核频率优化而降低。
+    * `high`：建议执行一次 SOL 零工具单轮复核；它是 advisory，不是收口门禁，
+      但高风险任务仍须完成 G1–G3 与台账闭合。
 
     “针对性调查”不是正式复核：普通子 Agent 咨询、`Explore` 调查不会创建
-    review attempt、G4 任务或台账。
+    复核记录或台账。
     """
     tier = tier_for(risk)
     risk_value = _text(risk).lower()
@@ -623,8 +599,9 @@ def admission(*, risk: str = "medium", triggers: list[str] | None = None,
     base = {"schema": ADMISSION_SCHEMA, "risk": risk_value, "tier": tier,
             "triggers": requested, "reason": _text(reason)[:1000]}
     if tier == "high":
-        return {**base, "decision": "required", "scope": "g4",
-                "detail": "高风险任务收口需要 G4 原生独立只读复核（原有门禁不变）。"}
+        return {**base, "decision": "recommended", "scope": "sol",
+                "detail": "高风险任务建议执行一次 SOL 零工具单轮独立复核（advisory）；"
+                          "SOL 不构成收口门禁，也不证明宿主只读权限。"}
     if requested:
         return {**base, "decision": "required", "scope": "advisory",
                 "detail": "声明了实质风险或重入触发因素，建议派发一次定向只读复核；"
@@ -638,11 +615,9 @@ def admission(*, risk: str = "medium", triggers: list[str] | None = None,
                       "触发因素时才派发一次定向只读复核；不强制完整复核。"}
 
 
-def last_stop(state: dict, *, g4_only: bool = False) -> dict | None:
+def last_stop(state: dict) -> dict | None:
     stops = [item for item in state.get("review_stops") or []
              if isinstance(item, dict)]
-    if g4_only:
-        stops = [item for item in stops if item.get("g4_eligible") is True]
     if not stops:
         return None
     return max(stops, key=lambda item: _text(item.get("created_at")))
@@ -678,11 +653,9 @@ def record_stop(state: dict, review: dict, *, code_scope_sha256: str = "",
         "task_id": _text(review.get("task_id")),
         "work_item_id": _text(review.get("work_item_id")),
         "review_sha256": review_sha,
-        "review_attempt_id": _text(review.get("review_attempt_id")),
         "target_sha256": _text(review.get("target_sha256")),
         "code_scope_sha256": _text(code_scope_sha256),
         "verdict": "pass",
-        "g4_eligible": review.get("g4_eligible") is True,
         "authoritative": bool(authoritative),
         "findings": {
             "blocking": sum(1 for item in findings
@@ -702,50 +675,14 @@ def record_stop(state: dict, review: dict, *, code_scope_sha256: str = "",
     return stop
 
 
-def _changed_paths(previous: list[dict], current: list[dict]) -> list[str]:
-    before = {_text(item.get("path")): _text(item.get("sha256")) + "|"
-              + _text(item.get("status"))
-              for item in previous if isinstance(item, dict)}
-    now = {_text(item.get("path")): _text(item.get("sha256")) + "|"
-           + _text(item.get("status"))
-           for item in current if isinstance(item, dict)}
-    return sorted(path for path in set(before) | set(now)
-                  if before.get(path) != now.get(path))
+def reentry_decision(state: dict, *, target: str,
+                     triggers: list[str] | None = None,
+                     reason: str = "") -> dict:
+    """判断已有 PASS 之后是否允许再次独立复核。
 
-
-def _docs_only(paths: list[str]) -> bool:
-    if not paths:
-        return False
-    for path in paths:
-        name = os.path.basename(path)
-        lowered = name.lower()
-        if name in DOC_NAMES:
-            continue
-        if not lowered.endswith(DOC_SUFFIXES):
-            return False
-    return True
-
-
-def _attempt_for(state: dict, attempt_id: str) -> dict | None:
-    target = _text(attempt_id)
-    if not target:
-        return None
-    for attempt in state.get("review_attempts") or []:
-        if isinstance(attempt, dict) and \
-                _text(attempt.get("review_attempt_id")) == target:
-            return attempt
-    return None
-
-
-def reentry_decision(state: dict, *, target: str, code_scope_sha256: str = "",
-                     scope: str = "full", triggers: list[str] | None = None,
-                     reason: str = "", files: list[dict] | None = None) -> dict:
-    """判断已有 PASS 之后是否允许再次完整复核。
-
-    * 目标与代码范围都没变：直接复用上轮结论（`review_not_needed`）。
-    * 只有文档/格式变化且没有声明触发因素：按“文案调整不需要复核”停止。
-    * 代码或目标实质变化：必须声明 `REENTRY_TRIGGERS` 之一并写入原因，避免
-      用“再来一轮”掩盖非收敛；增量复核（有合法基线）不受此限。
+    * 目标摘要未变且没有声明触发因素：直接复用上轮结论（`review_not_needed`）。
+    * 目标实质变化：必须声明 `REENTRY_TRIGGERS` 之一并写入原因，避免用
+      “再来一轮”掩盖非收敛。局部修复优先用定向测试/证据验证。
     """
     requested = []
     for item in triggers or []:
@@ -754,7 +691,7 @@ def reentry_decision(state: dict, *, target: str, code_scope_sha256: str = "",
             requested.append(value)
     effective = [TRIGGER_ALIASES.get(item, item) for item in requested]
     unknown = [item for item in effective if item not in REENTRY_TRIGGERS]
-    stop = last_stop(state, g4_only=str(state.get("risk") or "").lower() == "high")
+    stop = last_stop(state)
     if stop is None:
         # 首次复核：triggers 属于风险准入词汇（security/core-logic…），不是
         # 重入触发因素，不能拿 REENTRY_TRIGGERS 去拒绝。
@@ -766,51 +703,20 @@ def reentry_decision(state: dict, *, target: str, code_scope_sha256: str = "",
                           + "；可选：" + ", ".join(sorted(REENTRY_TRIGGERS)) + "。",
                 "triggers": requested, "stop_id": stop.get("stop_id")}
     same_target = _text(stop.get("target_sha256")) == _text(target)
-    same_code = _text(stop.get("code_scope_sha256")) == _text(code_scope_sha256)
-    if same_target and same_code and not requested:
+    if same_target and not requested:
         return {"allowed": False, "code": "review_not_needed",
-                "detail": "当前目标摘要与代码范围与上轮 PASS 完全相同；直接复用"
-                          "该结论，不重新派发复核。如确有新的实质风险，"
-                          "用 --trigger 显式声明重入原因。",
+                "detail": "当前目标摘要与上轮 PASS 完全相同；直接复用该结论，"
+                          "不重新派发复核。如确有新的实质风险，用 --trigger "
+                          "显式声明重入原因。",
                 "triggers": requested, "stop_id": stop.get("stop_id")}
-    if scope == "incremental":
-        return {"allowed": True, "code": "", "detail":
-                "增量复核只覆盖基线之后的新增/变更证据；基线仍须可信。",
-                "triggers": requested, "stop_id": stop.get("stop_id")}
-    previous_files: list[dict] = []
-    attempt = _attempt_for(state, _text(stop.get("review_attempt_id")))
-    if attempt is not None:
-        previous_files = [item for item in
-                          (attempt.get("code_snapshot") or {}).get("files") or []
-                          if isinstance(item, dict)]
-    changed = _changed_paths(previous_files, [item for item in files or []
-                                              if isinstance(item, dict)])
-    docs_only = bool(changed) and _docs_only(changed)
-    if docs_only and not requested:
-        if stop.get("g4_eligible") is True:
-            # 高风险 G4 的代码范围包含 tracked 文档；文档变化同样使旧快照失效。
-            # 这不是“低风险文案任务可省略复核”，而是必须重新做一次 G4。
-            return {"allowed": True, "code": "",
-                    "detail": "G4 PASS 之后文档/格式文件变化改变了代码范围，原 G4 "
-                              "不再覆盖当前快照；需要重新完整复核（高风险门禁不变）。",
-                    "triggers": requested, "stop_id": stop.get("stop_id"),
-                    "changed_paths": changed, "docs_only": True}
-        return {"allowed": False, "code": "review_not_needed_docs_only",
-                "detail": "上轮 PASS 之后只有文档/格式文件变化（"
-                          + ", ".join(changed[:8]) + "）：文案调整不需要独立复核；"
-                          "如需改变风险判断，请显式声明 --trigger 与 --reason。",
-                "triggers": requested, "stop_id": stop.get("stop_id"),
-                "changed_paths": changed}
     if not requested:
         return {"allowed": False, "code": "review_reentry_requires_trigger",
-                "detail": "已有 PASS 且目标/代码范围发生变化；重新完整复核前必须"
-                          "声明实质触发因素（--trigger）与原因（--reason）。"
-                          "局部修复优先用定向测试/证据验证，不要默认重跑完整复核。",
-                "triggers": requested, "stop_id": stop.get("stop_id"),
-                "changed_paths": changed}
+                "detail": "已有 PASS 且目标发生变化；重新完整复核前必须声明实质"
+                          "触发因素（--trigger）与原因（--reason）。局部修复优先用"
+                          "定向测试/证据验证，不要默认重跑完整复核。",
+                "triggers": requested, "stop_id": stop.get("stop_id")}
     return {"allowed": True, "code": "",
             "detail": "允许重新复核：" + "、".join(
                 REENTRY_TRIGGERS[item] for item in effective),
             "triggers": requested, "stop_id": stop.get("stop_id"),
-            "changed_paths": changed, "docs_only": docs_only,
             "reason": _text(reason)[:1000]}

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""v6 本地治理引擎回归：合同、四门、PARTIAL 推进、证据完整性、CAS、历史只读。"""
+"""本地治理引擎回归：合同、三道门、PARTIAL 推进、证据完整性、CAS、历史只读。"""
 from __future__ import annotations
 
 import json
@@ -15,13 +15,6 @@ SCRIPTS = os.path.join(ROOT, "scripts")
 sys.path.insert(0, SCRIPTS)
 
 import governance as G  # noqa: E402
-
-# 只读复核 Profile 的有效权限策略：判定只看策略，不看 Profile 名称。
-READONLY_REVIEWER_PROFILE = {
-    "tools": ["Read", "Grep", "Glob"],
-    "disallowedTools": ["Write", "Edit", "Bash"],
-    "permissionMode": "default",
-}
 
 CONTRACT = """## 完成条件
 - 产出可复核的结果文件
@@ -270,7 +263,17 @@ class PartialPersistenceTests(unittest.TestCase):
         self.assertEqual(evaluation["actions"], ["A1"])
 
 
-class HighRiskGateTests(unittest.TestCase):
+class HighRiskRetirementTests(unittest.TestCase):
+    """v8：G4 已退役。高风险任务不再需要原生只读复核，但安全约束保持。
+
+    锁定行为：
+    * 高风险任务可用 legacy 后端创建（不再强制 native）；
+    * closure 只有 G1–G3，没有 G4；
+    * 历史 native_reviews / review_attempts / g4_attestations 不参与门禁；
+    * 未闭合 blocking/major finding 仍然阻断收口（原 G4 的台账检查保留）；
+    * derive_work 不再派生 AUTO-G4 工作项。
+    """
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -278,7 +281,7 @@ class HighRiskGateTests(unittest.TestCase):
         init_git(self.dir)
         self.state = os.path.join(self.dir, "state.json")
         G.start_state(self.state, goal="目标", contract=CONTRACT, risk="high",
-                      execution_backend="native",
+                      execution_backend="legacy",
                       test_policy={"required": False})
         G.plan_state(self.state, {"summary": "s", "actions": [
             {"id": "A1", "title": "实现", "goal": "产出结果",
@@ -290,229 +293,102 @@ class HighRiskGateTests(unittest.TestCase):
         G.record_action(self.state, "A1", "done", result="完成", evidence_ids=["E1"])
         G.record_criterion(self.state, "C1", "met", evidence_ids=["E1"])
 
-    def _review(self, **overrides) -> dict:
-        state = G.load_state(self.state)
-        target = str(overrides.get("target_sha256")
-                     or G.final_evidence_digest(state))
-        attempt_id = overrides.pop("review_attempt_id",
-                                   "RA" + os.urandom(12).hex())
-        code_snapshot = G.capture_code_snapshot(
-            self.dir, exclude_paths=G._evidence_paths(state))
-        attempt = {
-            "review_attempt_id": attempt_id,
-            "task_id": state["task_id"],
-            "contract_sha256": state["contract_sha256"],
-            "plan_id": "",
-            "plan_sha256": "",
-            "dispatch_id": "",
-            "work_item_id": "AUTO-G4",
-            "execution_result_sha256": "",
-            # 夹具模拟“派发时固化、之后目标变化”的旧 attempt：目标摘要与
-            # 复核记录一致，从而让门禁按 native_review_stale 拒绝。
-            "target_sha256": target,
-            "criteria_sha256": G._review_criteria_state_digest(state),
-            "code_snapshot": code_snapshot,
-            "code_scope_sha256": code_snapshot.get("digest") or "",
-            "evidence_snapshot": G._review_evidence_snapshot(state),
-            "review_scope": "full",
-            "based_on_review_sha256": "",
-            "evidence_manifest": [],
-            "created_at": G.now_iso(),
-            "created_by": "test",
-            "consumed": True,
-            "consumed_by_result_sha256": "r" * 64,
-            "consumed_at": G.now_iso(),
-            "reviewer": {"agent_id": "agent-1", "child_session_id": "child-1"},
-        }
-        state.setdefault("review_attempts", []).append(attempt)
-        review = {
-            "task_id": state["task_id"],
-            "contract_sha256": state["contract_sha256"],
-            "work_item_id": "AUTO-G4",
-            "verdict": "pass",
-            "findings": [],
-            "unverified": [],
-            "changed_files": [],
-            "g4_eligible": True,
-            "g4_source": "candidate",
-            "candidate_g4": {"eligible": True, "reasons": []},
-            "target_sha256": target,
-            "review_attempt_id": attempt_id,
-            "review_attempt_created_at": attempt["created_at"],
-            "result_sha256": "r" * 64,
-            "reviewer": {"profile_id": "reviewer", "agent_id": "agent-1",
-                         "child_session_id": "child-1",
-                         "profile": READONLY_REVIEWER_PROFILE},
-            "host": {"metadata_path": "/tmp/meta.json",
-                     "output_file": "/tmp/out.txt",
-                     "rollout_path": "/tmp/rollout.jsonl",
-                     "tool_calls": [{"name": "Read", "count": 1}],
-                     "agent_id": "agent-1", "child_session_id": "child-1",
-                     "workspace_root": self.dir},
-        }
-        review["host_sha256"] = G._sha256_text(G.canonical_json(review["host"]))
-        review.update(overrides)
-        state.setdefault("native_reviews", []).append(review)
-        G.save_state(self.state, state)
-        return review
-
-    def test_high_risk_without_review_fails_closed(self):
-        state = G.load_state(self.state)
-        check = G.closure_check(state)
-        g4 = [r for r in check["reasons"] if r["gate"] == "G4"]
-        self.assertEqual(g4[0]["code"], "native_review_missing")
-        self.assertEqual(G.evaluate(state)["phase"], "PARTIAL")
-
-    def test_high_risk_with_bound_review_passes(self):
-        self._review()
-        state = G.load_state(self.state)
-        self.assertEqual(G.evaluate(state)["phase"], "PASS")
-        self.assertTrue(G.close_task(self.state)["closed"])
-
-    def test_stale_review_target_fails_closed(self):
-        self._review(target_sha256="0" * 64)
+    def test_high_risk_closes_without_native_review(self):
         check = G.closure_check(G.load_state(self.state))
-        codes = {r["code"] for r in check["reasons"]}
-        self.assertIn("native_review_stale", codes)
+        self.assertEqual(set(check["gates"]), {"G1", "G2", "G3"})
+        self.assertEqual(check["reasons"], [])
+        closure = G.close_task(self.state)
+        self.assertEqual(closure["verdict"], "pass")
+        self.assertEqual(G.evaluate(G.load_state(self.state))["phase"], "CLOSED")
 
-    def test_review_must_be_pass_without_unverified_or_blocking(self):
-        self._review(verdict="partial")
-        codes = {r["code"] for r in
-                 G.closure_check(G.load_state(self.state))["reasons"]}
-        self.assertIn("native_review_not_pass", codes)
+    def test_high_risk_accepts_legacy_backend(self):
         state = G.load_state(self.state)
-        state["native_reviews"] = []
+        self.assertEqual(state["risk"], "high")
+        self.assertEqual(state["execution_backend"], "legacy")
+
+    def test_historical_g4_records_do_not_gate(self):
+        state = G.load_state(self.state)
+        state["native_reviews"] = [{
+            "task_id": state["task_id"], "verdict": "pass",
+            "g4_eligible": True, "g4_source": "candidate",
+            "candidate_g4": {"eligible": True},
+            "target_sha256": "0" * 64, "findings": [], "unverified": [],
+        }]
+        state["review_attempts"] = [{"review_attempt_id": "RA" + "a" * 24,
+                                     "consumed": False}]
+        state["g4_attestations"] = [{"status": "rejected",
+                                     "new_g4_eligible": False}]
         G.save_state(self.state, state)
-        self._review(unverified=["未验证项"])
-        codes = {r["code"] for r in
-                 G.closure_check(G.load_state(self.state))["reasons"]}
-        self.assertIn("native_review_unverified", codes)
+        check = G.closure_check(G.load_state(self.state))
+        self.assertEqual(check["reasons"], [])
+        self.assertTrue(check["passed"])
 
-    def test_ledger_open_major_blocks_g4_despite_clean_pass(self):
-        self._review()
+    def test_unresolved_blocking_finding_blocks_high_risk_closure(self):
         state = G.load_state(self.state)
-        state["finding_ledger"] = {
-            "schema": "copilot-finding-ledger/v1", "next_id": 2,
-            "items": [{
-                "finding_id": "F1", "severity": "major", "status": "open",
-                "file": "src/a.py", "line": 7, "summary": "旧问题仍未修复",
-                "occurrences": 1,
-            }],
-        }
-        G.save_state(self.state, state)
-        codes = {r["code"] for r in
-                 G.closure_check(G.load_state(self.state))["reasons"]}
-        self.assertIn("native_review_finding_open", codes)
-
-        G.record_finding_status(self.state, "F1", "fixed",
-                                evidence_ids=["E1"])
-        codes = {r["code"] for r in
-                 G.closure_check(G.load_state(self.state))["reasons"]}
-        self.assertIn("native_review_finding_unverified", codes)
-
-        G.record_finding_status(self.state, "F1", "verified",
-                                evidence_ids=["E1"])
-        codes = {r["code"] for r in
-                 G.closure_check(G.load_state(self.state))["reasons"]}
-        self.assertNotIn("native_review_finding_open", codes)
-        self.assertNotIn("native_review_finding_unverified", codes)
-
-    def test_g4_review_action_does_not_invalidate_its_own_target(self):
-        state = G.load_state(self.state)
-        before = G.final_evidence_digest(state)
-        state["actions"].append({
-            "id": "AUTO-G4", "title": "复核", "origin": "g4-review",
-            "status": "pending", "result": "", "evidence_ids": [],
+        state.setdefault("finding_ledger", {}).setdefault("items", []).append({
+            "finding_id": "F1", "severity": "major", "status": "open",
+            "authority": "advisory", "summary": "未修复问题",
+            "root_cause": "未修复问题", "file": "", "line": None,
+            "occurrences": 1, "reported_ids": ["F1"], "history": [],
         })
-        self.assertEqual(G.final_evidence_digest(state), before)
-        state["actions"][-1]["status"] = "done"
-        state["actions"][-1]["result"] = "复核完成"
-        self.assertEqual(G.final_evidence_digest(state), before)
-
-    def test_review_from_other_task_is_rejected(self):
-        self._review(task_id="task-other")
-        codes = {r["code"] for r in
-                 G.closure_check(G.load_state(self.state))["reasons"]}
-        self.assertIn("native_review_foreign", codes)
-
-
-    def test_g4_rejections_are_fail_closed(self):
-        cases = [
-            ({"findings": [{"severity": "blocking", "summary": "x"}]},
-             "native_review_blocking"),
-            ({"unverified": ["未验证"]}, "native_review_unverified"),
-            ({"changed_files": ["a.py"]}, "native_review_changed_files"),
-            ({"g4_eligible": False}, "native_review_not_g4_eligible"),
-            ({"reviewer": {"profile_id": "reviewer", "agent_id": "agent-1",
-                           "child_session_id": "child-1",
-                           "profile": {**READONLY_REVIEWER_PROFILE,
-                                       "tools": ["Read", "Bash"]}}},
-             "native_review_profile_not_readonly"),
-            ({"reviewer": {"profile_id": "reviewer", "agent_id": "agent-1",
-                           "child_session_id": "child-1"}},
-             "native_review_profile_invalid"),
-            ({"contract_sha256": "0" * 64}, "native_review_contract_mismatch"),
-        ]
-        for overrides, code in cases:
-            with self.subTest(code=code):
-                state = G.load_state(self.state)
-                state["native_reviews"] = []
-                G.save_state(self.state, state)
-                self._review(**overrides)
-                codes = {r["code"] for r in
-                         G.closure_check(G.load_state(self.state))["reasons"]}
-                self.assertIn(code, codes)
-
-    def test_review_without_host_binding_is_rejected(self):
-        review = self._review()
-        state = G.load_state(self.state)
-        state["native_reviews"][-1] = {
-            k: v for k, v in review.items() if k != "host"}
         G.save_state(self.state, state)
-        codes = {r["code"] for r in
-                 G.closure_check(G.load_state(self.state))["reasons"]}
-        self.assertIn("native_review_host_missing", codes)
+        check = G.closure_check(G.load_state(self.state))
+        self.assertFalse(check["passed"])
+        self.assertIn("native_review_finding_open",
+                      [r["code"] for r in check["reasons"]])
 
-    def test_tampered_host_binding_is_rejected(self):
-        self._review()
+    def test_verified_finding_no_longer_blocks(self):
         state = G.load_state(self.state)
-        state["native_reviews"][-1]["host"]["agent_id"] = "agent-evil"
+        state.setdefault("finding_ledger", {}).setdefault("items", []).append({
+            "finding_id": "F1", "severity": "blocking", "status": "verified",
+            "authority": "authoritative", "summary": "已修复",
+            "root_cause": "已修复", "file": "", "line": None,
+            "resolved_severity": "blocking",
+            "occurrences": 1, "reported_ids": ["F1"], "history": [],
+        })
         G.save_state(self.state, state)
-        codes = {r["code"] for r in
-                 G.closure_check(G.load_state(self.state))["reasons"]}
-        self.assertIn("native_review_host_changed", codes)
+        check = G.closure_check(G.load_state(self.state))
+        self.assertTrue(check["passed"], check["reasons"])
 
-    def test_host_identity_must_match_reviewer(self):
-        self._review()
+    def test_derive_work_never_creates_g4_items(self):
         state = G.load_state(self.state)
-        host = state["native_reviews"][-1]["host"]
-        host["child_session_id"] = "child-other"
-        state["native_reviews"][-1]["host_sha256"] = G._sha256_text(
-            G.canonical_json(host))
-        G.save_state(self.state, state)
-        codes = {r["code"] for r in
-                 G.closure_check(G.load_state(self.state))["reasons"]}
-        self.assertIn("native_review_host_identity_mismatch", codes)
+        state["actions"] = [a for a in state["actions"]
+                            if str(a.get("id")) != "A1"]
+        state["contract"]["criteria"][0]["status"] = "pending"
+        state["contract"]["criteria"][0]["evidence_refs"] = []
+        created = G.derive_work(state)
+        self.assertTrue(created)
+        self.assertFalse([a for a in created
+                          if str(a.get("id")).startswith("AUTO-G4")])
 
-    def test_high_risk_requires_native_backend_at_start(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = os.path.join(tmp, "state.json")
-            with self.assertRaises(G.GovernanceError):
-                G.start_state(path, goal="目标", contract=CONTRACT, risk="high",
-                              test_policy={"required": False})
-            self.assertFalse(os.path.exists(path))
+    def test_high_risk_pass_suggests_sol_review_advisory(self):
+        state = G.load_state(self.state)
+        evaluate = G.evaluate(state)
+        self.assertEqual(evaluate["phase"], "PASS")
+        hints = "\n".join(evaluate.get("next_commands") or [])
+        self.assertIn("sol-review", hints)
+        self.assertIn("advisory", hints)
+        # SOL 记录存在后不再重复提示。
+        state["sol_reviews"] = [{"status": "completed", "verdict": "pass"}]
+        evaluate = G.evaluate(state)
+        hints = "\n".join(evaluate.get("next_commands") or [])
+        self.assertNotIn("sol-review", hints)
+
+    def test_review_metrics_marks_g4_retired(self):
+        metrics = G.review_metrics(G.load_state(self.state))
+        self.assertTrue(metrics["g4"]["retired"])
+        self.assertNotIn("g4_reviews", metrics)
 
     def test_high_risk_requires_explicit_test_policy(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "state.json")
             with self.assertRaises(G.GovernanceError) as ctx:
-                G.start_state(path, goal="目标", contract=CONTRACT, risk="high",
-                              execution_backend="native")
+                G.start_state(path, goal="目标", contract=CONTRACT, risk="high")
             self.assertIn("test_policy", str(ctx.exception))
             self.assertFalse(os.path.exists(path))
             with self.assertRaises(G.GovernanceError):
                 G.start_state(path, goal="目标", contract=CONTRACT, risk="high",
-                              execution_backend="native", test_policy={})
+                              test_policy={})
 
     def test_high_risk_binding_requires_contract_policy(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -536,7 +412,6 @@ class HighRiskGateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "state.json")
             G.start_state(path, goal="目标", contract=CONTRACT, risk="high",
-                          execution_backend="native",
                           test_policy={"required": False})
             with self.assertRaises(G.GovernanceError):
                 G.amend_contract(path, contract=CONTRACT, test_policy={})
@@ -648,7 +523,7 @@ class FormalReviewTests(unittest.TestCase):
         check = G.closure_check(G.load_state(self.state))
         self.assertNotIn("formal_review", str(check["gates"]))
         names = set(check["gates"])
-        self.assertEqual(names, {"G1", "G2", "G3", "G4"})
+        self.assertEqual(names, {"G1", "G2", "G3"})
 
     def _authorized_pass(self) -> dict:
         G.authorize_formal_review(self.state, authorized_by="user",

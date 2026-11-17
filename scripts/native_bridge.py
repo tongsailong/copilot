@@ -1,27 +1,23 @@
 #!/usr/bin/env python3
-"""Agent Bridge v2：ZCode 本地计划 → 原生执行/复核 → 治理状态。
+"""Agent Bridge v2：ZCode 本地计划 → 原生执行 → 治理状态。
 
 本模块只做**协议结构与绑定校验**，不调度子代理、不调用模型、不改任务状态：
 
 * DISPATCH：把 `governance.py` 中已登记的计划工作项交给宿主，绑定
   task / contract / plan（不再绑定任何远程模型轮次）；
-* RESULT：执行方回传实际结果、原始证据文件及其 SHA-256、运行元数据；
-* REVIEW：独立 Reviewer 回传复核结论，绑定它检查过的执行结果 SHA；正式 G4
-  资格由 `g4_attest`/`test_execution`/`g4_shadow` 新链独立核验，不由 Reviewer
-  自述，也不由本模块计算。
+* RESULT：执行方回传实际结果、原始证据文件及其 SHA-256、运行元数据。
+
+独立模型复核由 SOL 零工具单轮复核（`sol_review.py`）承担。v7 及更早的原生复核
+信封（`copilot-native-review/*`）与 G4 资格链已随 G4 退役；本模块不再接受或校验
+复核信封，历史复核记录只作为状态里的审计数据保留。
 
 安全边界
 --------
-1. 所有信封都绑定 task_id / contract_sha256 / plan_id / plan_sha256；执行与
-   复核还绑定 dispatch_id / work_item_id。
+1. 所有信封都绑定 task_id / contract_sha256 / plan_id / plan_sha256，执行还
+   绑定 dispatch_id / work_item_id。
 2. 执行结果必须由当前 dispatch 的工作项产生；证据文件必须存在且 SHA-256 一致。
-3. 复核必须晚于对应执行结果，且 Reviewer 不能是执行方本人（Agent ID /
-   Child Session ID 任一相同即拒绝）。
-4. Reviewer 不得改动文件；`changed_files` 非空即视为污染并拒绝。
-5. PASS 不得带 blocking finding 或未验证事项。
-6. 本模块的校验是**本地完整性与绑定校验**，不是密码学签名，也不是宿主可信
-   身份证明；本模块的 `g4_eligible` 只是信封结构预检，正式资格在 ingest 时由
-   `g4_attest` 读取宿主 metadata/SQLite 后派生，治理层收口只接受 candidate 来源。
+3. 本模块的校验是**本地完整性与绑定校验**，不是密码学签名，也不是宿主可信
+   身份证明。
 """
 from __future__ import annotations
 
@@ -40,33 +36,10 @@ LEGACY_SCHEMAS = ("copilot-native-dispatch/v1", "copilot-native-result/v1",
                   "copilot-native-review/v1")
 
 EXECUTION_STATUSES = ("done", "failed", "blocked", "dropped")
-REVIEW_VERDICTS = ("pass", "partial", "blocked")
-# full：完整复核；incremental：在一条既有合格复核之上只复核新增/变更证据。
-REVIEW_SCOPES = ("full", "incremental")
-FINDING_SEVERITIES = ("blocking", "major", "minor", "info")
-# v6.3：finding 生命周期与稳定 ID。Reviewer 首轮给出的 ID 在后续轮次复用，
-# closed 的问题只有新证据才能以 `regressed` 重开，宿主据此统计重复 finding。
-FINDING_STATUSES = ("open", "resolved", "regressed")
 NATIVE_ASSIGNEES = ("zcode", "deepseek")
 EXECUTOR_KINDS = ("main", "subagent")
-# 独立复核的宿主权限契约：只读工具精确集合 + 必须显式禁用的写入/执行工具 +
-# 可接受的权限模式。判定只看宿主实际施加的有效策略，不看 Profile 名称、来源
-# 或所在路径；`g4_attest` 从 metadata.profileSnapshot 独立复核同一契约。
-REVIEWER_TOOLS = ("Read", "Grep", "Glob")
-REVIEWER_DISALLOWED = ("Write", "Edit", "Bash")
-REVIEWER_PERMISSION_MODES = ("default", "plan")
-# G4 的载体来源：原定架构只允许 ZCode 内置子代理。宿主 `rCi` 把
-# `~/.zcode/agents` 标为 user、`<cwd>/.zcode/agents` 标为 project，内置只有
-# `Explore`（含 Bash）与 `general-purpose`（全工具）。项目/用户/插件自定义
-# Profile 即使工具集精确，也不属于“内置子代理”，不能作为正式 G4 载体。
-G4_CARRIER_SOURCE = "built-in"
-
 EVIDENCE_ID_RE = re.compile(r"^E[1-9][0-9]{0,3}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
-_REVIEW_ATTEMPT_RE = re.compile(r"^RA[0-9a-f]{24}$")
-_FINDING_ID_RE = re.compile(r"^F[1-9][0-9]{0,3}$")
-# 这些路径不得作为 Reviewer 的 inspected 文件：设备/管道/目录不是可复核内容。
-_NON_REGULAR_PREFIXES = ("/dev/", "/proc/", "/sys/")
 
 
 class BridgeError(ValueError):
@@ -83,7 +56,7 @@ def _fail(code: str, message: str) -> None:
 
 
 def normalize_profile_policy(snapshot: object) -> dict:
-    """把宿主 profileSnapshot 归一化成 G4 判定用的**有效权限策略**。
+    """把宿主 profileSnapshot 归一化成**有效权限策略**记录（执行方身份元数据）。
 
     Profile 名称、来源与路径只作为记录事实保留，不参与“是否只读”的判定。
     """
@@ -105,52 +78,6 @@ def normalize_profile_policy(snapshot: object) -> dict:
         "skills": data.get("skills"),
         "mcpServers": data.get("mcpServers"),
     }
-
-
-def reviewer_policy_problems(policy: object) -> list[tuple[str, str]]:
-    """返回只读复核策略的偏离项；空列表表示等价于只读复核。
-
-    `tools=[]` 在宿主语义里等于“继承父工具”，一律拒绝；`tools` 必须精确等于
-    只读集合，多一个 Bash/Write/MCP 工具都不行。
-    """
-    data = normalize_profile_policy(policy)
-    problems: list[tuple[str, str]] = []
-    tools = data["tools"]
-    if not tools:
-        problems.append(("profile_tools_empty",
-                         "空工具集会被宿主解释为继承父工具"))
-    elif set(tools) != set(REVIEWER_TOOLS):
-        problems.append(("profile_tools_not_exact",
-                         f"tools={tools} 必须精确等于 {list(REVIEWER_TOOLS)}"))
-    disallowed = set(data["disallowedTools"])
-    missing = [name for name in REVIEWER_DISALLOWED if name not in disallowed]
-    if missing:
-        problems.append(("profile_disallowed_missing", ",".join(missing)))
-    mode = data["permissionMode"]
-    if mode and mode not in REVIEWER_PERMISSION_MODES:
-        problems.append(("profile_permission_mode", f"permissionMode={mode!r}"))
-    if data["skills"]:
-        problems.append(("profile_skills_not_allowed",
-                         f"skills={data['skills']}"))
-    if data["mcpServers"]:
-        problems.append(("profile_mcp_servers",
-                         f"mcpServers={data['mcpServers']}"))
-    return problems
-
-
-def g4_carrier_problems(policy: object) -> list[tuple[str, str]]:
-    """G4 载体来源约束：只接受宿主内置 Agent。
-
-    `source` 由宿主按加载目录赋值（user/project/built-in），不是 frontmatter
-    可伪造字段。项目/用户/插件 Profile 即便工具集精确只读，也不是原定架构的
-    “内置子代理”，不能作为正式 G4 载体。
-    """
-    data = normalize_profile_policy(policy)
-    source = str(data.get("source") or "").strip()
-    if source != G4_CARRIER_SOURCE:
-        return [("profile_source_not_builtin",
-                 f"source={source or '<missing>'!r} 不是宿主内置 Agent")]
-    return []
 
 
 def _profile_policy_or_none(obj: dict) -> dict | None:
@@ -219,13 +146,14 @@ def envelope_sha256(envelope: dict) -> str:
 
 
 def classify_native_result(envelope: object) -> str:
-    """返回 execution / review；未知 schema 失败关闭。"""
+    """返回 execution；原生复核信封已退役，未知 schema 失败关闭。"""
     obj = _obj(envelope, "native result")
     schema = str(obj.get("schema") or "").strip()
     if schema == RESULT_SCHEMA:
         return "execution"
     if schema == REVIEW_SCHEMA:
-        return "review"
+        _fail("native_review_retired",
+              "原生复核信封已随 G4 退役；独立复核请用 sol-review（SOL 零工具单轮）。")
     if schema in LEGACY_SCHEMAS:
         _fail("schema_retired",
               f"{schema} 属于 v1 SOL 通道，已退役；历史记录请用 legacy-status 只读查看。")
@@ -499,20 +427,13 @@ def _validate_executor(executor: object, name: str) -> dict:
     if not agent_id or not child or not profile:
         _fail("executor_identity_missing",
               "子代理执行结果必须提供 agent_id / child_session_id / profile_id。")
-    # 只读 Profile 不得承担执行工作项。判定按宿主快照的有效策略，不按名称：
-    # 任一只读工具集都跑不了工程执行，名字叫什么都一样。`executor.profile`
-    # 字段必填（缺失失败关闭）；字段存在但未声明 tools 时视为“继承父工具/未知”，
-    # 按宿主语义不构成只读，因此不拒绝——只读判定只认精确的 Read/Grep/Glob。
-    # 权威复核仍由 `test_execution` 读取宿主 metadata 后重做。
+    # 执行方 Profile 快照作为运行元数据记录（身份可追溯）；G4 退役后不再用
+    # “是否等价于只读复核”作为执行方准入门槛。
     policy = _profile_policy_or_none(obj)
     if policy is None:
         _fail("executor_profile_invalid",
               "执行结果缺少 executor.profile（宿主 profileSnapshot 派生的有效"
-              "工具策略）；没有策略就无法证明执行方不是只读 Profile。")
-    if not reviewer_policy_problems(policy):
-        _fail("executor_profile_readonly",
-              "执行方 Profile 的有效工具策略等价于只读复核"
-              "（tools 仅 Read/Grep/Glob）；只读 Profile 不得承担工程执行。")
+              "工具策略）；执行方身份不完整。")
     return {"kind": "subagent", "agent_id": agent_id,
             "child_session_id": child, "profile_id": profile,
             "profile": normalize_profile_policy(policy),
@@ -586,41 +507,6 @@ def _validate_evidence(raw: object, state: dict, *, check_files: bool) -> list[d
     return out
 
 
-
-def _validate_files_inspected(raw: object, *, check_files: bool) -> list[str]:
-    """校验自报的 inspected 文件清单；允许为空。
-
-    v6.1 起复核命令与实际读取由宿主 rollout 派生，`files_inspected` 只是补充
-    声明：只做路径合法性检查，不再要求至少一条或多条声明匹配。G4 的证据覆盖
-    仍由宿主实际工具调用计算，不能靠这里放行。
-    """
-    items = _list(raw or [], "files_inspected")
-    out: list[str] = []
-    for idx, value in enumerate(items, 1):
-        path = _text(value, f"files_inspected[{idx}]")
-        if not os.path.isabs(path):
-            _fail("review_inspection_invalid",
-                  f"files_inspected[{idx}] 必须是绝对路径：{path}")
-        if path.startswith(_NON_REGULAR_PREFIXES):
-            _fail("review_inspection_invalid",
-                  f"files_inspected[{idx}] 不是普通文件：{path}")
-        if check_files and not os.path.isfile(path):
-            _fail("review_inspection_invalid",
-                  f"Reviewer 声称检查的文件不存在：{path}")
-        if path not in out:
-            out.append(path)
-    return out
-
-
-def _validate_commands(raw: object) -> list[str]:
-    """新只读 Reviewer 没有 Bash：任何自述命令都不能作为 G4 证据。"""
-    commands = _list(raw or [], "review.commands_run")
-    if commands:
-        _fail("review_command_unexpected",
-              "Reviewer 没有 Bash 权限；commands_run 必须为空。")
-    return []
-
-
 def _optional_text(obj: dict, key: str, name: str) -> str:
     value = obj.get(key)
     if value is None:
@@ -628,107 +514,6 @@ def _optional_text(obj: dict, key: str, name: str) -> str:
     if not isinstance(value, str):
         _fail("schema_invalid", f"{name}.{key} 必须是字符串。")
     return value.strip()
-
-
-def _validate_findings(raw: object, *, check_files: bool) -> list[dict]:
-    items = _list(raw or [], "findings")
-    out: list[dict] = []
-    seen_ids: dict[str, int] = {}
-    seen_bodies: dict[tuple, int] = {}
-    for idx, value in enumerate(items, 1):
-        name = f"findings[{idx}]"
-        obj = _obj(value, name)
-        severity = _text(obj.get("severity"), f"{name}.severity").lower()
-        if severity not in FINDING_SEVERITIES:
-            _fail("review_finding_invalid",
-                  f"{name}.severity 只能是 {', '.join(FINDING_SEVERITIES)}。")
-        summary = _text(obj.get("summary"), f"{name}.summary")
-        file = str(obj.get("file") or "").strip()
-        evidence = str(obj.get("evidence") or "").strip()
-        if severity in ("blocking", "major"):
-            if not file or not evidence:
-                _fail("review_finding_invalid",
-                      f"{severity} finding 必须给出 file 与 evidence（具体证据）。")
-        if file and check_files and os.path.isabs(file) and not os.path.exists(file):
-            _fail("review_finding_invalid",
-                  f"{name}.file 不存在：{file}")
-        line = obj.get("line")
-        if line is not None:
-            line = _int(line, f"{name}.line", minimum=1)
-        # v6.3 可选元数据：稳定 ID 与生命周期用于跨轮去重和指标，root_cause 用于
-        # 把同一根因的多处表现聚成一条，category 只做归类。缺失时保持旧行为。
-        fid = _optional_text(obj, "id", name).upper()
-        if fid:
-            if not _FINDING_ID_RE.match(fid):
-                _fail("review_finding_invalid",
-                      f"{name}.id 必须是 F1–F9999 形式（实际 {fid!r}）。")
-            if fid in seen_ids:
-                _fail("review_finding_duplicate",
-                      f"{name}.id={fid} 与 findings[{seen_ids[fid]}] 重复；"
-                      f"同一 finding 只登记一次。")
-            seen_ids[fid] = idx
-        root_cause = _optional_text(obj, "root_cause", name)
-        category = _optional_text(obj, "category", name)
-        reproduce = _optional_text(obj, "reproduce", name)
-        status = _optional_text(obj, "status", name).lower() or "open"
-        if status not in FINDING_STATUSES:
-            _fail("review_finding_invalid",
-                  f"{name}.status 只能是 {', '.join(FINDING_STATUSES)}。")
-        related_raw = obj.get("related")
-        related: list[str] = []
-        for rel_idx, rel in enumerate(_list(related_raw or [], f"{name}.related"), 1):
-            rel_id = _text(rel, f"{name}.related[{rel_idx}]").upper()
-            if not _FINDING_ID_RE.match(rel_id):
-                _fail("review_finding_invalid",
-                      f"{name}.related[{rel_idx}] 必须是 F1–F9999 形式。")
-            if rel_id == fid:
-                _fail("review_finding_invalid",
-                      f"{name}.related 不能引用自身 {rel_id}。")
-            if rel_id not in related:
-                related.append(rel_id)
-        # 同一轮把同一问题写两遍只会放大 finding 数量，不增加信息量。
-        body = (severity, file, line, summary)
-        if body in seen_bodies:
-            _fail("review_finding_duplicate",
-                  f"{name} 与 findings[{seen_bodies[body]}] 是同一问题"
-                  f"（severity/file/line/summary 相同）；请合并并引用 ID。")
-        seen_bodies[body] = idx
-        out.append({"severity": severity, "summary": summary,
-                    "file": file, "line": line, "evidence": evidence,
-                    "id": fid, "root_cause": root_cause, "category": category,
-                    "status": status, "related": related,
-                    "reproduce": reproduce})
-    return out
-
-
-def _validate_reviewer(reviewer: object) -> dict:
-    obj = _obj(reviewer, "reviewer")
-    kind = _text(obj.get("kind") or "subagent", "reviewer.kind").lower()
-    if kind != "subagent":
-        _fail("reviewer_invalid", "Reviewer 必须是独立子代理（kind=subagent）。")
-    agent_id = _text(obj.get("agent_id"), "reviewer.agent_id")
-    child = _text(obj.get("child_session_id"), "reviewer.child_session_id")
-    profile = _text(obj.get("profile_id"), "reviewer.profile_id")
-    profile_policy = _profile_policy_or_none(obj)
-    if profile_policy is None:
-        _fail("reviewer_profile_invalid",
-              "Reviewer 信封缺少 reviewer.profile（宿主 profileSnapshot 派生的"
-              "有效工具策略）；Profile 名称、来源或路径都不能代替权限证据。")
-    problems = reviewer_policy_problems(profile_policy)
-    if problems:
-        code, detail = problems[0]
-        _fail("reviewer_profile_not_readonly",
-              f"Reviewer 的有效工具策略不满足只读复核（{code}: {detail}）。")
-    model = _text(obj.get("model_reported"), "reviewer.model_reported")
-    return {
-        "kind": "subagent",
-        "agent_id": agent_id,
-        "child_session_id": child,
-        "profile_id": profile,
-        "profile": normalize_profile_policy(profile_policy),
-        "model_reported": model,
-    }
-
 
 
 def validate_execution_result(envelope: object, dispatch: dict | None, state: dict, *,
@@ -960,67 +745,6 @@ def _validate_execution_binding(raw: object, state: dict, *, work_item_id: str,
             "contract_artifacts": list(stored.get("contract_artifacts") or [])}
 
 
-def _validate_host_record(raw: object, *, required: bool) -> dict:
-    """校验宿主运行记录引用；G4 复核必须有可重新核对的宿主文件。"""
-    if raw is None:
-        if required:
-            _fail("g4_host_record_missing",
-                  "g4_eligible=true 的复核必须附宿主 metadata/outputFile/rollout 记录。")
-        return {}
-    obj = _obj(raw, "host")
-    out: dict = {}
-    for key in ("metadata_path", "output_file", "rollout_path"):
-        value = str(obj.get(key) or "").strip()
-        if not value:
-            if key == "metadata_path" and required:
-                _fail("g4_host_record_invalid",
-                      "host.metadata_path 缺失：G4 复核必须能重新核对宿主记录。")
-            out[key] = ""
-            continue
-        path = os.path.abspath(os.path.expanduser(value))
-        if not os.path.isabs(path):
-            _fail("g4_host_record_invalid", f"host.{key} 必须是绝对路径：{path}")
-        if required and key == "metadata_path" and not os.path.isfile(path):
-            _fail("g4_host_record_invalid", f"host.{key} 不存在：{path}")
-        out[key] = path
-    # rollout/outputFile 被宿主清理时，G4 不合格的信封可标注持久化来源
-    # （db.message.part / session_entry）；这些字段只是溯源标记，不改变资格。
-    for key in ("tool_call_source", "model_source", "output_source"):
-        out[key] = str(obj.get(key) or "").strip()[:80]
-    out["output_sha256"] = str(obj.get("output_sha256") or "").strip().lower()
-    if out["output_sha256"] and not re.fullmatch(r"[0-9a-f]{64}",
-                                                 out["output_sha256"]):
-        _fail("g4_host_record_invalid", "host.output_sha256 格式非法")
-    host_db = str(obj.get("host_db") or "").strip()
-    if host_db:
-        host_db = os.path.abspath(os.path.expanduser(host_db))
-        if not os.path.isabs(host_db):
-            _fail("g4_host_record_invalid", f"host.host_db 必须是绝对路径：{host_db}")
-    out["host_db"] = host_db
-    calls = _list(obj.get("tool_calls"), "host.tool_calls")
-    normalized = []
-    for idx, call in enumerate(calls, 1):
-        item = _obj(call, f"host.tool_calls[{idx}]")
-        name = _text(item.get("name"), f"host.tool_calls[{idx}].name")
-        if name not in REVIEWER_TOOLS:
-            _fail("g4_tool_not_readonly",
-                  f"G4 复核出现非只读工具 {name!r}；只允许 {', '.join(REVIEWER_TOOLS)}。")
-        normalized.append({"name": name,
-                           "count": _int(item.get("count") or 0,
-                                         f"host.tool_calls[{idx}].count")})
-    out["tool_calls"] = normalized
-    out["agent_id"] = str(obj.get("agent_id") or "").strip()
-    out["child_session_id"] = str(obj.get("child_session_id") or "").strip()
-    # G4 快照绑定的宿主侧证据：会话创建时间与 prompt 摘要。只接受字符串，
-    # 具体时间顺序与值是否与 metadata 一致由 native_agent 重新核对。
-    for key in ("session_created_at", "session_completed_at", "prompt_sha256",
-                "workspace_root"):
-        value = obj.get(key)
-        if value is not None:
-            out[key] = str(value).strip()
-    return out
-
-
 def _action_fingerprint(action: dict) -> str:
     """工作项覆盖指纹：与 final_evidence_digest 的动作项口径保持一致。"""
     return sha256_text(canonical_json([
@@ -1028,331 +752,3 @@ def _action_fingerprint(action: dict) -> str:
         sha256_text(str(action.get("result") or "")),
         sorted(action.get("evidence_ids") or []),
     ]))
-
-
-def review_coverage(state: dict) -> dict:
-    """复核覆盖快照：证据摘要、工作项指纹与条件状态。
-
-    增量复核只允许在“未覆盖的变化”都能被本轮逐条点出时使用；这份快照在
-    ingest 时固化，后续据它计算变化集，避免把旧结论套到新状态上。
-    """
-    evidence: dict[str, str] = {}
-    for entry in state.get("evidence") or []:
-        if isinstance(entry, dict) and str(entry.get("id") or ""):
-            # 归档（dropped）也是覆盖状态的一部分：若不进入指纹，基线后归档
-            # 证据 + 改动工作项结果会被误判为“无需覆盖新证据”的增量复核。
-            evidence[str(entry["id"])] = "%s:%s" % (
-                str(entry.get("sha256") or ""),
-                "dropped" if entry.get("dropped") else "live")
-    actions: dict[str, str] = {}
-    for action in state.get("actions") or []:
-        if not isinstance(action, dict):
-            continue
-        if str(action.get("origin") or "") == "g4-review":
-            continue
-        actions[str(action.get("id") or "")] = _action_fingerprint(action)
-    criteria: dict[str, str] = {}
-    for criterion in (state.get("contract") or {}).get("criteria") or []:
-        if not isinstance(criterion, dict):
-            continue
-        criteria[str(criterion.get("criterion_id") or "")] = sha256_text(
-            canonical_json([criterion.get("status"),
-                            sorted([[r.get("id"), r.get("sha256")]
-                                    for r in criterion.get("evidence_refs") or []])]))
-    return {"evidence": evidence, "actions": actions, "criteria": criteria}
-
-
-def execution_evidence_drift(execution: dict, state: dict) -> list[dict]:
-    """执行信封 evidence[] 与当前 live 证据之间的漂移（非阻断提示）。
-
-    执行结果登记后，证据可能被更正、重新捕获或归档；执行正文仍引用旧快照时，
-    复核必须能看见这层不一致，而不是靠人读正文发现。返回空列表表示一致。
-    """
-    live = {str(entry.get("id") or ""): entry
-            for entry in state.get("evidence") or [] if isinstance(entry, dict)}
-    out: list[dict] = []
-    for entry in execution.get("evidence") or []:
-        if not isinstance(entry, dict):
-            continue
-        eid = str(entry.get("id") or "")
-        if not eid:
-            continue
-        current = live.get(eid)
-        execution_sha = str(entry.get("sha256") or "")
-        if current is None:
-            out.append({"id": eid, "problem": "not_registered",
-                        "execution_sha256": execution_sha, "live_sha256": ""})
-            continue
-        live_sha = str(current.get("sha256") or "")
-        if live_sha != execution_sha:
-            out.append({"id": eid, "problem": "sha_differs",
-                        "execution_sha256": execution_sha, "live_sha256": live_sha})
-        elif current.get("dropped"):
-            out.append({"id": eid, "problem": "dropped",
-                        "execution_sha256": execution_sha, "live_sha256": live_sha})
-    return out
-
-
-def _validate_review_scope(env: dict, state: dict, *, contract: str,
-                           work_item_id: str) -> tuple[str, str, list[str]]:
-    """校验复核范围；增量复核必须绑定一条可用基线并覆盖全部变化。"""
-    scope = str(env.get("review_scope") or "full").strip().lower()
-    if scope not in REVIEW_SCOPES:
-        _fail("review_scope_invalid",
-              f"review_scope 只能是 {', '.join(REVIEW_SCOPES)}（实际 {scope!r}）。")
-    if scope == "full":
-        if env.get("based_on_review_sha256") or env.get("evidence_manifest"):
-            _fail("review_scope_invalid",
-                  "review_scope=full 不应带 based_on_review_sha256 / "
-                  "evidence_manifest；增量复核请显式声明 review_scope=incremental。")
-        return scope, "", []
-    based_on = _sha(env.get("based_on_review_sha256"),
-                    "review.based_on_review_sha256")
-    base = None
-    for record in state.get("native_reviews") or []:
-        if isinstance(record, dict) and str(record.get("result_sha256") or "") == based_on:
-            base = record
-            break
-    if base is None:
-        _fail("incremental_base_missing",
-              f"增量复核的基线 {based_on[:16]}… 不在本任务复核记录中；"
-              "请先回填基线复核，或改用完整复核。")
-    if str(base.get("contract_sha256") or "") != contract:
-        _fail("incremental_base_contract_mismatch",
-              "基线复核属于旧合同；合同已变更，必须做完整复核。")
-    if str(base.get("verdict") or "").strip().lower() != "pass" or base.get(
-            "g4_eligible") is not True:
-        _fail("incremental_base_ineligible",
-              "基线复核不是可用的 G4 PASS 结论；不能作为增量基础。")
-    if any(isinstance(f, dict) and str(f.get("severity") or "") == "blocking"
-           for f in base.get("findings") or []):
-        _fail("incremental_base_ineligible", "基线复核仍有 blocking finding。")
-    # 基线的最终信任由治理层统一判定：旧版无 attempt 的 PASS、宿主记录被
-    # 改写、attempt 未消费或证据文件漂移都不能作为增量基础。这里只做同一
-    # 口径的早期拒绝，避免 ingest 接受一条收口必败的增量复核。
-    try:
-        import governance as G  # 延迟导入：避免状态引擎与信封层在导入期耦合
-    except ImportError:
-        G = None
-    if G is not None:
-        trust = G._review_trust_problems(base, state, check_target=False)
-        if trust:
-            _fail("incremental_base_ineligible",
-                  "基线复核未通过当前 G4 信任检查：" + ", ".join(trust)
-                  + "；请对当前快照做一次完整复核。")
-        base_attempt = G.find_review_attempt(
-            state, str(base.get("review_attempt_id") or ""))
-        code_problems = G.code_scope_problems(
-            base_attempt, state, check_current=True) if base_attempt else \
-            ["native_review_code_scope_missing"]
-        if code_problems:
-            _fail("incremental_code_changed",
-                  "基线复核之后工作区代码范围已变化（"
-                  + ", ".join(code_problems)
-                  + "）；增量复核只覆盖证据，不能覆盖源码变更，请做完整复核。")
-    base_coverage = base.get("coverage")
-    if not isinstance(base_coverage, dict) or not base_coverage:
-        _fail("incremental_base_coverage_missing",
-              "基线复核缺少覆盖快照（旧记录）；请做一次完整复核后再增量。")
-    current = review_coverage(state)
-    base_evidence = base_coverage.get("evidence") or {}
-    base_actions = base_coverage.get("actions") or {}
-    base_criteria = base_coverage.get("criteria") or {}
-    changed_evidence = sorted(
-        eid for eid, sha in current["evidence"].items()
-        if base_evidence.get(eid) != sha)
-    changed_actions = sorted(
-        aid for aid, fp in current["actions"].items()
-        if base_actions.get(aid) != fp)
-    changed_criteria = sorted(
-        cid for cid, fp in current["criteria"].items()
-        if base_criteria.get(cid) != fp)
-    if changed_criteria:
-        _fail("incremental_criteria_changed",
-              "完成条件或其核销状态在基线与本轮之间发生变化（"
-              f"{', '.join(changed_criteria)}）；改动范围超出增量复核，"
-              "必须做完整复核。")
-    manifest = [str(item).strip()
-                for item in _list(env.get("evidence_manifest") or [],
-                                  "review.evidence_manifest")
-                if str(item).strip()]
-    unknown = [eid for eid in manifest if eid not in current["evidence"]]
-    if unknown:
-        _fail("incremental_manifest_unknown",
-              f"evidence_manifest 含未登记的证据 id：{', '.join(unknown)}。")
-    if changed_evidence:
-        if not manifest:
-            _fail("incremental_manifest_missing",
-                  "本轮新增/变更证据必须逐条列入 evidence_manifest："
-                  f"{', '.join(changed_evidence)}。")
-        missing = [eid for eid in changed_evidence if eid not in manifest]
-        if missing:
-            _fail("incremental_evidence_uncovered",
-                  "增量复核未覆盖新增/变更证据：" + ", ".join(missing) +
-                  "；请检查这些证据或改做完整复核。")
-    others = [aid for aid in changed_actions if aid != work_item_id]
-    if others:
-        _fail("incremental_scope_too_narrow",
-              "基线之后还有其他工作项的结论变化（" + ", ".join(others) +
-              "）；增量复核只覆盖被复核的工作项，请做完整复核。")
-    if not changed_evidence and not changed_actions:
-        _fail("incremental_without_change",
-              "相对基线没有任何变化，无需增量复核；如需复述结论请复用基线。")
-    return scope, based_on, manifest
-
-
-def validate_review_result(envelope: object, dispatch: dict | None, execution: dict,
-                           state: dict, *, check_files: bool = True) -> dict:
-    """校验独立复核：绑定执行结果 SHA、Reviewer 独立性、只读性与 PASS 门槛。"""
-    env = _obj(envelope, "review result")
-    schema = str(env.get("schema") or "").strip()
-    if schema in LEGACY_SCHEMAS:
-        _fail("schema_retired",
-              f"{schema} 属于 v1 SOL 通道，已退役；不能用于 v6 复核。")
-    if schema != REVIEW_SCHEMA:
-        _fail("schema_invalid", f"review schema 必须是 {REVIEW_SCHEMA}。")
-    if not isinstance(dispatch, dict):
-        _fail("dispatch_missing", "状态没有 native_dispatch；不能回填复核结果。")
-    task_id, contract = _require_state_credential(state)
-    if str(env.get("task_id") or "").strip() != task_id:
-        _fail("task_mismatch", "复核结果 task_id 与当前任务不一致。")
-    if str(env.get("contract_sha256") or "").strip() != contract:
-        _fail("contract_mismatch", "复核结果 contract_sha256 与当前合同不一致。")
-    plan_id = _text(env.get("plan_id"), "review.plan_id")
-    plan_sha = _sha(env.get("plan_sha256"), "review.plan_sha256")
-    if plan_id != str(dispatch.get("plan_id") or ""):
-        _fail("plan_mismatch", "复核结果 plan_id 与当前 dispatch 不一致。")
-    if plan_sha != str(dispatch.get("plan_sha256") or "").lower():
-        _fail("plan_mismatch", "复核结果 plan_sha256 与当前 dispatch 不一致。")
-    _check_plan(state, plan_id, plan_sha)
-    wid = _text(env.get("work_item_id"), "review.work_item_id")
-    did = _text(env.get("dispatch_id"), "review.dispatch_id")
-    items = {str(i.get("work_item_id") or ""): i
-             for i in dispatch.get("actions") or [] if isinstance(i, dict)}
-    item = items.get(wid)
-    if not isinstance(item, dict):
-        _fail("work_item_unknown", f"当前 dispatch 不含工作项 {wid}。")
-    if str(item.get("dispatch_id") or "") != did:
-        _fail("dispatch_mismatch",
-              f"复核结果 dispatch_id={did} 与工作项 {wid} 的派发 ID 不一致。")
-    if str(execution.get("work_item_id") or "") != wid:
-        _fail("review_binding_mismatch", "复核工作项与被执行工作项不一致。")
-    if str(execution.get("dispatch_id") or "") != did:
-        _fail("review_binding_mismatch", "复核 dispatch_id 与执行结果不一致。")
-    exec_sha = _sha(execution.get("result_sha256"), "execution.result_sha256")
-    bound_sha = _sha(env.get("execution_result_sha256"),
-                     "review.execution_result_sha256")
-    if bound_sha != exec_sha:
-        _fail("review_binding_mismatch",
-              "复核绑定的 execution_result_sha256 与已入账执行结果不一致。")
-    reviewer = _validate_reviewer(env.get("reviewer"))
-    executor = execution.get("executor") or {}
-    if not isinstance(executor, dict):
-        _fail("schema_invalid", "执行结果缺少 executor 元数据。")
-    for key in ("agent_id", "child_session_id"):
-        exec_value = str(executor.get(key) or "").strip()
-        rev_value = str(reviewer.get(key) or "").strip()
-        if exec_value and rev_value and exec_value == rev_value:
-            _fail("executor_reviewer_same",
-                  f"Reviewer 与执行方的 {key} 相同；独立复核必须使用独立子会话。")
-    if _profile_policy_or_none(executor) is not None and not \
-            reviewer_policy_problems(executor.get("profile")):
-        _fail("executor_profile_readonly", "执行方不得使用只读 Profile。")
-    changed = _list(env.get("changed_files") or [], "review.changed_files")
-    if changed:
-        _fail("review_contaminated",
-              "Reviewer 报告了 changed_files；只读复核不得改动工作区。")
-    files = _validate_files_inspected(env.get("files_inspected"),
-                                      check_files=check_files)
-    commands = _validate_commands(env.get("commands_run"))
-    findings = _validate_findings(env.get("findings"), check_files=check_files)
-    unverified_raw = _list(env.get("unverified") or [], "review.unverified")
-    unverified = [str(x).strip() for x in unverified_raw if str(x).strip()]
-    risks_raw = _list(env.get("residual_risks") or [], "review.residual_risks")
-    residual = [str(x).strip() for x in risks_raw if str(x).strip()]
-    verdict = _text(env.get("verdict"), "review.verdict").lower()
-    if verdict not in REVIEW_VERDICTS:
-        _fail("invalid_verdict",
-              f"复核 verdict={verdict!r} 只能是 {', '.join(REVIEW_VERDICTS)}。")
-    g4_eligible = env.get("g4_eligible")
-    if not isinstance(g4_eligible, bool):
-        _fail("schema_invalid", "review.g4_eligible 必须是布尔值。")
-    attempt_id = str(env.get("review_attempt_id") or "").strip()
-    attempt_created = str(env.get("review_attempt_created_at") or "").strip()
-    if attempt_id and not _REVIEW_ATTEMPT_RE.match(attempt_id):
-        _fail("review_attempt_invalid",
-              "review.review_attempt_id 必须是 RA + 24 位小写十六进制。")
-    if g4_eligible and not attempt_id:
-        _fail("review_attempt_missing",
-              "G4 复核必须绑定派发前创建的 review_attempt_id；"
-              "不能用信封生成时的 target 代替实际评审快照。")
-    if g4_eligible and not attempt_created:
-        _fail("review_attempt_invalid",
-              "G4 复核必须携带 review_attempt_created_at。")
-    target_sha = ""
-    if g4_eligible:
-        target_sha = _sha(env.get("target_sha256"), "review.target_sha256")
-        if verdict != "pass":
-            _fail("g4_requires_pass", "g4_eligible=true 的复核必须 verdict=pass。")
-        if unverified:
-            _fail("g4_with_unverified", "G4 复核仍有未验证事项；不能标记可用。")
-        if any(f["severity"] == "blocking" for f in findings):
-            _fail("g4_with_blocking", "G4 复核存在 blocking finding；不能标记可用。")
-    host = _validate_host_record(env.get("host"), required=g4_eligible)
-    scope, based_on, manifest = _validate_review_scope(
-        env, state, contract=contract, work_item_id=wid)
-    if verdict == "pass" and any(f["severity"] == "blocking" for f in findings):
-        _fail("pass_with_blocking_finding",
-              "复核 verdict=pass 但存在 blocking finding；必须改判或补齐。")
-    if verdict == "pass" and unverified:
-        _fail("pass_with_unverified",
-              "复核 verdict=pass 但仍有未验证事项；不得猜测 PASS。")
-    declared_sha = _sha(env.get("result_sha256"), "review.result_sha256")
-    actual_sha = envelope_sha256(env)
-    if declared_sha != actual_sha:
-        _fail("result_sha_mismatch",
-              "复核结果 result_sha256 与信封内容不一致（可能被篡改）。")
-    record = {
-        "schema": REVIEW_SCHEMA,
-        "task_id": task_id,
-        "contract_sha256": contract,
-        "plan_id": plan_id,
-        "plan_sha256": plan_sha,
-        "dispatch_id": did,
-        "work_item_id": wid,
-        "execution_result_sha256": exec_sha,
-        "target_sha256": target_sha,
-        "review_attempt_id": attempt_id,
-        "review_attempt_created_at": attempt_created,
-        "reviewer": reviewer,
-        "host": host,
-        "verdict": verdict,
-        "findings": findings,
-        "files_inspected": files,
-        "commands_run": commands,
-        "changed_files": [],
-        "unverified": unverified,
-        "residual_risks": residual,
-        "review_scope": scope,
-        "based_on_review_sha256": based_on,
-        "evidence_manifest": manifest,
-        # 覆盖快照固化在复核记录上，供后续增量复核计算“哪些证据/工作项/条件
-        # 在基线之后发生了变化”，而不是重新猜测历史状态。
-        "coverage": review_coverage(state),
-        # 执行证据与 live 证据的漂移：非阻断，但收口与复核需要看见。
-        "execution_evidence_unbound": execution_evidence_drift(execution, state),
-        "g4_eligible": g4_eligible,
-        "g4_reasons": [str(item).strip() for item in
-                       _list(env.get("g4_reasons") or [], "review.g4_reasons")
-                       if str(item).strip()],
-        "result_sha256": declared_sha,
-    }
-    declared = [str(item).strip()
-                for item in _list(env.get("declared_files_unverified") or [],
-                                  "review.declared_files_unverified")
-                if str(item).strip()]
-    if declared:
-        # Reviewer 自报但宿主记录里没有实际检查痕迹的文件：保留在台账里供审计，
-        # 不影响 G4 判定（G4 只看宿主派生出的实际访问记录）。
-        record["declared_files_unverified"] = declared
-    return record

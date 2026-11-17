@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Execution binding：创建、消费、信封校验与 test_execution 贯通。"""
+"""Execution binding：创建、消费与执行信封校验。"""
 from __future__ import annotations
 
 import json
@@ -21,7 +21,6 @@ sys.path.insert(0, os.path.join(ROOT, "scripts"))
 import governance as G  # noqa: E402
 import native_agent as NA  # noqa: E402
 import native_bridge as NB  # noqa: E402
-import test_execution as TE  # noqa: E402
 import v6_support as F  # noqa: E402
 
 COMMAND = "node --test tests/calc.test.js"
@@ -86,34 +85,7 @@ class ExecutionBindingFlowTests(F.BridgeBase):
                                            "modelId": "m"}}) + "\n")
         return meta, rollout
 
-    def _db(self) -> str:
-        db = os.path.join(self.out, "db.sqlite")
-        con = sqlite3.connect(db)
-        con.execute("create table session (id text, parent_id text,"
-                    " task_type text, trace_id text)")
-        con.execute("create table tool_usage (tool_call_id text, session_id"
-                    " text, tool_name text, status text, exit_code integer,"
-                    " started_at integer, completed_at integer, output_bytes"
-                    " integer, error_code text, error_message text, trace_id"
-                    " text, turn_id text)")
-        con.execute("create table part (message_id text, session_id text,"
-                    " data text, sequence integer)")
-        con.execute("insert into session values (?,?,?,?)",
-                    ("child-exec", "sess-parent", "subagent_child", "trace-1"))
-        con.execute("insert into tool_usage values (?,?,?,?,?,?,?,?,?,?,?,?)",
-                    ("c1", "child-exec", "Bash", "completed", 0,
-                     ms(-8), ms(-7), 2, "", "", "trace-1", "turn-1"))
-        con.execute("insert into part values (?,?,?,?)",
-                    ("m1", "child-exec", json.dumps({
-                        "type": "tool", "tool": "Bash", "callID": "c1",
-                        "state": {"status": "completed",
-                                  "input": {"command": COMMAND},
-                                  "output": "ok"}}, ensure_ascii=False), 1))
-        con.commit()
-        con.close()
-        return db
-
-    def test_binding_flows_from_creation_to_verified_test_evidence(self):
+    def test_binding_flows_from_creation_to_consumption(self):
         binding = self._binding()
         self.assertEqual(len(binding["nonce"]), 32)
         self.assertTrue(binding["binding_id"].startswith("EB"))
@@ -140,81 +112,9 @@ class ExecutionBindingFlowTests(F.BridgeBase):
         self.assertTrue(stored["consumed"])
         self.assertEqual(stored["consumed_by_result_sha256"],
                          env["result_sha256"])
-        attempt = G.create_review_attempt(
-            self.state_path, work_item_id="A1",
-            execution_result_sha256=env["result_sha256"],
-            workspace=self.dir)
-        execution = [r for r in state["native_results"]
-                     if r["result_sha256"] == env["result_sha256"]][0]
-        record = TE.build(execution, attempt, db=self._db(),
-                          binding=stored, require_binding=True)
-        self.assertEqual(record["status"], "verified", record["problems"])
-        self.assertTrue(record["layers"]["command_execution_verified"])
-        self.assertTrue(record["layers"]["expected_test_verified"])
-        self.assertEqual(record["execution_binding_id"],
-                         binding["binding_id"])
+        self.assertTrue(state["native_results"])
 
-    def test_tracked_evidence_is_not_excluded_from_execution_scope(self):
-        subprocess.run(["git", "-C", self.dir, "add", "evidence.txt"],
-                       check=True)
-        subprocess.run(["git", "-C", self.dir, "commit", "-qm", "evidence"],
-                       check=True)
-        binding = self._binding()
-        meta, rollout = self._metadata(binding["nonce"])
-        args = SimpleNamespace(
-            state=self.state_path,
-            dispatch=write_json(os.path.join(self.out, "dispatch.json"),
-                                self.dispatch),
-            work_item="A1", metadata=meta, model_rollout=rollout,
-            result_file="", result_text="实际结果", summary="完成",
-            status="done", evidence=[f"E1={self.evidence}"],
-            test_command=[COMMAND], test_artifact=["E1"],
-            workspace=self.dir, base="", output="",
-            binding=binding["binding_id"])
-        env = NA.build_execution(args)
-        path = write_json(os.path.join(self.out, "execution.json"), env)
-        proc = F.run_cli("copilot_auto.py", "ingest", "--state",
-                         self.state_path, "--result-file", path)
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        attempt = G.create_review_attempt(
-            self.state_path, work_item_id="A1",
-            execution_result_sha256=env["result_sha256"],
-            workspace=self.dir)
-        self.assertEqual(env["code_scope_sha256"],
-                         attempt["code_scope_sha256"])
 
-    def test_late_registered_artifact_keeps_execution_scope(self):
-        artifact = os.path.join(self.dir, "run.log")
-        with open(artifact, "w", encoding="utf-8") as fh:
-            fh.write("log\n")
-        binding = self._binding()
-        meta, rollout = self._metadata(binding["nonce"])
-        args = SimpleNamespace(
-            state=self.state_path,
-            dispatch=write_json(os.path.join(self.out, "dispatch.json"),
-                                self.dispatch),
-            work_item="A1", metadata=meta, model_rollout=rollout,
-            result_file="", result_text="实际结果", summary="完成",
-            status="done", evidence=[f"E1={self.evidence}"],
-            test_command=[COMMAND], test_artifact=["E1"],
-            workspace=self.dir, base="", output="",
-            binding=binding["binding_id"])
-        env = NA.build_execution(args)
-        path = write_json(os.path.join(self.out, "execution.json"), env)
-        proc = F.run_cli("copilot_auto.py", "ingest", "--state",
-                         self.state_path, "--result-file", path)
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        state = G.load_state(self.state_path)
-        G.register_evidence(state, "E2", file_path=artifact)
-        G.save_state(self.state_path, state)
-        attempt = G.create_review_attempt(
-            self.state_path, work_item_id="A1",
-            execution_result_sha256=env["result_sha256"],
-            workspace=self.dir)
-        self.assertEqual(env["code_scope_sha256"],
-                         attempt["code_scope_sha256"])
-        self.assertEqual(G.CS.code_scope_problems(
-            attempt, G.load_state(self.state_path)), [])
 
     def test_output_inside_workspace_is_rejected(self):
         binding = self._binding()

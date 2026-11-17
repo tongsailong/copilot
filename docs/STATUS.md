@@ -1,8 +1,36 @@
 # STATUS
 
 更新：2026-11-17 CST。本文件只记录现场可核实的事实；规划与未完成事项单独标注。
+当前版本：v8.0.0（G4 退役，SOL 统一承接独立审查）。
+
+## G4 退役与 SOL 统一（2026-11-17，v8.0.0）
+
+基线：HEAD `873112d`（v7.0.0）。**本轮只做源码修改，未提交、未推送。**
+
+### 已实施
+- **G4 活动机制退役**：删除 `g4_attest.py`、`g4_shadow.py`、`test_execution.py`、
+  `review_output.py`；`native_agent.py` 只保留 `bind-execution` / `execution`；
+  `native_bridge` 只校验执行信封；`copilot_auto ingest` 只接受执行信封
+  （复核信封返回 `native_review_retired`）。
+- **状态机与门禁**：`closure_check` 返回 G1/G2/G3；`_gate_findings` 对所有风险等级生效；
+  `derive_work` 不再派生 `AUTO-G4*`；`review_metrics` 只统计 SOL/准入/停止/台账，历史 G4
+  计数标记 `g4.retired`；`start_state` 的 `risk=high` 不再要求 `--backend native`。
+- **SOL 承接**：`review_policy.admission` / `sol_review.admission` 的 high 分支为
+  `recommended` + `scope=sol`（不再有 `g4_separate`）；SOL 仍零工具、单轮、advisory。
+- **历史兼容**：历史 `native_reviews` / `review_attempts` / `g4_attestations` 原样保留，
+  只读审计；`legacy-status`、历史 G4 台账与 authoritative finding 保护级别不变。
+- **版本**：`copilot_dispatch.__version__ = 8.0.0`；`SKILL.md` v8.0.0 块新增，v7.0.0 块
+  降为历史。
+
+### 验证
+- 活动测试：`python3 -B -m unittest discover -s tests -p 'test_*.py'`（G4 专项测试文件
+  已随模块删除；其余测试按 v8 契约重写）。
+- 历史回归：`legacy/tests` 只验证 v5 行为，另行运行。
+- 运行时同步：`scripts-sync/sync_runtime.py --apply` 后 `--check` 缺失 0、不同 0。
+- **未验证**：未做真实 SOL 调用（无新增付费授权）；未做 G4 真实宿主 E2E（机制已移除）。
 
 ## SOL 单轮复核与 Reviewer 退役（2026-11-17，v7.0.0）
+
 
 基线：HEAD `f68fafa`（v6.11.0）+ 工作区 v6.12.0 未提交改动。**本轮继续未提交、未推送。**
 

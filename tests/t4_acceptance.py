@@ -3,6 +3,9 @@
 
 只使用临时目录与本地夹具，不读写生产任务台账/运行时；输出 JSON 报告。
 用法：python3 -B tests/t4_acceptance.py [--report /tmp/copilot-t4-report.json]
+
+v8.0.0 起 G4 原生只读复核已退役：验收场景改为覆盖执行绑定、代码快照、
+合同策略、G1–G3 门禁、G4 历史只读与 SOL advisory。
 """
 from __future__ import annotations
 
@@ -19,164 +22,93 @@ ROOT = os.path.dirname(HERE)
 
 LAYERS = {
     "T0": ["tests.test_docs_v6", "tests.test_architecture"],
-    "T1": ["tests.test_review_output", "tests.test_host_records",
-           "tests.test_execution_binding", "tests.test_test_execution",
-           "tests.test_code_scope_unified", "tests.test_g4_attest",
-           "tests.test_g4_shadow", "tests.test_profile_policy"],
+    "T1": ["tests.test_host_records", "tests.test_execution_binding",
+           "tests.test_code_scope_unified", "tests.test_profile_policy",
+           "tests.test_sync_runtime", "tests.test_agent_policy"],
     "T2": ["discover", "-s", "tests", "-p", "test_*.py"],
     "T3": ["discover", "-s", "legacy/tests", "-p", "test_*.py"],
 }
 
 # 场景 → 覆盖它的定向测试（真实执行，非文字声明）。
 SCENARIOS = {
-    "happy_executor_reviewer": [
+    "happy_execution_binding": [
         "tests.test_execution_binding.ExecutionBindingFlowTests."
-        "test_binding_flows_from_creation_to_verified_test_evidence"],
-    "executor_old_session_reuse": [
-        "tests.test_test_execution.TestExecutionTests."
-        "test_session_before_binding_is_failed",
-        "tests.test_test_execution.TestExecutionTests."
-        "test_prompt_without_nonce_is_failed"],
-    "reviewer_old_session_reuse": [
-        "tests.test_g4_attest.AttemptBindingTests."
-        "test_session_precedes_attempt"],
-    "executor_command_mismatch": [
-        "tests.test_test_execution.TestExecutionTests."
-        "test_binding_command_change_is_failed"],
-    "test_exit_nonzero": [
-        "tests.test_test_execution.TestExecutionTests."
-        "test_nonzero_exit_is_failed"],
-    "test_report_failure": [
-        "tests.test_test_execution.TestExecutionTests."
-        "test_junit_failure_does_not_verify_result",
-        "tests.test_test_execution.TestExecutionTests."
-        "test_junit_failure_element_without_attribute_is_not_verified"],
-    "stale_test_artifact": [
-        "tests.test_test_execution.TestExecutionTests."
-        "test_artifact_drift_is_failed",
-        "tests.test_test_execution.TestExecutionTests."
-        "test_stale_artifact_is_failed"],
-    "source_change_after_execution": [
-        "tests.test_test_execution.ExecutionIngestBindingTest."
-        "test_execution_envelope_feeds_verified_test_binding"],
-    "reviewer_outside_read": [
-        "tests.test_g4_attest.EvidenceBoundaryTests."
-        "test_outside_workspace_read_rejected"],
-    "reviewer_output_invalid": [
-        "tests.test_review_output.ReviewOutputTests."
-        "test_fence_outside_text_rejected",
-        "tests.test_review_output.ReviewOutputTests."
-        "test_duplicate_keys_rejected"],
-    "raw_output_missing": [
-        "tests.test_g4_attest.HostOutputFallbackTests."
-        "test_missing_output_file_and_db_fails_closed"],
-    "sqlite_missing": [
-        "tests.test_test_execution.TestExecutionTests."
-        "test_db_missing_is_unverified"],
-    "history_after_session_cleanup": [
-        "tests.test_g4_attest.HostOutputFallbackTests."
-        "test_db_output_is_used_when_output_file_is_pruned"],
-    "attempt_replay": [
-        "tests.test_g4_attest.AttemptBindingTests.test_consumed_attempt"],
+        "test_binding_flows_from_creation_to_consumption"],
     "binding_replay": [
         "tests.test_execution_binding.ExecutionBindingFlowTests."
         "test_consumed_binding_cannot_be_reused"],
+    "execution_envelope_tamper": [
+        "tests.test_cli_v6.NativeCliTests."
+        "test_tampered_execution_envelope_is_rejected"],
+    "native_execution_flow": [
+        "tests.test_cli_v6.NativeCliTests."
+        "test_native_flow_ingests_execution_and_closes_without_review"],
     "submodule_dirty": [
         "tests.test_code_scope_unified.CodeScopeUnifiedTests."
         "test_submodule_dirty_tracked_change_changes_digest"],
     "undeclared_nested_repo": [
         "tests.test_code_scope_unified.CodeScopeUnifiedTests."
         "test_undeclared_nested_repo_dirty_is_included"],
-    "ingest_interrupted": [
-        "tests.test_g4_shadow.ShadowIngestIntegrationTests."
-        "test_save_failure_leaves_no_partial_consumption"],
-    "incremental_baseline_invalid": [
-        "tests.test_g4_shadow.ShadowBuildTests."
-        "test_incremental_baseline_attestation_tamper_is_rejected"],
-    "contract_no_test_not_applicable": [
-        "tests.test_test_execution.TestExecutionTests."
-        "test_contract_no_test_is_not_applicable",
-        "tests.test_g4_shadow.CandidateFinalizeTests."
-        "test_contract_no_test_not_applicable_is_eligible"],
     "contract_layer_cannot_be_lowered": [
         "tests.test_execution_binding.ContractPolicyTests."
         "test_contract_commands_and_layers_cannot_be_lowered",
         "tests.test_execution_binding.ContractPolicyTests."
         "test_tampered_binding_policy_is_rejected"],
-    "contract_report_missing": [
-        "tests.test_test_execution.TestExecutionTests."
-        "test_contract_report_missing_is_failed"],
-    "contract_artifact_missing": [
-        "tests.test_test_execution.TestExecutionTests."
-        "test_contract_artifact_missing_is_failed",
-        "tests.test_test_execution.TestExecutionTests."
-        "test_contract_path_outside_workspace_is_failed",
-        "tests.test_execution_binding.ContractPolicyTests."
-        "test_tampered_contract_report_artifacts_are_rejected"],
-    "contract_not_applicable_accepted": [
-        "tests.test_g4_shadow.TestExecutionAcceptanceTests."
-        "test_contract_no_test_not_applicable_is_accepted",
-        "tests.test_g4_shadow.CandidateFinalizeTests."
-        "test_not_applicable_with_contract_artifacts_is_rejected"],
-    "contract_amend_after_binding": [
-        "tests.test_test_execution.TestExecutionTests."
-        "test_contract_changed_after_binding_is_failed",
-        "tests.test_g4_shadow.CandidateFinalizeTests."
-        "test_binding_contract_changed_blocks_candidate",
-        "tests.test_g4_shadow.ShadowBuildTests."
-        "test_build_passes_current_contract_to_test_execution"],
-    "contract_source_without_current_policy": [
-        "tests.test_g4_shadow.TestExecutionAcceptanceTests."
-        "test_contract_source_without_current_policy_is_rejected",
-        "tests.test_g4_shadow.ShadowBuildTests."
-        "test_build_rejects_not_applicable_without_current_policy"],
-    "require_binding_by_contract": [
-        "tests.test_g4_shadow.RequirementPolicyTests."
-        "test_contract_policy_requires_binding_even_for_normal_risk"],
-    "stored_findings_tamper": [
-        "tests.test_g4_attest.StoredVerificationTests."
-        "test_tampered_stored_findings_are_rejected",
-        "tests.test_g4_attest.StoredVerificationTests."
-        "test_legacy_record_without_findings_detail_is_limited"],
-    "test_policy_cli": [
-        "tests.test_execution_binding.TestPolicyCliTests."
-        "test_start_and_amend_accept_test_policy"],
     "contract_changed": [
         "tests.test_execution_binding.ExecutionBindingFlowTests."
         "test_contract_change_invalidates_binding"],
-    "formal_g4_requires_candidate": [
-        "tests.test_snapshot_binding.SnapshotBindingTests."
-        "test_formal_g4_requires_attested_candidate",
-        "tests.test_snapshot_binding.SnapshotBindingTests."
-        "test_attested_but_ineligible_is_not_formal"],
-    "legacy_g4_source_rejected": [
-        "tests.test_snapshot_binding.SnapshotBindingTests."
-        "test_legacy_g4_source_is_rejected_by_gate"],
-    "reviewer_bash_retired": [
-        "tests.test_native_agent_v6.BuildReviewTests."
-        "test_non_readonly_tool_is_rejected",
-        "tests.test_snapshot_binding.SnapshotBindingTests."
-        "test_bash_review_is_rejected"],
+    "test_policy_cli": [
+        "tests.test_execution_binding.TestPolicyCliTests."
+        "test_start_and_amend_accept_test_policy"],
+    "g4_retired_high_risk_closes": [
+        "tests.test_governance.HighRiskRetirementTests."
+        "test_high_risk_closes_without_native_review",
+        "tests.test_governance.HighRiskRetirementTests."
+        "test_high_risk_accepts_legacy_backend"],
+    "historical_g4_records_do_not_gate": [
+        "tests.test_governance.HighRiskRetirementTests."
+        "test_historical_g4_records_do_not_gate"],
+    "finding_ledger_gate_all_risks": [
+        "tests.test_governance.HighRiskRetirementTests."
+        "test_unresolved_blocking_finding_blocks_high_risk_closure",
+        "tests.test_governance.HighRiskRetirementTests."
+        "test_verified_finding_no_longer_blocks"],
+    "no_auto_g4_derivation": [
+        "tests.test_native_agent_v6.NoG4DerivationTests."
+        "test_historical_capability_gap_never_derives_g4_work",
+        "tests.test_native_agent_v6.NoG4DerivationTests."
+        "test_repeated_historical_g4_actions_do_not_trigger_replan"],
+    "native_review_envelope_retired": [
+        "tests.test_review_efficiency.NativeReviewRetiredTests."
+        "test_native_review_envelope_is_retired",
+        "tests.test_review_efficiency.NativeReviewRetiredTests."
+        "test_legacy_review_envelope_is_retired"],
+    "sol_review_is_advisory": [
+        "tests.test_sol_review_v7.StateIntegrationTests."
+        "test_sol_review_is_advisory_not_a_closure_gate",
+        "tests.test_sol_review_v7.AdmissionTests.test_tiers"],
+    "sol_zero_tool_single_round": [
+        "tests.test_sol_review_v7.ZeroToolTests."
+        "test_run_review_sends_exactly_one_zero_tool_request",
+        "tests.test_sol_review_v7.SingleRoundTests."
+        "test_same_materials_reuse_existing_review"],
     "reviewer_profile_retired": [
         "tests.test_profile_policy.WorkspaceProfileTests."
         "test_legacy_reviewer_profile_is_gone",
         "tests.test_profile_policy.WorkspaceProfileTests."
         "test_agents_dir_has_only_the_generic_profile",
-        "tests.test_profile_policy.WorkspaceProfileTests."
-        "test_profile_disallows_bash_and_writes",
         "tests.test_sync_runtime.RealDistributionTests."
         "test_v6_modules_are_distributed_and_legacy_is_not"],
+    "agent_dispatch_advice": [
+        "tests.test_agent_policy.DispatchAdviceTests.test_default_is_main",
+        "tests.test_agent_policy.AgentPolicyCLITests."
+        "test_g4_required_flag_is_removed"],
 }
 
 
 def run_suite(names: list[str]) -> dict:
     start = time.time()
-    if names and names[0] == "discover":
-        command = [sys.executable, "-B", "-m", "unittest", *names]
-        # discover 是 unittest 子命令，不能与模块名混用
-        command = [sys.executable, "-B", "-m", "unittest", *names]
-    else:
-        command = [sys.executable, "-B", "-m", "unittest", *names]
+    command = [sys.executable, "-B", "-m", "unittest", *names]
     proc = subprocess.run(command,
                           cwd=ROOT, capture_output=True, text=True)
     tail = (proc.stderr or proc.stdout).strip().splitlines()[-6:]

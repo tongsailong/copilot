@@ -15,7 +15,6 @@ ROOT = os.path.dirname(HERE)
 sys.path.insert(0, os.path.join(ROOT, "scripts"))
 
 import code_scope as CS  # noqa: E402
-import g4_attest as A  # noqa: E402
 
 
 def run(*args, cwd):
@@ -49,7 +48,6 @@ class CodeScopeUnifiedTests(unittest.TestCase):
         snapshot = CS.capture_code_snapshot(self.dir, **kwargs)
         self.assertTrue(snapshot["available"], snapshot)
         self.assertEqual(snapshot["digest"], CS.snapshot_digest(snapshot))
-        self.assertEqual(snapshot["digest"], A._snapshot_digest(snapshot))
         return snapshot
 
     def paths(self, snapshot):

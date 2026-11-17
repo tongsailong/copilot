@@ -12,7 +12,7 @@ Copilot v7 用一次性的 SOL REVIEW 取代原生 Reviewer 多轮复核：
   由主代理决定是否人工重新发起。
 * **模型身份是硬门**：上游 `model` 回显必须与请求完全一致，否则该回复不得进入
   任务状态（退出码 9）。
-* **只做 REVIEW**：不恢复 CONSULT / PLAN，不把 SOL 当 G4，也不让 SOL 接管工程
+* **只做 REVIEW**：不恢复 CONSULT / PLAN，不把 SOL 当工程执行或权限证明，
   执行或技术决策。结果只是建议，主代理判断、修复并验证。
 
 本模块不读写任务状态：状态登记、单轮判定与 finding 合并由
@@ -900,7 +900,7 @@ def admission(*, risk: str, triggers: list[str] | None = None,
     """SOL 复核准入建议（只读建议，不是门禁）。
 
     简单/普通任务由主代理自检闭环；多模块改造、数据链路、安全与生产高风险、
-    用户明确要求时建议调用一次。高风险 G4 与 SOL 分离：SOL 不能替代 G4。
+    用户明确要求时建议调用一次。SOL 是 advisory，不构成收口门禁。
     """
     import review_policy as RP
 
@@ -924,7 +924,7 @@ def admission(*, risk: str, triggers: list[str] | None = None,
     if tier == "high":
         decision, scope = "recommended", "high-risk"
         detail = ("高风险/安全/生产变更建议在最终验证后调用一次 SOL 复核；"
-                  "G4 仍需宿主精确只读载体，SOL 不能替代 G4。")
+                  "SOL 只提供独立审查意见，不证明宿主权限，也不构成收口门禁。")
     elif requested:
         decision, scope = "recommended", "triggered"
         detail = "声明了实质风险因素，建议调用一次 SOL 复核；主代理自行决定。"
@@ -943,6 +943,5 @@ def admission(*, risk: str, triggers: list[str] | None = None,
         "triggers": requested,
         "reason": str(reason or "")[:1000],
         "single_round": True,
-        "g4_separate": True,
         "detail": detail,
     }

@@ -99,24 +99,20 @@ class SkillEntryTests(unittest.TestCase):
         self.assertIn("不会解除阻塞", self.doc)
         self.assertIn("evidence --drop", self.doc)
 
-    def test_four_gates_and_native_reviewer(self):
-        for gate in ("G1", "G2", "G3", "G4"):
+    def test_gates_and_sol_review(self):
+        for gate in ("G1", "G2", "G3"):
             self.assertIn(gate, self.doc)
+        self.assertIn("G4", self.doc)
+        self.assertIn("已正式退役", self.doc)
         self.assertIn("fail-closed", self.doc)
-        self.assertIn("g4_eligible", self.doc)
-        self.assertIn("copilot-native-review/v2", self.doc)
-        self.assertIn("--create-attempt", self.doc)
-        self.assertIn("review_attempt_id", self.doc)
-        self.assertIn("代码范围快照", self.doc)
-        self.assertIn("--workspace", self.doc)
-        # SOL 单轮复核必须写进入口，且明确不是 G4。
+        # SOL 单轮复核必须写进入口，并明确是 advisory。
         self.assertIn("sol-review", self.doc)
         self.assertIn("单轮", self.doc)
         self.assertIn("零工具", self.doc)
-        self.assertIn("不是 G4", self.doc)
-        # 高风险与 native 后端的绑定必须写进入口，否则会留下无法收口的任务。
+        self.assertIn("advisory", self.doc)
+        # 高风险不再绑定 native 后端。
         self.assertIn("--risk high", self.doc)
-        self.assertIn("--backend native", self.doc)
+        self.assertIn("不再绑定 `--backend native`", self.doc)
 
     def test_reference_routing_lists_all_active_docs(self):
         for name in ACTIVE_REFS + ("history.md",):
@@ -132,14 +128,13 @@ class ReferenceTests(unittest.TestCase):
         self.assertIn("sol_reviews", o["review.md"])
         self.assertIn("单轮", o["review.md"])
         self.assertIn("零工具", o["review.md"])
-        self.assertIn("不是 G4", o["review.md"])
+        self.assertIn("已正式退役", o["review.md"])
         self.assertIn("MAX_DRIVE_STEPS", o["runtime.md"])
         self.assertIn("PARTIAL 不是终点", o["runtime.md"])
         self.assertIn("G4", o["review.md"])
         self.assertIn("在任一门失败时拒绝", o["review.md"])
         self.assertIn("copilot-native-dispatch/v2", o["agent-bridge.md"])
-        self.assertIn("new_g4_eligible", o["agent-bridge.md"])
-        self.assertIn("native_review_legacy_g4_source", o["review.md"])
+        self.assertIn("native_review_retired", o["agent-bridge.md"])
         self.assertIn("--authorized-by user", o["workflow.md"])
         self.assertIn("退出码 0", o["workflow.md"])
         self.assertIn("--amend", o["workflow.md"])
@@ -147,13 +142,8 @@ class ReferenceTests(unittest.TestCase):
         self.assertIn("BLOCKED 下的受控写入", o["runtime.md"])
         self.assertIn("amendment", o["review.md"])
         self.assertIn("superseded", o["review.md"])
-        self.assertIn("--create-attempt", o["review.md"])
-        self.assertIn("native_review_attempt_workspace_drift", o["review.md"])
-        self.assertIn("native_review_code_scope_drift", o["review.md"])
         self.assertIn("code_snapshot", o["agent-bridge.md"])
-        self.assertIn("review_attempt_id", o["agent-bridge.md"])
-        self.assertIn("review_attempt_created_at", o["agent-bridge.md"])
-        self.assertIn("--create-attempt", o["workflow.md"])
+        self.assertIn("review_attempt", o["agent-bridge.md"])
         for name, doc in o.items():
             self.assertNotIn("call_gpt.py --", doc, name)
         self.assertIn("native_review_retired", o["agent-bridge.md"])
@@ -195,12 +185,14 @@ class ReadonlyProfileTests(unittest.TestCase):
 
 
 class ProjectDocTests(unittest.TestCase):
-    def test_agents_md_points_to_v7_architecture(self):
+    def test_agents_md_points_to_v8_architecture(self):
         doc = text(os.path.join(ROOT, "AGENTS.md"))
         self.assertIn("唯一远程调用是 SOL REVIEW", doc)
         self.assertIn("PARTIAL 不是终点", doc)
         self.assertIn("legacy/tests", doc)
         self.assertIn("native_review_retired", doc)
+        self.assertIn("G4 原生只读复核正式退役", doc)
+        self.assertIn("G1–G3", doc)
         self.assertNotIn("SOL 固定", doc)
         self.assertNotIn("唯一正式 GPT/SOL 入口", doc)
 
@@ -210,8 +202,9 @@ class ProjectDocTests(unittest.TestCase):
         self.assertIn("只恢复 REVIEW", charter)
         self.assertIn("唯一工程执行与技术决策主体", charter)
         self.assertIn("v7.0", roadmap)
+        self.assertIn("v8.0", roadmap)
 
-    def test_status_and_decisions_record_v7(self):
+    def test_status_and_decisions_record_versions(self):
         status = text(os.path.join(ROOT, "docs", "STATUS.md"))
         decisions = text(os.path.join(ROOT, "docs", "DECISIONS.md"))
         self.assertIn("v6.0.0", status)
@@ -219,6 +212,8 @@ class ProjectDocTests(unittest.TestCase):
         self.assertIn("本地治理引擎", decisions)
         self.assertIn("v7.0.0", decisions)
         self.assertIn("SOL 零工具单轮", decisions)
+        self.assertIn("v8.0.0", decisions)
+        self.assertIn("G4", decisions)
 
     def test_readme_presents_sol_review_as_active(self):
         doc = text(os.path.join(ROOT, "README.md"))

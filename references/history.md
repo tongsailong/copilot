@@ -3,10 +3,25 @@
 > 本文件记录版本沿革与 SOL 通道变化过程，供追溯，**不是当前规则来源**。现行规则见
 > `SKILL.md`、`references/workflow.md`、`runtime.md`、`review.md`、`agent-bridge.md`。
 > **SOL 决策通道已于 v6.0.0（2026-11-12）退役；v7.0.0（2026-11-17）只恢复一次性 REVIEW
-> （零工具、单轮、建议性）**，不恢复 CONSULT/PLAN 或状态门禁。下文涉及 SOL 的段落按时间
-> 标注是否为历史事实描述。
+> （零工具、单轮、建议性）；v8.0.0（2026-11-17）正式退役 G4 原生只读复核**。下文涉及
+> SOL 与 G4 的段落按时间标注是否为历史事实描述。
 
-## v7.0.0（2026-11-17）SOL Review Edition
+## v8.0.0（2026-11-17）G4 Retirement Edition
+
+- **G4 正式退役**：删除 `g4_attest.py`、`g4_shadow.py`、`test_execution.py`、
+  `review_output.py` 与 `native_bridge` 复核校验、`native_agent.py review/review-context/
+  capability`、`copilot_auto` 复核 ingest、`AUTO-G4*` 派生与宿主能力拒绝码。不再产生
+  `g4_eligible`、G4 PASS、G4 BLOCKED 或 `host_capability_missing`。
+- **门禁收敛**：`closure_check` 只返回 G1/G2/G3；Finding 台账门禁对所有风险等级生效
+  （保留原 G4 的“未闭合 blocking/major 阻断收口”职责）；高风险任务不再要求 native 后端。
+- **SOL 统一承接**：高风险建议执行一次 SOL 零工具单轮复核（advisory，不构成门禁）；
+  `review_policy.admission` 与 `sol_review.admission` 的 high 分支返回
+  `recommended` + `scope=sol`。
+- **历史只读**：`native_reviews` / `review_attempts` / `g4_attestations` 与
+  `authority=authoritative` 字段原样保留；历史 G4 BLOCKED 不改写为 PASS。
+- **未放宽**：G1–G3、fail-closed、证据完整性、PWW 接受、授权与安全边界不变。
+
+## v7.0.0（2026-11-17）SOL Review Edition（历史）
 
 - **原生多轮 Reviewer 退役**：普通复核不再派发只读子代理、不再创建 review attempt、
   不做多轮重入；`native_agent.py review`、`review-context` 与原生复核 ingest 只接受

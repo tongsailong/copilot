@@ -38,7 +38,7 @@ import agent_policy as AP  # noqa: E402
 import review_policy as RP  # noqa: E402
 import sol_review as SR  # noqa: E402
 
-__version__ = "7.0.0"
+__version__ = "8.0.0"
 
 
 class CLIError(Exception):
@@ -432,9 +432,9 @@ def cmd_closure_check(args) -> int:
     if args.json:
         _print({"task_id": state.get("task_id"), **check})
         return 0
-    print(f"任务 {state.get('task_id')} 四门检查："
+    print(f"任务 {state.get('task_id')} 三道门检查："
           f"{'PASS' if check['passed'] else 'FAIL'}")
-    for name in ("G1", "G2", "G3", "G4"):
+    for name in ("G1", "G2", "G3"):
         gate = check["gates"][name]
         print(f"- {name}: {'PASS' if gate.get('passed') else 'FAIL'}")
         for reason in gate.get("reasons") or []:
@@ -506,7 +506,7 @@ def cmd_review_admission(args) -> int:
         print(decision.get("detail") or "")
         if decision.get("triggers"):
             print("触发因素：" + ", ".join(decision["triggers"]))
-        print("说明：SOL 是建议性独立审查，不是 G4；单轮调用，不自动二审。")
+        print("说明：SOL 是建议性独立审查（advisory），不是收口门禁；单轮调用，不自动二审。")
     return 0
 
 
@@ -681,8 +681,6 @@ def cmd_agent_policy(args) -> int:
         saves_time=bool(args.saves_time),
         research_only=bool(args.research_only),
         subagent_unavailable=bool(args.subagent_unavailable),
-        g4_required=bool(getattr(args, "g4_required", False)),
-        plan_mode=bool(getattr(args, "plan_mode", False)),
     )
     decision["schema"] = "copilot-agent-dispatch-advice/v1"
     decision["note"] = (
@@ -1077,8 +1075,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--test-policy-file", default="",
                    help="合同测试策略 JSON 文件")
     p.add_argument("--risk", default="medium", choices=G.RISKS,
-                   help="low/medium 默认不派 Reviewer；high 需要 G4，只能配 "
-                        "--backend native")
+                   help="low/medium 默认不派 Reviewer；high 建议一次 SOL 单轮复核"
+                        "（advisory，不阻塞收口）")
     p.add_argument("--backend", default="legacy", choices=G.BACKENDS)
     p.add_argument("--task-id", default="")
     p.add_argument("--mode", default="")
@@ -1191,7 +1189,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="存在多条未解除阻塞时必填，只解除指定 block")
     p.set_defaults(func=cmd_unblock)
 
-    p = sub.add_parser("closure-check", help="检查 G1–G4")
+    p = sub.add_parser("closure-check", help="检查 G1–G3")
     p.add_argument("--state", required=True)
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_closure_check)
@@ -1253,8 +1251,6 @@ def build_parser() -> argparse.ArgumentParser:
                    help="只读调查，不修改工程文件；只建议 Explore，不交给全工具代理")
     p.add_argument("--subagent-unavailable", action="store_true",
                    help="Profile/类型不可用或权限不满足；建议主代理继续")
-    p.add_argument("--g4-required", action="store_true",
-                   help="本次需要 G4 只读复核（要求精确 Read/Grep/Glob）")
     p.add_argument("--plan-mode", action="store_true",
                    help="父会话处于 plan 模式（planEnabled）：宿主会给子代理注入 Bash")
     p.add_argument("--json", action="store_true")

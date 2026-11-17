@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""v6 CLI 回归：本地治理命令、自动驱动退出码、原生回填与 G4 宿主核对。"""
+"""CLI 回归：本地治理命令、自动驱动退出码与原生执行信封回填。"""
 from __future__ import annotations
 
 import json
@@ -142,11 +142,12 @@ class LegacyCliTests(unittest.TestCase):
             self.assertEqual(proc.returncode, 0, proc.stderr)
             self.assertEqual(json.loads(proc.stdout)["phase"], "PARTIAL")
 
-    def test_high_risk_with_legacy_backend_is_rejected_at_start(self):
-        proc = self.start("--risk", "high")
-        self.assertEqual(proc.returncode, 2)
-        self.assertIn("--backend native", proc.stderr)
-        self.assertFalse(os.path.exists(self.state))
+    def test_high_risk_with_legacy_backend_starts(self):
+        # v8：G4 退役后高风险任务不再强制 native 后端。
+        proc = self.start("--risk", "high",
+                          "--test-policy", '{"required": false}')
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(read_json(self.state)["execution_backend"], "legacy")
 
     def test_review_authorization_requires_explicit_user_declaration(self):
         self.assertEqual(self.start().returncode, 0)
@@ -285,48 +286,7 @@ class NativeCliTests(unittest.TestCase):
         env["result_sha256"] = NB.envelope_sha256(env)
         return env
 
-    def _review(self, dispatch: dict, execution: dict) -> dict:
-        state = read_json(self.state)
-        attempt = G.create_review_attempt(
-            self.state, work_item_id=str(execution["work_item_id"]),
-            execution_result_sha256=str(execution["result_sha256"]),
-            workspace=self.dir)
-        host = F.make_fake_review_host(self.dir, execution=execution,
-                                       dispatch=dispatch, evidence=self.evidence,
-                                       task_id=state["task_id"],
-                                       attempt_id=attempt["review_attempt_id"],
-                                       session_created_at=attempt["created_at"])
-        env = {
-            "schema": NB.REVIEW_SCHEMA,
-            "task_id": state["task_id"],
-            "contract_sha256": state["contract_sha256"],
-            "plan_id": dispatch["plan_id"],
-            "plan_sha256": dispatch["plan_sha256"],
-            "dispatch_id": execution["dispatch_id"],
-            "work_item_id": execution["work_item_id"],
-            "execution_result_sha256": execution["result_sha256"],
-            "target_sha256": G.final_evidence_digest(G.load_state(self.state)),
-            "review_attempt_id": attempt["review_attempt_id"],
-            "review_attempt_created_at": attempt["created_at"],
-            "reviewer": {"kind": "subagent", "agent_id": host["agent_id"],
-                         "child_session_id": host["child_session_id"],
-                         "profile_id": "reviewer",
-                         "profile": F.readonly_profile_policy(),
-                         "model_reported": "m"},
-            "host": host,
-            "verdict": "pass",
-            "findings": [],
-            "files_inspected": [self.evidence],
-            "commands_run": [],
-            "changed_files": [],
-            "unverified": [],
-            "residual_risks": [],
-            "g4_eligible": True,
-        }
-        env["result_sha256"] = NB.envelope_sha256(env)
-        return env
-
-    def test_native_flow_ingests_execution_and_g4_review(self):
+    def test_native_flow_ingests_execution_and_closes_without_review(self):
         proc = F.run_cli("copilot_auto.py", "drive", "--state", self.state,
                          "--dispatch-out", self.dispatch_path)
         self.assertEqual(proc.returncode, 10, proc.stderr)
@@ -350,27 +310,15 @@ class NativeCliTests(unittest.TestCase):
                                    "--id", "C1", "--status", "met",
                                    "--evidence", "E1").returncode, 0)
 
+        # G4 退役：证据与条件齐备后直接收口，不再派生 AUTO-G4。
         proc = F.run_cli("copilot_auto.py", "drive", "--state", self.state,
                          "--dispatch-out", self.dispatch_path)
-        self.assertEqual(proc.returncode, 10, proc.stderr)
-        self.assertIn("AUTO-G4", proc.stdout)
-        self.assertEqual(read_json(self.state)["native_dispatch"]["plan_id"],
-                         dispatch["plan_id"])
-
-        review = self._review(dispatch, execution)
-        review_file = write_json(os.path.join(self.dir, "review.json"), review)
-        proc = F.run_cli("copilot_auto.py", "ingest", "--state", self.state,
-                         "--review-file", review_file)
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        # 阶段九：没有真实 Executor 宿主记录/新链 attestation 的复核不再获得
-        # 正式 G4，即使信封自报 g4_eligible=true。
-        self.assertIn("g4_eligible=False", proc.stdout)
         state = read_json(self.state)
-        self.assertEqual(state["native_reviews"][0]["g4_source"], "")
-        self.assertTrue(state["native_reviews"][0]["g4_reasons"])
-        attempt = G.find_review_attempt(
-            state, review["review_attempt_id"])
-        self.assertFalse(attempt["consumed"])
+        self.assertTrue(state["closure"]["closed"])
+        self.assertEqual(state["closure"]["verdict"], "pass")
+        self.assertFalse([a for a in state["actions"]
+                          if str(a.get("id", "")).startswith("AUTO-G4")])
 
     def test_tampered_execution_envelope_is_rejected(self):
         F.run_cli("copilot_auto.py", "drive", "--state", self.state,
@@ -385,34 +333,16 @@ class NativeCliTests(unittest.TestCase):
         self.assertIn("result_sha_mismatch", proc.stderr)
         self.assertEqual(read_json(self.state)["native_results"], [])
 
-    def test_review_with_changed_host_profile_is_rejected(self):
-        F.run_cli("copilot_auto.py", "drive", "--state", self.state,
-                  "--dispatch-out", self.dispatch_path)
-        dispatch = read_json(self.dispatch_path)
-        execution = self._execution(dispatch)
-        result_file = write_json(os.path.join(self.dir, "execution.json"), execution)
-        self.assertEqual(F.run_cli("copilot_auto.py", "ingest", "--state", self.state,
-                                   "--result-file", result_file).returncode, 0)
-        self.assertEqual(F.run_cli("copilot_dispatch.py", "criterion", "--state", self.state,
-                                   "--id", "C1", "--status", "met",
-                                   "--evidence", "E1").returncode, 0)
-        F.run_cli("copilot_auto.py", "drive", "--state", self.state,
-                  "--dispatch-out", self.dispatch_path)
-        review = self._review(dispatch, execution)
-        meta_path = review["host"]["metadata_path"]
-        metadata = read_json(meta_path)
-        metadata["profileSnapshot"]["tools"] = ["Read", "Write"]
-        write_json(meta_path, metadata)
-        review_file = write_json(os.path.join(self.dir, "review.json"), review)
+    def test_review_file_flag_is_removed(self):
+        result_file = write_json(os.path.join(self.dir, "execution.json"),
+                                 self._execution(read_json(self.state) and {
+                                     "actions": [], "plan_id": "",
+                                     "plan_sha256": ""}) if False else {})
         proc = F.run_cli("copilot_auto.py", "ingest", "--state", self.state,
-                         "--review-file", review_file)
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        # 新链独立核对 Profile 快照：工具集被改写后影子取证不通过，复核不以
-        # 正式 G4 记录；不再是旧 G4 的 ingest 硬拒绝。
-        review_record = read_json(self.state)["native_reviews"][0]
-        self.assertFalse(review_record["g4_eligible"])
-        self.assertEqual(review_record["g4_source"], "")
-        self.assertTrue(review_record["g4_reasons"])
+                         "--result-file", result_file,
+                         "--review-file", result_file)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("unrecognized", proc.stderr)
 
 
 if __name__ == "__main__":

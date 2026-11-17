@@ -1,28 +1,20 @@
 #!/usr/bin/env python3
-"""Agent 调度与权限能力判定（纯函数，不派发子代理、不调用模型）。
+"""Agent 调度建议（纯函数，不派发子代理、不调用模型、不写状态）。
 
-本模块只回答两个问题：
+本模块只回答一个问题：当前工作应该由主代理直接做，还是值得派发内置
+`Explore` / `general-purpose`？调度决定仍由 ZCode 主代理作出；Copilot 只提供
+可核对的判定口径。
 
-1. 宿主 `profileSnapshot` 实际给了这个子代理什么能力？能否作为 G4 只读复核执行者？
-2. 当前工作应该由主代理直接做，还是值得派发内置 `Explore` / `general-purpose`？
+ZCode 3.18.2 的内置能力（宿主源码与真实 metadata/DB 记录）：
 
-它**不创建 Agent、不调度、不写状态**；调度决定仍由 ZCode 主代理作出。Copilot 只提供
-可核对的判定口径，避免用 Profile 名称、Prompt 声明或“看起来只读”替代宿主策略证据。
+* `Explore`：`Bash,Glob,Grep,Read,WebFetch,WebSearch,TodoWrite`，
+  `injectAgentsMd=false`；Bash 在宿主记录里恒为 `read_only=0`，只能用于调查。
+* `general-purpose`：`tools=["*"]`，`injectAgentsMd=true`；继承主会话工具（含 MCP）
+  与写入能力。
 
-判定只看宿主有效工具策略，不看 Profile 名称、来源或路径；内置 Agent 名称只用于诊断
-说明与文档对照。ZCode 3.18.2 的内置能力（宿主源码与真实 metadata/DB 记录）：
-
-* `Explore`：`Bash,Glob,Grep,Read,WebFetch,WebSearch,TodoWrite`，`injectAgentsMd=false`；
-  Bash 在宿主记录里恒为 `read_only=0`，因此**不是**只读代理，只能用于调查。
-* `general-purpose`：`tools=["*"]`，`injectAgentsMd=true`；继承主会话工具（含 MCP）与
-  写入能力，不能当作只读复核者。
-* 没有按派发覆盖工具的参数，也没有 OS 级只读沙箱；G4 的“精确 Read/Grep/Glob”只能由
-  宿主强制 `tools=[Read,Grep,Glob]` 且禁用 `Write/Edit/Bash` 的 Profile 证明。
+v8 起 G4 原生只读复核已退役：本模块不再判定 Profile 是否满足 G4 只读载体。
 """
 from __future__ import annotations
-
-import host_records
-import native_bridge as NB
 
 # 宿主版本与内置能力基线。升级 ZCode 后必须用真实 metadata/DB 重新核对，不能假设不变。
 HOST_VERSION = "3.18.2"
@@ -32,7 +24,7 @@ BUILTIN_AGENTS = {
                   "TodoWrite"),
         "inject_agents_md": False,
         "inherits_mcp": False,
-        "note": "只读调查助手；含 Bash，宿主记录 read_only=0，非只读代理。",
+        "note": "只读调查助手；含 Bash，宿主记录 read_only=0，非只读沙箱。",
     },
     "general-purpose": {
         "tools": ("*",),
@@ -41,287 +33,6 @@ BUILTIN_AGENTS = {
         "note": "全工具代理；可写、可执行命令并继承 MCP。",
     },
 }
-# G4 只读工具集（与 native_bridge.REVIEWER_TOOLS 一致）。
-READ_ONLY_TOOLS = tuple(NB.REVIEWER_TOOLS)
-# 宿主 3.18.2 的写工具集合是 Write/Edit/ApplyPatch/Bash；这里额外并入执行类
-# （js*）、代理类（Agent/Task）与旧版编辑工具。集合只用于**逐工具调用**的证据
-# 判定；Profile 级“能不能写”走 `_can_write` 的未知工具 fail-closed 口径。
-WRITE_CAPABLE_TOOLS = frozenset({
-    "Bash", "Write", "Edit", "ApplyPatch", "NotebookEdit", "MultiEdit",
-    "Agent", "Task", "js", "js_reset", "js_add_node_module_dir",
-})
-# 明确只读、即使出现在 Profile 也不构成写能力的工具。Read/Grep/Glob 直接取
-# G4 只读集合，避免两处定义漂移；不在本集合内的任何工具（未来新增工具、
-# ApplyPatch、js、Agent、Skill）一律按“可能写入”处理。
-KNOWN_READ_ONLY_TOOLS = frozenset(
-    set(READ_ONLY_TOOLS) | {"WebFetch", "WebSearch", "TodoRead", "TodoWrite"})
-
-
-def _tool_names(value: object) -> list[str]:
-    return [str(item) for item in value] if isinstance(value, list) else []
-
-
-def _can_write(tools: list[str], policy: dict) -> bool:
-    """Profile 是否可能写文件/执行命令；未知工具一律视为可能写入。"""
-    if "*" in tools:
-        return True
-    if any(name not in KNOWN_READ_ONLY_TOOLS for name in tools):
-        return True
-    if policy.get("mcpServers") or policy.get("skills"):
-        return True
-    return False
-
-
-def tool_call_is_write(name: str, read_only: int = 0) -> tuple[bool, bool]:
-    """逐调用判定 (是否写能力, 是否无法分类)。
-
-    `read_only=1` 为宿主明确记录的只读调用；`0` 为写/执行；其它值（含 NULL
-    归一化的 -1）表示宿主未分类，交给调用方作为告警而不是静默放行。
-    """
-    tool = str(name or "")
-    if tool in WRITE_CAPABLE_TOOLS or tool.startswith("mcp__"):
-        return True, False
-    if tool in KNOWN_READ_ONLY_TOOLS:
-        return False, False
-    if read_only == 0:
-        return True, False
-    return False, True
-
-
-def _base_classification(codes: list[str] | None = None,
-                         reasons: list[str] | None = None,
-                         remedy: str = "") -> dict:
-    base_codes = codes or ["profile_snapshot_missing"]
-    base_reasons = reasons or ["缺少宿主 profileSnapshot，无法证明实际权限"]
-    return {
-        "name": "",
-        "source": "",
-        "path": "",
-        "tools": [],
-        "disallowed_tools": [],
-        "permission_mode": "",
-        "role": "unknown",
-        "can_write": False,
-        "g4_executor": False,
-        "codes": base_codes,
-        "reasons": base_reasons,
-        "remedy": remedy or ("没有宿主有效权限策略时保持 fail-closed；不得用 Profile "
-                             "名称或 Prompt 声明代替权限证据。"),
-        "builtin": "",
-    }
-
-
-def _remedy_for_codes(codes: list[str]) -> str:
-    """按偏离项给出可执行的补救说明，避免“工具集不精确”掩盖真实原因。"""
-    remedies = {
-        "profile_tools_empty": "Profile 的 tools=[] 在宿主语义里等于继承父工具，"
-                               "必须写精确工具集。",
-        "profile_tools_not_exact": "tools 必须精确等于 Read/Grep/Glob，"
-                                   "多一个工具都不能算只读复核资格。",
-        "profile_disallowed_missing": "disallowedTools 必须显式包含 Write/Edit/Bash。",
-        "profile_permission_mode": "permissionMode 只能是 default/plan 或留空。",
-        "profile_skills_not_allowed": "Profile 启用了 skills，G4 要求无 skills。",
-        "profile_mcp_servers": "Profile 启用了 MCP，G4 要求无 MCP。",
-        "profile_source_not_builtin": (
-            "G4 只接受 ZCode 内置子代理（source=built-in）；项目/用户/插件自定义 "
-            "Profile 不是原定架构的载体。宿主当前内置 Explore 含 Bash、"
-            "general-purpose 为全工具，没有精确只读载体，G4 应保持 BLOCKED。"),
-    }
-    parts = [remedies.get(code, code) for code in codes]
-    if not parts:
-        parts = ["当前 Profile 不满足 G4 只读能力。"]
-    return ("；".join(parts) + " 保持 fail-closed，不要用名称或 Prompt 声明"
-            "替代宿主策略。")
-
-
-def classify_profile(snapshot: object) -> dict:
-    """把宿主 `profileSnapshot` 归类为可执行/只读/未知，并给出 G4 判定。
-
-    返回的 `g4_executor` 与 `native_bridge.reviewer_policy_problems` 完全一致：
-    `tools` 必须精确等于 `Read/Grep/Glob`，显式禁用 `Write/Edit/Bash`，无 skills/MCP；
-    名称、来源、路径只作记录事实。
-    """
-    if not isinstance(snapshot, dict) or not snapshot:
-        return _base_classification()
-    if "tools" not in snapshot:
-        return _base_classification(
-            ["profile_tools_missing"],
-            ["宿主 profileSnapshot 缺少 tools 字段，无法证明实际权限"],
-            "Profile 快照没有 tools 字段时视为无有效权限策略；重新派发并读取宿主 "
-            "metadata 的完整 profileSnapshot。")
-    policy = NB.normalize_profile_policy(snapshot)
-    tools = _tool_names(policy.get("tools"))
-    problems = NB.reviewer_policy_problems(policy)
-    # 原定架构只允许 ZCode 内置子代理；项目/用户自定义 Profile 即使工具集精确，
-    # 也不能作为正式 G4 载体（宿主内置 Explore 含 Bash、general-purpose 为全工具）。
-    problems = problems + NB.g4_carrier_problems(policy)
-    codes = [code for code, _detail in problems]
-    reasons = [f"{code}: {detail}" for code, detail in problems]
-    can_write = _can_write(tools, policy)
-    name = str(policy.get("name") or "").strip()
-    source = str(policy.get("source") or "").strip()
-    builtin = BUILTIN_AGENTS.get(name) if source in ("built-in", "") else None
-
-    if not problems:
-        role = "read_only"
-    elif "*" in tools:
-        role = "unrestricted"
-    elif can_write:
-        role = "write_capable"
-    elif tools:
-        # 工具都只读但策略仍不满足复核（permissionMode/skills/禁用项）：可读，
-        # 但不能算“只读复核资格”。
-        role = "read_only_conditional"
-    else:
-        role = "unknown"
-
-    if not problems:
-        codes = ["g4_ready"]
-        reasons = ["宿主有效策略精确为 Read/Grep/Glob，并禁用 Write/Edit/Bash"]
-        remedy = ("满足 G4 只读能力要求；仍需 review attempt、宿主记录与原始输出"
-                  "绑定，正式资格由 g4_attest 决定。")
-    elif builtin is not None:
-        if name == "Explore":
-            codes.append("g4_tools_include_bash")
-            reasons.append("内置 Explore 含 Bash：可写文件/执行命令，宿主记录恒为 "
-                           "read_only=0")
-            remedy = ("内置 Explore 含 Bash（可写文件/执行命令，宿主记录恒为 "
-                      "read_only=0），不是只读代理，只能用于调查；不得作为 G4 "
-                      "执行者。宿主没有按派发覆盖工具的参数，必须保持 fail-closed。")
-        else:
-            codes.append("g4_tools_unrestricted")
-            reasons.append("内置 general-purpose 为 tools=[*]，可写、可执行并继承 MCP")
-            remedy = ("内置 general-purpose 不能当作只读复核者；需要独立复核时使用"
-                      "宿主强制只读的能力载体，否则如实报告 G4 能力缺口。")
-    elif "*" in tools:
-        codes.append("g4_tools_unrestricted")
-        remedy = ("该 Profile 为全工具集，不能证明只读；G4 需要精确 "
-                  "Read/Grep/Glob 且禁用 Write/Edit/Bash。")
-    elif can_write:
-        codes.append("g4_tools_write_capable")
-        remedy = ("该 Profile 含写入/执行/MCP 能力，不能证明只读；G4 需要精确 "
-                  "Read/Grep/Glob 且禁用 Write/Edit/Bash。")
-    else:
-        remedy = _remedy_for_codes(codes)
-
-    return {
-        "name": name,
-        "source": source,
-        "carrier": ("built-in" if source == "built-in"
-                    else "project-profile" if source == "project"
-                    else "user-profile" if source == "user"
-                    else "unknown"),
-        "architecture_compliant": source == NB.G4_CARRIER_SOURCE,
-        "path": str(policy.get("path") or "").strip(),
-        "tools": tools,
-        "disallowed_tools": _tool_names(policy.get("disallowedTools")),
-        "permission_mode": str(policy.get("permissionMode") or "").strip(),
-        "role": role,
-        "can_write": can_write,
-        "g4_executor": not problems,
-        "codes": codes,
-        "reasons": reasons,
-        "remedy": remedy,
-        "builtin": name if builtin is not None else "",
-    }
-
-
-def capability_report(metadata: object, metadata_path: str = "",
-                      execution_state: object = None,
-                      host_info: object = None) -> dict:
-    """从宿主 metadata 生成只读能力报告（不派发、不改状态）。
-
-    `execution_state` 是子会话的 `runtime/execution_state`（由
-    `host_records.session_execution_state` 读取）。宿主在 plan 模式下会给子代理
-    注入 Bash（真实记录：planEnabled=true 的独立只读子会话执行过 `git status`），
-    所以“Profile 策略只读”还不够；plan 模式或状态未知都必须让 `g4.executor` 为假。
-    """
-    data = metadata if isinstance(metadata, dict) else {}
-    snapshot = data.get("profileSnapshot")
-    classification = (classify_profile(snapshot) if isinstance(snapshot, dict)
-                      else _base_classification())
-    profile_id = str(data.get("profileId") or "").strip()
-    snapshot_name = str(classification.get("name") or "").strip()
-    warnings: list[str] = []
-    if not isinstance(snapshot, dict):
-        warnings.append("profile_snapshot_missing")
-    elif "tools" not in snapshot:
-        warnings.append("profile_tools_missing")
-    elif profile_id and snapshot_name and profile_id != snapshot_name:
-        warnings.append("profile_id_mismatch")
-    if isinstance(snapshot, dict):
-        mode = snapshot.get("permissionMode")
-        if isinstance(mode, str) and mode != mode.strip():
-            warnings.append("permission_mode_whitespace")
-    status = str(data.get("status") or "").strip()
-    if status and status != "completed":
-        warnings.append("agent_not_completed")
-    session_state = execution_state if isinstance(execution_state, dict) else {}
-    unchecked = execution_state is None
-    session_problems = host_records.execution_state_problems(session_state) \
-        if not unchecked else []
-    if unchecked:
-        # 调用方没有提供子会话执行状态：无法排除 plan 模式注入 Bash，不能只凭
-        # Profile 策略判定可执行 G4（fail-closed）。
-        warnings.append("session_state_unchecked")
-    elif session_problems:
-        warnings.extend(code for code, _detail in session_problems)
-    g4_executor = bool(classification.get("g4_executor")) \
-        and not unchecked and not session_problems
-    codes = list(classification.get("codes") or [])
-    if unchecked:
-        codes = ["session_state_unchecked"]
-    elif session_problems:
-        codes = [code for code, _detail in session_problems]
-    remedy = str(classification.get("remedy") or "")
-    if unchecked:
-        remedy = ("调用方没有提供子会话 runtime/execution_state；先用 "
-                  "host_records.session_execution_state 读取并确认 planEnabled=false，"
-                  "否则保持 fail-closed。")
-    elif session_problems:
-        code = session_problems[0][0]
-        if code == host_records.HOST_SESSION_PLAN_MODE:
-            remedy = ("子会话继承了 plan 模式，宿主会给子代理注入 Bash；"
-                      "先退出 plan 模式（planEnabled=false）再重新派发只读复核。")
-        elif code == host_records.HOST_SESSION_STATE_MISSING:
-            remedy = ("宿主没有子会话 runtime/execution_state 记录，无法排除 plan "
-                      "模式注入 Bash；保持 fail-closed 并如实报告能力缺口。")
-        else:
-            remedy = ("runtime/execution_state 缺少可判定的 mode/planEnabled；"
-                      "无法证明非 plan 模式时保持 fail-closed。")
-    detected_version = ""
-    if isinstance(host_info, dict):
-        detected_version = str(host_info.get("version") or "").strip()
-    return {
-        "schema": "copilot-agent-capability/v1",
-        # host_version 优先使用本次真实探测值；探测失败时回退到代码基线常量，
-        # 同时用 host_baseline 明确区分“当前宿主”与“实现基线”。
-        "host_version": detected_version or HOST_VERSION,
-        "host_baseline": HOST_VERSION,
-        "host": host_info if isinstance(host_info, dict) else {},
-        "metadata_path": str(metadata_path or ""),
-        "agent_id": str(data.get("agentId") or "").strip(),
-        "child_session_id": str(data.get("childSessionId") or "").strip(),
-        "profile_id": profile_id,
-        "status": status,
-        "session_execution": {
-            "found": bool(session_state.get("found")),
-            "mode": str(session_state.get("mode") or ""),
-            "plan_enabled": session_state.get("plan_enabled"),
-            "source": str(session_state.get("source") or ""),
-        } if execution_state is not None else None,
-        "classification": classification,
-        "warnings": warnings,
-        "g4": {
-            "executor": g4_executor,
-            "precheck_only": True,
-            "codes": codes,
-            "remedy": remedy,
-        },
-        "note": ("只读诊断：本报告不代表 G4 已通过。`g4.executor` 只是宿主 Profile "
-                 "策略 + 子会话执行模式的预检；Profile 文件存在性/正文一致性、"
-                 "会话与 prompt 绑定、工具调用与原始输出仍由 g4_attest 独立核验。"),
-    }
 
 
 def dispatch_advice(*, needs_independent_context: bool = False,
@@ -330,9 +41,7 @@ def dispatch_advice(*, needs_independent_context: bool = False,
                     write_conflict: bool = False,
                     saves_time: bool = False,
                     research_only: bool = False,
-                    subagent_unavailable: bool = False,
-                    g4_required: bool = False,
-                    plan_mode: bool = False) -> dict:
+                    subagent_unavailable: bool = False) -> dict:
     """按五问给出调度建议：主代理默认执行，子代理按需。
 
     参数对应五问：1 独立上下文 → `needs_independent_context`；2 真正并行 →
@@ -340,27 +49,14 @@ def dispatch_advice(*, needs_independent_context: bool = False,
     `saves_time`；5 是否值得多一次调用与核对 → `saves_time`（并受
     `write_conflict`/`subagent_unavailable` 直接否决）。
 
-    两个宿主能力开关：`plan_mode`（父会话 planEnabled）会让宿主给子代理注入
-    Bash；`g4_required` 表示这次需要的是 G4 只读复核。二者同时为真时不能派发，
-    必须先退出 plan 模式，否则会得到一个“看起来只读、实际可执行 Bash”的会话。
-
-    判定顺序（先否决、后选择）：G4 + plan 模式 → 不可派发；子代理不可用 →
-    主代理；写入冲突 → 主代理；只读调查 → 内置 `Explore`（绝不交给全工具代理）；
-    独立交付物 → 内置 `general-purpose`（需并发且有收益，否则主代理）；其余 →
-    主代理。
+    判定顺序（先否决、后选择）：子代理不可用 → 主代理；写入冲突 → 主代理；
+    只读调查 → 内置 `Explore`（绝不交给全工具代理）；独立交付物 → 内置
+    `general-purpose`（需并发且有收益，否则主代理）；其余 → 主代理。
 
     这是**建议**，不是调度器：不创建任务、不派发 Agent、不设调用比例或预算。
     主代理可以结合现场证据否决，但否决理由应是不值得独立上下文，而不是为了
     “体现 Agent 协作”。
     """
-    if g4_required and plan_mode:
-        return {
-            "executor": "unavailable",
-            "reason": ("plan 模式会给子代理注入 Bash，有效工具策略不再是精确 "
-                       "Read/Grep/Glob；G4 不能在该模式下派发。先退出 plan 模式"
-                       "（planEnabled=false）再新建只读复核会话"),
-            "prompt_requirements": [],
-        }
     if subagent_unavailable:
         return {
             "executor": "main",
@@ -425,11 +121,5 @@ def dispatch_advice(*, needs_independent_context: bool = False,
 __all__ = [
     "HOST_VERSION",
     "BUILTIN_AGENTS",
-    "READ_ONLY_TOOLS",
-    "KNOWN_READ_ONLY_TOOLS",
-    "WRITE_CAPABLE_TOOLS",
-    "classify_profile",
-    "capability_report",
     "dispatch_advice",
-    "tool_call_is_write",
 ]

@@ -30,9 +30,9 @@ python3 -B scripts/copilot_dispatch.py <子命令> --state <state.json> [参数]
 
 | 子命令 | 用途 | 关键参数 |
 |---|---|---|
-| `start` | 创建任务合同 | `--goal`、`--contract-file`、`--criteria-file`、`--test-policy`/`--test-policy-file`（JSON：`required`/`commands`/`report`/`artifacts`/`require_*`）、`--risk low\|medium\|high`（历史 `normal` 等价 `medium`）、`--backend legacy\|native`、`--task-id`、`--mode`、`--note`、`--workspace`（省略取状态文件所在目录的 git 根）；`--risk high` 必须配 `--backend native` |
+| `start` | 创建任务合同 | `--goal`、`--contract-file`、`--criteria-file`、`--test-policy`/`--test-policy-file`（JSON：`required`/`commands`/`report`/`artifacts`/`require_*`）、`--risk low\|medium\|high`（历史 `normal` 等价 `medium`）、`--backend legacy\|native`、`--task-id`、`--mode`、`--note`、`--workspace`（省略取状态文件所在目录的 git 根）；`--backend` 可选；`risk=high` 不再强制 native |
 | `plan` | 登记 ZCode 本地计划 | `--plan <plan.json>`（或 stdin）、`--source` |
-| `status` / `next` | 查看阶段、工作项、四门、下一步 | `--json` |
+| `status` / `next` | 查看阶段、工作项、门禁、下一步 | `--json` |
 | `record` | 回填工作项结果 | `--id`、`--status`、`--result`、`--evidence E1`（可重复） |
 | `rerun` | 把已终结工作项重开为 pending（修复后重新验证） | `--id`、`--reason`；旧结果保留在 `rerun_history` |
 | `criterion` | 核销完成条件 | `--id C1`、`--status pending\|met\|not_met`、`--evidence`（`met` 必填） |
@@ -43,13 +43,13 @@ python3 -B scripts/copilot_dispatch.py <子命令> --state <state.json> [参数]
 | `quality` | 查看质量结论与接受状态 | `--json` |
 | `decide` | 记录用户/任务决策 | `--text`、`--source`；**不能替代 PWW 接受** |
 | `block` / `unblock` | 记录/解除真实阻塞 | `block --reason ... --needs ...`；`unblock --reason ... [--block-id B...]`（多条未解除时必须指定） |
-| `closure-check` | 只读检查 G1–G4 | `--json` |
+| `closure-check` | 只读检查 G1–G3 | `--json` |
 | `review-admission` | SOL 复核准入建议（只读、不写状态、不是门禁） | `--trigger security`（可重复）、`--reason`、`--json`；返回 `not_needed`/`optional`/`recommended` |
 | `sol-review` | SOL 零工具单轮复核：材料 → 一次请求 → 结构化结果 → advisory findings | `--materials <file>`、`--dry-run`、`--list`、`--json`、`--timeout`、`--max-output-tokens`、`--audit-log`、`--output-dir`；再次复核：`--force --trigger <user-request\|scope-changed\|new-risk\|materials-omitted> --reason` |
 | `agent-policy` | Agent 调度建议：主代理默认，Explore/general-purpose 按需（只读、不派发）。判定顺序：子代理不可用 → 主代理；写入冲突 → 主代理；`--research-only` → Explore（绝不交给全工具代理）；独立交付物需并发且有收益才建议 general-purpose；其余 → 主代理 | `--needs-independent-context`、`--parallel`、`--independent-deliverable`、`--write-conflict`、`--saves-time`、`--research-only`、`--subagent-unavailable`、`--json` |
 | `finding` | 查看 / 更新 Finding 台账（不触发复核） | `--list`；`--id F1 --status open\|fixed\|verified\|closed\|regressed\|dropped --evidence E1 --note`；`fixed`/`verified` 必须有证据 |
-| `review-metrics` | 统计真实复核效率与 SOL 单轮复核次数/Finding 计数 | `--state`；SOL、正式 REVIEW、G4、原生复核分别计数 |
-| `closure` | 收口（必须四门通过） | `--close`、`--by` |
+| `review-metrics` | 统计 SOL 单轮复核、准入门槛、停止标记与 Finding 计数 | `--state`；历史 G4 数据标记 `g4.retired` |
+| `closure` | 收口（必须 G1–G3 通过） | `--close`、`--by` |
 | `reopen` | 用户授权后重开 | `--reason`、`--authorized-by user`（必填） |
 | `handoff` | 只读列出生效交付清单：分支/HEAD/上游、已暂存、未暂存、未跟踪分类 | `--state`（可选）、`--cwd`、`--limit`、`--json`；不提交、不删除、不改 `.gitignore` |
 | `contract` | 查看/修订合同与条件 | `--show`、`--amend --contract-file/--criteria-file`、`--test-policy`/`--test-policy-file`（省略则保留原策略）；BLOCKED 时也可修订；登记源文件摘要，文件被改动时 `status` 给出非阻断提醒 |
@@ -90,7 +90,7 @@ python3 -B scripts/copilot_dispatch.py <子命令> --state <state.json> [参数]
   `evidence_tampered`（内容变化）、`evidence_file_missing`（文件丢失）都失败关闭。
 - **证据卫生提醒（非阻断）**：`closure-check` 会提示重复登记同一文件、不同 id 内容完全相同、
   证据文件位于 `/tmp`/`/var/tmp`/`/dev/shm`、以及 `<任务>/evidence/` 下有未登记文件。
-  这些提醒不进入四门原因，由 ZCode 决定补 note、归档或保留。
+  这些提醒不进入门禁原因，由 ZCode 决定补 note、归档或保留。
 
 ### 只读交付清单（`handoff`）
 
@@ -168,13 +168,13 @@ python3 -B scripts/copilot_dispatch.py accept --state S --report VR-... \
 - 收口保留原始结论：`closure.verdict=pass_with_warnings`、`closure.quality` 记录
   `raw_verdict`/`report_id`/接受状态/已接受 id；未接入质量报告的历史任务显示
   `quality.verdict=unrecorded`，**不伪造**已接受。
-- 高风险任务：接受会改变条件状态与最终证据摘要，应在最终 G4 之前完成接受登记。
+- 高风险任务：接受会改变条件状态与最终证据摘要，建议在最终验收前完成接受登记。
 
 ## 3. `copilot_auto.py`：驱动与回填
 
 ```bash
 python3 -B scripts/copilot_auto.py drive  --state <state.json> [--dispatch-out <path>] [--max-actions N]
-python3 -B scripts/copilot_auto.py ingest --state <state.json> [--result-file f] [--review-file f]
+python3 -B scripts/copilot_auto.py ingest --state <state.json> [--result-file f]
 ```
 
 ### `drive`
@@ -194,11 +194,8 @@ python3 -B scripts/copilot_auto.py ingest --state <state.json> [--result-file f]
 
 - `--result-file`：`copilot-native-result/v2` 执行信封；校验绑定与证据后回填工作项状态，
   重复回填同一 `result_sha256` 是幂等成功。
-- `--review-file`：`copilot-native-review/v2` 复核信封；正式 G4 由 `g4_attest` 读取
-  宿主 metadata 与 SQLite（`tool_usage`/`part`/`session_entry`）独立核对 Profile、
-  会话/prompt/工作区、原始输出与证据，再由 `test_execution` 与 `g4_shadow` 判定；
-  只有 shadow attested 且新链 eligible 才写正式资格并消费 attempt。被拒的 attempt
-  不消费，修正后可用同一 attempt 重试。
+- 复核不再经 `ingest`：原生复核信封已随 G4 退役，`--review-file` 参数已移除；独立复核
+  使用 `sol-review`（SOL 零工具单轮复核，advisory）。
 - 被拒绝时退出码 12，错误码写在 stderr，状态不被部分写入。
 
 ## 4. 标准回合
@@ -231,7 +228,7 @@ python3 -B scripts/copilot_auto.py drive --state T/state.json    # PASS → 0
 
 PARTIAL 时不需要额外命令：直接再次 `drive`，由本地派生工作项。
 
-## 5. 正式 REVIEW 与 G4
+## 5. 正式 REVIEW 与已退役的 G4
 
 ```bash
 # 用户明确要求时才记录授权；同一合同内持续有效
@@ -259,49 +256,17 @@ python3 -B scripts/copilot_dispatch.py formal-review --state T/state.json \
   superseded。
 - BLOCKED 下允许登记已授权的正式 REVIEW 及其 amendment；不会解除阻塞，也不能替代
   `unblock` 或收口。`plan`、`decide`、`evidence --drop` 在 BLOCKED 下仍被拒绝。
-- 高风险 G4 不依赖 `formal-review`：它需要 `native` 后端下的原生复核信封（见
-  `agent-bridge.md`）与四门检查，缺失即 fail-closed。因此 `--risk high` 只能用
-  `--backend native` 启动；`legacy` 后端没有派发链路，无法产生可回填的复核。
+- G4 已退役：`risk=high` 不再需要原生复核信封，也不要求 `--backend native`；收口只检查
+  G1–G3。历史 G4 记录只读保留（见 `review.md` 第 3 节）。
 
-### 高风险 G4 的最小流程
+### 历史 G4 流程（仅供追溯，不再执行）
 
-```bash
-# 条件核销、证据稳定后，先创建 attempt（未核销/漂移会被拒）
-python3 -B scripts/native_agent.py review-context --state T/state.json \
-  --dispatch T/state.dispatch.json --execution A1.execution.json \
-  --work-item A1 --create-attempt --workspace "$(git rev-parse --show-toplevel)" \
-  [--base <任务开始 commit>] [--trigger major-fix --reason "修复后重验"] \
-  --output A1.context.json
-
-# 把 A1.context.json 的 review_attempt_id 写入 Reviewer prompt，再派发只读子代理；
-# 生成信封时必须带同一个 attempt
-python3 -B scripts/native_agent.py review --state T/state.json \
-  --dispatch T/state.dispatch.json --execution A1.execution.json \
-  --work-item A1 --attempt RA... --metadata <reviewer>/metadata.json \
-  --output A1.review.json
-
-# 可选但推荐：只读诊断实际权限；内置 Explore/general-purpose 会给出 g4.executor=false
-python3 -B scripts/native_agent.py capability --metadata <reviewer>/metadata.json
-
-python3 -B scripts/copilot_auto.py ingest --state T/state.json \
-  --review-file A1.review.json
-```
-
-attempt 在派发前冻结目标摘要、文件证据内容与 git 工作区代码范围，ingest 成功时一次性
-消费；旧 Reviewer 输出即使重新计算当前 SHA，也会因为 attempt 目标过期、会话/工作区不匹配
-或已消费而被拒绝。失败后修正宿主记录可复用同一 attempt 重试；代码/证据/合同变化则必须
-新建 attempt 重新复核。`--workspace` 应指向任务实际仓库根，且必须与任务证据所属仓库
-一致；高风险任务在非 git 工作区会拒绝创建 attempt。默认快照覆盖工作区相对 HEAD 的变更，
-任务代码已提交时用 `--base <任务开始 commit>` 纳入已提交范围。
-
-同一目标/代码范围/执行结果的未消费 attempt 会直接复用，重复调用不会生成第二个派发
-快照。PASS 之后已有 `review_stops`：同一快照再次创建 attempt 返回 `review_not_needed`，
-只有文档/格式变化返回 `review_not_needed_docs_only`；代码/目标/证据实质变化时必须用
-`--trigger`（`blocking-fix`/`major-fix`/`code-changed`/`scope-expanded`/
-`evidence-changed`/`risk-changed`/`security-fix`/`concurrency-fix`）与 `--reason`
-说明重入原因。Reviewer 报出的 findings 进入 Finding 台账；修复后用
-`copilot_dispatch.py finding --id F1 --status fixed --evidence E3` 登记，运行定向测试后
-再标 `verified`，不需要重新派发完整复核。
+v7 及更早的高风险任务通过 `review-context --create-attempt`、`native_agent.py review`、
+`capability` 与 `copilot_auto.py ingest --review-file` 完成原生只读复核；这些命令与
+`g4_attest`/`g4_shadow`/`test_execution` 已在 v8.0.0 删除。历史状态中的
+`native_reviews` / `review_attempts` / `g4_attestations` 只读保留，不参与当前门禁。
+现在需要独立意见时，按第 2 节用 `sol-review` 执行一次；它的 findings 进入 Finding 台账，
+由主代理修复并用定向测试验证。
 
 ## 6. 历史只读
 
@@ -332,7 +297,7 @@ python3 -B scripts/copilot_dispatch.py legacy-status --ledger review-ledger.json
 | `result_sha_mismatch` | 信封内容与 `result_sha256` 不符；重新生成信封 |
 | `evidence_tampered` / `evidence_sha_changed` | 证据文件变化或引用摘要不符；用新证据登记，不覆盖旧记录 |
 | `evidence_foreign` | 证据属于其他任务；使用本任务证据 |
-| `g4_*` | G4 复核记录缺失/无效/未通过；重新组织独立复核 |
+| `native_review_retired` | 使用了已退役的原生复核信封；改用 `sol-review` |
 | `schema_retired` | 使用了 v1 信封；改成 v2 |
 | CAS 并发冲突（无单独错误码） | `save_seq` 比较交换发现其他进程已写入；重新读取状态后重做本步 |
 
