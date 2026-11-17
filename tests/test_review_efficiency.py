@@ -211,6 +211,35 @@ class FindingLedgerTests(unittest.TestCase):
         self.assertEqual([item["finding_id"]
                           for item in RP.blocking_findings(state)], ["F1"])
 
+    def test_duplicate_merge_does_not_rollback_fixed_status(self):
+        state = {}
+        entry = review([{
+            "severity": "major", "file": "a", "summary": "问题",
+            "root_cause": "rc", "evidence": "e"}], sha="2" * 64)
+        RP.merge_review(state, entry)
+        RP.transition(state, "F1", "fixed", evidence_ids=["E1"])
+        RP.merge_review(state, entry)
+        item = RP.get_item(state, "F1")
+        self.assertEqual(item["status"], "fixed")
+        self.assertEqual(item["occurrences"], 1)
+
+    def test_repeated_reference_escalation_reuses_entry(self):
+        state = {}
+        RP.merge_review(state, review([{
+            "severity": "minor", "file": "a", "summary": "小问题",
+            "root_cause": "rc"}], sha="1" * 64))
+        RP.transition(state, "F1", "fixed", evidence_ids=["E1"])
+        RP.transition(state, "F1", "verified", evidence_ids=["E2"])
+        for sha in ("2" * 64, "3" * 64):
+            RP.merge_review(state, review([{
+                "severity": "major", "file": "a", "summary": "小问题",
+                "root_cause": "rc"}], sha=sha), authoritative=False)
+        escalations = [item for item in RP.ledger_summary(state)["items"]
+                       if item.get("escalation_of") == "F1"]
+        self.assertEqual(len(escalations), 1)
+        self.assertEqual(escalations[0]["occurrences"], 2)
+        self.assertEqual(RP.get_item(state, "F1")["status"], "verified")
+
     def test_reference_review_escalation_still_blocks(self):
         state = {}
         RP.merge_review(state, review([{
@@ -221,9 +250,19 @@ class FindingLedgerTests(unittest.TestCase):
             "severity": "major", "file": "a", "summary": "小问题",
             "root_cause": "rc", "evidence": "same"}], sha="2" * 64),
             authoritative=False)
-        self.assertEqual(RP.get_item(state, "F1")["status"], "regressed")
+        # advisory 不能把已解决的 authoritative 记录单方面提级为不可驳回阻断：
+        # 原记录保持 dropped，提级单独登记为可驳回的 advisory 条目并阻断收口。
+        self.assertEqual(RP.get_item(state, "F1")["status"], "dropped")
+        escalation = RP.get_item(state, "F2")
+        self.assertIsNotNone(escalation)
+        self.assertEqual(escalation["authority"], "advisory")
+        self.assertEqual(escalation["severity"], "major")
+        self.assertEqual(escalation["escalation_of"], "F1")
         self.assertEqual([item["finding_id"]
-                          for item in RP.blocking_findings(state)], ["F1"])
+                          for item in RP.blocking_findings(state)], ["F2"])
+        RP.transition(state, "F2", "dropped", note="误报：原记录已验证")
+        self.assertEqual(RP.blocking_findings(state), [])
+        self.assertEqual(RP.get_item(state, "F1")["status"], "dropped")
 
     def test_reference_review_cannot_verify_existing_finding(self):
         state = {}

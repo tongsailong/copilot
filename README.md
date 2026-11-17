@@ -5,6 +5,11 @@ Copilot 是运行于 ZCode 内的**轻量协作治理 Skill**：用户侧 ChatGP
 调试、测试与验证；Copilot 负责任务合同、完成条件、状态、证据、审计与收口门禁，并用 PARTIAL
 派生持续推进任务；独立质量审查由 SOL 零工具单轮复核按风险提供。
 
+**v8.0.1 安全与效率加固**：SOL 错误详情统一脱敏限长，本机 CPA 出口在解析凭据前无条件
+校验并禁用环境代理；远程成功后审计/落盘失败不再被误报为调用失败，可恢复结果避免同材料
+重复付费，并加任务级互斥锁；Finding 合并完全幂等，advisory 复核不能把已解决的 authoritative
+finding 单方面提级为不可驳回阻断。dry-run 与真实调用共用材料校验。
+
 **v8.0.0 起 G4 原生只读复核正式退役**：删除 `g4_attest.py`、`g4_shadow.py`、
 `test_execution.py`、原生复核信封与 `native_agent.py review/review-context/capability`。
 收口门禁收敛为 G1–G3（工作项终态、合同/条件/证据与 Finding 台账、无停摆），不再产生

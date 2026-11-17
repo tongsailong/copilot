@@ -1,7 +1,66 @@
 # STATUS
 
 更新：2026-11-17 CST。本文件只记录现场可核实的事实；规划与未完成事项单独标注。
-当前版本：v8.0.0（G4 退役，SOL 统一承接独立审查）。
+当前版本：v8.0.1（G4 退役 + SOL 安全/效率加固）。
+
+## SOL 安全与效率加固（2026-11-17，v8.0.1）
+
+基线：HEAD `55058ce`（v8.0.0）。**本轮只做源码/测试/文档与运行时同步，未提交、未推送。**
+
+### 真实 SOL 复核（一次，零工具）
+- 模型 `gpt-6.1-sol`（本机 CPA `127.0.0.1:8317`，`reasoning.effort=high`），回显一致；
+  请求体无 `tools`/`functions`，`tool_choice="none"`，一次请求、无重试。
+- 材料 154,821 字符；usage input 51,827 / output 7,481（reasoning 3,805）/ total 59,308；
+  耗时 234,984 ms；原始输出 `SR7680218d6f76e7c458b37374.raw.txt`。
+- verdict `partial`：0 blocking / 4 major / 6 minor / 1 info / 11 unverified。逐项结论见
+  `docs/STATUS.md` 下方的“SOL findings 处置”。
+
+### 已实施
+- **F1 错误详情脱敏**：`_safe_detail`/`_safe_url` 统一脱敏限长（拒绝端点、上游错误正文、
+  模型回显、传输异常）；审计/状态/stderr 不再回显完整 URL 或未净化正文。
+- **F2 路由校验**：`run_review` 对最终 `base_url` 无条件执行本机 CPA 校验，且在解析凭据前
+  失败；本机请求显式 `ProxyHandler({})`，不经过环境代理。
+- **F3 advisory 提级**：SOL 不能把已解决的 authoritative finding 单方面提级为不可驳回阻断；
+  单独登记 `escalation_of` 的 advisory 条目，原记录状态与严重度不变，可按误报驳回。
+- **F4 防重复付费**：远程成功后先写可恢复结果（`sol-reviews/pending-<digest>.json`）再登记；
+  审计/原始输出失败只告警，不再把成功结果登记为 failed；同材料再次调用直接恢复；
+  `sol-review` 用任务级 `task_lock` 互斥。
+- **F5/F6 台账与 ID**：同一 `review_sha` 重复合并完全幂等；重复 finding ID 的后备编号保证唯一。
+- **F7/F11 效率**：dry-run 与真实调用共用材料校验；非 dry-run 不再重复构建 payload。
+- **F8/F9/F10 文档**：正式 REVIEW 独立性改为 SOL 路径；活动文案统一 G1–G3；STATUS 更正
+  high 准入 scope 为 `high-risk`。
+
+### 验证
+- 定向：`tests.test_sol_review_v7` + `tests.test_review_efficiency` 93 tests OK（含新增 F1/F2/F4/F5/F6/F7 回归）。
+- 活动测试：430 tests OK（T2 33.9s）。
+- 历史回归：853 tests OK（skipped=32）。
+- T4 隔离验收：`tests/t4_acceptance.py` 全部 layers（T0 29 / T1 78 / T2 430 / T3 853）与
+  18 个场景 OK。
+- 运行时：`--baseline` 25 文件；`--apply` 写入 8 个文件并预编译 13 个；`--check` 缺失 0、
+  不同 0、多出 0。
+- 治理任务：本轮 `task-v8-sol-review-20261117` 使用仓库外临时状态，G1–G3 PASS、CLOSED，
+  11 条 finding 全部 `verified`；临时状态、证据与原始输出未提交。
+  收口后补了一处 advisory 提级重复去重（同一提级只保留一条），由 T4 final2 验证；按规则
+  未在无用户授权时 reopen 重新登记。
+- **未验证**：CPA 内部实际上游身份与是否内部重试（只能校验回显 model）；并发压力下锁的
+  实际排队时长（互斥逻辑有单元级恢复测试，未做多进程压测）；pending 恢复只做故障注入级
+  验证，未在生产磁盘故障下演练。
+
+### SOL findings 处置
+
+| ID | 级别 | 结论 | 处置 |
+|---|---|---|---|
+| F1 | major | 成立 | 新增 `_safe_detail`/`_safe_url`，错误详情脱敏限长；不再回显完整 URL/正文 |
+| F2 | major | 成立 | `run_review` 对最终 `base_url` 无条件校验，且在解析凭据前失败；禁用环境代理 |
+| F3 | major | 成立 | advisory 提级 authoritative 记录时改为单独登记可驳回条目，原记录不变 |
+| F4 | major | 成立 | 先落 pending 可恢复结果再登记；审计/原始输出失败只告警；任务级互斥锁 |
+| F5 | minor | 成立 | 同一 `review_sha` 重复合并完全幂等 |
+| F6 | minor | 成立 | 重复 finding ID 后备编号保证唯一 |
+| F7 | minor | 成立 | dry-run 与真实调用共用材料校验 |
+| F8 | minor | 成立 | 正式 REVIEW 独立性说明改为 SOL 路径 |
+| F9 | minor | 成立 | 活动文案统一 G1–G3 |
+| F10 | minor | 成立 | STATUS 更正 high 准入 scope；说明历史 `review_policy.admission` 非活动入口 |
+| F11 | info | 成立 | 非 dry-run 不再重复构建 payload |
 
 ## G4 退役与 SOL 统一（2026-11-17，v8.0.0）
 
@@ -15,8 +74,9 @@
 - **状态机与门禁**：`closure_check` 返回 G1/G2/G3；`_gate_findings` 对所有风险等级生效；
   `derive_work` 不再派生 `AUTO-G4*`；`review_metrics` 只统计 SOL/准入/停止/台账，历史 G4
   计数标记 `g4.retired`；`start_state` 的 `risk=high` 不再要求 `--backend native`。
-- **SOL 承接**：`review_policy.admission` / `sol_review.admission` 的 high 分支为
-  `recommended` + `scope=sol`（不再有 `g4_separate`）；SOL 仍零工具、单轮、advisory。
+- **SOL 承接**：活动准入 `governance.review_admission`（经 `sol_review.admission`）的 high
+  分支为 `recommended` + `scope=high-risk`（不再有 `g4_separate`）；历史
+  `review_policy.admission` 只保留给兼容测试，不是活动入口。SOL 仍零工具、单轮、advisory。
 - **历史兼容**：历史 `native_reviews` / `review_attempts` / `g4_attestations` 原样保留，
   只读审计；`legacy-status`、历史 G4 台账与 authoritative finding 保护级别不变。
 - **版本**：`copilot_dispatch.__version__ = 8.0.0`；`SKILL.md` v8.0.0 块新增，v7.0.0 块

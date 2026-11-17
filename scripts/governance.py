@@ -25,6 +25,7 @@ import re
 import secrets
 import sys
 import tempfile
+from contextlib import contextmanager
 from datetime import datetime
 
 import code_scope as CS
@@ -313,6 +314,23 @@ def _unlock_file(fh) -> None:
     except ImportError:  # pragma: no cover
         return
     fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+
+
+@contextmanager
+def task_lock(task_dir: str, name: str = ".sol-review.lock"):
+    """同一任务的跨进程互斥锁；用于远程付费调用前的“检查—调用—登记”临界区。
+
+    锁文件与状态文件分离：持有时间覆盖一次 SOL 请求，但不会阻塞普通状态命令
+    的保存（保存只锁自己的状态文件）。平台无 fcntl 时退化为无锁。
+    """
+    os.makedirs(task_dir, exist_ok=True)
+    path = os.path.join(task_dir, name)
+    with open(path, "a+", encoding="utf-8") as fh:
+        _lock_file(fh)
+        try:
+            yield
+        finally:
+            _unlock_file(fh)
 
 
 def _fsync_dir(path: str) -> None:
@@ -1292,9 +1310,9 @@ def _criterion(state: dict, cid: str) -> dict:
 
 def record_judgment(path: str, status: str, summary: str, *,
                     evidence_ids: list[str] | None = None) -> dict:
-    """记录 ZCode 的自我判断；只作审计，不替代本地四门。"""
+    """记录 ZCode 的自我判断；只作审计，不替代本地 G1–G3。"""
     state = load_state(path)
-    # 判断只作审计，不参与四门；BLOCKED 下保留真实判断记录。
+    # 判断只作审计，不参与 G1–G3；BLOCKED 下保留真实判断记录。
     _assert_open(state, "记录判断", allow_blocked=True)
     status = str(status or "").strip().lower()
     if status not in VERDICTS:
@@ -3122,7 +3140,7 @@ def progress_digest(state: dict) -> str:
     }))
 
 
-# ── 四门 / 收口 ────────────────────────────────────────────────────────────
+# ── G1–G3 / 收口 ────────────────────────────────────────────────────────────
 def _gate_actions(state: dict) -> dict:
     reasons = []
     for action in state.get("actions") or []:
@@ -3578,7 +3596,7 @@ _TEMP_EVIDENCE_PREFIXES = ("/tmp/", "/var/tmp/", "/dev/shm/")
 def evidence_warnings(state: dict, *, task_dir: str = "") -> list[str]:
     """证据卫生提醒：重复登记、临时目录与未登记文件。
 
-    非阻断：同一文件登记两次、不同时点快照内容相同都可能是刻意保留，四门不应
+    非阻断：同一文件登记两次、不同时点快照内容相同都可能是刻意保留，G1–G3 不应
     因此失败。但这些情况会让收口后的证据包难以解释，所以在收口检查里提示一次，
     由 ZCode 决定是否补 note、归档或保留。
     """
@@ -3847,7 +3865,7 @@ def close_task(path: str, *, by: str = "zcode-native",
                           cache=cache)
     if not check["passed"]:
         summary = "; ".join(f"{r.get('gate')}:{r.get('code')}" for r in check["reasons"])
-        raise GovernanceError(f"四门未通过，不能收口：{summary}")
+        raise GovernanceError(f"G1–G3 未通过，不能收口：{summary}")
     quality = quality_summary(state, cache=cache)
     # 原始质量结论与任务关闭状态分离：用户接受 PWW 不把 verdict 改写为 PASS。
     verdict = PWW if quality.get("verdict") == PWW else "pass"
@@ -4289,7 +4307,7 @@ def _evaluate_core(state: dict, *, cache: dict | None = None) -> dict:
 
 
 def evaluate(state: dict, *, cache: dict | None = None) -> dict:
-    """本地阶段求值；附带非阻断提醒（不影响 phase 与四门）。"""
+    """本地阶段求值；附带非阻断提醒（不影响 phase 与 G1–G3）。"""
     result = _evaluate_core(state, cache=cache)
     warnings = contract_source_warnings(state)
     if warnings:

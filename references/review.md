@@ -120,9 +120,10 @@ copilot_dispatch.py formal-review --state <state> --verdict pass \
 
 ### 独立性
 
-正式 REVIEW 若使用原生 Reviewer，必须满足 `agent-bridge.md` 的独立性约束：不同 Agent、
-不同 Child Session、只读工具集、独立取证与独立报告、不继承执行方判断。无法保证独立性时，
-如实说明是“主代理自检”或“同一上下文复核”，不得标记为正式 REVIEW。
+v8 起原生 Reviewer 已退役，正式 REVIEW 的独立意见只能来自 SOL 零工具单轮复核：材料由主
+代理一次性准备，请求体不含工具定义（`tool_choice="none"`），一次调用只发一次请求，模型
+回显必须与请求一致。无法真实调用 SOL 时，如实说明是“主代理自检”或“同一上下文复核”，
+不得标记为正式 REVIEW，也不得伪造 SOL 结论。历史原生 Reviewer 结论只读保留，不参与新任务。
 
 ## 2. 独立复核流程（SOL）
 

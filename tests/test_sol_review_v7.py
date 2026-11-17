@@ -531,5 +531,111 @@ class CliTests(unittest.TestCase):
                          hashlib.sha256(text.encode("utf-8")).hexdigest())
 
 
+class HardeningV801Tests(unittest.TestCase):
+    def test_base_url_parameter_cannot_bypass_local_route(self):
+        sent = []
+
+        def fake(*args):
+            sent.append(args)
+            return response(reply())
+
+        with self.assertRaises(SR.SolUsageError) as ctx:
+            SR.run_review("材料", transport=fake, api_key="k",
+                          base_url="https://example.com:8317/v1")
+        self.assertEqual(ctx.exception.code, "sol_route_not_local")
+        self.assertEqual(sent, [])
+
+    def test_route_error_never_echoes_userinfo(self):
+        with self.assertRaises(SR.SolUsageError) as ctx:
+            SR.run_review("材料", transport=lambda *a: response(reply()),
+                          api_key="k",
+                          base_url="http://alice:s3cret@evil.example:8317/v1")
+        detail = ctx.exception.detail
+        self.assertNotIn("s3cret", detail)
+        self.assertNotIn("alice:", detail)
+
+    def test_dry_run_material_validation_is_shared(self):
+        with self.assertRaises(SR.SolUsageError) as ctx:
+            SR.build_payload("x" * (SR.MAX_MATERIALS_CHARS + 1))
+        self.assertEqual(ctx.exception.code, "sol_materials_too_large")
+        with self.assertRaises(SR.SolUsageError) as empty:
+            SR.build_payload("   ")
+        self.assertEqual(empty.exception.code, "sol_materials_empty")
+
+    def test_duplicate_finding_ids_are_normalized_unique(self):
+        parsed = SR.normalize_review({
+            "schema": SR.REVIEW_SCHEMA, "verdict": "partial",
+            "findings": [
+                {"id": "F2", "severity": "minor", "summary": "a"},
+                {"id": "F2", "severity": "minor", "summary": "b"},
+                {"id": "F2", "severity": "minor", "summary": "c"},
+            ],
+        })
+        ids = [item["id"] for item in parsed["findings"]]
+        self.assertEqual(len(ids), len(set(ids)))
+
+    def test_audit_failure_does_not_discard_successful_result(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bad_audit = os.path.join(tmp, "audit-dir")
+            os.makedirs(bad_audit)
+            result = SR.run_review(
+                "材料", transport=lambda *a: response(reply()),
+                api_key="k", audit_log=bad_audit)
+        self.assertEqual(result["verdict"], "pass")
+        self.assertFalse(result["audit_written"])
+        self.assertEqual(result["audit_error"], "sol_audit_write_failed")
+
+
+class PendingRecoveryTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = self.tmp.name
+        self.state_path = os.path.join(self.dir, "state.json")
+        F.init_git_workspace(self.dir)
+        G.start_state(self.state_path, goal="目标", contract=F.CONTRACT,
+                      risk="medium", task_id="pending-task")
+        self.materials = "材料正文"
+        mat_path = os.path.join(self.dir, "materials.md")
+        with open(mat_path, "w", encoding="utf-8") as fh:
+            fh.write(self.materials)
+        self.mat_path = mat_path
+
+    def test_pending_result_is_recorded_without_new_request(self):
+        import copilot_dispatch as D
+
+        state = G.load_state(self.state_path)
+        digest = SR.review_subject_sha256(state, self.materials)
+        result = {
+            "schema": SR.REVIEW_SCHEMA, "model": SR.MODEL,
+            "model_resolved": SR.MODEL, "reasoning_effort": "high",
+            "zero_tool": True, "attempts": 1,
+            "materials_sha256": digest,
+            "materials_chars": len(self.materials),
+            "request_sha256": "r" * 64, "reply_text": reply(),
+            "reply_sha256": "a" * 64, "reply_chars": 10,
+            "usage": {}, "usage_available": True, "latency_ms": 1,
+            "verdict": "pass", "summary": "ok", "findings": [],
+            "unverified": [], "materials_reviewed": [],
+            "verdict_adjusted": [],
+            "findings_count": {"blocking": 0, "major": 0, "minor": 0,
+                               "info": 0},
+            "completed_at": G.now_iso(),
+        }
+        pending = D._pending_result_path(self.dir, digest)
+        os.makedirs(os.path.dirname(pending), exist_ok=True)
+        with open(pending, "w", encoding="utf-8") as fh:
+            json.dump(result, fh)
+        with mock.patch.object(SR, "run_review",
+                               side_effect=AssertionError("不应再次请求")):
+            code = D.main(["sol-review", "--state", self.state_path,
+                           "--materials", self.mat_path])
+        self.assertEqual(code, 0)
+        record = G.load_state(self.state_path)["sol_reviews"][-1]
+        self.assertEqual(record["status"], "completed")
+        self.assertTrue(record["recovered_from_pending"])
+        self.assertFalse(os.path.exists(pending))
+
+
 if __name__ == "__main__":
     unittest.main()

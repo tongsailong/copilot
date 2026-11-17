@@ -8,7 +8,7 @@ when_to_use: >
   由 ZCode 原生完成，不进入本 Skill。
 ---
 
-# copilot：轻量协作治理（v8.0.0）
+# copilot：轻量协作治理（v8.0.1）
 
 Copilot 是运行在 ZCode 内的**协作治理层**，不是决策模型，也不是执行体。它负责把任务变成可
 追踪的合同、状态、证据与收口条件，并在任务没有真正完成时继续推进。
@@ -435,8 +435,23 @@ SOL 输出契约：总体结论 `verdict=pass|partial|blocked`；`findings` 按
 
 ## 版本
 
-当前版本 **v8.0.0（G4 Retirement Edition）**。v8.0.0 正式退役 G4 原生只读复核，把独立
-质量审查统一交给 SOL 零工具单轮复核：
+当前版本 **v8.0.1（Security & Efficiency Hardening）**。本版只收紧安全与可靠性，不改变
+任务合同、G1–G3 与授权边界：
+
+- **凭据与材料不外泄**：拒绝端点、上游错误正文、模型回显、传输异常等错误详情统一脱敏并
+  限长；本机 CPA 出口在解析凭据与发送前无条件校验（显式 `base_url` 也不能绕过）；本机请求
+  显式禁用环境代理，避免 `Authorization` 被转发。
+- **不重复付费**：远程已成功但审计/原始输出/状态落盘失败时，审计失败不再把成功结果误报为
+  失败；先落可恢复结果再登记状态，同材料下次调用直接恢复登记；并发 `sol-review` 用任务级
+  互斥锁避免重复请求。
+- **台账幂等与可驳回**：同一 `review_sha` 重复合并完全幂等，不把已 `fixed`/`verified` 的条目
+  回滚；advisory 复核不能把已解决的 authoritative finding 单方面提级为不可驳回的阻断，而是
+  单独登记一条可驳回的 advisory 提级条目。
+- **效率**：dry-run 与真实调用共用材料校验；非 dry-run 不再重复构建 payload；材料超限在
+  dry-run 阶段就失败。
+- **文档一致**：活动错误/帮助文案统一为 G1–G3；正式 REVIEW 的独立性说明改为 SOL 路径。
+
+v8.0.0（历史）正式退役 G4 原生只读复核，把独立质量审查统一交给 SOL 零工具单轮复核：
 
 - **G4 退役**：删除 `g4_attest.py`、`g4_shadow.py`、`test_execution.py`、原生复核信封与
   `native_agent.py review/review-context/capability`；不再产生 `g4_eligible`、G4 PASS、

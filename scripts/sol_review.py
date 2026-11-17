@@ -31,6 +31,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+from lib_common import redact as _redact_text
+
 REVIEW_SCHEMA = "copilot-sol-review/v1"
 ADMISSION_SCHEMA = "copilot-sol-admission/v1"
 MODEL = "gpt-6.1-sol"
@@ -65,6 +67,27 @@ _FENCE = re.compile(r"```[ \t]*[A-Za-z0-9_+.-]*[ \t]*\r?\n?(.*?)```", re.S)
 
 EXIT_OK, EXIT_USAGE, EXIT_UPSTREAM, EXIT_TIMEOUT, EXIT_TOOLCALL = 0, 2, 3, 4, 5
 EXIT_SHAPE, EXIT_AUDIT, EXIT_QUOTA, EXIT_IDENTITY = 6, 7, 8, 9
+
+# 错误详情进入 stderr、审计与任务状态：先脱敏再限长，绝不回显凭据或完整请求体。
+MAX_ERROR_DETAIL = 500
+
+
+def _safe_detail(value: object, limit: int = MAX_ERROR_DETAIL) -> str:
+    """脱敏并限长错误详情；用于上游正文、异常文本与非受控字段。"""
+    text = _redact_text(str(value or ""))
+    if len(text) > limit:
+        text = text[:limit] + "…(truncated)"
+    return text
+
+
+def _safe_url(raw: object) -> str:
+    """只保留 scheme/host/port；丢弃 userinfo、路径、查询参数与片段。"""
+    try:
+        parsed = urllib.parse.urlsplit(str(raw or ""))
+        port = f":{parsed.port}" if parsed.port else ""
+    except ValueError:
+        return "<invalid-url>"
+    return f"{parsed.scheme}://{parsed.hostname or ''}{port}"
 
 
 class SolError(Exception):
@@ -194,7 +217,7 @@ def resolve_base_url() -> str:
         raise SolUsageError(
             "sol_route_not_local",
             f"SOL 只允许本机 CPA 出口（http(s)://127.0.0.1:8317，"
-            f"无 userinfo），拒绝 {raw!r}；不新增或切换 Provider。")
+            f"无 userinfo），拒绝 {_safe_url(raw)}；不新增或切换 Provider。")
     return raw.rstrip("/")
 
 
@@ -227,11 +250,24 @@ JSON 结构：
 findings 按严重度排序；没有问题用空数组。你的结论是建议，不是工程决策。"""
 
 
+def validate_materials(materials: object) -> str:
+    """材料前置校验：非空、字符上限；dry-run 与真实调用共用同一口径。"""
+    if not isinstance(materials, str) or not materials.strip():
+        raise SolUsageError("sol_materials_empty", "审查材料为空。")
+    if len(materials) > MAX_MATERIALS_CHARS:
+        raise SolUsageError(
+            "sol_materials_too_large",
+            f"审查材料 {len(materials)} 字符超过上限 {MAX_MATERIALS_CHARS}；"
+            "请主代理整理必要材料后重试，不静默截断。")
+    return materials
+
+
 def build_payload(materials: str, *, model: str = MODEL,
                   effort: str = REASONING_EFFORT,
                   max_output_tokens: int | None = DEFAULT_MAX_OUTPUT_TOKENS,
                   instructions: str = INSTRUCTIONS) -> dict:
     """构建 Responses API 请求体；工具字段一律不存在。"""
+    validate_materials(materials)
     if effort not in ("low", "medium", "high"):
         raise SolUsageError("sol_effort_invalid",
                             f"推理强度 {effort!r} 不受支持。")
@@ -301,7 +337,7 @@ def response_problem(payload: dict) -> str | None:
     err = payload.get("error")
     if err:
         detail = err.get("message") if isinstance(err, dict) else str(err)
-        return f"response error: {detail}"
+        return f"response error: {_safe_detail(detail)}"
     if not status:
         return "response status missing"
     if status not in ("completed", "succeeded"):
@@ -500,7 +536,13 @@ def normalize_review(data: dict) -> dict:
                 f"{item.get('id') or index}: {item.get('severity')!r}")
         finding_id = _text(raw_id).upper() or f"F{index}"
         if finding_id in used_ids:
-            finding_id = f"F{index}"
+            # 后备 ID 也必须唯一：重复的 "F2" 不能因为替换成 "F2" 继续冲突。
+            candidate = f"F{index}"
+            suffix = 1
+            while candidate in used_ids:
+                suffix += 1
+                candidate = f"F{index}-{suffix}"
+            finding_id = candidate
         used_ids.add(finding_id)
         normalized.append({
             "id": finding_id,
@@ -556,7 +598,9 @@ def _post_once(url: str, key: str, body: dict, timeout: float) -> dict:
         url, data=data, method="POST",
         headers={"Authorization": "Bearer " + key,
                  "Content-Type": "application/json"})
-    opener = urllib.request.build_opener(_NoRedirect())
+    # 显式空 ProxyHandler：本机 CPA 请求不经过环境代理，避免凭据转发到第三方。
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({}), _NoRedirect())
     try:
         with opener.open(request, timeout=timeout) as response:
             raw = response.read()
@@ -580,7 +624,7 @@ def _post_once(url: str, key: str, body: dict, timeout: float) -> dict:
         raise SolUpstreamError(
             "sol_upstream_error",
             f"上游 HTTP {exc.code}: "
-            f"{raw.decode('utf-8', errors='replace')[:300]}") from None
+            f"{_safe_detail(raw.decode('utf-8', errors='replace'), 300)}") from None
     except (socket.timeout, TimeoutError) as exc:
         raise SolTimeoutError(
             "sol_timeout",
@@ -591,13 +635,14 @@ def _post_once(url: str, key: str, body: dict, timeout: float) -> dict:
             raise SolTimeoutError(
                 "sol_timeout",
                 f"请求在 {timeout:g}s 内未完成；结果未知，未自动重试。") from None
-        raise SolUpstreamError("sol_transport_error", str(reason)) from None
+        raise SolUpstreamError("sol_transport_error",
+                               _safe_detail(reason)) from None
     except (http.client.HTTPException, OSError) as exc:
         # 响应读到一半中断、连接重置、Content-Length 不足等：请求已发出，
         # 结果未知。显式映射为 SolError，确保进入失败审计与状态登记。
         raise SolUpstreamError(
             "sol_transport_error",
-            f"{type(exc).__name__}: {exc}") from None
+            _safe_detail(f"{type(exc).__name__}: {exc}")) from None
     try:
         payload = json.loads(raw.decode("utf-8", errors="replace"))
     except ValueError as exc:
@@ -628,18 +673,18 @@ def run_review(materials: str, *, audit_log: str = "",
                transport=None, api_key: str | None = None,
                base_url: str | None = None) -> dict:
     """发起一次 SOL REVIEW 并返回结构化结果；任何异常都显式失败。"""
-    if not isinstance(materials, str) or not materials.strip():
-        raise SolUsageError("sol_materials_empty", "审查材料为空。")
-    if len(materials) > MAX_MATERIALS_CHARS:
-        raise SolUsageError(
-            "sol_materials_too_large",
-            f"审查材料 {len(materials)} 字符超过上限 {MAX_MATERIALS_CHARS}；"
-            "请主代理整理必要材料后重试，不静默截断。")
     payload = build_payload(
         materials, model=model, effort=effort,
         max_output_tokens=max_output_tokens)
+    # 无论 URL 来自环境还是显式参数，都在解析凭据与发送前做同一本机出口校验。
+    base = (base_url or resolve_base_url()).rstrip("/")
+    if not _is_local_cpa_url(base):
+        raise SolUsageError(
+            "sol_route_not_local",
+            f"SOL 只允许本机 CPA 出口（http(s)://127.0.0.1:8317，"
+            f"无 userinfo），拒绝 {_safe_url(base)}；未解析凭据、未发送请求。")
+    url = base + ENDPOINT
     key = api_key if api_key is not None else resolve_api_key()
-    url = (base_url or resolve_base_url()).rstrip("/") + ENDPOINT
     body_sha = hashlib.sha256(
         json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
     ).hexdigest()
@@ -661,7 +706,7 @@ def run_review(materials: str, *, audit_log: str = "",
     try:
         response = (transport or _post_once)(url, key, payload, timeout)
     except SolError as exc:
-        _audit(audit_log, {**audit_base, "ok": False,
+        _audit_safe(audit_log, {**audit_base, "ok": False,
                            "error": exc.code, "detail": exc.detail,
                            "elapsed_ms": int((time.monotonic() - started) * 1000)})
         raise
@@ -672,7 +717,7 @@ def run_review(materials: str, *, audit_log: str = "",
         exc = SolQuotaError(
             "sol_quota",
             f"HTTP 200 携带限流/冷却（code={quota['code']}）；未自动重试。")
-        _audit(audit_log, {**audit_base, "ok": False, "error": exc.code,
+        _audit_safe(audit_log, {**audit_base, "ok": False, "error": exc.code,
                            "http_status": status, "elapsed_ms": elapsed_ms})
         raise exc
     try:
@@ -680,7 +725,7 @@ def run_review(materials: str, *, audit_log: str = "",
         problem = response_problem(response)
         text = extract_text(response) if not problem else ""
     except (AttributeError, TypeError, ValueError, KeyError) as exc:
-        _audit(audit_log, {**audit_base, "ok": False,
+        _audit_safe(audit_log, {**audit_base, "ok": False,
                            "error": "sol_malformed_response",
                            "detail": f"{type(exc).__name__}: {exc}",
                            "http_status": status, "elapsed_ms": elapsed_ms})
@@ -694,7 +739,7 @@ def run_review(materials: str, *, audit_log: str = "",
         exc = SolToolCallError(
             "sol_unexpected_output_item",
             f"上游返回非良性 output 条目 {unexpected}；已拒绝处理且未执行。")
-        _audit(audit_log, {**audit_base, "ok": False, "error": exc.code,
+        _audit_safe(audit_log, {**audit_base, "ok": False, "error": exc.code,
                            "detail": json.dumps(unexpected, ensure_ascii=False),
                            "http_status": status,
                            "model_resolved": model_resolved,
@@ -703,15 +748,16 @@ def run_review(materials: str, *, audit_log: str = "",
     if not identity_ok:
         exc = SolIdentityError(
             "sol_model_identity_mismatch",
-            f"请求模型 {model!r}，上游回显 {model_resolved!r}；该回复不得被消费。")
-        _audit(audit_log, {**audit_base, "ok": False, "error": exc.code,
+            f"请求模型 {model!r}，上游回显 "
+            f"{_safe_detail(model_resolved, 200)!r}；该回复不得被消费。")
+        _audit_safe(audit_log, {**audit_base, "ok": False, "error": exc.code,
                            "http_status": status,
                            "model_resolved": model_resolved,
                            "usage": usage, "elapsed_ms": elapsed_ms})
         raise exc
     if problem:
         exc = SolResponseError("sol_response_incomplete", problem)
-        _audit(audit_log, {**audit_base, "ok": False, "error": exc.code,
+        _audit_safe(audit_log, {**audit_base, "ok": False, "error": exc.code,
                            "detail": problem, "http_status": status,
                            "model_resolved": model_resolved,
                            "usage": usage, "elapsed_ms": elapsed_ms})
@@ -720,7 +766,7 @@ def run_review(materials: str, *, audit_log: str = "",
     try:
         parsed = parse_review_output(text)
     except SolResponseError as exc:
-        _audit(audit_log, {**audit_base, "ok": False, "error": exc.code,
+        _audit_safe(audit_log, {**audit_base, "ok": False, "error": exc.code,
                            "detail": exc.detail, "http_status": status,
                            "model_resolved": model_resolved,
                            "reply_sha256": text_sha,
@@ -755,14 +801,19 @@ def run_review(materials: str, *, audit_log: str = "",
         "findings_count": counts,
         "completed_at": _now_iso(),
     }
-    _audit(audit_log, {**audit_base, "ok": True,
-                       "http_status": status,
-                       "model_resolved": model_resolved,
-                       "reply_sha256": text_sha,
-                       "reply_chars": len(text),
-                       "verdict": parsed["verdict"],
-                       "findings_count": counts,
-                       "usage": usage, "elapsed_ms": elapsed_ms})
+    audit_error = _audit_safe(audit_log, {**audit_base, "ok": True,
+                                          "http_status": status,
+                                          "model_resolved": model_resolved,
+                                          "reply_sha256": text_sha,
+                                          "reply_chars": len(text),
+                                          "verdict": parsed["verdict"],
+                                          "findings_count": counts,
+                                          "usage": usage,
+                                          "elapsed_ms": elapsed_ms})
+    # 远程请求已经成功并解析：审计/落盘失败只能作为告警，不能让调用方把这次
+    # 付费结果当成“未发生”并再次发起请求。
+    result["audit_written"] = audit_error is None
+    result["audit_error"] = audit_error or ""
     return result
 
 
@@ -785,6 +836,15 @@ def _audit(path: str, record: dict) -> None:
     except OSError as exc:
         raise SolAuditError("sol_audit_write_failed",
                             f"无法写入审计日志 {path}：{exc}") from None
+
+
+def _audit_safe(path: str, record: dict) -> str | None:
+    """审计写入失败不掩盖已经发生的远程结果；返回错误码供调用方记录。"""
+    try:
+        _audit(path, record)
+    except SolAuditError as exc:
+        return exc.code
+    return None
 
 
 # ── 材料、单轮判定与准入 ───────────────────────────────────────────────────

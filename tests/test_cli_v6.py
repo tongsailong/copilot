@@ -83,7 +83,7 @@ class LegacyCliTests(unittest.TestCase):
 
         proc = F.run_cli("copilot_auto.py", "drive", "--state", self.state)
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("四门通过", proc.stdout)
+        self.assertIn("G1–G3 通过", proc.stdout)
         data = read_json(self.state)
         self.assertTrue(data["closure"]["closed"])
 

@@ -158,7 +158,7 @@ def drive(args) -> int:
             return EXIT_WAIT
         if phase == "PASS":
             closure = G.close_task(path, cache=cache)
-            print(f"四门通过，任务已收口：verdict={closure.get('verdict')} "
+            print(f"G1–G3 通过，任务已收口：verdict={closure.get('verdict')} "
                   f"iteration={closure['iteration_id']} by={closure['closed_by']}")
             quality = closure.get("quality") or {}
             if quality.get("verdict") == "pass_with_warnings":

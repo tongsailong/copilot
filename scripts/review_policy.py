@@ -294,10 +294,23 @@ def merge_review(state: dict, review: dict, *, at: str = "",
             items.append(item)
             created.append(item["finding_id"])
             action = "created"
-        # 同一复核重复合并：不重复累计 occurrence，也不重复写历史。
+        # 同一复核重复合并：完全幂等——不重复累计 occurrence，不重放生命周期，
+        # 也不覆盖之后由 ZCode 人工推进的 fixed/verified 状态。
         already = any(entry.get("review_sha256") == review_sha
                       for entry in item.get("history") or []
                       if isinstance(entry, dict))
+        if already:
+            if item["finding_id"] not in matched:
+                matched.append(item["finding_id"])
+            refs.append({
+                "reported_id": reported,
+                "finding_id": item["finding_id"],
+                "status": item.get("status"),
+                "severity": item.get("severity"),
+                "action": "duplicate",
+                "id_conflict": False,
+            })
+            continue
         id_conflict = False
         aliases = {_text(alias).upper()
                    for other in items if other is not item
@@ -311,6 +324,98 @@ def merge_review(state: dict, review: dict, *, at: str = "",
                 id_conflict = True
             else:
                 item["reported_ids"].append(reported)
+        previous = _text(item.get("status")) or "open"
+        incoming_severity = _text(finding.get("severity")).lower()
+        resolved_severity = _text(item.get("resolved_severity")).lower()
+        if (not authoritative
+                and previous in RESOLVED_STATUSES
+                and incoming_severity in BLOCKING_SEVERITIES
+                and resolved_severity not in BLOCKING_SEVERITIES
+                and _text(item.get("authority")) == "authoritative"):
+            # advisory 复核不能把已解决的 authoritative finding 单方面提级为
+            # 不可驳回的阻断：单独登记一条可驳回的 advisory 提级条目，原权威
+            # 记录的 verified/closed 状态与严重度保持不变。
+            existing_id = _text(item.get("advisory_escalation_id"))
+            existing = next(
+                (other for other in items
+                 if _text(other.get("finding_id")) == existing_id), None)
+            if existing is not None and \
+                    _text(existing.get("status")) not in RESOLVED_STATUSES:
+                # 同一提级再次出现：更新已有 advisory 条目，不重复登记。
+                existing["severity"] = _max_severity(
+                    existing.get("severity"), incoming_severity)
+                if finding.get("file"):
+                    existing["file"] = _text(finding.get("file"))
+                if finding.get("line") is not None:
+                    existing["line"] = finding.get("line")
+                if finding.get("summary"):
+                    existing["summary"] = _text(finding.get("summary"))
+                if finding.get("evidence"):
+                    existing["last_evidence"] = _text(finding.get("evidence"))
+                duplicate_review = any(
+                    isinstance(entry, dict)
+                    and entry.get("review_sha256") == review_sha
+                    for entry in existing.get("history") or [])
+                if not duplicate_review:
+                    existing["occurrences"] = int(
+                        existing.get("occurrences") or 0) + 1
+                    _append_history(existing, _text(existing.get("status")),
+                                    at=stamp, review_sha=review_sha,
+                                    note="advisory escalation repeated")
+                existing["last_review_sha256"] = (
+                    review_sha or existing.get("last_review_sha256"))
+                if existing["finding_id"] not in matched:
+                    matched.append(existing["finding_id"])
+                refs.append({
+                    "reported_id": reported,
+                    "finding_id": existing["finding_id"],
+                    "status": existing.get("status"),
+                    "severity": existing.get("severity"),
+                    "action": "advisory-escalation",
+                    "id_conflict": False,
+                })
+                continue
+            escalation = {
+                "finding_id": _new_finding_id(ledger),
+                "root_cause": ("advisory-escalation:"
+                               + item["finding_id"] + ":"
+                               + _normalize(finding.get("summary"))[:200]),
+                "severity": incoming_severity,
+                "file": _text(finding.get("file")) or _text(item.get("file")),
+                "line": (finding.get("line")
+                         if finding.get("line") is not None
+                         else item.get("line")),
+                "summary": (_text(finding.get("summary"))
+                            or _text(item.get("summary"))),
+                "status": "open",
+                "authority": "advisory",
+                "escalation_of": item["finding_id"],
+                "first_review_sha256": review_sha,
+                "last_review_sha256": review_sha,
+                "occurrences": 1,
+                "reported_ids": [],
+                "last_evidence": _text(finding.get("evidence")),
+                "history": [{
+                    "status": "open",
+                    "at": stamp,
+                    "review_sha256": review_sha,
+                    "note": "advisory escalation of " + item["finding_id"],
+                    "evidence_ids": [],
+                }],
+            }
+            item["advisory_escalation_id"] = escalation["finding_id"]
+            items.append(escalation)
+            created.append(escalation["finding_id"])
+            matched.append(escalation["finding_id"])
+            refs.append({
+                "reported_id": reported,
+                "finding_id": escalation["finding_id"],
+                "status": "open",
+                "severity": incoming_severity,
+                "action": "advisory-escalation",
+                "id_conflict": False,
+            })
+            continue
         previous_evidence = _text(item.get("last_evidence"))
         if authoritative:
             # 权威复核把同一 finding 升级为 authoritative，之后不再允许仅凭
@@ -338,9 +443,6 @@ def merge_review(state: dict, review: dict, *, at: str = "",
                 if value not in aliases:
                     aliases.append(value)
         evidence = _text(finding.get("evidence"))
-        previous = _text(item.get("status")) or "open"
-        incoming_severity = _text(finding.get("severity")).lower()
-        resolved_severity = _text(item.get("resolved_severity")).lower()
         escalated = bool(
             previous in RESOLVED_STATUSES
             and incoming_severity in BLOCKING_SEVERITIES
@@ -384,12 +486,11 @@ def merge_review(state: dict, review: dict, *, at: str = "",
                 item["resolved_severity"] = item.get("severity")
         else:
             item.pop("resolved_severity", None)
-        if not already:
-            item["occurrences"] = int(item.get("occurrences") or 0) + 1
-            if next_status == previous:
-                _append_history(item, _text(item.get("status")) or "open",
-                                at=stamp, review_sha=review_sha,
-                                note="review " + _text(review.get("verdict")))
+        item["occurrences"] = int(item.get("occurrences") or 0) + 1
+        if next_status == previous:
+            _append_history(item, _text(item.get("status")) or "open",
+                            at=stamp, review_sha=review_sha,
+                            note="review " + _text(review.get("verdict")))
         item["last_review_sha256"] = review_sha or item.get("last_review_sha256")
         if action == "rereported":
             if item["finding_id"] not in rereported:
