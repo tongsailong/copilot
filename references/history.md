@@ -6,7 +6,21 @@
 > （零工具、单轮、建议性）；v8.0.0（2026-11-17）正式退役 G4 原生只读复核；v8.1.0
 > （2026-11-18）升级 `gpt-6.2-sol` 并恢复建议性 CONSULT / PLAN；v8.2.0（2026-11-18）
 > 把三模式融合为 Copilot 内部统一按需认知能力；v8.3.0（2026-11-18）把“什么时候调用
-> SOL”升级为确定性复杂度判断与主动介入**。
+> SOL”升级为确定性复杂度判断与主动介入；v8.4.0（2026-11-18）把 CONSULT / PLAN 并入
+> 默认认知引擎 THINK，REVIEW 只在用户明确要求时执行**。
+
+## v8.4.0（2026-11-18）SOL 默认认知引擎 THINK
+
+- **模式收敛**：`SOL_MODES=("THINK","REVIEW")`；CONSULT / PLAN 只作为历史别名读取并归一
+  到 THINK；`sol-advisory` 命令移除，新入口 `sol-think`。
+- **触发**：简单任务 0 调用；中高复杂任务形成初步理解后建议一次 THINK；只有升级型信号
+  （`risk-high` / `replan-history` / `reopened`）或合同修订才追加。
+- **REVIEW**：只在 `review-admission --review-request`（用户明确要求）时建议；不再由风险
+  或收口阶段自动派生。
+- **输出与降级**：`copilot-sol-think/v1` 九段结构化判断；THINK 失败只登记并返回
+  `status=unavailable`（退出码 0），REVIEW 失败仍非零。
+- **不变量**：零工具、单轮、`gpt-6.2-sol` + `high`、CPA `127` 出口；G1–G3、授权边界与
+  G4 退役状态不变。
 
 ## v8.3.0（2026-11-18）SOL 主动介入策略
 

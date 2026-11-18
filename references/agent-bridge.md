@@ -7,15 +7,16 @@ v1 信封（SOL 通道时代）已退役，出现即 `schema_retired`。
 > `native_agent.py review` / `review-context` / `capability`、review attempt 与
 > `g4_attest`/`g4_shadow`/`test_execution` 已删除。独立复核请使用
 > `copilot_dispatch.py sol-review`（零工具、单轮、advisory）；历史复核记录只读保留。
-> v8.1.0 起 SOL 统一 `gpt-6.2-sol` + `reasoning.effort=high`，并新增建议性
-> `sol-advisory --mode CONSULT|PLAN`（同样零工具、单轮、不入门禁）。
+> v8.4.0 起 SOL 收敛为默认认知引擎 **THINK**：`copilot_dispatch.py sol-think` 按确定性
+> 复杂度建议一次整体判断；**REVIEW** 只在用户明确要求时执行。CONSULT / PLAN 已并入
+> THINK，`sol-advisory` 命令移除，历史记录只读兼容。SOL 仍零工具、单轮、advisory。
 
 ## 1. 角色与边界
 
 | 角色 | 职责 | 约束 |
 |---|---|---|
 | Executor | 执行单个工作项，产出结果与原始证据 | 必须是原生子代理（`kind=subagent`），带 Agent/Child Session 身份与 profile 快照 |
-| SOL（REVIEW / CONSULT / PLAN） | 独立复核与认知辅助（advisory） | 由 `sol_review.py` 零工具单轮调用；不读写文件、不证明宿主权限、不构成收口门禁 |
+| SOL（THINK / REVIEW） | 默认认知判断与用户要求的独立复核（advisory） | 由 `sol_review.py` 零工具单轮调用；不读写文件、不证明宿主权限、不构成收口门禁 |
 
 Copilot 不派发 Agent、不调用模型、不写别人的会话。它只校验宿主已产生的记录并回填状态。
 `native_agent.py` 从真实 `metadata.json`、宿主 SQLite（`tool_usage`/`part`/`session_entry`）
@@ -220,13 +221,20 @@ python3 -B scripts/native_agent.py execution --state T/state.json \
 
 - `bind-execution` 从合同 `test_policy` 派生测试命令与 `require_test_result`/
   `require_artifact_integrity`：调用方只能加严，不能换掉合同命令或关闭合同要求的层；
-  合同显式 `required=false` 时对应层为 NOT APPLICABLE（`test_execution.status=
-  not_applicable`），普通任务不被强制跑无意义测试。影子与候选只在**当前合同**
-  有 captured 策略、`required=false`、binding `requirement_source=contract` 且
-  `contract_sha256` 等于当前合同、策略/报告/产物与当前合同一致时接受 N/A；
+  合同显式 `required=false` 时对应层为 NOT APPLICABLE，普通任务不被强制跑无意义测试。
   amend 后旧 binding 或伪造 contract-source binding 不放行。
-- 合同 `report`/`artifacts` 路径必须位于 workspace 内，且必须出现在本次声明的测试
-  产物中；缺失或越界判 `failed`。产物 mtime 必须晚于本轮测试命令启动。
+- `execution` 生成信封前核验 binding 身份：`metadata.prompt` 必须包含 binding nonce，
+  且 `metadata.createdAt` 必须晚于 `binding.created_at`；缺失或不符即失败关闭
+  （`execution_binding_prompt_missing` / `execution_binding_session_too_old`），
+  防止复用旧 completed 子会话。
+- `ingest` 实际执行合同测试层：`require_test_result` 要求至少一条测试命令或测试产物，
+  声明了测试命令时还必须有 `test_artifacts`；`require_artifact_integrity` 要求
+  `test_artifacts` 非空。合同 `report`/`artifacts` 路径必须在 workspace 内、文件存在、
+  已作为本次文件证据登记（登记时已计算 SHA-256），且 mtime 不早于 execution binding。
+  缺失、越界、未登记或过旧分别失败为 `execution_test_result_missing` /
+  `execution_test_artifact_missing` / `test_artifact_stale` /
+  `contract_artifact_outside_workspace` / `contract_artifact_missing` /
+  `contract_artifact_unbound` / `contract_artifact_stale`。
 - 子命令在写文件前调用 `native_bridge` 的正式校验；失败不产生输出文件。
 - `review` / `review-context` / `capability` 子命令已随 G4 退役；`bind-execution` 与
   `execution` 只负责执行绑定与执行信封。

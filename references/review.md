@@ -235,20 +235,20 @@ v8 起原生 Reviewer 已退役，正式 REVIEW 的独立意见只能来自 SOL 
 
 ## 2. 独立复核流程（SOL）
 
-### 风险建议（SOL）
+### 调用建议（SOL）
 
-| 任务类型 | 建议 |
+| 场景 | 建议 |
 |---|---|
-| 简单文案、小 Bug、简单 UI | 不调用 |
-| 普通功能开发 | 按需 |
-| 多模块重大改造 / 复杂核心业务 | 建议一次 |
-| 广告、归因、数据链路 | 建议一次 |
-| 安全/权限逻辑、生产高风险 | 按风险一次 |
-| 用户明确要求 REVIEW | 一次 |
+| 简单文案、小 Bug、简单 UI（0 复杂度信号） | 0 调用；主代理自检闭环 |
+| 中高复杂任务且已形成初步理解（有计划/证据） | 建议一次 THINK |
+| 出现升级型新信号（风险升级/重规划/重开） | 允许追加一次 THINK |
+| 用户明确要求独立复核（`--review-request`） | 一次 REVIEW |
+| 高风险 / 收口阶段 | 不自动 REVIEW；按复杂度决定是否 THINK |
 
-`review-admission` 只返回建议（`not_needed` / `optional` / `recommended`），不写状态、
-不是门禁。高风险任务返回 `recommended` + `scope=high-risk`；`recommended_action` 会先看
-本地 G1–G3：门禁仍有缺口时是 `not_needed`，门禁全绿后才是风险建议。
+`review-admission` 只返回建议（`none` / `reuse` / `think` / `review`），不写状态、不是
+门禁。`recommended_action` 由确定性复杂度与合同覆盖判断给出，不再要求 G1–G3 全绿；
+门禁缺口不改变 THINK 建议。REVIEW 只在 `review_requested`（用户明确要求）时建议，不由
+风险等级或阶段自动派生。
 
 ### Finding 台账与定向复验
 

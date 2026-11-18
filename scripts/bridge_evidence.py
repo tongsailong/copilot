@@ -27,6 +27,7 @@ import re
 import signal
 import subprocess
 import sys
+import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from lib_common import (  # noqa: E402
@@ -849,13 +850,27 @@ def main() -> int:
         "items": manifest,
     }
 
+    def _atomic_write(path: str, text: str) -> None:
+        target = os.path.abspath(path)
+        directory = os.path.dirname(target) or "."
+        os.makedirs(directory, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(prefix=".evidence-", dir=directory)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(text)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, target)
+        finally:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+
     if args.manifest:
-        with open(args.manifest, "w", encoding="utf-8") as fh:
-            json.dump(manifest_doc, fh, ensure_ascii=False, indent=2)
-            fh.write("\n")
+        _atomic_write(args.manifest, json.dumps(
+            manifest_doc, ensure_ascii=False, indent=2) + "\n")
     if args.out:
-        with open(args.out, "w", encoding="utf-8") as fh:
-            fh.write(body)
+        _atomic_write(args.out, body)
         suffix = f"，{len(truncated)} 条被截断" if truncated else ""
         print(f"copilot: 证据包已写入 {args.out}"
               f"（纳入 {manifest_doc['items_included']}/{len(items)} 条，{total} 字符{suffix}）",

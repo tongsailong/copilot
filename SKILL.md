@@ -74,10 +74,11 @@ start（合同 + 完成条件 + 风险 + 后端）
   → drive（继续直到 PASS 或真实 BLOCKED）
 ```
 
-除 `sol-think` 与 `sol-review` 外，所有命令只读写任务状态文件，不发起网络或模型调用。
-两个 SOL 命令都是一次调用只发一次请求，不自动重试、不自动二审；THINK 失败只记录并降级，
-不阻断工程推进。完整命令矩阵见 `references/workflow.md`；阶段机与驱动语义见
-`references/runtime.md`。
+除 `sol-think` 与 `sol-review` 外，所有命令不发起网络或模型调用，只读写任务状态与本地
+证据/派发文件；其中 `evidence --capture-cmd` 会执行调用方给出的本地命令，`handoff` 会做
+只读 Git 查询。两个 SOL 命令都是一次调用只发一次请求，不自动重试、不自动二审；THINK
+失败只记录并降级，不阻断工程推进。完整命令矩阵见 `references/workflow.md`；阶段机与驱动
+语义见 `references/runtime.md`。
 
 ## 模式
 

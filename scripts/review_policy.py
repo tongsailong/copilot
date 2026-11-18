@@ -25,8 +25,6 @@ import os
 import re
 
 LEDGER_SCHEMA = "copilot-finding-ledger/v1"
-ADMISSION_SCHEMA = "copilot-review-admission/v1"
-STOP_SCHEMA = "copilot-review-stop/v1"
 COMPLEXITY_SCHEMA = "copilot-task-complexity/v1"
 SOL_ADVICE_SCHEMA = "copilot-sol-advice/v2"
 
@@ -59,10 +57,6 @@ SEVERITY_ORDER = {"blocking": 0, "major": 1, "minor": 2, "info": 3}
 
 # 复核层级：按任务影响、失败后果、变更范围与不确定性划分，不引入评分模型。
 # `normal` 是历史风险标签，语义等同于 `medium`；读取旧状态时按 medium 处理。
-REVIEW_TIERS = ("low", "medium", "high")
-RISK_TIER = {"low": "low", "medium": "medium", "normal": "medium", "high": "high"}
-
-# 中风险任务按需复核的触发因素；没有触发因素时默认不派 Reviewer。
 ADMISSION_TRIGGERS = {
     "security": "安全/隐私/凭据处理",
     "permissions": "权限或访问控制",
@@ -72,31 +66,6 @@ ADMISSION_TRIGGERS = {
     "global-execution": "全局执行机制或调度",
     "production": "生产环境或数据迁移",
     "release": "高风险发布或不可逆操作",
-}
-
-# 已经有一次 PASS 之后，允许重新完整复核的实质触发因素。
-REENTRY_TRIGGERS = {
-    "blocking-fix": "修复了 blocking finding",
-    "major-fix": "修复了 major finding",
-    "code-changed": "关键代码范围实质变化",
-    "scope-expanded": "变更范围实质扩大",
-    "evidence-changed": "最终证据或完成条件发生实质变化",
-    "risk-changed": "风险判断发生变化",
-    "security-fix": "安全/权限修复改变了整体结论",
-    "concurrency-fix": "并发/事务修复改变了整体结论",
-}
-
-# 准入触发因素 → 重入触发因素：同一风险在首次与重入阶段使用不同词汇，
-# 不因叫法差异把合法的重入请求判成非法。
-TRIGGER_ALIASES = {
-    "security": "security-fix",
-    "permissions": "security-fix",
-    "core-logic": "code-changed",
-    "data-integrity": "concurrency-fix",
-    "architecture": "scope-expanded",
-    "global-execution": "scope-expanded",
-    "production": "risk-changed",
-    "release": "risk-changed",
 }
 
 class ReviewPolicyError(ValueError):
@@ -680,171 +649,6 @@ def ledger_summary(state: dict) -> dict:
     }
 
 
-def tier_for(risk: object) -> str:
-    """把风险标签归一化为复核层级；缺失或未知标签失败关闭，不猜测。"""
-    value = _text(risk).lower()
-    tier = RISK_TIER.get(value)
-    if tier is None:
-        raise ReviewPolicyError(
-            f"风险等级 {value!r} 缺失或未知；只能是 {' / '.join(REVIEW_TIERS)}"
-            "（历史 normal 等价于 medium）。")
-    return tier
-
-
-def admission(*, risk: str = "medium", triggers: list[str] | None = None,
-              reason: str = "") -> dict:
-    """风险准入：按 low/medium/high 三级决定是否需要独立复核。
-
-    * `low`：文档/文案/样式/简单修复/小范围既有模式改动——主代理自检闭环，
-      默认不派 Reviewer；显式声明的实质触发因素仍然优先。
-    * `medium`（含历史 `normal`）：普通开发/多页面 UI/常规重构——主代理完成
-      开发与验证；只有声明实质触发因素时才建议一次定向只读复核。
-    * `high`：建议执行一次 SOL 零工具单轮复核；它是 advisory，不是收口门禁，
-      但高风险任务仍须完成 G1–G3 与台账闭合。
-
-    “针对性调查”不是正式复核：普通子 Agent 咨询、`Explore` 调查不会创建
-    复核记录或台账。
-    """
-    tier = tier_for(risk)
-    risk_value = _text(risk).lower()
-    requested = []
-    for item in triggers or []:
-        value = _text(item).lower()
-        if value and value not in requested:
-            requested.append(value)
-    unknown = [item for item in requested
-               if item not in ADMISSION_TRIGGERS and item not in REENTRY_TRIGGERS]
-    if unknown:
-        raise ReviewPolicyError(
-            "未知复核触发因素：" + ", ".join(unknown) + "；可选："
-            + ", ".join(sorted(set(ADMISSION_TRIGGERS) | set(REENTRY_TRIGGERS)))
-            + "。")
-    base = {"schema": ADMISSION_SCHEMA, "risk": risk_value, "tier": tier,
-            "triggers": requested, "reason": _text(reason)[:1000]}
-    if tier == "high":
-        return {**base, "decision": "recommended", "scope": "sol",
-                "detail": "高风险任务建议执行一次 SOL 零工具单轮独立复核（advisory）；"
-                          "SOL 不构成收口门禁，也不证明宿主只读权限。"}
-    if requested:
-        return {**base, "decision": "required", "scope": "advisory",
-                "detail": "声明了实质风险或重入触发因素，建议派发一次定向只读复核；"
-                          "针对性调查本身不等于正式复核。"}
-    if tier == "low":
-        return {**base, "decision": "not_required", "scope": "none",
-                "detail": "低风险任务（文档/文案/样式/简单修复/小范围既有模式改动）："
-                          "由主代理自检、diff 与必要测试闭环，不派发 Reviewer。"}
-    return {**base, "decision": "not_required", "scope": "none",
-            "detail": "中风险普通开发任务：由主代理完成开发与验证，只在声明实质"
-                      "触发因素时才派发一次定向只读复核；不强制完整复核。"}
-
-
-def last_stop(state: dict) -> dict | None:
-    stops = [item for item in state.get("review_stops") or []
-             if isinstance(item, dict)]
-    if not stops:
-        return None
-    return max(stops, key=lambda item: _text(item.get("created_at")))
-
-
-def record_stop(state: dict, review: dict, *, code_scope_sha256: str = "",
-                at: str = "", authoritative: bool = True) -> dict | None:
-    """为一次 PASS 记录停止标记；同一复核只记录一次（幂等）。"""
-    if _text(review.get("verdict")).lower() != "pass":
-        return None
-    findings = [item for item in review.get("findings") or []
-                if isinstance(item, dict)]
-    if any(_text(item.get("severity")).lower() == "blocking"
-           for item in findings):
-        return None
-    if review.get("unverified"):
-        return None
-    review_sha = _text(review.get("result_sha256"))
-    stops = state.setdefault("review_stops", [])
-    if not isinstance(stops, list):
-        stops = []
-        state["review_stops"] = stops
-    for item in stops:
-        if isinstance(item, dict) and \
-                _text(item.get("review_sha256")) == review_sha:
-            return item
-    refs = [item for item in review.get("finding_refs") or []
-            if isinstance(item, dict)]
-    stop = {
-        "schema": STOP_SCHEMA,
-        "stop_id": "RST" + sha256_text(
-            review_sha + "|" + _text(review.get("target_sha256")))[:20],
-        "task_id": _text(review.get("task_id")),
-        "work_item_id": _text(review.get("work_item_id")),
-        "review_sha256": review_sha,
-        "target_sha256": _text(review.get("target_sha256")),
-        "code_scope_sha256": _text(code_scope_sha256),
-        "verdict": "pass",
-        "authoritative": bool(authoritative),
-        "findings": {
-            "blocking": sum(1 for item in findings
-                            if _text(item.get("severity")) == "blocking"),
-            "major": sum(1 for item in findings
-                         if _text(item.get("severity")) == "major"),
-            "minor": sum(1 for item in findings
-                         if _text(item.get("severity")) == "minor"),
-            "info": sum(1 for item in findings
-                        if _text(item.get("severity")) == "info"),
-        },
-        "minor_ids": [item.get("finding_id") for item in refs
-                      if _text(item.get("severity")) in ("minor", "info")],
-        "created_at": at or _text(review.get("received")) or _now(),
-    }
-    stops.append(stop)
-    return stop
-
-
-def reentry_decision(state: dict, *, target: str,
-                     triggers: list[str] | None = None,
-                     reason: str = "") -> dict:
-    """判断已有 PASS 之后是否允许再次独立复核。
-
-    * 目标摘要未变且没有声明触发因素：直接复用上轮结论（`review_not_needed`）。
-    * 目标实质变化：必须声明 `REENTRY_TRIGGERS` 之一并写入原因，避免用
-      “再来一轮”掩盖非收敛。局部修复优先用定向测试/证据验证。
-    """
-    requested = []
-    for item in triggers or []:
-        value = _text(item).lower()
-        if value and value not in requested:
-            requested.append(value)
-    effective = [TRIGGER_ALIASES.get(item, item) for item in requested]
-    unknown = [item for item in effective if item not in REENTRY_TRIGGERS]
-    stop = last_stop(state)
-    if stop is None:
-        # 首次复核：triggers 属于风险准入词汇（security/core-logic…），不是
-        # 重入触发因素，不能拿 REENTRY_TRIGGERS 去拒绝。
-        return {"allowed": True, "code": "", "detail": "首次复核，无停止标记。",
-                "triggers": requested, "stop_id": ""}
-    if unknown:
-        return {"allowed": False, "code": "review_reentry_trigger_invalid",
-                "detail": "未知重入触发因素：" + ", ".join(unknown)
-                          + "；可选：" + ", ".join(sorted(REENTRY_TRIGGERS)) + "。",
-                "triggers": requested, "stop_id": stop.get("stop_id")}
-    same_target = _text(stop.get("target_sha256")) == _text(target)
-    if same_target and not requested:
-        return {"allowed": False, "code": "review_not_needed",
-                "detail": "当前目标摘要与上轮 PASS 完全相同；直接复用该结论，"
-                          "不重新派发复核。如确有新的实质风险，用 --trigger "
-                          "显式声明重入原因。",
-                "triggers": requested, "stop_id": stop.get("stop_id")}
-    if not requested:
-        return {"allowed": False, "code": "review_reentry_requires_trigger",
-                "detail": "已有 PASS 且目标发生变化；重新完整复核前必须声明实质"
-                          "触发因素（--trigger）与原因（--reason）。局部修复优先用"
-                          "定向测试/证据验证，不要默认重跑完整复核。",
-                "triggers": requested, "stop_id": stop.get("stop_id")}
-    return {"allowed": True, "code": "",
-            "detail": "允许重新复核：" + "、".join(
-                REENTRY_TRIGGERS[item] for item in effective),
-            "triggers": requested, "stop_id": stop.get("stop_id"),
-            "reason": _text(reason)[:1000]}
-
-
 # ── SOL 主动介入：任务认知复杂度与调用建议 ──────────────────────────────────
 #
 # 目标不是增加调用量，而是让真正值得认知推理的任务在**足够了解现场之后**主动获得
@@ -1032,6 +836,11 @@ def sol_advice(state: dict, *, calls: list[dict] | None = None,
     same = [item for item in completed if _covers_contract(item, contract_sha)]
     covered = {mode: any(_record_mode(item) == mode for item in same)
                for mode in ("THINK", "REVIEW")}
+    # CLI 的 single_round_decision 按“同模式是否有任何已完成记录”要求 --force，
+    # 不按合同过滤。建议命令必须与真实准入一致，否则合同修订后给出的命令会被
+    # 直接拒绝（sol_review_requires_reason）。
+    attempted = {mode: any(_record_mode(item) == mode for item in completed)
+                 for mode in ("THINK", "REVIEW")}
     last = None
     if same:
         last = max(same, key=lambda item: _text(item.get("created_at")))
@@ -1082,12 +891,15 @@ def sol_advice(state: dict, *, calls: list[dict] | None = None,
             })
             return base
         # 只有已有 REVIEW 才是第二轮；已有 THINK 不要求 REVIEW 带 --force。
+        base["second_round"] = attempted["REVIEW"]
+        if attempted["REVIEW"]:
+            base["trigger"] = "new-risk" if new_codes else "user-request"
         base.update({
             "action": "review", "recommended_action": "recommended",
             "mode": "REVIEW", "phase": "review",
             "reason": ("用户明确要求独立复核：执行一次 SOL REVIEW（advisory）；"
                        "结论仍是建议，不构成收口门禁。"),
-            "command": _advice_command("REVIEW", second_round=covered["REVIEW"],
+            "command": _advice_command("REVIEW", second_round=attempted["REVIEW"],
                                        trigger="new-risk" if new_codes
                                        else "user-request"),
         })
@@ -1121,17 +933,25 @@ def sol_advice(state: dict, *, calls: list[dict] | None = None,
         return base
     if gates_passed:
         if risk == "high" or level == "high":
+            base["second_round"] = attempted["THINK"]
+            if attempted["THINK"]:
+                base["trigger"] = base["trigger"] or "scope-changed"
             base.update({
                 "action": "think", "recommended_action": "optional",
                 "mode": "THINK", "phase": "closure",
                 "reason": ("G1–G3 已通过；高风险或高复杂任务可在收口前做一次整体"
                            "判断（advisory，可选，不改变 PASS 判定）。"),
-                "command": _advice_command("THINK", second_round=False, trigger=""),
+                "command": _advice_command(
+                    "THINK", second_round=attempted["THINK"],
+                    trigger=base["trigger"] if attempted["THINK"] else ""),
             })
             return base
         base["reason"] = ("G1–G3 已通过且没有新的认知不确定性：不因阶段自动调用 "
                           "SOL。")
         return base
+    base["second_round"] = attempted["THINK"]
+    if attempted["THINK"]:
+        base["trigger"] = base["trigger"] or "scope-changed"
     base.update({
         "action": "think",
         "recommended_action": "recommended",
@@ -1139,7 +959,9 @@ def sol_advice(state: dict, *, calls: list[dict] | None = None,
         "phase": "development",
         "reason": ("中高复杂任务已形成初步理解：建议调用一次 SOL 做整体判断"
                    "（问题本质、策略、取舍、风险与验证信号）；是否采纳由主代理判断。"),
-        "command": _advice_command("THINK", second_round=False, trigger=""),
+        "command": _advice_command(
+            "THINK", second_round=attempted["THINK"],
+            trigger=base["trigger"] if attempted["THINK"] else ""),
     })
     if user_request:
         base["reason"] = ("用户明确要求 SOL 判断：直接调用一次（advisory）；"

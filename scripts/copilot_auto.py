@@ -23,6 +23,7 @@ import json
 import os
 import re
 import sys
+import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
@@ -120,21 +121,33 @@ def _write_dispatch(state: dict, ready: list[dict], path: str,
     # ZCode 主代理直接执行并用 CLI 回填，不属于任何计划。
     plan_id = str(ready[0].get("plan_id") or "")
     batch = [a for a in ready if str(a.get("plan_id") or "") == plan_id]
+    if not batch:
+        raise AutoError("原生派发没有可派发的工作项。")
     plan = NB._plan_record(state, plan_id) if plan_id else None
     existing = state.get("native_dispatch")
     env = NB.build_dispatch(state, batch, plan=plan, existing=existing)
     state = G.load_state(path)
+    # 求值与写入之间另一进程可能已收口；CLOSED 状态不允许再写入派发。
+    if bool((state.get("closure") or {}).get("closed")):
+        raise AutoError("任务已收口（CLOSED），不能写入原生派发。")
     state["native_dispatch"] = env
     G.save_state(path, state)
     out = args.dispatch_out or (os.path.splitext(path)[0] + ".dispatch.json")
     out = os.path.abspath(out)
     directory = os.path.dirname(out) or "."
     os.makedirs(directory, exist_ok=True)
-    tmp = f"{out}.tmp-{os.getpid()}"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(env, fh, ensure_ascii=False, indent=2)
-        fh.write("\n")
-    os.replace(tmp, out)
+    fd, tmp = tempfile.mkstemp(prefix=".dispatch-", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(env, fh, ensure_ascii=False, indent=2)
+            fh.write("\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, out)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
     return out
 
 
@@ -184,6 +197,14 @@ def drive(args) -> int:
             dispatch_path = ""
             dispatchable = [a for a in chosen if str(a.get("plan_id") or "")]
             if state.get("execution_backend") == "native" and dispatchable:
+                # 原生 dispatch 一次只覆盖一个计划；工作单必须与 dispatch 同集合，
+                # 不能出现“打印了工作项但 dispatch 文件里没有”的情况。
+                anchor = str(dispatchable[0].get("plan_id") or "")
+                chosen = [a for a in chosen
+                          if not str(a.get("plan_id") or "")
+                          or str(a.get("plan_id") or "") == anchor]
+                dispatchable = [a for a in chosen
+                                if str(a.get("plan_id") or "") == anchor]
                 try:
                     dispatch_path = _write_dispatch(state, dispatchable, path, args)
                 except NB.BridgeError as exc:

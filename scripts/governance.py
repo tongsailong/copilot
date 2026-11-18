@@ -1079,6 +1079,13 @@ def plan_state(path: str, plan: dict, *, source: str = "zcode") -> dict:
     for existing in state.get("plans") or []:
         if str(existing.get("sha256") or "") == plan_sha:
             return {"plan": existing, "actions": [], "idempotent": True}
+    # 工作项 id 全任务唯一：跨计划重复会让 `_by_id` 永远命中第一条，第二条
+    # 永远 pending，G1 无法收口，`drive` 反复输出同一工作单。
+    duplicates = sorted({item["id"] for item in actions} & known)
+    if duplicates:
+        raise GovernanceError(
+            "工作项 id 已在其他计划中登记，不能跨计划重复："
+            + ", ".join(duplicates))
     plan_id = "P" + _sha256_text(canonical_json([state.get("task_id"), plan_sha]))[:16]
     created: list[dict] = []
     now = now_iso()
@@ -1118,15 +1125,36 @@ def _by_id(state: dict, aid: str) -> dict:
     raise GovernanceError(f"不存在的工作项：{aid}。")
 
 
+def _tracked_actions(state: dict) -> list[dict]:
+    """当前仍参与治理的工作项。
+
+    v7 及更早的高风险任务可能留有 `origin=g4-review` 工作项；G4 已退役，
+    这些历史记录只读保留，不再参与可领取、停摆、G1 或恢复派生。
+    """
+    out = []
+    for action in state.get("actions") or []:
+        if not isinstance(action, dict):
+            continue
+        origin = str(action.get("origin") or "")
+        aid = str(action.get("id") or "")
+        # 旧代码可能已从 G4 缺口派生过 AUTO-R-AUTO-G4*；它们同样是历史残留。
+        if origin == "g4-review" or aid.startswith(
+                ("AUTO-G4", "AUTO-R-AUTO-G4")):
+            continue
+        out.append(action)
+    return out
+
+
 def ready_actions(state: dict) -> list[dict]:
     if bool((state.get("closure") or {}).get("closed")):
         return []
     if any(not b.get("resolved_at") for b in state.get("blocks") or []):
         return []
-    done = {a["id"] for a in state.get("actions") or []
+    actions = _tracked_actions(state)
+    done = {a["id"] for a in actions
             if str(a.get("status") or "") == "done"}
     out = []
-    for action in state.get("actions") or []:
+    for action in actions:
         if str(action.get("status") or "") != "pending":
             continue
         if all(dep in done for dep in action.get("depends_on") or []):
@@ -1136,8 +1164,9 @@ def ready_actions(state: dict) -> list[dict]:
 
 def stalled_actions(state: dict) -> list[tuple[dict, str]]:
     out: list[tuple[dict, str]] = []
-    by_id = {a["id"]: a for a in state.get("actions") or []}
-    for action in state.get("actions") or []:
+    actions = _tracked_actions(state)
+    by_id = {a["id"]: a for a in actions}
+    for action in actions:
         status = str(action.get("status") or "")
         if status in ("running", "failed", "blocked"):
             out.append((action, f"{status}：需重新 record 或说明真实阻塞"))
@@ -1180,8 +1209,8 @@ def _validate_evidence_refs(state: dict, refs: list) -> list[dict]:
         if not expected:
             raise GovernanceError(f"证据 {eid} 缺少摘要；引用无效。")
         if hint and hint != "<inline>":
-            if not os.path.exists(hint):
-                raise GovernanceError(f"证据 {eid} 的文件不存在：{hint}")
+            if not os.path.isfile(hint):
+                raise GovernanceError(f"证据 {eid} 的文件不存在或不是普通文件：{hint}")
             try:
                 actual = _sha256_file(hint)
             except OSError as exc:
@@ -2366,6 +2395,9 @@ def _quality_binding(state: dict, report: dict) -> str:
 def _quality_binding_current(state: dict, report: dict) -> bool:
     if not _quality_report_structurally_valid(report):
         return False
+    # 重开后旧报告必须重新验收：即使目标/合同文本未变，旧结论也不能直接复用。
+    if report.get("reopened_at"):
+        return False
     stored = str(report.get("binding_sha256") or "")
     return bool(stored) and stored in _quality_binding_candidates(state, report)
 
@@ -2736,15 +2768,15 @@ def accept_pww(path: str, *, report_id: str = "", ids: list[str] | None = None,
     if stored_binding in _quality_binding_candidates(state, report):
         # legacy 过渡口径：保留已登记的绑定值，避免幂等/部分接受合并失效。
         current = stored_binding
+    if str(report.get("acceptance_status") or "") == "stale":
+        raise GovernanceError(
+            "[pww_reverify_required] 任务重开后旧接受已失效；必须重新验收并接入新的"
+            "质量报告，再取得用户明确接受。")
     if not _quality_binding_current(state, report):
         # 不落盘：校验失败时状态必须保持不变；stale 由查询/门禁按当前绑定派生。
         raise GovernanceError(
             "[pww_acceptance_stale] 目标、合同、条件或报告已变化，原接受绑定失效；"
             "请重新验收并接入新的质量报告后再接受。")
-    if str(report.get("acceptance_status") or "") == "stale":
-        raise GovernanceError(
-            "[pww_reverify_required] 任务重开后旧接受已失效；必须重新验收并接入新的"
-            "质量报告，再取得用户明确接受。")
     scope = _code_scope_status(report, state)
     if scope["reasons"]:
         raise GovernanceError(
@@ -3033,8 +3065,8 @@ def register_evidence(state: dict, eid: str, *, kind: str = "",
         raise GovernanceError("证据登记必须且只能提供 --file 或 --text 之一。")
     if file_path:
         path = os.path.abspath(file_path)
-        if not os.path.exists(path):
-            raise GovernanceError(f"证据文件不存在：{path}")
+        if not os.path.isfile(path):
+            raise GovernanceError(f"证据文件不存在或不是普通文件：{path}")
         digest = _sha256_file(path)
         size = os.path.getsize(path)
         hint = path
@@ -3145,7 +3177,7 @@ def progress_digest(state: dict) -> str:
 # ── G1–G3 / 收口 ────────────────────────────────────────────────────────────
 def _gate_actions(state: dict) -> dict:
     reasons = []
-    for action in state.get("actions") or []:
+    for action in _tracked_actions(state):
         status = str(action.get("status") or "")
         if status not in TERMINAL:
             reasons.append({"code": "action_open",
@@ -3206,9 +3238,9 @@ def _gate_criteria(state: dict, *, cache: dict | None = None) -> dict:
                                 "detail": f"{cid} 引用的 {eid} 摘要与登记不一致"})
             hint = str(entry.get("path_hint") or "")
             if hint and hint != "<inline>":
-                if not os.path.exists(hint):
+                if not os.path.isfile(hint):
                     reasons.append({"code": "evidence_file_missing",
-                                    "detail": f"{eid} 证据文件已不存在：{hint}"})
+                                    "detail": f"{eid} 证据文件已不存在或不是普通文件：{hint}"})
                     continue
                 try:
                     # 同一文件被多条条件引用时只重读一次；键里带 mtime/size，
@@ -3432,11 +3464,6 @@ def list_sol_think_calls(state: dict) -> list[dict]:
     return list_sol_calls(state, mode="THINK")
 
 
-def list_sol_advisories(state: dict) -> list[dict]:
-    """历史名称：等同 `list_sol_think_calls`。"""
-    return list_sol_think_calls(state)
-
-
 def record_sol_call(path: str, call: dict, *, mode: str = "",
                     materials_sha256: str = "", trigger: str = "",
                     reason: str = "") -> dict:
@@ -3571,49 +3598,6 @@ def record_sol_advisory_failure(path: str, *, mode: str = "THINK",
 def list_findings(state: dict) -> dict:
     """只读返回 Finding 台账摘要与条目。"""
     return RP.ledger_summary(state)
-
-
-def record_review_admission(path: str, *, decision: dict, work_item_id: str = "",
-                            target_sha256: str = "",
-                            code_scope_sha256: str = "",
-                            scope: str = "full", base: str = "") -> dict:
-    """登记一次准入判断（普通风险的自愿复核也应有可审计依据）。"""
-    state = load_state(path)
-    _assert_open(state, "记录复核准入", allow_blocked=True)
-    record = {
-        "schema": RP.ADMISSION_SCHEMA,
-        "admission_id": "RVA" + secrets.token_hex(12),
-        "task_id": str(state.get("task_id") or ""),
-        "work_item_id": str(work_item_id or ""),
-        "execution_result_sha256": "",
-        "target_sha256": str(target_sha256 or final_evidence_digest(state)),
-        "code_scope_sha256": str(code_scope_sha256 or ""),
-        "review_scope": str(scope or "full"),
-        "base": str(base or ""),
-        "decision": str(decision.get("decision") or "unknown"),
-        "risk": str(decision.get("risk") or state.get("risk") or ""),
-        "tier": str(decision.get("tier") or ""),
-        "triggers": list(decision.get("triggers") or []),
-        "reason": str(decision.get("reason") or "")[:1000],
-        "reentry_stop_id": str((decision.get("reentry") or {}).get("stop_id") or ""),
-        "reentry_allowed": bool((decision.get("reentry") or {}).get("allowed")),
-        "reentry_code": str((decision.get("reentry") or {}).get("code") or ""),
-        "reentry_changed_paths": list(
-            (decision.get("reentry") or {}).get("changed_paths") or [])[:50],
-        "created_at": now_iso(),
-        "created_by": "zcode-native",
-    }
-    state.setdefault("review_admissions", []).append(record)
-    _history(state, "review_admission_recorded", {
-        "admission_id": record["admission_id"],
-        "work_item_id": record["work_item_id"],
-        "decision": record["decision"],
-        "review_scope": record["review_scope"],
-        "triggers": record["triggers"],
-        "target_sha256": record["target_sha256"],
-    })
-    save_state(path, state)
-    return record
 
 
 def record_finding_status(path: str, finding_id: str, status: str, *,
@@ -4153,9 +4137,10 @@ def reopen_task(path: str, reason: str, *, authorized_by: str = "") -> dict:
         "reason": reason, "at": now_iso(), "authorized_by": authorized_by,
         "previous": old,
     })
-    # 重开意味着还会有新的工作/证据/代码；旧 PWW 接受不覆盖重开后的状态，
-    # 必须重新验收并经用户再次明确接受，不能直接拿旧接受再收口。
+    # 重开意味着还会有新的工作/证据/代码；旧质量结论（含普通 PASS）不能直接
+    # 复用。标记 reopened_at 让 binding 立即失效，必须对当前状态重新验收。
     for report in active_quality_reports(state):
+        report["reopened_at"] = now_iso()
         if str(report.get("verdict") or "") != PWW:
             continue
         if str(report.get("acceptance_status") or "") in ("accepted", "partial"):

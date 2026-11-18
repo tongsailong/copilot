@@ -287,10 +287,6 @@ class FindingLedgerTests(unittest.TestCase):
             RP.transition(state, "F1", "dropped", note="误报")
         self.assertEqual(RP.get_item(state, "F1")["status"], "open")
 
-    def test_admission_accepts_reentry_trigger_vocabulary(self):
-        decision = RP.admission(risk="normal", triggers=["major-fix"])
-        self.assertEqual(decision["decision"], "required")
-
     def test_verified_requires_fixed_first(self):
         state = {}
         RP.merge_review(state, review([{
@@ -317,55 +313,6 @@ class FindingLedgerTests(unittest.TestCase):
         self.assertEqual([item["finding_id"] for item in blocked], ["F1"])
         self.assertEqual([item["finding_id"]
                           for item in RP.pending_verification(state)], ["F1"])
-
-
-class ReentryStopTests(unittest.TestCase):
-    def _state(self, target="t" * 64):
-        return {
-            "risk": "high",
-            "review_stops": [{
-                "schema": RP.STOP_SCHEMA, "stop_id": "RST1",
-                "review_sha256": "r" * 64,
-                "target_sha256": target,
-                "verdict": "pass",
-                "findings": {"blocking": 0, "major": 0, "minor": 1, "info": 0},
-                "created_at": G.now_iso(),
-            }],
-        }
-
-    def test_same_target_is_not_reviewed_again(self):
-        decision = RP.reentry_decision(self._state(), target="t" * 64)
-        self.assertFalse(decision["allowed"])
-        self.assertEqual(decision["code"], "review_not_needed")
-
-    def test_target_change_requires_declared_trigger(self):
-        denied = RP.reentry_decision(self._state(), target="u" * 64)
-        self.assertFalse(denied["allowed"])
-        self.assertEqual(denied["code"], "review_reentry_requires_trigger")
-        allowed = RP.reentry_decision(self._state(), target="u" * 64,
-                                      triggers=["code-changed"],
-                                      reason="修复后代码变化")
-        self.assertTrue(allowed["allowed"])
-
-    def test_unknown_trigger_is_rejected(self):
-        decision = RP.reentry_decision(self._state(), target="u" * 64,
-                                       triggers=["looks-complex"])
-        self.assertEqual(decision["code"], "review_reentry_trigger_invalid")
-
-    def test_first_review_needs_no_trigger(self):
-        decision = RP.reentry_decision({"review_stops": []}, target="t" * 64)
-        self.assertTrue(decision["allowed"])
-
-    def test_record_stop_is_idempotent_and_skips_non_pass(self):
-        state = {}
-        entry = review([], sha="1" * 64, target="t" * 64)
-        first = RP.record_stop(state, entry, code_scope_sha256="c" * 64)
-        second = RP.record_stop(state, entry, code_scope_sha256="c" * 64)
-        self.assertEqual(first["stop_id"], second["stop_id"])
-        self.assertEqual(len(state["review_stops"]), 1)
-        self.assertNotIn("g4_eligible", first)
-        self.assertIsNone(RP.record_stop(state, review([], verdict="partial",
-                                                       sha="2" * 64)))
 
 
 class DeriveWorkEfficiencyTests(unittest.TestCase):

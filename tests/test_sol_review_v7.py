@@ -921,7 +921,10 @@ class PendingRecoveryTests(unittest.TestCase):
             "schema": SR.REVIEW_SCHEMA, "model": SR.MODEL,
             "model_resolved": SR.MODEL, "reasoning_effort": "high",
             "zero_tool": True, "attempts": 1,
-            "materials_sha256": digest,
+            # 真实 run_sol() 记录的是提示词文本哈希，与 subject 摘要不同；
+            # pending 恢复必须按 subject_sha256 匹配，不能拿这两个值混用。
+            "subject_sha256": digest,
+            "materials_sha256": "p" * 64,
             "materials_chars": len(self.materials),
             "request_sha256": "r" * 64, "reply_text": reply(),
             "reply_sha256": "a" * 64, "reply_chars": 10,
@@ -946,6 +949,42 @@ class PendingRecoveryTests(unittest.TestCase):
         self.assertEqual(record["status"], "completed")
         self.assertTrue(record["recovered_from_pending"])
         self.assertFalse(os.path.exists(pending))
+
+    def test_legacy_pending_is_recovered_by_prompt_hash(self):
+        import copilot_dispatch as D
+
+        state = G.load_state(self.state_path)
+        digest = SR.review_subject_sha256(state, self.materials, mode="REVIEW")
+        prompt = SR.build_prompt(state, self.materials, mode="REVIEW")
+        result = {
+            "schema": SR.REVIEW_SCHEMA, "model": SR.MODEL,
+            "model_resolved": SR.MODEL, "reasoning_effort": "high",
+            "zero_tool": True, "attempts": 1,
+            # 旧格式没有 subject_sha256，只能靠提示词文本哈希恢复。
+            "materials_sha256": hashlib.sha256(
+                prompt.encode("utf-8")).hexdigest(),
+            "materials_chars": len(prompt),
+            "request_sha256": "r" * 64, "reply_text": reply(),
+            "reply_sha256": "a" * 64, "reply_chars": 10,
+            "usage": {}, "usage_available": True, "latency_ms": 1,
+            "verdict": "pass", "summary": "ok", "findings": [],
+            "unverified": [], "materials_reviewed": [],
+            "verdict_adjusted": [],
+            "findings_count": {"blocking": 0, "major": 0, "minor": 0,
+                               "info": 0},
+            "completed_at": G.now_iso(),
+        }
+        pending = D._pending_result_path(self.dir, digest)
+        os.makedirs(os.path.dirname(pending), exist_ok=True)
+        with open(pending, "w", encoding="utf-8") as fh:
+            json.dump(result, fh)
+        with mock.patch.object(SR, "run_review",
+                               side_effect=AssertionError("不应再次请求")):
+            code = D.main(["sol-review", "--state", self.state_path,
+                           "--materials", self.mat_path])
+        self.assertEqual(code, 0)
+        record = G.load_state(self.state_path)["sol_calls"][-1]
+        self.assertTrue(record["recovered_from_pending"])
 
 
 if __name__ == "__main__":

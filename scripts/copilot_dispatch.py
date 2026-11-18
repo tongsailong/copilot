@@ -25,11 +25,13 @@ SOL 的结论只是认知输入，工程执行与技术决策始终由 ZCode 主
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import secrets
 import subprocess
 import sys
+import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
@@ -554,13 +556,16 @@ def cmd_review_admission(args) -> int:
 
 def _write_atomic(path: str, text: str) -> str:
     path = os.path.abspath(path)
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    tmp = f"{path}.tmp-{os.getpid()}"
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    # mkstemp 使用不可预测文件名与 O_EXCL，避免同机攻击者预置符号链接截断目标。
+    fd, tmp = tempfile.mkstemp(prefix=".write-", dir=directory)
     try:
-        with open(tmp, "w", encoding="utf-8") as fh:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(text)
             fh.flush()
             os.fsync(fh.fileno())
+        os.chmod(tmp, 0o600)
         os.replace(tmp, path)
     except OSError as exc:
         try:
@@ -577,7 +582,8 @@ def _pending_result_path(task_dir: str, digest: str,
 
 
 def _load_pending_result(task_dir: str, digest: str,
-                         subdir: str = "sol-reviews") -> dict | None:
+                         subdir: str = "sol-reviews",
+                         prompt: str = "") -> dict | None:
     """读取已取得响应但尚未登记完成的 SOL 结果，避免再次付费。"""
     path = _pending_result_path(task_dir, digest, subdir)
     try:
@@ -587,8 +593,18 @@ def _load_pending_result(task_dir: str, digest: str,
         return None
     if not isinstance(value, dict):
         return None
-    if str(value.get("materials_sha256") or "") != digest:
-        return None
+    # pending 文件名使用 subject 摘要；`materials_sha256` 是 run_sol() 对实际
+    # 提示词文本的哈希，二者不是同一个值。
+    if value.get("subject_sha256"):
+        if str(value["subject_sha256"]) != digest:
+            return None
+    else:
+        # 旧格式没有 subject_sha256：只有能重算出同一提示词哈希时才恢复，
+        # 不能仅凭文件名接受一份可能属于其他材料的 pending。
+        recorded = str(value.get("materials_sha256") or "")
+        if not prompt or recorded != hashlib.sha256(
+                prompt.encode("utf-8")).hexdigest():
+            return None
     if not str(value.get("reply_sha256") or ""):
         return None
     return value
@@ -606,7 +622,7 @@ def _invoke_sol_once(*, state_path: str, task_dir: str, prompt: str,
     非零退出码，不伪造 PASS。
     """
     recovered = False
-    result = _load_pending_result(task_dir, digest, audit_subdir)
+    result = _load_pending_result(task_dir, digest, audit_subdir, prompt)
     if result is not None:
         recovered = True
         print("发现已取得、尚未登记完成的 SOL 结果：直接恢复登记，"
@@ -650,10 +666,13 @@ def _invoke_sol_once(*, state_path: str, task_dir: str, prompt: str,
             return None, 0
         # 远程已成功：先落一份可恢复结果，再写状态。状态/审计落盘失败时，
         # 下一次同材料调用直接恢复这份结果，不会再次付费。
+        # pending 以 subject 摘要命名，必须显式保存该键；`materials_sha256`
+        # 仍保留提示词文本摘要用于审计，两者不能混用。
+        pending = {**result, "subject_sha256": digest}
         try:
             _write_atomic(
                 _pending_result_path(task_dir, digest, audit_subdir),
-                json.dumps(result, ensure_ascii=False, sort_keys=True))
+                json.dumps(pending, ensure_ascii=False, sort_keys=True))
         except CLIError as exc:
             print(f"警告：无法写入待登记结果（不影响本次登记）：{exc}",
                   file=sys.stderr)
@@ -1584,8 +1603,6 @@ def build_parser() -> argparse.ArgumentParser:
                    help="只读调查，不修改工程文件；只建议 Explore，不交给全工具代理")
     p.add_argument("--subagent-unavailable", action="store_true",
                    help="Profile/类型不可用或权限不满足；建议主代理继续")
-    p.add_argument("--plan-mode", action="store_true",
-                   help="父会话处于 plan 模式（planEnabled）：宿主会给子代理注入 Bash")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_agent_policy)
 

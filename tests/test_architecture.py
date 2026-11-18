@@ -94,7 +94,7 @@ class RemoteReviewBoundaryTests(unittest.TestCase):
         # CONSULT / PLAN 只作为历史别名读取，不再出现在活动模式集合里。
         self.assertIn('LEGACY_SOL_MODES = ("CONSULT", "PLAN")', text)
         self.assertIn('REASONING_EFFORT = "high"', text)
-        self.assertIn('PINNED_EFFORTS = ("high",)', text)
+        self.assertIn("sol_effort_not_pinned", text)
         # DECIDE 不恢复；SOL 不接管工程执行或决策（文案可提退役，但不得成为模式）。
         self.assertNotIn('"DECIDE"', text)
         self.assertNotIn("'DECIDE'", text)

@@ -936,8 +936,18 @@ def _redact_embedded_json(text: str, depth: int = 0) -> str | None:
 
 
 def is_sensitive_path(path: str) -> bool:
-    """文件名命中凭据命名模式 → True（默认拒绝整读，需显式放行）。"""
-    return bool(_SENSITIVE_NAME.search(os.path.basename(path.rstrip("/")) or path))
+    """文件名命中凭据命名模式 → True（默认拒绝整读，需显式放行）。
+
+    同时检查原路径与 `realpath`：`innocuous.txt -> .env` 这类符号链接不能靠
+    链接名绕过凭据文件保护。
+    """
+    candidates = [str(path or "")]
+    try:
+        candidates.append(os.path.realpath(path))
+    except OSError:
+        pass
+    return any(_SENSITIVE_NAME.search(os.path.basename(item.rstrip("/")) or item)
+               for item in candidates)
 
 
 # ── 指纹与统计 ──────────────────────────────────────────────────────────────

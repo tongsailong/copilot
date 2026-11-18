@@ -104,6 +104,30 @@ class StartAndPlanTests(unittest.TestCase):
         self.assertTrue(second["idempotent"])
         self.assertEqual(first["plan"]["plan_id"], second["plan"]["plan_id"])
 
+    def test_cross_plan_action_id_is_rejected(self):
+        G.start_state(self.state, goal="目标", contract=CONTRACT)
+        G.plan_state(self.state, {"summary": "s1", "actions": [
+            {"id": "A1", "title": "t", "goal": "g",
+             "expected_evidence": "结果"}]})
+        with self.assertRaisesRegex(G.GovernanceError, "跨计划重复"):
+            G.plan_state(self.state, {"summary": "s2", "actions": [
+                {"id": "A1", "title": "另一个", "goal": "g",
+                 "expected_evidence": "结果"}]})
+        state = G.load_state(self.state)
+        self.assertEqual(len([a for a in state["actions"] if a["id"] == "A1"]), 1)
+
+    def test_retired_g4_actions_do_not_block_or_stall(self):
+        state = {"actions": [
+            {"id": "A1", "status": "done", "origin": "zcode-plan"},
+            {"id": "AUTO-G4", "status": "failed", "origin": "g4-review"},
+            {"id": "G4-PENDING", "status": "pending", "origin": "g4-review"},
+            {"id": "AUTO-R-AUTO-G4", "status": "pending",
+             "origin": "recovery"},
+        ]}
+        self.assertEqual(G._gate_actions(state)["passed"], True)
+        self.assertEqual(G.stalled_actions(state), [])
+        self.assertEqual([a["id"] for a in G.ready_actions(state)], [])
+
 
 class GateTests(unittest.TestCase):
     def setUp(self):

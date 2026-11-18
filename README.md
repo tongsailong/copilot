@@ -17,7 +17,9 @@ Read 的 Memory/Vault 卡片渲染为带状态、核验时间与必要摘录的�
 `index-only`/`unverified` 不得冒充已读。`read` 是主代理声明 + 脚本核对来源，不证明
 宿主同轮工具调用；可选 `read_evidence` 记录会话/工具证据。
 子 Agent 使用同一工具生成 `--target subagent`
-块并由主 Agent 放入 prompt。
+块并由主 Agent 放入 prompt。**该扩展当前按用户指令保持未跟踪**：文件存在于工作区与运行时，
+但不进入 Git 提交；`manifests/source-baseline.sha256` 只记录 Git 跟踪文件，因此干净
+checkout 不包含该扩展。
 
 **v8.3.0 SOL 主动介入（历史）**：触发判断从“风险标签 + 门禁是否全绿”升级为**确定性
 复杂度 + 覆盖判断**，简单任务 0 调用，中高复杂任务一次，只有升级型新信号才追加；v8.4
@@ -47,11 +49,12 @@ finding 单方面提级为不可驳回阻断。dry-run 与真实调用共用材�
 风险等级生效。历史 `native_reviews` / `review_attempts` / `g4_attestations` 只读保留用于
 审计，不参与新任务准入或收口。
 
-**v7.0.0 起独立模型复核走 SOL 零工具单轮复核**：主代理完成开发、自检与测试后，按风险
-调用 `copilot_dispatch.py sol-review` 一次；SOL（既有本机 CPA `127` 通道的 `gpt-6.2-sol`）
-只阅读材料并返回结构化问题清单，工具定义不会出现在请求体中（并显式
+**v7.0.0 起独立模型复核走 SOL 零工具单轮复核（历史）**：主代理完成开发、自检与测试后，
+调用 `copilot_dispatch.py sol-review` 一次；v7 使用既有本机 CPA `127` 通道的 `gpt-6.1-sol`
+（v8.1.0 起升级为 `gpt-6.2-sol`）。工具定义不会出现在请求体中（并显式
 `tool_choice="none"`）。一次复核只发一次请求；失败不重试、不换 Provider。SOL 是 advisory，
-不构成收口门禁，也不证明宿主只读权限；修复与验证仍由主代理完成。
+不构成收口门禁，也不证明宿主只读权限；修复与验证仍由主代理完成。v8.4 起 REVIEW 只在用户
+明确要求时执行，开发期的主动认知建议由 THINK 承担。
 
 **v6.11.0 起命令开销按“一次命令一次快照”收敛**：`sync_runtime.py --apply` 同步后预编译
 运行时字节码（文档命令用 `python3 -B`，只禁止写 `.pyc`），单次命令不再重复编译源码；

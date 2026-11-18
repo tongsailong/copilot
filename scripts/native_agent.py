@@ -47,6 +47,8 @@ import os
 import re
 import sqlite3
 import sys
+from datetime import datetime
+
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -140,6 +142,48 @@ def _load_metadata(raw: str) -> dict:
         "status": data["status"].strip(),
         "data": data,
     }
+
+
+def _parse_iso(value: object, label: str) -> datetime:
+    text = str(value or "").strip()
+    if not text:
+        raise AgentRecordError(f"{label} 缺失；无法核验执行会话时间窗口。")
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        raise AgentRecordError(f"{label} 不是合法 ISO 时间：{text!r}") from None
+    if parsed.tzinfo is None:
+        parsed = parsed.astimezone()
+    return parsed
+
+
+def _validate_binding_identity(binding: dict, meta: dict) -> None:
+    """核验 binding 确实约束了这次执行会话，而不是复用旧 completed 会话。
+
+    `bind-execution` 的 nonce 必须出现在 Executor prompt 中，且会话创建时间必须
+    晚于 binding 创建时间。缺少任一证据都失败关闭，不用“看起来是新的”替代。
+    """
+    data = meta.get("data") or {}
+    prompt = data.get("prompt")
+    nonce = str(binding.get("nonce") or "")
+    if not nonce:
+        raise AgentRecordError(
+            "[execution_binding_nonce_missing] execution binding 缺少 nonce；"
+            "不能证明执行会话与本次绑定关联。")
+    if not isinstance(prompt, str) or nonce not in prompt:
+        raise AgentRecordError(
+            "[execution_binding_prompt_missing] Executor metadata.prompt 未包含 "
+            "binding nonce；不能证明该会话在本次绑定之后创建。")
+    session_created = _parse_iso(data.get("createdAt"),
+                                 "metadata.createdAt")
+    binding_created = _parse_iso(binding.get("created_at"),
+                                 "execution_binding.created_at")
+    if session_created < binding_created:
+        raise AgentRecordError(
+            "[execution_binding_session_too_old] 执行会话创建时间早于 binding；"
+            "不能复用旧 completed 会话生成执行信封。")
 
 
 def _rollout_path(meta: dict, override: str = "") -> str:
@@ -374,6 +418,7 @@ def build_execution(args) -> dict:
         if binding is None:
             raise AgentRecordError(
                 f"状态中没有 execution binding {binding_id!r}；先运行 bind-execution。")
+        _validate_binding_identity(binding, meta)
         binding_env = {
             "binding_id": str(binding["binding_id"]),
             "nonce": str(binding["nonce"]),
@@ -448,12 +493,6 @@ def build_execution(args) -> dict:
             f"生成的信封未通过正式校验 [{exc.code}]：{exc}") from None
     return env
 
-
-REVIEW_FIELDS = ("verdict", "findings", "files_inspected", "commands_run",
-                 "changed_files", "unverified", "residual_risks")
-
-
-_TOKEN_SPLIT_RE = re.compile(r"[\s'\"`=,;:()\[\]{}<>|]+")
 
 
 def _write_json(path: str, payload: dict) -> None:

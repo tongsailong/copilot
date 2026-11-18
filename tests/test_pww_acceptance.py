@@ -321,6 +321,19 @@ class PwwGateTests(PwwFixture):
         self.assertEqual(second["verdict"], "pass_with_warnings")
         self.assertEqual(second["quality"]["report_id"], "VR-2")
 
+    def test_reopen_invalidates_plain_pass_binding(self):
+        self.ingest(self.write_report(
+            quality_block(verdict="PASS", warnings=[], risks=[],
+                          acceptance_required=False)))
+        first = G.close_task(self.state_path)
+        self.assertEqual(first["verdict"], "pass")
+        G.reopen_task(self.state_path, "需要补充验证", authorized_by="user")
+        state = G.load_state(self.state_path)
+        self.assertFalse(G.quality_summary(state)["binding_current"])
+        self.assertIn("quality_binding_stale", self.gate_codes())
+        with self.assertRaises(G.GovernanceError):
+            G.close_task(self.state_path)
+
     def test_g2_blocks_until_user_accepts_all(self):
         self.ingest(self.write_report())
         self.assertIn("pww_acceptance_pending", self.gate_codes())

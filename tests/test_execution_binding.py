@@ -9,6 +9,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -66,7 +67,8 @@ class ExecutionBindingFlowTests(F.BridgeBase):
         G.save_state(self.state_path, state)
         return binding
 
-    def _metadata(self, nonce: str = "") -> tuple[str, str]:
+    def _metadata(self, nonce: str = "", *, created_at: str = "",
+                  prompt: str = "") -> tuple[str, str]:
         meta = os.path.join(self.out, "metadata.json")
         write_json(meta, {
             "agentId": "agent-exec", "childSessionId": "child-exec",
@@ -75,8 +77,8 @@ class ExecutionBindingFlowTests(F.BridgeBase):
             "metadataFile": meta, "cwd": self.dir, "workspaceRoot": self.dir,
             "status": "completed", "totalDurationMs": 300000,
             "usage": {"totalTokens": 10},
-            "createdAt": iso(-9), "completedAt": iso(-5),
-            "prompt": f"执行任务 nonce={nonce}",
+            "createdAt": created_at or iso(-9), "completedAt": iso(-5),
+            "prompt": prompt or f"执行任务 nonce={nonce}",
         })
         rollout = os.path.join(self.out, "rollout.jsonl")
         with open(rollout, "w", encoding="utf-8") as fh:
@@ -114,7 +116,31 @@ class ExecutionBindingFlowTests(F.BridgeBase):
                          env["result_sha256"])
         self.assertTrue(state["native_results"])
 
+    def _execution_args(self, binding: dict, meta: str, rollout: str):
+        return SimpleNamespace(
+            state=self.state_path,
+            dispatch=write_json(os.path.join(self.out, "dispatch.json"),
+                                self.dispatch),
+            work_item="A1", metadata=meta, model_rollout=rollout,
+            result_file="", result_text="实际结果", summary="完成",
+            status="done", evidence=[f"E1={self.evidence}"],
+            test_command=[COMMAND], test_artifact=["E1"],
+            workspace=self.dir, base="", output="",
+            binding=binding["binding_id"])
 
+    def test_binding_requires_nonce_in_executor_prompt(self):
+        binding = self._binding()
+        meta, rollout = self._metadata("not-the-binding-nonce")
+        with self.assertRaisesRegex(NA.AgentRecordError,
+                                    "execution_binding_prompt_missing"):
+            NA.build_execution(self._execution_args(binding, meta, rollout))
+
+    def test_binding_rejects_session_created_before_binding(self):
+        binding = self._binding()
+        meta, rollout = self._metadata(binding["nonce"], created_at=iso(-20))
+        with self.assertRaisesRegex(NA.AgentRecordError,
+                                    "execution_binding_session_too_old"):
+            NA.build_execution(self._execution_args(binding, meta, rollout))
 
     def test_output_inside_workspace_is_rejected(self):
         binding = self._binding()
@@ -232,6 +258,83 @@ class ContractPolicyTests(unittest.TestCase):
             G.create_execution_binding(
                 self.state_path, work_item_id="A1", workspace=self.dir,
                 test_commands=["npm test"])
+
+    def _metadata(self, binding: dict) -> tuple[str, str]:
+        meta = os.path.join(self.dir, "metadata.json")
+        write_json(meta, {
+            "agentId": "agent-exec", "childSessionId": "child-exec",
+            "parentSessionId": "sess-parent", "profileId": "executor",
+            "profileSnapshot": {"name": "executor"},
+            "metadataFile": meta, "cwd": self.dir, "workspaceRoot": self.dir,
+            "status": "completed", "totalDurationMs": 300000,
+            "usage": {"totalTokens": 10},
+            "createdAt": iso(1), "completedAt": iso(2),
+            "prompt": f"执行任务 nonce={binding['nonce']}",
+        })
+        rollout = os.path.join(self.dir, "rollout.jsonl")
+        with open(rollout, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps({"sessionId": "child-exec",
+                                 "model": {"providerId": "p",
+                                           "modelId": "m"}}) + "\n")
+        return meta, rollout
+
+    def _args(self, binding: dict, evidence: str):
+        dispatch = write_json(os.path.join(self.dir, "dispatch.json"),
+                              self.dispatch)
+        meta, rollout = self._metadata(binding)
+        return SimpleNamespace(
+            state=self.state_path, dispatch=dispatch, work_item="A1",
+            metadata=meta, model_rollout=rollout, result_file="",
+            result_text="实际结果", summary="完成", status="done",
+            evidence=[f"E1={evidence}"], test_command=[COMMAND],
+            test_artifact=["E1"], workspace=self.dir, base="", output="",
+            binding=binding["binding_id"])
+
+    def test_contract_report_must_be_registered_as_evidence(self):
+        binding = G.create_execution_binding(
+            self.state_path, work_item_id="A1", workspace=self.dir)
+        evidence = os.path.join(self.dir, "result.txt")
+        with open(evidence, "w", encoding="utf-8") as fh:
+            fh.write("result\n")
+        with self.assertRaisesRegex(NA.AgentRecordError,
+                                    "contract_artifact_missing"):
+            NA.build_execution(self._args(binding, evidence))
+
+    def test_contract_report_created_before_binding_is_rejected(self):
+        report = os.path.join(self.dir, "reports", "junit.xml")
+        os.makedirs(os.path.dirname(report), exist_ok=True)
+        with open(report, "w", encoding="utf-8") as fh:
+            fh.write("<testsuite/>\n")
+        old = time.time() - 60
+        os.utime(report, (old, old))
+        binding = G.create_execution_binding(
+            self.state_path, work_item_id="A1", workspace=self.dir)
+        with self.assertRaisesRegex(NA.AgentRecordError,
+                                    "test_artifact_stale|contract_artifact_stale"):
+            NA.build_execution(self._args(binding, report))
+
+    def test_test_commands_without_artifact_are_rejected(self):
+        binding = G.create_execution_binding(
+            self.state_path, work_item_id="A1", workspace=self.dir)
+        evidence = os.path.join(self.dir, "result.txt")
+        with open(evidence, "w", encoding="utf-8") as fh:
+            fh.write("result\n")
+        args = self._args(binding, evidence)
+        args.test_artifact = []
+        with self.assertRaisesRegex(NA.AgentRecordError,
+                                    "execution_test_artifact_missing"):
+            NA.build_execution(args)
+
+    def test_contract_report_as_evidence_is_accepted(self):
+        binding = G.create_execution_binding(
+            self.state_path, work_item_id="A1", workspace=self.dir)
+        report = os.path.join(self.dir, "reports", "junit.xml")
+        os.makedirs(os.path.dirname(report), exist_ok=True)
+        with open(report, "w", encoding="utf-8") as fh:
+            fh.write("<testsuite/>\n")
+        env = NA.build_execution(self._args(binding, report))
+        self.assertEqual(env["test_artifacts"], ["E1"])
+        self.assertEqual(env["test_commands"], [COMMAND])
 
     def test_gate_criteria_accepts_contract_test_policy(self):
         state = G.load_state(self.state_path)

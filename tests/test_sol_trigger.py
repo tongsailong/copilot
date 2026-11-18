@@ -346,8 +346,34 @@ class MaterialChangeTests(TriggerBase):
                          contract=CONTRACT + "- 新增边界：仅本地\n")
         advice = self.advice()
         self.assertEqual(advice["action"], "think")
-        self.assertFalse(advice["second_round"])
+        # 合同修订后是新的认知对象，但 CLI 仍按“同模式已有记录”要求 --force；
+        # 建议命令必须可执行，不能给出会被 sol_review_requires_reason 拒绝的命令。
+        self.assertTrue(advice["second_round"])
         self.assertIn("sol-think", advice["command"])
+        self.assertIn("--force --trigger scope-changed", advice["command"])
+        # 建议命令必须能被 CLI 真正接受，而不只是字符串看起来正确。
+        materials = os.path.join(self.dir, "materials.md")
+        with open(materials, "w", encoding="utf-8") as fh:
+            fh.write("合同修订后的材料\n")
+        proc = F.run_cli(
+            "copilot_dispatch.py", "sol-think", "--state", self.state_path,
+            "--materials", materials, "--force", "--trigger", "scope-changed",
+            "--reason", "合同修订后重新判断", "--dry-run", "--json")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_review_request_is_explicit_and_reuses_only_when_covered(self):
+        self.start(risk="medium")
+        self.plan(3)
+        self.evidence(modules=2, count=2)
+        first = self.advice(review_requested=True)
+        self.assertEqual(first["action"], "review")
+        self.assertEqual(first["mode"], "REVIEW")
+        self.assertIn("sol-review", first["command"])
+        self.assertNotIn("--force", first["command"])
+        self.record("REVIEW")
+        covered = self.advice(review_requested=True)
+        self.assertEqual(covered["action"], "reuse")
+        self.assertEqual(covered["mode"], "REVIEW")
 
 
 class GatesNoAutoCallTests(TriggerBase):

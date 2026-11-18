@@ -3,6 +3,57 @@
 更新：2026-11-18 CST。本文件只记录现场可核实的事实；规划与未完成事项单独标注。
 当前版本：v8.4.0（SOL 默认认知引擎）。
 
+## 全面评审与加固（2026-11-18，v8.4.0 基线）
+
+现场基线：`HEAD=2035755`、`origin/main=2035755`、运行时与源码受管理文件一致；工作区保留
+两个未跟踪知识交接文件（`scripts/knowledge_handoff.py`、`tests/test_knowledge_handoff.py`），
+未删除、未纳入提交。
+
+本轮已修复的确认缺陷：
+
+- **SOL pending 恢复**：pending 文件名使用 subject 摘要，但旧代码拿提示词文本哈希
+  （`materials_sha256`）比较，真实失败窗口下永远无法恢复，可能重复付费；现在单独保存
+  `subject_sha256` 并兼容旧文件。
+- **SOL 建议命令可执行性**：合同修订后建议命令未带 `--force`，会被
+  `single_round_decision` 直接拒绝；建议的 `second_round`/`trigger` 现在按同模式历史记录
+  计算，与 CLI 准入一致。
+- **跨计划工作项 id**：同一 id 跨计划登记会让 `_by_id` 永远命中第一条、第二条永远
+  pending；现在显式拒绝跨计划重复。
+- **历史 G4 工作项**：`origin=g4-review` 的旧动作不再参与可领取、停摆、G1 或恢复派生。
+- **execution binding**：`execution` 核验 `metadata.prompt` 含 nonce 且
+  `metadata.createdAt` 晚于 `binding.created_at`；缺失或不符失败关闭。
+- **合同测试策略**：`ingest` 实际执行 `require_test_result` / `require_artifact_integrity`，
+  合同 `report`/`artifacts` 必须是工作区内、存在且已登记的文件证据。
+- **reopen 报告失效**：重开使所有活动质量报告 `reopened_at` 生效，普通 PASS 报告也必须
+  重新验收，不能直接再次收口。
+- **manifest**：`--baseline` 只记录 Git 跟踪文件；新增 `--verify-baseline`。当前基线 20 个
+  跟踪文件，未跟踪的 `knowledge_handoff.py` 不进入基线。
+- **P2/P3**：多计划原生派发与工作单同集合；`_write_dispatch` 拒绝写 CLOSED 任务；
+  证据/派发/基线临时文件改为不可预测文件名 + 原子替换；敏感路径检查覆盖符号链接
+  realpath；删除 `review_stops`/重入准入/旧 admission/`--plan-mode` 等死代码。
+- **文档**：`agent-bridge.md` 移除 `sol-advisory` 现行能力；`review.md` 改为复杂度/覆盖
+  路由；`history.md` 补 v8.4.0；`runtime.md`/`AGENTS.md` 修正“按风险自动 REVIEW”旧口径；
+  `DECISIONS.md` 给 G4/Reviewer 历史条目加“历史/已被取代”标记。
+
+验证：活动测试 **543 项 OK**（含 17 项未跟踪知识交接测试；Git 跟踪部分 526 项）；
+`legacy/tests` 853 项与历史基线同集合（failures 99 / errors 47 / skipped 32）；
+`sync_runtime.py --check` 与 `--verify-baseline` 均通过。
+
+### 独立 REVIEW（2026-11-18，用户授权一次）
+
+`sol-review`（`gpt-6.2-sol`，零工具、单轮）在 `repair` 前快照上返回 `verdict=partial`：
+blocking 0 / major 2 / minor 0 / info 0。两条 major 均已处理：
+
+1. **旧格式 pending 回退仍无法恢复**：原修复只覆盖新 `subject_sha256`；现在旧格式按
+   `sha256(prompt)` 重算校验，能恢复且不会接受其他材料的 pending。
+2. **测试策略校验偏字段存在性**：现在 `require_test_result` 在声明测试命令时要求
+   `test_artifacts`；测试产物与合同 report/artifacts 的 mtime 必须不早于 binding，
+   并必须已登记为文件证据（SHA-256 由登记时计算）。
+
+REVIEW 的 `unverified` 项（并发同 subject、真实宿主 metadata 来源、干净 checkout 重建
+manifest、advisory 消费路径）保持未独立验证；本轮只按现场代码与测试证据处理，不声称
+已由 REVIEW 证明。REVIEW 结论是 advisory，不改变 G1–G3，也不构成收口门禁。
+
 ## SOL 默认认知引擎（2026-11-18，v8.4.0）
 
 - **THINK 取代 CONSULT / PLAN**：`sol_review.SOL_MODES=("THINK","REVIEW")`；
@@ -18,8 +69,9 @@
   risks / priority / verify / reconsult / unverified），严格类型校验。
 - **降级**：THINK 超时、429、网络、格式或身份失败只写入 `sol_calls` 失败记录并返回
   `copilot-sol-think-degraded/v1`（退出码 0）；REVIEW 失败仍显式失败。
-- **验证**：活动测试 **535 项 OK**（约 37s，含新增 `tests/test_sol_think.py` 17 项）；
-  `legacy/tests` 853 项与 HEAD `1626801` 基线完全一致（failures 99 / errors 47 /
+- **验证**：HEAD `2035755` 可复现活动测试 **518 项 OK**；当前工作区另有 17 项未跟踪的
+  `tests/test_knowledge_handoff.py`，合计 535 项（该文件不进入本轮提交）。
+  `legacy/tests` 853 项与 v8.3.0 基线 `1626801` 一致（failures 99 / errors 47 /
   skipped 32）；`sync_runtime.py --check` 缺失 0 / 不同 0；运行时 `sol-think --dry-run`
   实测 `mode=THINK`、`zero_tool=true`、`tool_keys_present=[]`、`prompt_version=sol-prompt-v3`。
 - **真实调用（2026-11-18，用户授权）**：`copilot_dispatch.py sol-think` 实际调用
@@ -35,9 +87,9 @@
 - 新增 `scripts/knowledge_handoff.py`：只接受 Vault/Memory 卡片；`read` 摘录必须出现在
   卡片正文中，`index-only`/`unverified` 不得冒充已读；最多 5 条，SOL 8,000 字符、
   子 Agent 5,000 字符。
-- `sol-review`/`sol-advisory` 新增 `--knowledge-file`，校验后追加到 materials；dry-run
+- `sol-think`/`sol-review` 新增 `--knowledge-file`，校验后追加到 materials；dry-run
   与 `sol_calls` 记录 `knowledge_file`、`knowledge_block_sha256`、`knowledge_entries`。
-- 验证：活动测试 **518 项 OK**（37.3s）；`sync_runtime.py --check` 缺失 0 / 不同 0；
+- 验证：HEAD 可复现活动测试 **518 项 OK**（37.3s）；`sync_runtime.py --check` 缺失 0 / 不同 0；
   场景 A（新会话 Read 卡片 + Copilot 交接 + SOL CONSULT 收到摘录）、B（无关任务 0 工具）、
   C（跨会话复用 `code-quality-perf-cleanup-2026-11-18`）、D（Explore 显式交接、0 工具）
   均完成。

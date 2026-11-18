@@ -601,6 +601,23 @@ def validate_execution_result(envelope: object, dispatch: dict | None, state: di
     binding = _validate_execution_binding(
         env.get("execution_binding"), state, work_item_id=wid,
         task_id=task_id, test_commands=test_commands)
+    if binding:
+        # 合同声明的测试层必须在执行结果里真实出现；G4 退役后没有第二个
+        # test_execution 模块兜底，不能只靠 binding 上的布尔值。
+        if binding.get("require_test_result") and not (
+                test_commands or test_artifacts):
+            _fail("execution_test_result_missing",
+                  "合同要求结构化测试结果，但执行信封没有测试命令或测试产物。")
+        if binding.get("require_test_result") and test_commands and not \
+                test_artifacts:
+            _fail("execution_test_artifact_missing",
+                  "声明了测试命令但没有登记 test_artifacts；"
+                  "不能证明测试实际产生了可复核结果。")
+        if binding.get("require_artifact_integrity") and not test_artifacts:
+            _fail("execution_test_artifact_missing",
+                  "合同要求测试产物完整性，但执行信封没有登记 test_artifacts。")
+        _test_artifact_problems(binding, evidence, test_artifacts)
+        _contract_evidence_problems(binding, evidence)
     code_scope = str(env.get("code_scope_sha256") or "").strip().lower()
     if code_scope and not _SHA256_RE.match(code_scope):
         _fail("code_scope_invalid",
@@ -636,6 +653,81 @@ def validate_execution_result(envelope: object, dispatch: dict | None, state: di
             str(item) for item in env.get("code_scope_excluded_paths") or []],
         "result_sha256": declared_sha,
     }
+
+
+def _binding_epoch(binding: dict) -> float:
+    text = str(binding.get("created_at") or "").strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        return datetime.fromisoformat(text).timestamp()
+    except (ValueError, OSError):
+        _fail("execution_binding_invalid",
+              "execution binding 缺少可解析的 created_at。")
+
+
+def _produced_after_binding(path: str, binding: dict) -> bool:
+    """产物 mtime 必须在 binding 之后（容忍 2 秒文件系统精度）。"""
+    try:
+        return os.path.getmtime(path) + 2 >= _binding_epoch(binding)
+    except OSError:
+        return False
+
+
+def _test_artifact_problems(binding: dict, evidence: list[dict],
+                            test_artifacts: list[str]) -> None:
+    """测试产物必须来自本次执行窗口，而不是复用的旧文件。"""
+    by_id = {str(item.get("id") or ""): item for item in evidence}
+    for eid in test_artifacts:
+        entry = by_id.get(eid)
+        if entry is None:
+            continue  # 已由 test_artifact_unknown 处理
+        path = str(entry.get("file") or "")
+        if not path or not _produced_after_binding(path, binding):
+            _fail("test_artifact_stale",
+                  f"测试产物 {eid} 的文件时间早于 execution binding；"
+                  "不能证明来自本次执行。")
+
+
+def _contract_evidence_problems(binding: dict, evidence: list[dict]) -> None:
+    """合同要求的报告/产物必须作为本次执行的文件证据出现。
+
+    G4 退役时删除了 `test_execution.py`；该模块原先承担四层测试证据校验。
+    这里保留其最关键的完整性条件：路径在工作区内、文件存在、且已在本次信封
+    登记（登记时已计算 SHA-256），否则合同测试要求只是文字声明。
+    """
+    workspace = os.path.realpath(str(binding.get("workspace") or ""))
+    files = {os.path.realpath(str(item.get("file")))
+             for item in evidence
+             if isinstance(item, dict) and item.get("file")}
+    required: list[tuple[str, str]] = []
+    report = str(binding.get("contract_report") or "").strip()
+    if report:
+        required.append(("report", report))
+    for item in binding.get("contract_artifacts") or []:
+        required.append(("artifact", str(item)))
+    for kind, raw in required:
+        if not raw.strip():
+            continue
+        path = raw if os.path.isabs(raw) else os.path.join(workspace, raw)
+        real = os.path.realpath(path)
+        try:
+            inside = bool(workspace) and os.path.commonpath(
+                [workspace, real]) == workspace
+        except ValueError:
+            inside = False
+        if not inside:
+            _fail("contract_artifact_outside_workspace",
+                  f"合同 {kind} 路径不在任务工作区内：{raw}")
+        if not os.path.isfile(real):
+            _fail("contract_artifact_missing",
+                  f"合同 {kind} 文件不存在：{raw}")
+        if real not in files:
+            _fail("contract_artifact_unbound",
+                  f"合同 {kind} 未作为本次执行的文件证据登记：{raw}")
+        if not _produced_after_binding(real, binding):
+            _fail("contract_artifact_stale",
+                  f"合同 {kind} 文件时间早于 execution binding：{raw}")
 
 
 def _validate_execution_binding(raw: object, state: dict, *, work_item_id: str,

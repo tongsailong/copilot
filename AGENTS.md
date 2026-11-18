@@ -28,7 +28,8 @@ Copilot 是运行于 ZCode 内的**轻量协作治理 Skill**：负责任务承�
   完成条件、工作项与证据登记）、`_run_sol_channel` → `run_sol` → `record_sol_call` 管线；
   记录统一写入 `sol_calls`，审计统一 `sol-audit.jsonl`，互斥统一 `.sol.lock`，记录 ID
   统一 `SC`。历史 `sol_reviews` / `sol_advisories` 只读兼容，不迁移、不改写、不重复计数。
-  `review-admission` 在门禁仍有缺口时返回 `recommended_action=not_needed`（确定性优先）。
+  v8.2 曾按“门禁仍有缺口 → `recommended_action=not_needed`”压制建议；该口径已被 v8.4
+  复杂度路由取代：中高复杂任务在形成初步理解后建议 THINK，不等待 G1–G3 全绿。
   G1–G3 语义、advisory 边界、单轮与授权规则不变。
 - **v8.1.0 起 SOL 升级为 `gpt-6.2-sol`**：所有 SOL 模式统一
   Responses API `/v1/responses`、`reasoning.effort="high"`、`reasoning.mode="standard"`、
@@ -114,8 +115,11 @@ Agent、SOL（THINK / REVIEW）、DesignWise。Executor 是 ZCode 工程执行�
    ```bash
    python3 scripts-sync/sync_runtime.py --apply
    python3 scripts-sync/sync_runtime.py --check   # 缺失 0、不同 0
+   python3 scripts-sync/sync_runtime.py --baseline       # 分发源码变化后重建基线
+   python3 scripts-sync/sync_runtime.py --verify-baseline  # 只读校验，必须通过
    ```
 
+   `--baseline` 只记录 Git 跟踪文件；未跟踪的本地脚本不进入提交树中的 manifest。
    同步只覆盖 Skill（Profile 不参与分发）；`--prune` 仅在明确要求清理运行时多余文件时使用。
    `--apply` 结束时会预编译运行时字节码（`__pycache__` 不在分发集合内，`--check` 口径不变）。
    源码仓库本地同样可以执行 `python3 -m compileall -q scripts`：文档命令都用 `python3 -B`，

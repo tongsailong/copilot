@@ -9,6 +9,7 @@ from __future__ import annotations
 import importlib.util
 import os
 import stat
+import subprocess
 import tempfile
 import unittest
 
@@ -258,6 +259,37 @@ class RealDistributionTests(unittest.TestCase):
         for retired in ("scripts/call_gpt.py", "scripts/review_ledger.py",
                         "scripts/reply_protocol.py"):
             self.assertNotIn(retired, manifest)
+
+    def test_real_manifest_matches_git_tracked_source(self):
+        self.assertEqual(S.verify_baseline(ROOT), [])
+
+
+class BaselineGenerationTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = self.tmp.name
+        make_repo(self.root)
+        subprocess.run(["git", "init", "-q", self.root], check=True)
+        subprocess.run(["git", "-C", self.root, "add", "SKILL.md",
+                        "scripts/a.py", "scripts/b.py", "references/ref.md"],
+                       check=True)
+
+    def test_untracked_distributed_file_is_not_in_baseline(self):
+        path = os.path.join(self.root, "scripts", "local_only.py")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("print('local')\n")
+        out, count, untracked = S.write_baseline(self.root)
+        self.assertEqual(count, 4)
+        self.assertEqual(untracked, ["scripts/local_only.py"])
+        self.assertEqual(S.verify_baseline(self.root), [])
+        with open(out, encoding="utf-8") as fh:
+            self.assertNotIn("local_only.py", fh.read())
+
+    def test_missing_tracked_file_refuses_baseline(self):
+        os.remove(os.path.join(self.root, "scripts", "b.py"))
+        with self.assertRaises(S.SyncError):
+            S.write_baseline(self.root)
 
 
 if __name__ == "__main__":

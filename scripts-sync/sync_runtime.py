@@ -36,6 +36,7 @@ import os
 import re
 import shutil
 import stat
+import subprocess
 import sys
 import tempfile
 
@@ -291,11 +292,38 @@ def _looks_like_copilot_skill(target: str) -> bool:
         return False
 
 
-def write_baseline(repo_root: str) -> tuple[str, int]:
+def tracked_source_files(repo_root: str) -> set[str]:
+    """返回 Git 跟踪的受管文件相对路径。
+
+    manifest 是提交树的一部分，必须能从版本库复现；未跟踪的本地文件即使位于
+    `scripts/` 下也不进入 baseline（它们不会随提交发布）。
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "-C", repo_root, "ls-files", "-z", "--",
+             "SKILL.md", "scripts", "references"],
+            capture_output=True, check=False)
+    except OSError as exc:
+        raise SyncError(f"无法调用 git 读取跟踪文件：{exc}") from exc
+    if proc.returncode != 0:
+        raise SyncError(
+            "读取 Git 跟踪文件失败："
+            + proc.stderr.decode("utf-8", "replace").strip())
+    return {item for item in proc.stdout.decode("utf-8").split("\0") if item}
+
+
+def write_baseline(repo_root: str) -> tuple[str, int, list[str]]:
     src = source_manifest(repo_root)
+    tracked = tracked_source_files(repo_root)
+    missing = sorted(tracked - set(src))
+    if missing:
+        raise SyncError(
+            "Git 跟踪的受管文件在磁盘不存在，拒绝写入不完整基线："
+            + ", ".join(missing))
+    untracked = sorted(set(src) - tracked)
     out = os.path.join(repo_root, BASELINE_PATH)
     os.makedirs(os.path.dirname(out), exist_ok=True)
-    lines = [f"{digest}  {rel}\n" for rel, digest in sorted(src.items())]
+    lines = [f"{src[rel]}  {rel}\n" for rel in sorted(tracked)]
     fd, tmp = tempfile.mkstemp(prefix=".baseline-", dir=os.path.dirname(out))
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
@@ -307,7 +335,38 @@ def write_baseline(repo_root: str) -> tuple[str, int]:
     finally:
         if os.path.exists(tmp):
             os.remove(tmp)
-    return out, len(src)
+    return out, len(tracked), untracked
+
+
+def verify_baseline(repo_root: str) -> list[str]:
+    """校验 manifest 与当前 Git 跟踪源码一致；返回问题列表（空表示通过）。"""
+    path = os.path.join(repo_root, BASELINE_PATH)
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            lines = [line.rstrip("\n") for line in fh if line.strip()]
+    except OSError as exc:
+        return [f"无法读取基线 {path}：{exc}"]
+    recorded: dict[str, str] = {}
+    problems: list[str] = []
+    for line in lines:
+        parts = line.split("  ", 1)
+        if len(parts) != 2 or len(parts[0]) != 64:
+            problems.append(f"格式非法：{line!r}")
+            continue
+        digest, rel = parts
+        if rel in recorded:
+            problems.append(f"重复路径：{rel}")
+        recorded[rel] = digest
+    src = source_manifest(repo_root)
+    tracked = tracked_source_files(repo_root)
+    for rel in sorted(tracked - set(recorded)):
+        problems.append(f"基线缺少跟踪文件：{rel}")
+    for rel in sorted(set(recorded) - tracked):
+        problems.append(f"基线包含未跟踪或不存在文件：{rel}")
+    for rel in sorted(set(recorded) & tracked):
+        if recorded[rel] != src.get(rel):
+            problems.append(f"摘要不一致：{rel}")
+    return problems
 
 
 def main(argv=None) -> int:
@@ -316,7 +375,9 @@ def main(argv=None) -> int:
     mode.add_argument("--check", action="store_true", help="只检查漂移（默认）")
     mode.add_argument("--apply", action="store_true", help="写入缺失/不同的文件")
     mode.add_argument("--baseline", action="store_true",
-                      help=f"记录分发文稿的 SHA-256 基线到 {BASELINE_PATH}")
+                      help=f"记录 Git 跟踪分发文稿的 SHA-256 基线到 {BASELINE_PATH}")
+    mode.add_argument("--verify-baseline", action="store_true",
+                      help=f"校验 {BASELINE_PATH} 与 Git 跟踪源码一致")
     ap.add_argument("--prune", action="store_true",
                     help="配合 --apply：删除 Skill 运行时里源码不存在的文件（默认关闭）")
     ap.add_argument("--skill-dest", default=DEFAULT_SKILL_DEST,
@@ -329,13 +390,30 @@ def main(argv=None) -> int:
         print("错误：--prune 只能与 --apply 一起使用。", file=sys.stderr)
         return 2
 
-    if args.baseline:
+    if args.verify_baseline:
         try:
-            path, count = write_baseline(REPO_ROOT)
+            problems = verify_baseline(REPO_ROOT)
         except (SyncError, OSError) as exc:
             print(f"错误：{exc}", file=sys.stderr)
             return 2
-        print(f"已写入基线：{path}（{count} 个文件）")
+        if problems:
+            print("基线校验失败：", file=sys.stderr)
+            for item in problems:
+                print(f"  ! {item}", file=sys.stderr)
+            return 1
+        print("基线校验通过：manifest 与 Git 跟踪源码一致。")
+        return 0
+
+    if args.baseline:
+        try:
+            path, count, untracked = write_baseline(REPO_ROOT)
+        except (SyncError, OSError) as exc:
+            print(f"错误：{exc}", file=sys.stderr)
+            return 2
+        print(f"已写入基线：{path}（{count} 个 Git 跟踪文件）")
+        if untracked:
+            print("未跟踪、未写入基线的分发文件（保持本地，不进入提交）："
+                  + ", ".join(untracked))
         return 0
 
     skill_dest = os.path.abspath(os.path.expanduser(args.skill_dest))

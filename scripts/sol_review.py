@@ -52,7 +52,7 @@ ENDPOINT = "/responses"
 REASONING_EFFORT = "high"
 REASONING_MODE = "standard"
 # 所有 SOL 模式统一 high：不允许按角色降级，也不允许缺失时回退。
-PINNED_EFFORTS = ("high",)
+# 实际校验在 validate_effort()；这里不再保留未被引用的常量副本。
 # THINK 是默认认知引擎；REVIEW 只保留给用户明确要求的独立复核。
 SOL_MODES = ("THINK", "REVIEW")
 # CONSULT / PLAN 已并入 THINK：只用于读取历史记录与旧调用方，不产生新流程。
@@ -317,7 +317,6 @@ MODE_INSTRUCTIONS = {
     "THINK": THINK_INSTRUCTIONS,
     "REVIEW": REVIEW_INSTRUCTIONS,
 }
-INSTRUCTIONS = REVIEW_INSTRUCTIONS  # 兼容既有调用方
 
 
 def normalize_mode(mode: str) -> str:
@@ -350,12 +349,6 @@ def validate_effort(effort: str) -> str:
         "sol_effort_not_pinned",
         f"推理强度 {effort!r} 被拒绝：SOL 统一 high，"
         "不允许降级到 low/medium，也不使用 xhigh/max。")
-
-
-def materials_limit(mode: str = "THINK") -> int:
-    """模式对应的材料字符上限；未知模式失败关闭。"""
-    resolved = normalize_mode(mode)
-    return MATERIALS_LIMITS[resolved]
 
 
 def validate_materials(materials: object, mode: str = "THINK") -> str:
