@@ -1053,6 +1053,36 @@
     - **不变**：ZCode 主代理仍是唯一工程执行与技术决策主体；零工具、单轮、不自动重试/换
       Provider/二审；G1–G3、证据完整性、PWW 接受、正式 REVIEW 授权规则与安全边界不变。
 
+61. **v8.2.0：SOL 与 G1–G3 融合，单一判断入口、单一记录流（2026-11-18，用户任务授权）。**
+    依据：用户《Copilot SOL 与 G1–G3 深度融合及治理效率优化》任务书；现场核实 HEAD
+    `802a875`（`origin/main` 一致、工作区干净、运行时 20 文件一致），按源码审计确认
+    REVIEW / CONSULT / PLAN 已有共享的 `_run_sol_channel` 与 `run_sol`，但记录、审计、锁、
+    提示词与登记函数仍按模式复制，且 SOL 从未收到合同正文（误读不存在的 `contract["text"]`）。
+    - **融合方式**：不新增治理层、不恢复 G4。三模式共用 `build_prompt`（目标、合同正文与
+      边界、完成条件、工作项、证据登记摘要）、`_run_sol_channel` → `run_sol` →
+      `record_sol_call`；差异只在提示词尾部、原始输出目录与结果字段。
+    - **单一记录流**：`sol_calls` 是唯一权威来源（`call_id` / `mode` / `prompt_version` /
+      `evidence_digest`）；历史 `sol_reviews` / `sol_advisories` 只读兼容，按 ID 去重合并，
+      不迁移、不改写。审计统一 `sol-audit.jsonl`，互斥统一 `.sol.lock`，ID 统一 `SC`。
+      历史四套登记函数保留为薄封装，避免破坏既有调用方。
+    - **不并入报告/证据**：SOL 结论是建议而非既成事实，若写入 `reports` 或 `evidence`
+      会让模型文本被当作完成证据引用，破坏 G2 的证据语义；因此只统一调用记录与审计事件
+      （`sol_call_completed` / `sol_call_failed`），REVIEW findings 仍经 Finding 台账由
+      主代理核实后推进，CONSULT/PLAN 不进入台账。
+    - **确定性优先**：`review-admission` 先算本地 G1–G3 与台账；门禁仍有缺口时
+      `recommended_action=not_needed`（先修机械缺口，SOL 不提供本地事实），门禁全绿后才按
+      风险给出 `optional` / `recommended`。`decision` 保留风险策略原义以兼容旧输出。
+    - **复用键与失效**：`PROMPT_VERSION`、模型与推理强度、目标、合同正文/边界、条件描述、
+      证据集合摘要、材料（辅助分析另加模式与问题）。条件状态变化不失效；合同、证据、提示词
+      版本或材料变化即失效。由此 v8.1 旧结论在升级后不会被误复用（证据与提示词口径已变）。
+    - **不变**：G1–G3 语义、fail-closed、证据绑定与 PWW 接受、SOL advisory 与零工具单轮、
+      不自动重试、ZCode 唯一工程执行与技术决策主体、正式 REVIEW 授权规则。
+    - **性能**：确定性命令墙钟无实质回归（同口径中位数 123–147ms，基线 119–128ms，进程启动
+      占主导）；SOL 单次调用提示词从 3,982 增至 5,230 字符（自动注入合同/工作项/证据，
+      约 +300 tokens），换算为换取主代理少准备同类材料与门禁事实，调用次数不变。
+    - **未验证**：本轮未发起真实 GPT-6.2 调用（请求构造与响应管线仅新增上下文字段，复用
+      2026-11-18 的真实调用证据）；融合后一次真实 REVIEW/CONSULT 的端到端耗时未复测。
+
 ## 建议（未采纳）
 
 > 以下为 v5 时期记录，保留原文；其中涉及 `call_gpt.py`、SOL 预算或远程 REVIEW 的建议

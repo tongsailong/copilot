@@ -1,6 +1,6 @@
 ---
 name: copilot
-description: "Copilot v8.1 轻量协作治理：任务承接、合同与完成条件、状态与证据登记、PARTIAL 持续推进、SOL（gpt-6.2-sol，high，零工具）按需 CONSULT/PLAN/REVIEW 认知辅助与 G1–G3 收口。SOL 只提供建议，不替代 ZCode 的技术决策与工程执行；G4 原生只读复核已退役，历史台账只读保留。"
+description: "Copilot v8.2 轻量协作治理：任务承接、合同与完成条件、状态与证据登记、PARTIAL 持续推进、SOL（gpt-6.2-sol，high，零工具）按需 CONSULT/PLAN/REVIEW 认知辅助，与 G1–G3 共用合同、条件与证据，统一记录在 sol_calls。SOL 只提供建议，不替代 ZCode 的技术决策与工程执行；G4 原生只读复核已退役，历史台账只读保留。"
 when_to_use: >
   需要把多步骤工程任务纳入可追踪治理时：任务合同/完成条件需要固定、证据与审计需要绑定、
   长任务需要 PARTIAL 持续推进与上下文恢复、复杂问题需要一次 SOL 零工具独立判断（CONSULT /
@@ -8,7 +8,7 @@ when_to_use: >
   G4 记录与 REVIEW 台账。简单、单步、低风险任务直接由 ZCode 原生完成，不进入本 Skill。
 ---
 
-# copilot：轻量协作治理（v8.1.0）
+# copilot：轻量协作治理（v8.2.0）
 
 Copilot 是运行在 ZCode 内的**协作治理层**，不是决策模型，也不是执行体。它负责把任务变成可
 追踪的合同、状态、证据与收口条件，并在任务没有真正完成时继续推进。
@@ -232,15 +232,18 @@ BLOCKED 表示**不能正常收口或继续受阻动作**，不表示无法记�
 - **执行信封审计事件**：执行信封回填写入 `native_result_ingested` 历史事件；被拒执行信封
   追加到任务目录 `review-attempts.jsonl`（只记错误码与绑定值，不记正文），供复盘统计
   “无效信封”而不必依赖终端输出。
-- **SOL 复核审计**：`sol-review` 成功时把结构化结果写入状态 `sol_reviews`、原始输出存入任务
-  目录 `sol-reviews/<review_id>.raw.txt`，失败把真实错误码与材料摘要写入 `sol_reviews`
-  （`status=failed`）与 `history`；`sol-review-audit.jsonl` 只记脱敏元数据（材料/请求/回复
-  摘要、模型、推理强度回显、请求/追踪 ID、usage、耗时、错误码），不记正文与凭据。相同材料
-  再次调用直接复用，不重复请求。
-- **SOL 辅助分析审计**：`sol-advisory` 成功写入状态 `sol_advisories`、原始输出存入
-  `sol-advisories/<advisory_id>.raw.txt`，审计写入 `sol-advisory-audit.jsonl`；失败写入
-  `sol_advisories`（`status=failed`）与 `history`。辅助分析不进入 Finding 台账、不改变完成
-  条件、不影响 G1–G3，也不阻断任务。
+- **SOL 调用记录（单一权威流）**：v8.2 起 `sol-review` 与 `sol-advisory` 的成功与失败记录
+  统一写入状态 `sol_calls`（字段含 `call_id` / `mode` / `prompt_version` /
+  `evidence_digest` / `materials_sha256` / usage / 延迟）；原始输出仍按模式存入
+  `sol-reviews/<call_id>.raw.txt` 或 `sol-advisories/<call_id>.raw.txt`；审计统一写
+  `sol-audit.jsonl`（三模式共用，只记脱敏元数据：材料/请求/回复摘要、模型、推理强度回显、
+  请求/追踪 ID、usage、耗时、错误码），不记正文与凭据。三模式共用同一把 `.sol.lock`。
+  历史任务状态里的 `sol_reviews` / `sol_advisories` 继续**只读兼容**：`--list`、
+  `review-metrics`、`review-admission` 与单轮复用都会合并读取，不迁移、不改写、不重复计数。
+- **SOL 与门禁共用上下文**：提示词自动注入任务目标、完整合同正文、完成条件、工作项状态与
+  证据登记摘要（ID/摘要/大小/支持的条件/归档标记），主代理只需提供本次增量的材料与问题。
+  单轮复用键包含提示词版本、模型与推理强度、目标、合同正文与边界、条件描述、证据集合摘要
+  与材料；合同、证据或提示词版本变化即失效，不会复用过期判断。
 
 ## 三道门与收口
 
@@ -400,15 +403,17 @@ SOL 输出契约：总体结论 `verdict=pass|partial|blocked`；`findings` 按
 
 ### 输出消费与 Finding 台账
 
-- SOL 的结论是**建议**，不是任务 PASS。`sol_reviews` 与历史 `native_reviews` 分开；
-  任何 SOL 记录都不会产生 `g4_eligible`，也不改变门禁集合。
+- SOL 的结论是**建议**，不是任务 PASS。SOL 记录统一在 `sol_calls`（历史
+  `sol_reviews` / `sol_advisories` 只读兼容），与历史 `native_reviews` 分开；任何 SOL 记录
+  都不会产生 `g4_eligible`，也不改变门禁集合。
 - SOL findings 以 `advisory` 身份进入 Finding 台账：主代理逐条核实后，修复并登记
   `fixed`/`verified`；确认是误报的，可用 `finding --status dropped --note <反证>` 驳回
   （仅 advisory 的 blocking/major 允许）。v7 及更早的 authoritative 记录仍只能修复并
   定向验证。
 - 未闭合的 blocking/major 阻断 G2（所有风险等级）；minor/info 不阻断、不派发新复核。
-- 原始输出保存在任务目录 `sol-reviews/`，审计 `sol-review-audit.jsonl` 只记脱敏元数据
-  （材料/请求/回复摘要、模型、usage、耗时、失败原因），不记正文与凭据。
+- 原始输出保存在任务目录 `sol-reviews/`（CONSULT/PLAN 为 `sol-advisories/`），审计
+  `sol-audit.jsonl` 只记脱敏元数据（材料/请求/回复摘要、模型、usage、耗时、失败原因），
+  不记正文与凭据。
 
 ### Finding 台账与定向复验
 
@@ -477,8 +482,25 @@ SOL 输出契约：总体结论 `verdict=pass|partial|blocked`；`findings` 按
 
 ## 版本
 
-当前版本 **v8.1.0（GPT-6.2 SOL + 按需认知辅助）**。本版升级模型并恢复可选的辅助认知能力，
-不改变任务合同、G1–G3、授权边界与工程执行主体：
+当前版本 **v8.2.0（SOL 与 G1–G3 融合）**。本版把 SOL 收敛为 Copilot 内部统一的按需认知
+能力，不新增治理层、不恢复 G4、不改变 ZCode 唯一工程执行与技术决策主体：
+
+- **一份任务上下文**：SOL 提示词自动注入同一份合同正文、完成条件、工作项状态与证据登记，
+  CONSULT / PLAN / REVIEW 共用同一个 `build_prompt`；不再要求主代理重复粘贴门禁已有事实。
+- **一份记录与一条管线**：三模式共用 `_run_sol_channel` → `run_sol` → `record_sol_call`，
+  统一写入 `sol_calls`、统一审计 `sol-audit.jsonl`、统一 `.sol.lock`、统一 `SC` 记录 ID；
+  历史 `sol_reviews` / `sol_advisories` 只读兼容。
+- **确定性优先**：`review-admission` 先算本地 G1–G3 与台账，门禁仍有缺口时
+  `recommended_action=not_needed`（先修机械缺口，SOL 不提供本地事实），门禁全绿才按风险
+  给出 `optional` / `recommended`；简单与普通任务默认不调用。
+- **缓存失效明确**：复用键 = 提示词版本 + 模型/推理强度 + 目标 + 合同正文/边界 + 条件描述 +
+  证据集合摘要 + 材料（+ 辅助分析的模式与问题）；条件状态变化不失效，证据/合同/提示词变化
+  即失效。
+- **不变量**：G1–G3 语义与 fail-closed 不变；SOL 无执行权、无状态改写权、无门禁裁决权；
+  单轮、不自动重试；失败只登记真实原因，不阻断主代理继续。
+
+v8.1.0（历史）升级模型并恢复可选的辅助认知能力，不改变任务合同、G1–G3、授权边界与工程
+执行主体：
 
 - **模型升级**：统一 `gpt-6.2-sol`（Responses API `/v1/responses`，本机 CPA `127` 出口）；
   不再使用 `gpt-6.1-sol`，不静默回退其他模型或别名。
@@ -489,7 +511,8 @@ SOL 输出契约：总体结论 `verdict=pass|partial|blocked`；`findings` 按
   等推理模型不支持的采样参数；不使用 `include` 的 logprobs；保持单请求、`store=false`，
   不引入 `previous_response_id` 多轮会话。
 - **恢复 CONSULT / PLAN（建议性）**：新增 `sol-advisory --mode CONSULT|PLAN`，零工具、
-  单轮、advisory；结论写入 `sol_advisories`，不进入 Finding 台账、不影响 G1–G3、不阻断任务。
+  单轮、advisory；结论写入 SOL 记录（v8.2 起为统一 `sol_calls`，当时为 `sol_advisories`），
+  不进入 Finding 台账、不影响 G1–G3、不阻断任务。
 - **职责边界不变**：ZCode 主代理仍是唯一工程执行与技术决策主体；SOL 不恢复 DECIDE、不强制
   调用、不执行命令、不读写台账、不调度子代理；正式 REVIEW 仍只按用户授权登记。
 - **可追溯性**：审计与任务记录新增请求 ID / CPA trace ID / 响应 ID、推理强度回显与

@@ -1,7 +1,119 @@
 # STATUS
 
 更新：2026-11-18 CST。本文件只记录现场可核实的事实；规划与未完成事项单独标注。
-当前版本：v8.1.0（GPT-6.2 SOL + 按需 CONSULT / PLAN）。
+当前版本：v8.2.0（SOL 与 G1–G3 融合）。
+
+## SOL 与 G1–G3 融合（2026-11-18，v8.2.0）
+
+基线：HEAD `802a875`（`origin/main` 一致，工作区干净），运行时 `~/.zcode/skills/copilot`
+受管理 20 文件、--check 缺失 0 / 不同 0。**本轮只做源码/测试/文档与运行时同步，未提交、
+未推送**（授权不含 commit/push）。
+
+### 架构审计：真实调用链与重复点
+
+现场源码确认（不是按文档推断）：
+
+- **已有**：REVIEW / CONSULT / PLAN 共用 `_run_sol_channel` → `run_sol` → 一次 HTTP；
+  G1–G3 是本地确定性门禁；SOL 是 advisory，不参与阶段判定。
+- **重复点与根因**：
+  1. 记录分 `sol_reviews` / `sol_advisories` 两套：两套审计文件、两把锁、两个 ID 前缀
+     （SR/SA）、四个近乎复制的登记/失败函数；指标与准入也各按历史键读取。
+  2. `build_materials` 与 `build_advisory_prompt` 除尾部要求外几乎逐行重复。
+  3. `review-admission` 只有风险策略，不读取门禁事实：门禁未绿时仍可能建议调用 SOL。
+  4. `build_materials` / `build_advisory_prompt` 读取不存在的 `contract["text"]`，合同正文
+     （实际在 `done_criteria_text`）从未进入 SOL 上下文；证据登记也未注入，SOL 与 G2
+     看到的不是同一份证据来源。
+- **保留的不变量**：G1–G3 语义与 fail-closed、合同指纹/证据摘要重读、Finding 台账门禁、
+  PWW 接受、授权边界、SOL advisory/零工具/单轮、ZCode 唯一执行与技术决策主体。
+
+### 实施
+
+- **单一记录流**：`sol_calls`（`call_id` / `mode` / `prompt_version` / `evidence_digest` /
+  用量与耗时）；`iter_sol_calls` 合并统一流 + 历史 `sol_reviews` / `sol_advisories`（按 ID
+  去重、按时间排序，不迁移、不改写）。`list_sol_reviews` / `list_sol_advisories` /
+  `review_metrics` / `review_admission` / `evaluate` 全部改读同一流。
+- **单一管线**：`build_prompt` 取代两个提示词构造器；`record_sol_call` /
+  `record_sol_call_failure` 取代四个按模式复制的函数（旧函数名保留为薄封装）；
+  `_sol_channel_config` 只保留原始输出目录、文案与预检 schema。审计统一
+  `sol-audit.jsonl`，互斥统一 `.sol.lock`，ID 统一 `SC`。
+- **共享上下文**：提示词自动注入目标、完整合同正文（`done_criteria_text`）与边界、
+  完成条件、工作项状态、证据登记摘要（ID/类型/摘要前缀/大小/支持条件/归档标记，上限
+  80 条 / 6000 字符）。修正了合同正文从未注入的事实缺陷。
+- **确定性优先**：`review-admission` 增加 `gates`（G1–G3 原因码）与
+  `recommended_action`：门禁有缺口时 `not_needed`（先修机械缺口），全绿后才按风险返回
+  `optional` / `recommended`；`decision` 保留风险策略原义以兼容旧输出。
+- **不并入报告/证据**：SOL 结论是建议，写进 `reports`/`evidence` 会让模型文本被当成完成
+  证据引用，破坏 G2 语义；因此只统一调用记录与 `history` 事件（`sol_call_completed` /
+  `sol_call_failed`），REVIEW findings 照旧经 Finding 台账由主代理核实推进。
+- **缓存失效**：复用键 = `PROMPT_VERSION` + 模型/推理强度 + 目标 + 合同正文/边界 +
+  条件描述 + 证据集合摘要 + 材料（辅助分析另加模式与问题）。条件状态变化不失效；
+  合同、证据、提示词版本或材料变化即失效。
+- **测试**：更新写路径断言到 `sol_calls`；新增 `tests/test_sol_fusion.py`（17 项）覆盖
+  单一记录流、历史兼容、共享上下文与上限、复用键失效、门禁优先准入、SOL 不改变阶段/
+  门禁、失败不停摆、审计与锁收敛。
+
+### 性能（同机 A/B，baseline = `git worktree` 于 `802a875`）
+
+同一基准脚本在同一台机器上构造同构任务（12 条证据、2 个工作项、200 文件工作区），
+每条命令 5 次取中位数、两组各重复 4 轮再取中位数；`python3 -B` + 预算字节码。
+
+| 指标 | 基线 802a875 | v8.2.0 | 差异 |
+|---|---|---|---|
+| `status` | 127.0ms | 123.4ms | −3.6ms |
+| `closure-check` | 139.8ms | 133.1ms | −6.7ms |
+| `review-metrics` | 133.0ms | 122.0ms | −11.0ms |
+| `review-admission` | 131.1ms | 123.8ms | −7.3ms |
+| `sol-review --dry-run` | 130.6ms | 122.2ms | −8.4ms |
+| `sol-review --list` | 129.8ms | 123.8ms | −6.0ms |
+| REVIEW 提示词 | 3,982 字符 | 5,230 字符 | +31% |
+| CONSULT 提示词 | 3,998 字符 | 5,276 字符 | +32% |
+| 状态文件 | 14,354 B | 14,328 B | −26 B |
+| 活动测试 | 452 / 34.8–36.7s | 469 / 37.0–37.6s | +17 项，+约 1.9s |
+
+- 确定性命令全部在 120–140ms 区间，差异在解释器启动与 I/O 噪声内：**没有实质开销增加**。
+- 提示词增大来自本轮要求的“共享合同/条件/证据”注入（约 +300 tokens/次）；主代理相应地
+  不必重复粘贴这些事实，调用次数不变。
+- **避免重复调用的实测**：同一主体摘要第二次调用时 transport 调用数为 0（mock 断言）；
+  门禁未绿的新任务上 `recommended_action=not_needed`，按 v8.1 的风险策略会建议一次
+  REVIEW（对应 13.1s / 1,166 tokens 的真实基线，见下节）。
+- **基线缺失（如实说明）**：仓库没有历史任务的 SOL 调用次数与 Token 遥测，无法给出
+  “端到端任务耗时下降 X%”的真实百分比；上表只覆盖可重复的确定性路径与提示词体积。
+
+### 融合后真实 API 验证（单次调用，无重试）
+
+`sol-advisory --mode CONSULT` 走融合后的 `build_prompt` → `run_sol` → `record_sol_call`，
+材料只写一句说明，合同/条件/工作项/证据全部由任务状态自动注入：
+
+| 项 | 实测值 |
+|---|---|
+| 记录 ID | `SC481eb53c3c687460fb69585e`（统一 `sol_calls`，`mode=CONSULT`） |
+| `model_resolved` | `gpt-6.2-sol`（与请求一致） |
+| reasoning 回显 | `effort=high`、`mode=standard`，`reasoning_verified=true` |
+| 提示词版本 | `sol-prompt-v2`（注入证据 1 条、工作项 2 个、合同正文与条件） |
+| usage | input 838 / output 591 / reasoning 0 / total 1,429 |
+| 延迟 | 16.6s（`latency_ms=16610`） |
+| 追踪 | `response_id=resp_01a8f9ed…`、`trace_id=20261118111726-…`；CPA 未返回 `X-Request-Id`，`request_id` 为空（如实记录） |
+| 零工具 | `tool_keys_present=[]`、`unsupported_params_present=[]` |
+| 上下文理解 | 模型正确指出 C1 已闭合、C2 未闭合、E1 支持 C1，并把“未提供 E1 正文/复核结论”列入 `unverified` |
+| 登记 | 状态 `sol_calls` 1 条 completed；审计 `sol-audit.jsonl` 写入成功（`audit_written=true`） |
+
+验证任务状态在仓库外 `/tmp/copilot-v82-api-verify-20261118/`，未纳入仓库。
+
+**验证后修复**：该次调用暴露原始输出文件名使用登记前的随机 ID，与记录 `call_id` 不一致
+（`SCfebfc0…raw.txt` vs `SC481eb5…`）。已改为记录直接采用同一 `record_id`，并新增
+“`reply_path` 基名 == `call_id`”断言；`tests/test_sol_fusion.py`（17）与
+`tests/test_sol_review_v7.py`（66）重跑通过。请求/响应管线未改动，未重复发起真实调用。
+
+### 验证与未验证
+
+- 活动测试 `python3 -B -m unittest discover -s tests -p 'test_*.py'`：469 项通过
+  （修复前 3 轮：37.1s / 37.0s / 37.6s）；修复后定向重跑 17 + 66 项通过。
+- 历史回归 `legacy/tests` 与同步后运行时一致性见本轮交付记录；运行时同步后重新执行
+  `--check` 与关键文件 SHA-256 抽查。
+- **未验证**：融合后一次真实 REVIEW 的端到端耗时未复测（本轮真实验证使用 CONSULT）；
+  真实调用只覆盖单次链路，未做并发或压力验证。
+- **历史状态实测缺口**：本机 `.copilot-tasks/` 只有 v6.12 任务、无 SOL 记录，历史
+  `sol_reviews` / `sol_advisories` 兼容性由构造状态测试覆盖（含无 `mode` 字段的历史记录）。
 
 ## GPT-6.2 SOL 升级与按需认知辅助（2026-11-18，v8.1.0）
 

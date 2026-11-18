@@ -9,11 +9,25 @@
 - **SOL 复核（REVIEW）**：按需一次性调用 `gpt-6.2-sol`（零工具、单轮、high）；结论是建议，
   不是门禁。
 - **SOL 认知辅助（CONSULT / PLAN）**：可选的一次性问题分析或规划建议，结论只写入
-  `sol_advisories`，不进入台账、不影响门禁。
+  SOL 记录（`sol_calls`，历史 `sol_advisories` / `sol_reviews` 只读兼容），不进入台账、
+  不影响门禁。
 - **正式 REVIEW**：用户明确要求时才做，是一个治理记录，**不是普通开发的强制前置门**。
 - ~~**G4 复核**~~：v8.0.0 已正式退役，不再是门禁；历史记录只读保留用于审计。
 
-## 0. SOL 零工具单轮调用（v8.1：REVIEW / CONSULT / PLAN）
+## 0. SOL 零工具单轮调用（v8.2：REVIEW / CONSULT / PLAN 融合）
+
+### 统一入口与共享上下文
+
+- 三种模式共用一条管线：`copilot_dispatch.py` 的 `_run_sol_channel` → `sol_review.run_sol`
+  → `governance.record_sol_call`；模式差异只在提示词尾部与结果字段。
+- 提示词由 `sol_review.build_prompt` 统一构造，自动注入同一份任务目标、合同正文（
+  `done_criteria_text` 与边界）、完成条件、工作项状态与证据登记摘要（ID、类型、摘要前缀、
+  大小、支持的条件、归档标记，上限 80 条 / 6000 字符）。主代理只需提供本次增量的材料与
+  具体问题，不必重复粘贴门禁已有事实。
+- `review-admission` 是“要不要调用 SOL”的单一确定性入口：先计算本地 G1–G3 与台账，
+  门禁仍有缺口时 `recommended_action=not_needed`（先修机械缺口）；门禁全绿后才按风险等级
+  返回 `optional` / `recommended`（`decision` 保留风险策略原义，便于兼容旧输出）。
+- 简单任务与普通任务默认不调用 SOL；没有自动触发、没有固定轮次。
 
 ### 模型与推理强度
 
@@ -49,16 +63,23 @@ python3 -B scripts/copilot_dispatch.py sol-review --state <state.json> \
 - **零工具**：请求体不含 `tools`/`functions`/`parallel_tool_calls`，`tool_choice="none"`；
   上游出现 `message`/`reasoning` 之外的 output 条目、回显非空 `tools`/`tool_usage`，即判
   安全事件并拒绝。
-- `--dry-run` 只构建并校验请求（零工具、模型、推理强度、材料大小），不发请求、不写状态。
+- `--dry-run` 只构建并校验请求（零工具、模型、推理强度、材料大小），并输出
+  `prompt_version`、`cache_key_components`、`evidence_digest` 与注入的证据/工作项数量；
+  不发请求、不写状态。
 
 ### 单轮与失败
 
-- 一次调用只发一次请求。相同材料摘要再次调用直接复用已有结论，不重复付费。
+- 一次调用只发一次请求。相同主体摘要再次调用直接复用已有结论，不重复付费。
+- **复用键**（`review_subject_sha256`）：提示词版本 `PROMPT_VERSION`、模型与推理强度、
+  任务目标、合同正文与边界、完成条件描述、证据集合摘要、主代理材料；辅助分析额外绑定
+  模式与问题。条件从 pending 变 met 不失效；合同、证据集合、提示词版本或材料变化即失效，
+  不会复用过期判断。
 - 再次复核必须 `--force --trigger <user-request|scope-changed|new-risk|materials-omitted>
   --reason <说明>`，并换新材料。
 - 超时、429/5xx、网络、截断、响应格式、模型身份、推理强度/模式回显不符：记录真实原因与
-  `sol_reviews` 失败记录，返回非零退出码；不自动重试、不换 Provider、不派原生 Reviewer
-  顶替。主代理继续开发；只有用户明确要求必须完成独立复核时才按 BLOCKED 报告。
+  `sol_calls` 失败记录（历史状态仍读 `sol_reviews`），返回非零退出码；不自动重试、不换
+  Provider、不派原生 Reviewer 顶替。失败不产生阻塞、不派生 SOL 工作项，主代理继续开发；
+  只有用户明确要求必须完成独立复核时才按 BLOCKED 报告。
 
 ### 输出
 
@@ -67,7 +88,7 @@ python3 -B scripts/copilot_dispatch.py sol-review --state <state.json> \
   `materials_reviewed`。PASS 与 blocking/major 或未验证项冲突时降级 PARTIAL。
 - findings 以 `advisory` 进入 Finding 台账：主代理修复后 `finding --status fixed`，
   运行定向测试后 `--status verified`；确认误报时 `--status dropped --note <反证>`。
-- 原始输出存任务目录 `sol-reviews/`，审计 `sol-review-audit.jsonl` 仅脱敏元数据。
+- 原始输出存任务目录 `sol-reviews/`，审计 `sol-audit.jsonl` 仅脱敏元数据（三模式共用）。
 
 ### 与门禁的关系
 
@@ -102,10 +123,11 @@ python3 -B scripts/copilot_dispatch.py sol-advisory --state <state.json> \
 - `copilot-sol-advisory/v1`：`mode`、`summary`、`analysis`，加 `options`（CONSULT）或
   `steps`（PLAN，含 `depends_on`）、`risks`、`alternatives`、`recommendation`、
   `unverified`。schema 或 mode 与请求不一致、字段类型不符时拒绝消费。
-- 结果写入状态 `sol_advisories`，原始输出存 `sol-advisories/`，审计
-  `sol-advisory-audit.jsonl`（仅脱敏元数据）。
+- 结果写入状态 `sol_calls`（历史状态为 `sol_advisories`），原始输出存
+  `sol-advisories/`，审计写同一份 `sol-audit.jsonl`（仅脱敏元数据）。
 - **治理边界**：不进入 Finding 台账、不改变完成条件、不影响 G1–G3、不阻断任务；是否采纳、
-  如何实施由 ZCode 主代理决定。相同材料 + 模式 + 问题再次调用直接复用结论。
+  如何实施由 ZCode 主代理决定。相同主体摘要（材料 + 模式 + 问题 + 证据集合）再次调用直接
+  复用结论。
 - **单轮与失败**：与 REVIEW 相同；辅助分析失败只登记真实原因，主代理继续工作。
 
 ## 1. 正式 REVIEW（opt-in）
@@ -189,7 +211,8 @@ v8 起原生 Reviewer 已退役，正式 REVIEW 的独立意见只能来自 SOL 
 | 用户明确要求 REVIEW | 一次 |
 
 `review-admission` 只返回建议（`not_needed` / `optional` / `recommended`），不写状态、
-不是门禁。高风险任务返回 `recommended` + `scope=high-risk`。
+不是门禁。高风险任务返回 `recommended` + `scope=high-risk`；`recommended_action` 会先看
+本地 G1–G3：门禁仍有缺口时是 `not_needed`，门禁全绿后才是风险建议。
 
 ### Finding 台账与定向复验
 
@@ -231,9 +254,10 @@ v8 起原生 Reviewer 已退役，正式 REVIEW 的独立意见只能来自 SOL 
 
 ### 记录与边界
 
-- 成功结果写入 `sol_reviews`，原始输出存 `sol-reviews/`，审计 `sol-review-audit.jsonl`
-  只记脱敏元数据。
-- 失败把真实错误码与材料摘要写入 `sol_reviews`（`status=failed`）与 `history`；不自动
+- 成功结果统一写入 `sol_calls`（历史任务状态中的 `sol_reviews` / `sol_advisories` 继续
+  只读兼容，不迁移、不改写、不重复计数），原始输出存 `sol-reviews/` 或 `sol-advisories/`，
+  审计统一写 `sol-audit.jsonl`，只记脱敏元数据。
+- 失败把真实错误码与材料摘要写入 `sol_calls`（`status=failed`）与 `history`；不自动
   重试、不换 Provider、不派原生 Reviewer 顶替。
 - SOL 结论不改变阶段判定；阶段只由 `evaluate` 按合同、工作项、证据与门禁计算。
 

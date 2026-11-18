@@ -5,7 +5,11 @@ Copilot 是运行于 ZCode 内的**轻量协作治理 Skill**：用户侧 ChatGP
 调试、测试与验证；Copilot 负责任务合同、完成条件、状态、证据、审计与收口门禁，并用 PARTIAL
 派生持续推进任务；独立质量审查与可选认知辅助（SOL REVIEW / CONSULT / PLAN）按需提供。
 
-**v8.1.0 SOL 升级 GPT-6.2**：SOL 统一 `gpt-6.2-sol`（Responses API `/v1/responses`，既有
+**v8.2.0 SOL 与 G1–G3 融合**：三种 SOL 模式共用一条调用管线、一份任务上下文（合同/条件/
+证据）与一份记录流（`sol_calls`，历史 `sol_reviews`/`sol_advisories` 只读兼容）、统一审计
+`sol-audit.jsonl`；`review-admission` 先算本地 G1–G3，门禁有缺口时不建议调用 SOL。
+
+**v8.1.0 SOL 升级 GPT-6.2（历史）**：SOL 统一 `gpt-6.2-sol`（Responses API `/v1/responses`，既有
 本机 CPA `127` 出口）、`reasoning.effort="high"`、`standard` 模式、零工具、单轮；不按角色
 降级推理强度，不静默回退旧模型或别名，上游回显的模型/推理强度/模式不一致即拒绝消费。新增
 `copilot_dispatch.py sol-advisory --mode CONSULT|PLAN` 提供建议性问题分析与规划辅助，结论写入
@@ -36,7 +40,7 @@ finding 单方面提级为不可驳回阻断。dry-run 与真实调用共用材�
 代码快照、`git_root` 结果在单次命令内复用，工作区只扫描一次；工作区根与 HEAD 合并为一次
 `rev-parse`。门禁、漂移检测与证据绑定规则不变。
 
-**v6.0.0 起 SOL 决策通道退役**（v7 恢复一次性 REVIEW，v8.1 恢复建议性 CONSULT/PLAN）：
+**v6.0.0 起 SOL 决策通道退役**（v7 恢复一次性 REVIEW，v8.1 恢复建议性 CONSULT/PLAN，v8.2 融合为统一按需认知能力）：
 不再有远程模型决策依赖，不再有等待 SOL 返回的状态门禁，也不新增其他远程大模型充当强制
 决策节点。历史调用记录、REVIEW 裁决、任务台账与证据原样保留，可只读查看。角色边界见
 `docs/PROJECT-CHARTER.md`。

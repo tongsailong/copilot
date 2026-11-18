@@ -11,10 +11,18 @@ Copilot 是运行于 ZCode 内的**轻量协作治理 Skill**：负责任务承�
 决策主体；用户侧 ChatGPT 负责需求与产品层目标、交接与验收；独立质量审查与可选认知辅助
 （SOL REVIEW / CONSULT / PLAN）由 `gpt-6.2-sol` 零工具单轮调用按需提供。
 
+- **v8.2.0 起 SOL 三模式融合为统一按需认知能力**：REVIEW / CONSULT / PLAN 共用
+  `build_prompt`（自动注入合同正文、完成条件、工作项与证据登记）、`_run_sol_channel` →
+  `run_sol` → `record_sol_call` 管线；记录统一写入 `sol_calls`，审计统一
+  `sol-audit.jsonl`，互斥统一 `.sol.lock`，记录 ID 统一 `SC`。历史 `sol_reviews` /
+  `sol_advisories` 只读兼容，不迁移、不改写、不重复计数。`review-admission` 在门禁仍有
+  缺口时返回 `recommended_action=not_needed`（确定性优先）。G1–G3 语义、advisory 边界、
+  单轮与授权规则不变。
 - **v8.1.0 起 SOL 升级为 `gpt-6.2-sol` 并恢复建议性 CONSULT / PLAN**：所有 SOL 模式统一
   Responses API `/v1/responses`、`reasoning.effort="high"`、`reasoning.mode="standard"`、
   零工具、单轮；不按角色降级，不回退 `gpt-6.1-sol` 或其他模型/别名。CONSULT / PLAN 只写入
-  `sol_advisories`，不进入 Finding 台账、不影响 G1–G3、不阻断任务；DECIDE 不恢复。
+  SOL 记录（v8.2 起为 `sol_calls`），不进入 Finding 台账、不影响 G1–G3、不阻断任务；
+  DECIDE 不恢复。
 - **v8.0.0 起 G4 原生只读复核正式退役**：删除 `g4_attest.py`、`g4_shadow.py`、
   `test_execution.py`、原生复核信封与 `native_agent.py review/review-context/capability`。
   不再产生 `g4_eligible`、G4 PASS、G4 BLOCKED、`AUTO-G4*` 或 `host_capability_missing`；
@@ -45,8 +53,8 @@ Agent、SOL（REVIEW / CONSULT / PLAN）、DesignWise。Executor 是 ZCode 工�
 | 内置 `Explore` | 独立只读调查：跨模块/调用链/改动前风险/独立上下文检查 | 工具集含 `Bash`，不是只读沙箱；不注入 AGENTS.md，主代理必须提供范围与项目背景；不修改工程文件 |
 | 内置 `general-purpose` | 边界清晰、可独立交付、并行收益明显的子任务 | `tools=["*"]` 并继承 MCP；主代理负责拆分、冲突检查、集成与验收；不能当作只读复核者 |
 | Copilot 状态层 | 合同、条件、状态、证据登记、G1–G3、PARTIAL 派生、收口、审计 | 是本地脚本与状态，不是模型；除显式 `sol-review` / `sol-advisory` 外不调用模型、不实施工程、不替代技术决策、门禁不得绕过 |
-| SOL REVIEW | 一次性零工具独立审查；结论写入 `sol_reviews` 与 Finding 台账（advisory） | 只做 REVIEW；不执行工程、不做技术决策、不自动二审；结论只是建议，不构成收口门禁 |
-| SOL CONSULT / PLAN | 一次性零工具认知辅助；结论写入 `sol_advisories`（advisory） | 只做分析与规划建议；不执行工程、不写状态、不进入 Finding 台账、不影响 G1–G3；不恢复 DECIDE |
+| SOL REVIEW | 一次性零工具独立审查；结论写入统一 `sol_calls`（历史 `sol_reviews` 只读兼容）与 Finding 台账（advisory） | 只做 REVIEW；不执行工程、不做技术决策、不自动二审；结论只是建议，不构成收口门禁 |
+| SOL CONSULT / PLAN | 一次性零工具认知辅助；结论写入统一 `sol_calls`（历史 `sol_advisories` 只读兼容，advisory） | 只做分析与规划建议；不执行工程、不写状态、不进入 Finding 台账、不影响 G1–G3；不恢复 DECIDE |
 | 正式 REVIEW | 用户明确要求时的治理记录 | 不是普通开发前置门禁；无授权不得伪造 |
 | ~~G4 复核~~ | **v8.0.0 已正式退役**；历史记录只读保留 | 不再参与准入、派生或收口；不得把历史 BLOCKED 改写成 PASS |
 

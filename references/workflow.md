@@ -44,12 +44,12 @@ python3 -B scripts/copilot_dispatch.py <子命令> --state <state.json> [参数]
 | `decide` | 记录用户/任务决策 | `--text`、`--source`；**不能替代 PWW 接受** |
 | `block` / `unblock` | 记录/解除真实阻塞 | `block --reason ... --needs ...`；`unblock --reason ... [--block-id B...]`（多条未解除时必须指定） |
 | `closure-check` | 只读检查 G1–G3 | `--json` |
-| `review-admission` | SOL 复核准入建议（只读、不写状态、不是门禁） | `--trigger security`（可重复）、`--reason`、`--json`；返回 `not_needed`/`optional`/`recommended` |
-| `sol-review` | SOL 零工具单轮复核：材料 → 一次请求 → 结构化结果 → advisory findings | `--materials <file>`、`--dry-run`、`--list`、`--json`、`--timeout`、`--max-output-tokens`、`--audit-log`、`--output-dir`；再次复核：`--force --trigger <user-request\|scope-changed\|new-risk\|materials-omitted> --reason` |
-| `sol-advisory` | SOL 零工具单轮认知辅助（CONSULT / PLAN）：建议写入 `sol_advisories`，不入门禁 | `--mode CONSULT\|PLAN`、`--materials <file>`、`--question`、`--dry-run`、`--list`、`--json`、`--timeout`、`--max-output-tokens`、`--audit-log`、`--output-dir`；再次调用：`--force --trigger ... --reason` |
+| `review-admission` | SOL 认知辅助准入的单一确定性入口（只读、不写状态、不是门禁）：先算本地 G1–G3，门禁有缺口时 `recommended_action=not_needed`，全绿后按风险给建议 | `--trigger security`（可重复）、`--reason`、`--json`；返回 `decision` 与门禁感知的 `recommended_action`、`sol_calls_total` |
+| `sol-review` | SOL 零工具单轮复核：材料 → 一次请求 → 结构化结果 → advisory findings；记录写入统一 `sol_calls` | `--materials <file>`、`--dry-run`、`--list`、`--json`、`--timeout`、`--max-output-tokens`、`--audit-log`（默认 `sol-audit.jsonl`）、`--output-dir`；再次复核：`--force --trigger <user-request\|scope-changed\|new-risk\|materials-omitted> --reason` |
+| `sol-advisory` | SOL 零工具单轮认知辅助（CONSULT / PLAN）：建议写入统一 `sol_calls`（历史 `sol_advisories` 只读兼容），不入门禁 | `--mode CONSULT\|PLAN`、`--materials <file>`、`--question`、`--dry-run`、`--list`、`--json`、`--timeout`、`--max-output-tokens`、`--audit-log`（默认 `sol-audit.jsonl`）、`--output-dir`；再次调用：`--force --trigger ... --reason` |
 | `agent-policy` | Agent 调度建议：主代理默认，Explore/general-purpose 按需（只读、不派发）。判定顺序：子代理不可用 → 主代理；写入冲突 → 主代理；`--research-only` → Explore（绝不交给全工具代理）；独立交付物需并发且有收益才建议 general-purpose；其余 → 主代理 | `--needs-independent-context`、`--parallel`、`--independent-deliverable`、`--write-conflict`、`--saves-time`、`--research-only`、`--subagent-unavailable`、`--json` |
 | `finding` | 查看 / 更新 Finding 台账（不触发复核） | `--list`；`--id F1 --status open\|fixed\|verified\|closed\|regressed\|dropped --evidence E1 --note`；`fixed`/`verified` 必须有证据 |
-| `review-metrics` | 统计 SOL 单轮复核、准入门槛、停止标记与 Finding 计数 | `--state`；历史 G4 数据标记 `g4.retired` |
+| `review-metrics` | 统计统一 SOL 调用流（`sol.calls_total` / `sol.by_mode`）、准入门槛、停止标记与 Finding 计数 | `--state`；历史 G4 数据标记 `g4.retired` |
 | `closure` | 收口（必须 G1–G3 通过） | `--close`、`--by` |
 | `reopen` | 用户授权后重开 | `--reason`、`--authorized-by user`（必填） |
 | `handoff` | 只读列出生效交付清单：分支/HEAD/上游、已暂存、未暂存、未跟踪分类 | `--state`（可选）、`--cwd`、`--limit`、`--json`；不提交、不删除、不改 `.gitignore` |

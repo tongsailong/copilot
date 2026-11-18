@@ -502,7 +502,7 @@ class StateIntegrationTests(unittest.TestCase):
         # G4 退役：门禁只有 G1–G3，SOL 记录不改变门禁集合。
         self.assertEqual(set(check["gates"]), {"G1", "G2", "G3"})
         self.assertNotIn("G4", check["gates"])
-        self.assertEqual(state["sol_reviews"][0]["status"], "completed")
+        self.assertEqual(state["sol_calls"][0]["status"], "completed")
 
     def test_duplicate_sol_record_does_not_double_count(self):
         record = {
@@ -529,7 +529,7 @@ class StateIntegrationTests(unittest.TestCase):
             materials_sha256="c" * 64)
         self.assertEqual(failure["status"], "failed")
         state = G.load_state(self.state_path)
-        self.assertEqual(state["sol_reviews"][-1]["error"], "sol_timeout")
+        self.assertEqual(state["sol_calls"][-1]["error"], "sol_timeout")
         self.assertEqual(G.evaluate(state)["phase"], "PARTIAL")
 
     def test_review_can_be_recorded_while_blocked(self):
@@ -538,7 +538,7 @@ class StateIntegrationTests(unittest.TestCase):
         self.assertEqual(record["status"], "completed")
         state = G.load_state(self.state_path)
         self.assertEqual(G.evaluate(state)["phase"], "BLOCKED")
-        self.assertTrue(state["sol_reviews"])
+        self.assertTrue(state["sol_calls"])
 
     def test_advisory_is_advisory_only(self):
         record = {
@@ -551,7 +551,7 @@ class StateIntegrationTests(unittest.TestCase):
         G.record_sol_advisory(self.state_path, record,
                               materials_sha256="c" * 64)
         state = G.load_state(self.state_path)
-        self.assertEqual(state["sol_advisories"][-1]["status"], "completed")
+        self.assertEqual(state["sol_calls"][-1]["status"], "completed")
         # 不进入 Finding 台账、不影响阶段、不改变 G1–G3。
         self.assertEqual(G.list_findings(state)["items"], [])
         self.assertEqual(G.evaluate(state)["phase"], "PARTIAL")
@@ -564,7 +564,7 @@ class StateIntegrationTests(unittest.TestCase):
             detail="300s", materials_sha256="d" * 64)
         self.assertEqual(failure["status"], "failed")
         state = G.load_state(self.state_path)
-        self.assertEqual(state["sol_advisories"][-1]["error"], "sol_timeout")
+        self.assertEqual(state["sol_calls"][-1]["error"], "sol_timeout")
         self.assertEqual(G.evaluate(state)["phase"], "PARTIAL")
 
 
@@ -769,9 +769,10 @@ class CliTests(unittest.TestCase):
                 contextlib.redirect_stdout(out):
             self.assertEqual(CD.cmd_sol_advisory(args), 0)
         state = G.load_state(self.state)
-        self.assertEqual(state["sol_advisories"][-1]["mode"], "CONSULT")
-        self.assertEqual(state["sol_advisories"][-1]["request_id"], "req-1")
-        self.assertEqual(state["sol_reviews"], [])
+        self.assertEqual(state["sol_calls"][-1]["mode"], "CONSULT")
+        self.assertEqual(state["sol_calls"][-1]["request_id"], "req-1")
+        self.assertEqual([r for r in state["sol_calls"]
+                          if r.get("mode") == "REVIEW"], [])
         self.assertEqual(G.list_findings(state)["items"], [])
         self.assertTrue(os.path.isdir(os.path.join(self.dir, "sol-advisories")))
 
@@ -783,8 +784,8 @@ class CliTests(unittest.TestCase):
                          self.state, "--mode", "PLAN", "--list", "--json")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         payload = json.loads(proc.stdout)
-        self.assertEqual(len(payload["sol_advisories"]), 1)
-        self.assertEqual(payload["sol_advisories"][0]["mode"], "PLAN")
+        self.assertEqual(len(payload["sol_calls"]), 1)
+        self.assertEqual(payload["sol_calls"][0]["mode"], "PLAN")
 
     def test_same_materials_reuse_without_network(self):
         import argparse
@@ -793,7 +794,7 @@ class CliTests(unittest.TestCase):
         import copilot_dispatch as CD
         state = G.load_state(self.state)
         materials_text = open(self.materials, encoding="utf-8").read()
-        digest = SR.review_subject_sha256(state, materials_text)
+        digest = SR.review_subject_sha256(state, materials_text, mode="REVIEW")
         G.record_sol_review(self.state, {
             "schema": SR.REVIEW_SCHEMA, "review_id": "SR" + "b" * 24,
             "verdict": "pass", "summary": "ok", "findings": [],
@@ -809,7 +810,7 @@ class CliTests(unittest.TestCase):
                 contextlib.redirect_stdout(out):
             self.assertEqual(CD.cmd_sol_review(args), 0)
         self.assertEqual(call.call_count, 0)
-        self.assertEqual(json.loads(out.getvalue())["review_id"],
+        self.assertEqual(json.loads(out.getvalue())["call_id"],
                          "SR" + "b" * 24)
 
     def test_status_change_does_not_create_new_subject(self):
@@ -829,8 +830,8 @@ class CliTests(unittest.TestCase):
                          self.state, "--list", "--json")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         payload = json.loads(proc.stdout)
-        self.assertEqual(len(payload["sol_reviews"]), 1)
-        self.assertEqual(payload["sol_reviews"][0]["error"], "sol_quota")
+        self.assertEqual(len(payload["sol_calls"]), 1)
+        self.assertEqual(payload["sol_calls"][0]["error"], "sol_quota")
 
     def test_audit_has_no_prompt_text_or_key(self):
         text = "SECRET-PROMPT-BODY"
@@ -921,7 +922,7 @@ class PendingRecoveryTests(unittest.TestCase):
         import copilot_dispatch as D
 
         state = G.load_state(self.state_path)
-        digest = SR.review_subject_sha256(state, self.materials)
+        digest = SR.review_subject_sha256(state, self.materials, mode="REVIEW")
         result = {
             "schema": SR.REVIEW_SCHEMA, "model": SR.MODEL,
             "model_resolved": SR.MODEL, "reasoning_effort": "high",
@@ -947,7 +948,7 @@ class PendingRecoveryTests(unittest.TestCase):
             code = D.main(["sol-review", "--state", self.state_path,
                            "--materials", self.mat_path])
         self.assertEqual(code, 0)
-        record = G.load_state(self.state_path)["sol_reviews"][-1]
+        record = G.load_state(self.state_path)["sol_calls"][-1]
         self.assertEqual(record["status"], "completed")
         self.assertTrue(record["recovered_from_pending"])
         self.assertFalse(os.path.exists(pending))

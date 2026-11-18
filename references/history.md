@@ -4,8 +4,27 @@
 > `SKILL.md`、`references/workflow.md`、`runtime.md`、`review.md`、`agent-bridge.md`。
 > **SOL 决策通道已于 v6.0.0（2026-11-12）退役；v7.0.0（2026-11-17）只恢复一次性 REVIEW
 > （零工具、单轮、建议性）；v8.0.0（2026-11-17）正式退役 G4 原生只读复核；v8.1.0
-> （2026-11-18）升级 `gpt-6.2-sol` 并恢复建议性 CONSULT / PLAN**。下文涉及 SOL 与 G4
-> 的段落按时间标注是否为历史事实描述。
+> （2026-11-18）升级 `gpt-6.2-sol` 并恢复建议性 CONSULT / PLAN；v8.2.0（2026-11-18）
+> 把三模式融合为 Copilot 内部统一按需认知能力**。
+
+## v8.2.0（2026-11-18）SOL 与 G1–G3 融合
+
+- **单一记录流**：三模式成功/失败记录统一写入状态 `sol_calls`（`call_id` / `mode` /
+  `prompt_version` / `evidence_digest`）；历史 `sol_reviews` / `sol_advisories` 只读兼容，
+  不迁移、不改写、不重复计数。审计统一 `sol-audit.jsonl`，互斥统一 `.sol.lock`，记录 ID
+  统一 `SC`。
+- **管线收敛**：`build_prompt` 取代 `build_materials` / `build_advisory_prompt`；
+  `record_sol_call` / `record_sol_call_failure` 取代四套按模式复制的登记函数（历史函数名
+  保留为薄封装）；`_sol_channel_config` 只保留原始输出目录、文案与预检 schema。
+- **共享上下文**：提示词自动注入目标、完整合同正文（`done_criteria_text` 与边界）、条件、
+  工作项与证据登记摘要。旧实现误读不存在的 `contract["text"]`，合同正文实际从未提供给 SOL；
+  本版修正并把该事实进入复用键。
+- **确定性优先**：`review-admission` 增加门禁感知的 `recommended_action`；门禁有缺口时
+  `not_needed`，全绿后按风险给出建议；`decision` 保留风险策略原义以兼容旧输出。
+- **复用键**：`PROMPT_VERSION` + 模型/推理强度 + 目标 + 合同正文/边界 + 条件描述 +
+  证据集合摘要 + 材料（辅助分析另加模式与问题）。条件状态变化不失效。
+- **不变**：G1–G3 语义与 fail-closed；SOL advisory、零工具、单轮、不自动重试；ZCode 唯一
+  工程执行与技术决策主体；G4 不恢复。
 
 ## v8.1.0（2026-11-18）GPT-6.2 SOL Edition
 

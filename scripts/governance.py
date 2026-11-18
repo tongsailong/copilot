@@ -232,8 +232,9 @@ def _default_state() -> dict:
         "contract": _default_contract(),
         "native_dispatch": None,
         "native_results": [],
-        "sol_reviews": [],
-        "sol_advisories": [],
+        # SOL 调用记录（REVIEW / CONSULT / PLAN）统一存放在 `sol_calls`。历史状态里的
+        # `sol_reviews` / `sol_advisories` 继续只读兼容，不再新增默认键，也不回写。
+        "sol_calls": [],
         "review_admissions": [],
         "review_stops": [],
         "finding_ledger": {
@@ -3266,172 +3267,269 @@ def review_admission(state: dict, *, triggers: list[str] | None = None,
                      reason: str = "", target_sha256: str = "",
                      code_scope_sha256: str = "",
                      files: list[dict] | None = None,
-                     scope: str = "full") -> dict:
-    """SOL 复核准入建议（只读，不写状态）。
+                     scope: str = "full", include_gates: bool = True) -> dict:
+    """SOL 认知辅助准入建议（只读，不写状态）。
 
-    v8 起 G4 已退役，独立模型复核只走 SOL 零工具单轮复核：`low` 默认不需要；
-    `medium` 按需；`high` 建议一次。SOL 是 advisory，不构成收口门禁，也不
-    证明宿主只读权限。`target` / `code_scope` 参数保留用于兼容调用方，不参与
-    自动多轮判断。
+    这是“要不要调用 SOL”的**单一确定性入口**：先用本地 G1–G3 与台账事实判断
+    是否存在必须先修的机械缺口，再按风险等级给出 `CONSULT` / `PLAN` / `REVIEW`
+    的建议。SOL 是 advisory，不构成收口门禁，也不证明宿主只读权限。
+
+    - `decision`：风险等级策略建议（`not_needed` / `optional` / `recommended`），
+      只反映风险与触发因素，便于与历史输出兼容。
+    - `recommended_action`：结合当前确定性门禁后的最终建议。门禁仍有缺口时一律
+      `not_needed`（本地工作单优先，SOL 不提供本地事实），门禁全绿时才回到风险建议。
     """
     import sol_review as SR
 
     risk = str(state.get("risk") or "")
     decision = SR.admission(risk=risk, triggers=triggers, reason=reason)
-    sol = [item for item in state.get("sol_reviews") or []
-           if isinstance(item, dict) and item.get("status") == "completed"]
+    calls = [item for item in iter_sol_calls(state)
+             if item.get("status") == "completed"]
+    reviews = [item for item in calls if sol_call_mode(item) == "REVIEW"]
+    by_mode = {mode: len([item for item in calls if sol_call_mode(item) == mode])
+               for mode in SOL_MODES}
     target = str(target_sha256 or final_evidence_digest(state))
-    return {
+    result = {
         **decision,
         "target_sha256": target,
-        "sol_reviews_total": len(sol),
+        "sol_calls_total": len(calls),
+        "sol_calls_by_mode": by_mode,
+        "sol_reviews_total": len(reviews),
         "last_sol_review": ({
-            "review_id": sol[-1].get("review_id"),
-            "verdict": sol[-1].get("verdict"),
-            "materials_sha256": sol[-1].get("materials_sha256"),
-            "created_at": sol[-1].get("created_at"),
-        } if sol else None),
+            "call_id": sol_call_id(reviews[-1]),
+            "verdict": reviews[-1].get("verdict"),
+            "materials_sha256": reviews[-1].get("materials_sha256"),
+            "prompt_version": reviews[-1].get("prompt_version"),
+            "created_at": reviews[-1].get("created_at"),
+        } if reviews else None),
+        "last_sol_call": ({
+            "call_id": sol_call_id(calls[-1]),
+            "mode": sol_call_mode(calls[-1]),
+            "materials_sha256": calls[-1].get("materials_sha256"),
+            "prompt_version": calls[-1].get("prompt_version"),
+            "created_at": calls[-1].get("created_at"),
+        } if calls else None),
         "ledger": RP.ledger_summary(state),
         "code_scope_checked": bool(code_scope_sha256 or files),
     }
+    if not include_gates:
+        return result
+    # 确定性优先：门禁缺口是本地事实，调用模型前必须先把它们当成可执行工作项。
+    check = closure_check(state)
+    gate_codes = {
+        name: sorted({str(item.get("code") or "") for item in check["gates"][name]["reasons"]})
+        for name in ("G1", "G2", "G3")
+    }
+    open_codes = [code for codes in gate_codes.values() for code in codes if code]
+    result["gates"] = {
+        "passed": bool(check["passed"]),
+        "codes": gate_codes,
+    }
+    if open_codes:
+        result["recommended_action"] = "not_needed"
+        result["recommended_reason"] = (
+            "确定性门禁仍有缺口（" + "、".join(sorted(set(open_codes)))
+            + "）：先按本地工作单修复，SOL 不提供本地事实。")
+    else:
+        result["recommended_action"] = decision["decision"]
+        result["recommended_reason"] = decision["detail"]
+    return result
+
+
+# ── SOL 调用记录：单一权威流 `sol_calls` + 历史只读兼容 ──────────────────────
+SOL_CALLS_KEY = "sol_calls"
+LEGACY_SOL_KEYS = ("sol_reviews", "sol_advisories")
+SOL_MODES = ("REVIEW", "CONSULT", "PLAN")
+SOL_ADVISORY_MODES = ("CONSULT", "PLAN")
+
+
+def sol_call_id(record: dict) -> str:
+    """统一记录 ID：新记录用 `call_id`；历史记录沿用当时的主键。"""
+    for key in ("call_id", "review_id", "advisory_id"):
+        value = str(record.get(key) or "")
+        if value:
+            return value
+    return ""
+
+
+def sol_call_mode(record: dict) -> str:
+    """记录模式；历史记录可能没有 mode 字段，按历史存放位置判定。"""
+    mode = str(record.get("mode") or "").upper()
+    if mode in SOL_MODES:
+        return mode
+    return "CONSULT" if record.get("advisory_id") else "REVIEW"
+
+
+def iter_sol_calls(state: dict) -> list[dict]:
+    """统一 SOL 调用记录流（含失败记录）。
+
+    `sol_calls` 是唯一权威来源。v8.2 之前分别存放在 `sol_reviews` /
+    `sol_advisories` 的历史记录继续只读可读：不迁移、不改写、不重复写入，
+    合并时按记录 ID 去重并按创建时间排序。
+    """
+    rows: list[dict] = []
+    seen: set[str] = set()
+    for key in (SOL_CALLS_KEY,) + LEGACY_SOL_KEYS:
+        for item in state.get(key) or []:
+            if not isinstance(item, dict):
+                continue
+            ident = sol_call_id(item)
+            if ident:
+                if ident in seen:
+                    continue
+                seen.add(ident)
+            rows.append(item)
+    rows.sort(key=lambda item: str(item.get("created_at")
+                                   or item.get("received") or ""))
+    return rows
+
+
+def list_sol_calls(state: dict, *, mode: str = "") -> list[dict]:
+    """只读返回统一 SOL 调用记录；`mode` 为空时返回全部模式。"""
+    rows = iter_sol_calls(state)
+    if not mode:
+        return rows
+    wanted = str(mode).upper()
+    return [item for item in rows if sol_call_mode(item) == wanted]
 
 
 def list_sol_reviews(state: dict) -> list[dict]:
-    """只读返回本任务的 SOL 复核记录（含失败记录）。"""
-    return [item for item in state.get("sol_reviews") or []
-            if isinstance(item, dict)]
+    """只读返回 REVIEW 模式记录（含失败记录与历史兼容记录）。"""
+    return list_sol_calls(state, mode="REVIEW")
+
+
+def list_sol_advisories(state: dict) -> list[dict]:
+    """只读返回 CONSULT / PLAN 辅助分析记录（含失败记录）。"""
+    return [item for item in list_sol_calls(state)
+            if sol_call_mode(item) in SOL_ADVISORY_MODES]
+
+
+def record_sol_call(path: str, call: dict, *, mode: str = "",
+                    materials_sha256: str = "", trigger: str = "",
+                    reason: str = "") -> dict:
+    """登记一次已完成的 SOL 调用（REVIEW / CONSULT / PLAN 共用）。
+
+    SOL 是建议层：REVIEW 的 findings 以 `advisory` 进入 Finding 台账，主代理
+    逐条核实后修复、定向验证或给出反证；CONSULT / PLAN 只留审计记录，不进入
+    台账、不改变完成条件、不影响 G1–G3。
+    """
+    state = load_state(path)
+    _assert_open(state, "登记 SOL 调用", allow_blocked=True)
+    record = {**call}
+    resolved = str(mode or record.get("mode") or "REVIEW").upper()
+    if resolved not in SOL_MODES:
+        raise GovernanceError(f"未知 SOL 模式：{resolved}")
+    record["mode"] = resolved
+    record["call_id"] = str(record.get("call_id") or sol_call_id(record)
+                            or "SC" + secrets.token_hex(12))
+    record["status"] = "completed"
+    # 用回复摘要作为台账去重键：同一份 SOL 输出重复合并时只计一次 occurrence。
+    if not record.get("result_sha256"):
+        record["result_sha256"] = str(record.get("reply_sha256") or "")
+    if not record.get("received"):
+        record["received"] = str(record.get("completed_at") or now_iso())
+    record["materials_sha256"] = str(materials_sha256
+                                     or record.get("materials_sha256") or "")
+    record["trigger"] = str(trigger or "")
+    record["reason"] = str(reason or "")[:1000]
+    record["created_at"] = str(record.get("completed_at") or now_iso())
+    detail = {
+        "call_id": record["call_id"],
+        "mode": resolved,
+        "materials_sha256": record["materials_sha256"],
+        "prompt_version": str(record.get("prompt_version") or ""),
+        "trigger": record["trigger"],
+    }
+    if resolved == "REVIEW":
+        merge = RP.merge_review(state, record, authoritative=False)
+        record["finding_refs"] = merge.get("refs") or []
+        detail.update({
+            "verdict": record.get("verdict") or "",
+            "findings": record.get("findings_count") or {},
+            "merged": {"created": merge.get("created") or [],
+                       "matched": merge.get("matched") or []},
+        })
+    else:
+        detail.update({
+            "analysis_items": len(record.get("analysis") or []),
+            "options": len(record.get("options") or []),
+            "steps": len(record.get("steps") or []),
+        })
+    state.setdefault(SOL_CALLS_KEY, []).append(record)
+    _history(state, "sol_call_completed", detail)
+    save_state(path, state)
+    return record
+
+
+def record_sol_call_failure(path: str, *, mode: str = "REVIEW",
+                            error_code: str = "", detail: str = "",
+                            materials_sha256: str = "",
+                            model: str = "") -> dict:
+    """登记一次失败的 SOL 调用；失败不改变任务阶段，也不阻断主代理继续。"""
+    state = load_state(path)
+    resolved = str(mode or "REVIEW").upper()
+    if resolved not in SOL_MODES:
+        raise GovernanceError(f"未知 SOL 模式：{resolved}")
+    record = {
+        "schema": "copilot-sol-call-failure/v1",
+        "call_id": "SC" + secrets.token_hex(12),
+        "task_id": str(state.get("task_id") or ""),
+        "mode": resolved,
+        "status": "failed",
+        "error": str(error_code or "sol_error"),
+        "detail": str(detail or "")[:2000],
+        "materials_sha256": str(materials_sha256 or ""),
+        "model": model,
+        "created_at": now_iso(),
+    }
+    state.setdefault(SOL_CALLS_KEY, []).append(record)
+    _history(state, "sol_call_failed", {
+        "call_id": record["call_id"],
+        "mode": resolved,
+        "error": record["error"],
+        "materials_sha256": record["materials_sha256"],
+    })
+    save_state(path, state)
+    return record
 
 
 def record_sol_review(path: str, review: dict, *,
                       materials_sha256: str = "",
                       trigger: str = "", reason: str = "") -> dict:
-    """登记一次成功的 SOL 复核，并把其 findings 作为建议合并进台账。
-
-    SOL 是 advisory：它不能把已有问题标成 verified；但它的 blocking/major
-    会进入 Finding 台账，主代理修复并定向验证，或在给出反证后
-    `finding --status dropped --note ...` 明确驳回。
-    """
-    state = load_state(path)
-    _assert_open(state, "登记 SOL 复核", allow_blocked=True)
-    record = {**review}
-    record["status"] = "completed"
-    # 用回复摘要作为台账去重键：同一份 SOL 输出重复合并时只计一次 occurrence。
-    if not record.get("result_sha256"):
-        record["result_sha256"] = str(review.get("reply_sha256") or "")
-    if not record.get("received"):
-        record["received"] = str(review.get("completed_at") or now_iso())
-    record["materials_sha256"] = (materials_sha256
-                                  or str(review.get("materials_sha256") or ""))
-    record["trigger"] = str(trigger or "")
-    record["reason"] = str(reason or "")[:1000]
-    record["created_at"] = str(review.get("completed_at") or now_iso())
-    merge = RP.merge_review(state, record, authoritative=False)
-    record["finding_refs"] = merge.get("refs") or []
-    state.setdefault("sol_reviews", []).append(record)
-    _history(state, "sol_review_completed", {
-        "review_id": record.get("review_id") or "",
-        "verdict": record.get("verdict") or "",
-        "materials_sha256": record["materials_sha256"],
-        "findings": record.get("findings_count") or {},
-        "merged": {"created": merge.get("created") or [],
-                   "matched": merge.get("matched") or []},
-        "trigger": record["trigger"],
-    })
-    save_state(path, state)
-    return record
-
-
-def list_sol_advisories(state: dict) -> list[dict]:
-    """只读返回本任务的 SOL 辅助分析记录（CONSULT / PLAN，含失败记录）。"""
-    return [item for item in state.get("sol_advisories") or []
-            if isinstance(item, dict)]
+    """历史名称：等同 `record_sol_call(..., mode="REVIEW")`，保留给既有调用方。"""
+    return record_sol_call(path, review, mode="REVIEW",
+                           materials_sha256=materials_sha256,
+                           trigger=trigger, reason=reason)
 
 
 def record_sol_advisory(path: str, advisory: dict, *,
                         materials_sha256: str = "",
                         trigger: str = "", reason: str = "") -> dict:
-    """登记一次成功的 SOL 辅助分析（CONSULT / PLAN）。
+    """历史名称：等同 `record_sol_call(mode=CONSULT|PLAN)`，保留给既有调用方。"""
+    return record_sol_call(path, advisory,
+                           mode=str(advisory.get("mode") or "CONSULT"),
+                           materials_sha256=materials_sha256,
+                           trigger=trigger, reason=reason)
 
-    辅助分析是纯建议：不进入 Finding 台账、不改变完成条件、不影响 G1–G3，
-    只作为主代理决策参考与审计留痕。
-    """
-    state = load_state(path)
-    _assert_open(state, "登记 SOL 辅助分析", allow_blocked=True)
-    record = {**advisory}
-    record["status"] = "completed"
-    record["mode"] = str(record.get("mode") or "CONSULT").upper()
-    record["materials_sha256"] = (materials_sha256
-                                  or str(advisory.get("materials_sha256") or ""))
-    record["trigger"] = str(trigger or "")
-    record["reason"] = str(reason or "")[:1000]
-    record["created_at"] = str(advisory.get("completed_at") or now_iso())
-    state.setdefault("sol_advisories", []).append(record)
-    _history(state, "sol_advisory_completed", {
-        "advisory_id": record.get("advisory_id") or "",
-        "mode": record["mode"],
-        "materials_sha256": record["materials_sha256"],
-        "analysis_items": len(record.get("analysis") or []),
-        "options": len(record.get("options") or []),
-        "steps": len(record.get("steps") or []),
-        "trigger": record["trigger"],
-    })
-    save_state(path, state)
-    return record
+
+def record_sol_review_failure(path: str, *, error_code: str, detail: str = "",
+                              materials_sha256: str = "",
+                              model: str = "") -> dict:
+    """历史名称：等同 `record_sol_call_failure(mode="REVIEW")`。"""
+    return record_sol_call_failure(path, mode="REVIEW", error_code=error_code,
+                                   detail=detail,
+                                   materials_sha256=materials_sha256, model=model)
 
 
 def record_sol_advisory_failure(path: str, *, mode: str = "CONSULT",
                                 error_code: str = "", detail: str = "",
                                 materials_sha256: str = "",
                                 model: str = "") -> dict:
-    """登记一次失败的 SOL 辅助分析；失败不改变任务阶段，也不阻断主代理。"""
-    state = load_state(path)
-    record = {
-        "schema": "copilot-sol-advisory-failure/v1",
-        "advisory_id": "SA" + secrets.token_hex(12),
-        "task_id": str(state.get("task_id") or ""),
-        "mode": str(mode or "CONSULT").upper(),
-        "status": "failed",
-        "error": str(error_code or "sol_error"),
-        "detail": str(detail or "")[:2000],
-        "materials_sha256": str(materials_sha256 or ""),
-        "model": model,
-        "created_at": now_iso(),
-    }
-    state.setdefault("sol_advisories", []).append(record)
-    _history(state, "sol_advisory_failed", {
-        "advisory_id": record["advisory_id"],
-        "mode": record["mode"],
-        "error": record["error"],
-        "materials_sha256": record["materials_sha256"],
-    })
-    save_state(path, state)
-    return record
+    """历史名称：等同 `record_sol_call_failure(mode=CONSULT|PLAN)`。"""
+    return record_sol_call_failure(path, mode=mode, error_code=error_code,
+                                   detail=detail,
+                                   materials_sha256=materials_sha256, model=model)
 
-
-def record_sol_review_failure(path: str, *, error_code: str, detail: str = "",
-                              materials_sha256: str = "",
-                              model: str = "") -> dict:
-    """登记一次失败的 SOL 调用；失败不改变任务阶段，也不阻断主代理继续。"""
-    state = load_state(path)
-    record = {
-        "schema": "copilot-sol-review-failure/v1",
-        "review_id": "SR" + secrets.token_hex(12),
-        "task_id": str(state.get("task_id") or ""),
-        "status": "failed",
-        "error": str(error_code or "sol_error"),
-        "detail": str(detail or "")[:2000],
-        "materials_sha256": str(materials_sha256 or ""),
-        "model": model,
-        "created_at": now_iso(),
-    }
-    state.setdefault("sol_reviews", []).append(record)
-    _history(state, "sol_review_failed", {
-        "review_id": record["review_id"],
-        "error": record["error"],
-        "materials_sha256": record["materials_sha256"],
-    })
-    save_state(path, state)
-    return record
 
 
 def list_findings(state: dict) -> dict:
@@ -3766,10 +3864,12 @@ def review_metrics(state: dict, *, task_dir: str = "") -> dict:
     Finding 台账与正式 REVIEW。历史状态里的 `native_reviews` /
     `review_attempts` / `g4_attestations` 只读保留，不计入活动指标。
     """
-    sol_reviews = [r for r in state.get("sol_reviews") or []
-                   if isinstance(r, dict)]
-    advisories = [r for r in state.get("sol_advisories") or []
-                  if isinstance(r, dict)]
+    # 统一 SOL 调用流：`sol_calls` 权威 + 历史 sol_reviews / sol_advisories 只读兼容，
+    # 指标口径只有一套，不因历史存放位置不同而重复计数。
+    sol_calls = iter_sol_calls(state)
+    sol_reviews = [r for r in sol_calls if sol_call_mode(r) == "REVIEW"]
+    advisories = [r for r in sol_calls
+                  if sol_call_mode(r) in SOL_ADVISORY_MODES]
     admissions = [item for item in state.get("review_admissions") or []
                   if isinstance(item, dict)]
     admission_triggers: dict[str, int] = {}
@@ -3844,6 +3944,11 @@ def review_metrics(state: dict, *, task_dir: str = "") -> dict:
             state.get("created"), closure.get("closed_at") or state.get("updated")),
         "reopen_count": len(closure.get("reopen_history") or []),
         "sol": {
+            "calls_total": len(sol_calls),
+            "by_mode": {
+                mode: len([r for r in sol_calls
+                           if sol_call_mode(r) == mode])
+                for mode in SOL_MODES},
             "total": len(sol_reviews),
             "completed": len([r for r in sol_reviews
                               if r.get("status") == "completed"]),
@@ -4372,8 +4477,9 @@ def _evaluate_core(state: dict, *, cache: dict | None = None) -> dict:
                     "或 copilot_dispatch.py closure --state <state> --close"]
         # 高风险任务建议一次 SOL 独立复核；advisory，不改变 PASS 判定。
         if str(state.get("risk") or "").lower() == "high" and not [
-                item for item in state.get("sol_reviews") or []
-                if isinstance(item, dict) and item.get("status") == "completed"]:
+                item for item in iter_sol_calls(state)
+                if isinstance(item, dict) and item.get("status") == "completed"
+                and sol_call_mode(item) == "REVIEW"]:
             commands.append(
                 "可选：copilot_dispatch.py sol-review --state <state> --materials "
                 "<materials.md>（高风险建议一次独立复核，advisory）")

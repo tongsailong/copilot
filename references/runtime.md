@@ -7,8 +7,9 @@
 
 - **本地判定**：阶段判定、工作项派生、门禁检查只读状态文件与证据文件，不调用网络、模型或
   子进程（命令采集只在 CLI 显式请求时执行）。`sol-review` 与 `sol-advisory` 是仅有的例外：
-  它们由主代理按需显式调用，结果分别写入 `sol_reviews` / `sol_advisories`，不自动改变阶段、
-  不参与 PARTIAL 派生；`sol_advisories` 也不进入 Finding 台账或 G1–G3。
+  它们由主代理按需显式调用，结果统一写入 `sol_calls`（历史 `sol_reviews` /
+  `sol_advisories` 只读兼容），不自动改变阶段、不参与 PARTIAL 派生；CONSULT / PLAN 也不
+  进入 Finding 台账或 G1–G3。SOL 调用失败只登记真实原因，不产生阻塞或派生工作项。
 - **PARTIAL 不是终点**：PARTIAL 表示还有工作可做，运行时必须派生下一步，而不是停止或
   等待外部判断。
 - **无人工上限**：没有轮次上限、Token 预算、费用阈值或评审次数限制。唯一的循环保护是

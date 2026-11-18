@@ -21,9 +21,10 @@ Copilot 的 SOL 通道只承担**认知辅助**，不承担决策或执行：
 * **按需调用**：由主代理判断是否有增量价值；没有 DECIDE 模式，没有强制调用，
   没有固定轮次。
 
-本模块不读写任务状态：状态登记、单轮判定与 finding 合并由
+本模块不写任务状态：状态登记、单轮判定与 finding 合并由
 `copilot_dispatch.py sol-review` / `sol-advisory` 编排；这里只构建请求、
-发一次请求、解析与审计。
+发一次请求、解析与审计。单轮判定需要读取统一 SOL 记录时，通过
+`governance.iter_sol_calls` 只读复用，合并逻辑只有一份。
 """
 from __future__ import annotations
 
@@ -1162,17 +1163,94 @@ def _audit_safe(path: str, record: dict) -> str | None:
 
 
 # ── 材料、单轮判定与准入 ───────────────────────────────────────────────────
-def build_materials(state: dict, materials: str) -> str:
-    """把任务合同/完成条件与主代理提供的材料拼成一次完整审查上下文。"""
+# 提示词/策略版本：进入单轮判定键。提示词、共享上下文或判定规则实质变化时，
+# 旧结论不再被当成同一审查对象复用（缓存失效条件见 review_subject_sha256）。
+PROMPT_VERSION = "sol-prompt-v2"
+
+_EVIDENCE_LIMIT = 80
+_EVIDENCE_MAX_CHARS = 6000
+_ACTION_LIMIT = 40
+
+
+def _criteria_lines(state: dict) -> list[str]:
     criteria = ((state.get("contract") or {}).get("criteria") or [])
-    lines = [
-        "# Copilot SOL REVIEW 材料",
-        "",
+    lines = []
+    for item in criteria:
+        if not isinstance(item, dict):
+            continue
+        lines.append(f"- {item.get('criterion_id') or ''} "
+                     f"[{item.get('status') or 'pending'}] "
+                     f"{item.get('description') or ''}")
+    return lines or ["(未登记完成条件)"]
+
+
+def _evidence_lines(state: dict, *, limit: int = _EVIDENCE_LIMIT,
+                    max_chars: int = _EVIDENCE_MAX_CHARS) -> list[str]:
+    """把任务证据登记压缩成可审查清单（自动注入，主代理不必重复粘贴）。
+
+    只列事实：ID、类型、摘要前缀、大小、被哪些完成条件引用、是否已归档。它让
+    SOL 与 G2 使用同一份证据来源；完整证据内容仍由主代理放在材料里。
+    """
+    evidence = [item for item in state.get("evidence") or []
+                if isinstance(item, dict)]
+    if not evidence:
+        return ["(尚未登记证据)"]
+    supports: dict[str, list[str]] = {}
+    for criterion in ((state.get("contract") or {}).get("criteria") or []):
+        if not isinstance(criterion, dict):
+            continue
+        cid = str(criterion.get("criterion_id") or "")
+        for ref in criterion.get("evidence_refs") or []:
+            if isinstance(ref, dict):
+                supports.setdefault(str(ref.get("id") or ""), []).append(cid)
+    lines: list[str] = []
+    used = 0
+    for index, item in enumerate(evidence):
+        eid = str(item.get("id") or "")
+        parts = [f"- {eid} [{item.get('kind') or 'file'}]",
+                 f"sha={str(item.get('sha256') or '')[:12]}",
+                 f"{item.get('size') or 0}B"]
+        refs = sorted(set(filter(None, supports.get(eid) or [])))
+        if refs:
+            parts.append("支持 " + ",".join(refs))
+        hint = str(item.get("path_hint") or "")
+        if hint and hint != "<inline>":
+            parts.append(f"path={hint}")
+        if item.get("dropped"):
+            parts.append("dropped=yes（已归档，不参与收口）")
+        line = " ".join(parts)
+        if index >= limit or used + len(line) > max_chars:
+            lines.append(f"(其余 {len(evidence) - index} 条证据已省略："
+                         "完整清单见任务状态 evidence)")
+            break
+        lines.append(line)
+        used += len(line)
+    return lines
+
+
+def _action_lines(state: dict, *, limit: int = _ACTION_LIMIT) -> list[str]:
+    actions = [item for item in state.get("actions") or []
+               if isinstance(item, dict)]
+    if not actions:
+        return ["(尚未登记工作项)"]
+    lines = [f"- {item.get('id') or ''} [{item.get('status') or ''}] "
+             f"{str(item.get('title') or '')[:160]}" for item in actions[:limit]]
+    if len(actions) > limit:
+        lines.append(f"(其余 {len(actions) - limit} 个工作项已省略)")
+    return lines
+
+
+def _context_lines(state: dict) -> list[str]:
+    """REVIEW / CONSULT / PLAN 共用的任务上下文：一份合同、一套条件与证据。"""
+    contract = state.get("contract") or {}
+    boundaries = str(contract.get("boundaries") or "").strip()
+    return [
         f"- 任务：{state.get('task_id') or '(未命名)'}",
         f"- 风险：{state.get('risk') or 'medium'}",
         f"- 执行后端：{state.get('execution_backend') or 'legacy'}",
         f"- 合同指纹：{state.get('contract_sha256') or '(未登记)'}",
         f"- 模型：{MODEL}（reasoning.effort={REASONING_EFFORT}，零工具）",
+        f"- 提示词版本：{PROMPT_VERSION}",
         "",
         "## 任务目标",
         "",
@@ -1180,81 +1258,61 @@ def build_materials(state: dict, materials: str) -> str:
         "",
         "## 完成条件",
         "",
-    ]
-    if criteria:
-        for item in criteria:
-            cid = item.get("criterion_id") if isinstance(item, dict) else ""
-            status = item.get("status") if isinstance(item, dict) else ""
-            desc = item.get("description") if isinstance(item, dict) else ""
-            lines.append(f"- {cid} [{status}] {desc}")
-    else:
-        lines.append("(未登记完成条件)")
-    lines += [
+        *_criteria_lines(state),
         "",
         "## 合同正文",
         "",
-        str((state.get("contract") or {}).get("text") or "").strip() or "(未登记)",
+        # 合同正文存放在 `done_criteria_text`（与合同指纹同源）；旧实现误读了
+        # 不存在的 `text` 键，导致 SOL 从未看到合同全文。
+        str(contract.get("done_criteria_text") or "").strip() or "(未登记)",
         "",
-        "## 主代理提供的审查材料",
+        *(["## 合同边界", "", boundaries, ""] if boundaries else []),
+        "## 工作项（按任务状态自动注入）",
         "",
-        materials.strip(),
+        *_action_lines(state),
         "",
-        "## 复核要求",
+        "## 证据登记（按任务状态自动注入）",
         "",
-        "一次性审查以上材料：只报告有材料依据的问题，未知项写入 unverified；"
-        "按契约输出单个 JSON 对象。",
+        *_evidence_lines(state),
         "",
     ]
-    return "\n".join(lines)
 
 
-def build_advisory_prompt(state: dict, materials: str, *, mode: str,
-                          question: str) -> str:
-    """把任务上下文、主代理的问题与材料拼成一次完整的辅助分析上下文。"""
+def build_prompt(state: dict, materials: str, *, mode: str = "REVIEW",
+                 question: str = "") -> str:
+    """把共享任务上下文与主代理材料拼成一次完整上下文（三模式共用）。"""
     resolved = normalize_mode(mode)
-    if resolved not in ADVISORY_MODES:
-        raise SolUsageError("sol_mode_invalid",
-                            f"{resolved} 不是辅助分析模式。")
-    criteria = ((state.get("contract") or {}).get("criteria") or [])
-    lines = [
-        f"# Copilot SOL {resolved} 材料",
-        "",
-        f"- 任务：{state.get('task_id') or '(未命名)'}",
-        f"- 风险：{state.get('risk') or 'medium'}",
-        f"- 合同指纹：{state.get('contract_sha256') or '(未登记)'}",
-        f"- 模型：{MODEL}（reasoning.effort={REASONING_EFFORT}，零工具）",
-        "",
-        "## 任务目标",
-        "",
-        str(state.get("goal") or "").strip() or "(未登记)",
-        "",
-        "## 完成条件",
-        "",
-    ]
-    if criteria:
-        for item in criteria:
-            cid = item.get("criterion_id") if isinstance(item, dict) else ""
-            status = item.get("status") if isinstance(item, dict) else ""
-            desc = item.get("description") if isinstance(item, dict) else ""
-            lines.append(f"- {cid} [{status}] {desc}")
+    if resolved not in SOL_MODES:
+        raise SolUsageError("sol_mode_invalid", f"{resolved} 不是 SOL 模式。")
+    lines = [f"# Copilot SOL {resolved} 材料", "", *_context_lines(state)]
+    if resolved == "REVIEW":
+        lines += [
+            "## 主代理提供的审查材料",
+            "",
+            materials.strip(),
+            "",
+            "## 复核要求",
+            "",
+            "一次性审查以上材料：只报告有材料依据的问题，未知项写入 unverified；"
+            "按契约输出单个 JSON 对象。",
+            "",
+        ]
     else:
-        lines.append("(未登记完成条件)")
-    lines += [
-        "",
-        "## 主代理的问题",
-        "",
-        str(question or "").strip() or "(未提供，按材料给出总体建议)",
-        "",
-        "## 主代理提供的材料",
-        "",
-        materials.strip(),
-        "",
-        f"## {resolved} 要求",
-        "",
-        "一次性给出辅助分析：只基于材料，未知项写入 unverified；"
-        "按契约输出单个 JSON 对象。你的输出是建议，由 ZCode 主代理决定是否采纳。",
-        "",
-    ]
+        lines += [
+            "## 主代理的问题",
+            "",
+            str(question or "").strip() or "(未提供，按材料给出总体建议)",
+            "",
+            "## 主代理提供的材料",
+            "",
+            materials.strip(),
+            "",
+            f"## {resolved} 要求",
+            "",
+            "一次性给出辅助分析：只基于材料，未知项写入 unverified；"
+            "按契约输出单个 JSON 对象。你的输出是建议，由 ZCode 主代理决定是否采纳。",
+            "",
+        ]
     return "\n".join(lines)
 
 
@@ -1263,14 +1321,28 @@ def review_digest(materials_text: str) -> str:
     return hashlib.sha256(materials_text.encode("utf-8")).hexdigest()
 
 
+def evidence_digest(state: dict) -> str:
+    """任务证据集合摘要：只含证据身份与归档标记，不含条件/工作项状态。"""
+    rows = sorted([str(item.get("id") or ""), str(item.get("sha256") or ""),
+                   bool(item.get("dropped"))]
+                  for item in state.get("evidence") or []
+                  if isinstance(item, dict))
+    return hashlib.sha256(
+        json.dumps(rows, sort_keys=True).encode("utf-8")).hexdigest()
+
+
 def review_subject_sha256(state: dict, materials: str, *, mode: str = "",
                           question: str = "") -> str:
-    """单轮判定用的稳定主体摘要：材料 + 目标/合同/条件描述。
+    """单轮判定用的稳定主体摘要（同一份上下文只允许一次调用）。
 
-    条件从 pending 变 met 属于流程状态变化，不是新的审查对象；同一材料重复调用
-    应复用已完成的结论，避免上下文恢复后重复付费。目标、合同正文、条件描述或
-    材料本身变化时摘要变化，才需要显式的再次调用原因。辅助分析额外绑定模式与
-    问题，避免 CONSULT / PLAN / REVIEW 之间误复用。
+    缓存键成分：提示词版本、模型与推理强度、目标、合同正文（`done_criteria_text`
+    与边界）、完成条件描述、**证据集合摘要**与主代理材料；辅助分析额外绑定模式
+    与问题。以下变化即失效：
+    - 合同/目标/条件描述或材料实质变化；
+    - 证据集合变化（新增、摘要变化、归档）；
+    - 提示词版本、模型或推理强度变化（升级后旧结论不再复用）。
+    条件从 pending 变 met 属于流程状态变化，不是新的审查对象：同一材料在证据
+    未变时仍复用已完成的结论，避免上下文恢复后重复付费。
     """
     contract = state.get("contract") or {}
     criteria = []
@@ -1280,9 +1352,14 @@ def review_subject_sha256(state: dict, materials: str, *, mode: str = "",
         criteria.append([str(item.get("criterion_id") or ""),
                          str(item.get("description") or "")])
     blob = {
+        "prompt_version": PROMPT_VERSION,
+        "model": MODEL,
+        "reasoning_effort": REASONING_EFFORT,
         "goal": str(state.get("goal") or ""),
-        "contract": str(contract.get("text") or ""),
+        "contract": str(contract.get("done_criteria_text") or ""),
+        "boundaries": str(contract.get("boundaries") or ""),
         "criteria": criteria,
+        "evidence_digest": evidence_digest(state),
         "materials": materials,
     }
     if mode:
@@ -1294,24 +1371,42 @@ def review_subject_sha256(state: dict, materials: str, *, mode: str = "",
     ).hexdigest()
 
 
-def completed_reviews(state: dict, records_key: str = "sol_reviews") -> list[dict]:
-    return [item for item in state.get(records_key) or []
-            if isinstance(item, dict) and item.get("status") == "completed"]
+def record_mode(record: dict) -> str:
+    """记录模式；历史记录可能没有 mode 字段，按当时存放位置判定。"""
+    mode = str(record.get("mode") or "").upper()
+    if mode in SOL_MODES:
+        return mode
+    return "CONSULT" if record.get("advisory_id") else "REVIEW"
+
+
+def completed_reviews(state: dict, records_key: str = "sol_calls") -> list[dict]:
+    """已完成记录：默认读取统一 `sol_calls` 流（含历史只读兼容）。
+
+    显式传入 `sol_reviews` / `sol_advisories` 时只读该历史键，供兼容调用方使用。
+    """
+    if records_key == "sol_calls":
+        import governance as G  # 延迟导入：状态合并逻辑只有一份
+        rows = G.iter_sol_calls(state)
+    else:
+        rows = [item for item in state.get(records_key) or []
+                if isinstance(item, dict)]
+    return [item for item in rows if item.get("status") == "completed"]
 
 
 def single_round_decision(state: dict, materials_sha256: str, *,
                           force: bool = False, reason: str = "",
                           trigger: str = "",
-                          records_key: str = "sol_reviews",
+                          records_key: str = "sol_calls",
                           mode: str = "REVIEW") -> dict:
     """单轮判定：同一材料直接复用；任何再次调用都必须有实质原因。
 
-    辅助分析（CONSULT / PLAN）与复核（REVIEW）各自独立判定，记录分别存放在
-    `sol_advisories` 与 `sol_reviews`，不会互相复用或互相覆盖。
+    辅助分析（CONSULT / PLAN）与复核（REVIEW）各自独立判定，不会互相复用或
+    互相覆盖；记录统一存放在 `sol_calls`，历史 `sol_reviews` /
+    `sol_advisories` 仍可只读复用。
     """
     resolved_mode = normalize_mode(mode)
     records = [item for item in completed_reviews(state, records_key)
-               if str(item.get("mode") or "REVIEW").upper() == resolved_mode]
+               if record_mode(item) == resolved_mode]
     same = [item for item in records
             if str(item.get("materials_sha256") or "") == materials_sha256]
     if same:
@@ -1334,6 +1429,7 @@ def single_round_decision(state: dict, materials_sha256: str, *,
                 "note": "再次调用必须用 --reason 说明具体原因。"}
     return {"action": "call", "trigger": trigger_value, "reason": reason_value,
             "note": f"允许再次调用：{RETRY_TRIGGERS[trigger_value]}。"}
+
 
 
 def admission(*, risk: str, triggers: list[str] | None = None,
