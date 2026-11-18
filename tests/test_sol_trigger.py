@@ -5,7 +5,7 @@
 
 1. 复杂度判断只用状态事实（风险、触发因素、计划结构、证据目录、重规划/重开）。
 2. 简单/局部任务保持 0 调用；进入 PASS 也不因阶段自动调用。
-3. 中高复杂任务在形成初步理解后主动获得一次 CONSULT / PLAN 建议。
+3. 中高复杂任务在形成初步理解后主动获得一次 THINK 建议。
 4. 已有有效结论且无新信号时复用；只有新信号才允许第二次调用。
 5. SOL 仍是 advisory：不改变阶段、不改变 G1–G3、失败不阻断；G4 不存在。
 """
@@ -208,25 +208,26 @@ class SimpleTaskZeroCallTests(TriggerBase):
 
 
 class ProactiveTriggerTests(TriggerBase):
-    def test_complex_task_gets_one_consult_after_plan(self):
+    def test_complex_task_gets_one_think_after_plan(self):
         self.start(risk="high")
         self.plan(5, deps=True)
         self.evidence(modules=2, count=2)
         advice = self.advice()
-        self.assertEqual(advice["action"], "consult")
-        self.assertEqual(advice["mode"], "CONSULT")
+        self.assertEqual(advice["action"], "think")
+        self.assertEqual(advice["mode"], "THINK")
         self.assertEqual(advice["phase"], "development")
         self.assertEqual(advice["recommended_action"], "recommended")
-        self.assertIn("sol-advisory --mode CONSULT", advice["command"])
+        self.assertIn("sol-think", advice["command"])
         self.assertFalse(advice["second_round"])
 
-    def test_high_risk_without_plan_suggests_plan_mode(self):
+    def test_high_risk_with_evidence_uses_same_cognitive_entry(self):
+        """没有计划但有证据：仍走唯一认知入口，不再分 CONSULT / PLAN。"""
         self.start(risk="high")
         self.evidence()
         advice = self.advice()
-        self.assertEqual(advice["mode"], "PLAN")
-        self.assertEqual(advice["action"], "plan")
-        self.assertIn("sol-advisory --mode PLAN", advice["command"])
+        self.assertEqual(advice["mode"], "THINK")
+        self.assertEqual(advice["action"], "think")
+        self.assertIn("sol-think", advice["command"])
 
     def test_drive_prints_the_proactive_advice(self):
         self.start(risk="high")
@@ -239,7 +240,7 @@ class ProactiveTriggerTests(TriggerBase):
             code = CA.drive(args)
         self.assertEqual(code, CA.EXIT_EXECUTE)
         rendered = out.getvalue()
-        self.assertIn("SOL CONSULT 建议", rendered)
+        self.assertIn("SOL THINK 建议", rendered)
         self.assertIn("advisory", rendered)
 
     def test_cli_admission_exposes_complexity_and_mode(self):
@@ -250,19 +251,19 @@ class ProactiveTriggerTests(TriggerBase):
                          "--state", self.state_path, "--json")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         payload = json.loads(proc.stdout)
-        self.assertEqual(payload["advice"]["action"], "consult")
-        self.assertEqual(payload["recommended_mode"], "CONSULT")
+        self.assertEqual(payload["advice"]["action"], "think")
+        self.assertEqual(payload["recommended_mode"], "THINK")
         self.assertEqual(payload["advice"]["complexity"]["level"], "high")
         self.assertEqual(payload["recommended_action"], "recommended")
 
 
 class DuplicateSuppressionTests(TriggerBase):
-    def test_existing_consult_is_reused_without_new_signals(self):
+    def test_existing_think_is_reused_without_new_signals(self):
         self.start(risk="high")
         self.plan(5, deps=True)
         self.evidence(modules=2, count=2)
         profile = self.advice()["complexity"]
-        self.record("CONSULT", signals=profile["signal_codes"])
+        self.record("THINK", signals=profile["signal_codes"])
         advice = self.advice()
         self.assertEqual(advice["action"], "reuse")
         self.assertEqual(advice["recommended_action"], "not_needed")
@@ -278,24 +279,27 @@ class DuplicateSuppressionTests(TriggerBase):
         self.assertEqual(advice["action"], "reuse")
         self.assertTrue(advice["second_round"])
 
-    def test_covered_review_is_not_repeated(self):
+    def test_covered_review_does_not_replace_cognition(self):
+        """REVIEW 不能替代整任务认知：收口前仍只给可选 THINK，不自动 REVIEW。"""
         self.start(risk="high")
         self.plan(2)
         self.close_all()
         profile = self.advice(gates_passed=True)["complexity"]
         self.record("REVIEW", signals=profile["signal_codes"])
         advice = self.advice(gates_passed=True)
-        self.assertEqual(advice["action"], "reuse")
-        self.assertEqual(advice["recommended_action"], "not_needed")
+        self.assertEqual(advice["action"], "think")
+        self.assertEqual(advice["mode"], "THINK")
+        self.assertEqual(advice["recommended_action"], "optional")
+        self.assertFalse(advice["covered"]["THINK"])
 
-    def test_declared_trigger_is_not_a_new_signal_after_consult(self):
+    def test_declared_trigger_is_not_a_new_signal_after_think(self):
         """调用方在准入时声明的触发因素不是新事实，不能诱发第二次调用。"""
         self.start(risk="high")
         self.plan(3, deps=True)
         self.evidence(modules=2, count=2)
         profile = self.advice(triggers=["architecture"])["complexity"]
         self.assertIn("declared-trigger", profile["signal_codes"])
-        self.record("CONSULT", signals=["risk-high"])
+        self.record("THINK", signals=["risk-high"])
         advice = self.advice(triggers=["architecture"])
         self.assertEqual(advice["action"], "reuse")
         self.assertEqual(advice["new_signals"], [])
@@ -305,7 +309,7 @@ class DuplicateSuppressionTests(TriggerBase):
         self.start(risk="high")
         self.plan(3, deps=True)
         self.evidence(modules=1, count=1)
-        self.record("CONSULT", signals=["risk-high"])
+        self.record("THINK", signals=["risk-high"])
         self.evidence(modules=2, count=3)
         advice = self.advice()
         self.assertEqual(advice["action"], "reuse")
@@ -318,7 +322,7 @@ class MaterialChangeTests(TriggerBase):
         self.plan(3, deps=True)
         self.evidence(modules=2, count=2)
         profile = self.advice()["complexity"]
-        self.record("CONSULT", signals=profile["signal_codes"])
+        self.record("THINK", signals=profile["signal_codes"])
         # 方案失败后重规划：出现新的认知信号，允许追加一次判断。
         state = G.load_state(self.state_path)
         state.setdefault("actions", []).append({
@@ -328,7 +332,7 @@ class MaterialChangeTests(TriggerBase):
             "result": "", "evidence_ids": []})
         G.save_state(self.state_path, state)
         advice = self.advice()
-        self.assertEqual(advice["action"], "consult")
+        self.assertEqual(advice["action"], "think")
         self.assertIn("replan-history", advice["new_signals"])
         self.assertTrue(advice["second_round"])
         self.assertIn("--force --trigger new-risk", advice["command"])
@@ -337,13 +341,13 @@ class MaterialChangeTests(TriggerBase):
         self.start(risk="high")
         self.plan(3, deps=True)
         self.evidence(modules=2, count=2)
-        self.record("CONSULT", signals=["risk-high"])
+        self.record("THINK", signals=["risk-high"])
         G.amend_contract(self.state_path,
                          contract=CONTRACT + "- 新增边界：仅本地\n")
         advice = self.advice()
-        self.assertEqual(advice["action"], "consult")
+        self.assertEqual(advice["action"], "think")
         self.assertFalse(advice["second_round"])
-        self.assertIn("sol-advisory --mode CONSULT", advice["command"])
+        self.assertIn("sol-think", advice["command"])
 
 
 class GatesNoAutoCallTests(TriggerBase):
@@ -358,17 +362,17 @@ class GatesNoAutoCallTests(TriggerBase):
         self.assertEqual(advice["action"], "none")
         self.assertEqual(advice["recommended_action"], "not_needed")
 
-    def test_high_risk_closure_review_is_optional(self):
+    def test_high_risk_closure_never_derives_review(self):
+        """正式 REVIEW 只由用户明确要求触发，不由阶段或风险自动派生。"""
         self.start(risk="high")
         self.plan(2)
         self.evidence()
-        self.record("CONSULT", signals=["risk-high"])
+        self.record("THINK", signals=["risk-high"])
         self.close_all()
         advice = self.advice(gates_passed=True)
-        self.assertEqual(advice["action"], "review")
-        self.assertEqual(advice["mode"], "REVIEW")
-        self.assertEqual(advice["recommended_action"], "optional")
-        self.assertEqual(advice["phase"], "closure")
+        self.assertNotEqual(advice["action"], "review")
+        self.assertNotEqual(advice["mode"], "REVIEW")
+        self.assertTrue(advice["covered"]["THINK"])
 
     def test_closure_never_derives_sol_work_items(self):
         self.start(risk="high")
@@ -414,11 +418,11 @@ class AdvisorySemanticsTests(TriggerBase):
         self.start(risk="high")
         self.plan(5, deps=True)
         self.evidence(modules=2, count=2)
-        G.record_sol_call_failure(self.state_path, mode="CONSULT",
+        G.record_sol_call_failure(self.state_path, mode="THINK",
                                   error_code="sol_timeout", detail="300s",
                                   materials_sha256="x" * 64)
         advice = self.advice()
-        self.assertEqual(advice["action"], "consult")
+        self.assertEqual(advice["action"], "think")
         state = G.load_state(self.state_path)
         self.assertEqual(state.get("blocks") or [], [])
         self.assertIn(G.evaluate(state)["phase"], ("RUNNING", "PARTIAL"))
@@ -452,18 +456,19 @@ class ExplicitRequestTests(TriggerBase):
         self.evidence()
         advice = self.advice(user_request=True)
         self.assertEqual(advice["recommended_action"], "recommended")
-        self.assertIn(advice["action"], ("consult", "plan"))
+        self.assertEqual(advice["action"], "think")
         self.assertIn("user-request", advice["complexity"]["signal_codes"])
 
-    def test_user_request_is_not_suppressed_by_existing_consult(self):
+    def test_user_request_is_not_suppressed_by_existing_think(self):
         self.start(risk="low")
         self.plan(1)
         self.evidence()
-        self.record("CONSULT", signals=[])
+        self.record("THINK", signals=[])
         advice = self.advice(user_request=True)
-        self.assertIn(advice["action"], ("consult", "plan"))
+        self.assertEqual(advice["action"], "think")
         self.assertEqual(advice["recommended_action"], "recommended")
         self.assertIn("用户明确要求", advice["reason"])
+        self.assertIn("--force", advice["command"])
 
     def test_cli_user_request_flag(self):
         self.start(risk="low")
@@ -483,14 +488,15 @@ class ExplicitRequestTests(TriggerBase):
         with open(materials, "w", encoding="utf-8") as fh:
             fh.write("材料\n")
         args = argparse.Namespace(
-            state=self.state_path, materials=materials, mode="CONSULT",
+            state=self.state_path, materials=materials,
             question="方案怎么选？", reason="", trigger="", force=False,
             dry_run=True, list=False, json=True, timeout=5,
-            max_output_tokens=100, audit_log="", output_dir="")
+            max_output_tokens=100, audit_log="", output_dir="",
+            knowledge_file="")
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            self.assertEqual(CD.cmd_sol_advisory(args), 0)
-        self.assertEqual(json.loads(out.getvalue())["mode"], "CONSULT")
+            self.assertEqual(CD.cmd_sol_think(args), 0)
+        self.assertEqual(json.loads(out.getvalue())["mode"], "THINK")
 
 
 class NoG4Tests(TriggerBase):

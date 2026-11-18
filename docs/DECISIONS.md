@@ -1562,3 +1562,29 @@
       收口快照按本决策重新判定为不符合原定架构。
     - **后续条件**：宿主提供内置精确只读 Agent（或派发期工具白名单）后，重新运行
       `capability` 与真实 G4 E2E；在此之前 G4 保持 fail-closed / BLOCKED。
+
+57. **SOL 收敛为默认认知引擎 THINK；REVIEW 仅在用户明确要求时执行（2026-11-18，v8.4.0，用户方案 A）。**
+    依据：用户《Copilot SOL 默认认知引擎升级｜方案 A 落地》；本仓库 v8.3.0 现场。
+    - **职责**：SOL 负责高价值认知（目标本质、根因、策略、取舍、风险、优先级、验证信号、
+      再咨询条件）；ZCode 主代理是唯一工程执行与技术决策主体；Copilot 只做轻量治理与
+      持续推进。SOL 不承担仓库扫描、工具操作、代码修改、测试、日志整理或台账维护。
+    - **模式收敛**：`SOL_MODES=("THINK","REVIEW")`；CONSULT / PLAN 并入 THINK，
+      `normalize_mode` 只做历史别名归一。`sol-advisory` 命令移除，新入口 `sol-think`。
+      历史 `sol_reviews` / `sol_advisories` 只读兼容，认知记录按 THINK 计入覆盖。
+    - **触发**：沿用确定性复杂度（0/1/≥2 信号 → low/medium/high）与合同覆盖判断；
+      简单任务 0 调用；中高复杂任务形成初步理解后一次；只有升级型信号（`risk-high` /
+      `replan-history` / `reopened`）或合同修订才追加。`sol_advice.action` 收敛为
+      `none` / `reuse` / `think` / `review`。
+    - **REVIEW 去自动派生**：高风险与收口阶段不再自动建议 REVIEW；唯一自动建议入口是
+      `review-admission --review-request`（用户明确要求），正式 REVIEW 授权规则不变。
+    - **输入预算**：THINK 材料上限 120,000 字符（提示 60,000）；REVIEW 保持 400,000。
+      THINK 提示词要求目标/基线/已确认事实/已尝试方案/证据摘要/本次问题，不接收完整仓库
+      或冗长日志。
+    - **输出结构**：`copilot-sol-think/v1`：`judgment` / `essence` / `strategy`（字符串），
+      `tradeoffs` / `risks` / `priority` / `verify` / `reconsult` / `unverified`（字符串
+      数组）；类型不符或判断为空时拒绝消费。
+    - **降级**：THINK 失败只登记 `sol_calls(status=failed)` 并输出
+      `copilot-sol-think-degraded/v1`（退出码 0），主代理继续；REVIEW 失败仍返回真实非零
+      退出码，不伪造结论。零工具、单轮、`gpt-6.2-sol` + `high`、CPA `127` 出口不变。
+    - **未放宽**：G1–G3、fail-closed、授权边界、Provider / 模型 / 凭据配置均不变；
+      G4 不恢复；不新增自定义子 Agent；不强制 Reviewer；SOL 仍不构成收口门禁。

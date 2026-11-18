@@ -28,7 +28,7 @@ LEDGER_SCHEMA = "copilot-finding-ledger/v1"
 ADMISSION_SCHEMA = "copilot-review-admission/v1"
 STOP_SCHEMA = "copilot-review-stop/v1"
 COMPLEXITY_SCHEMA = "copilot-task-complexity/v1"
-SOL_ADVICE_SCHEMA = "copilot-sol-advice/v1"
+SOL_ADVICE_SCHEMA = "copilot-sol-advice/v2"
 
 # 任务认知复杂度只使用状态里已有的确定性事实：不引入第二个模型，也不引入
 # 评分模型。每个信号都对应一条可复核的现场证据；0 个信号即低复杂度。
@@ -41,7 +41,7 @@ COMPLEXITY_SIGNALS = {
     "interdependent": "多个工作项相互依赖",
     "replan-history": "曾出现方案失败并重新规划",
     "reopened": "任务曾重开",
-    "user-request": "用户明确要求 CONSULT / PLAN / REVIEW",
+    "user-request": "用户明确要求 SOL 判断或独立复核",
 }
 
 # 只有“升级型”信号才算认知对象发生实质变化、允许第二次调用。结构型信号
@@ -904,7 +904,7 @@ def task_complexity(state: dict, *, triggers: list[str] | None = None,
 
     低复杂度（0 个信号）＝简单/局部改动：SOL 默认 0 调用。
     1 个信号＝中等复杂度：值得一次主动认知辅助。
-    2 个及以上＝高复杂度：优先在规划/方案阶段用一次 CONSULT 或 PLAN 收敛判断。
+    2 个及以上＝高复杂度：优先在策略/方案阶段用一次 THINK 收敛判断。
     """
     codes: list[str] = []
     details: dict[str, str] = {}
@@ -965,11 +965,13 @@ def task_complexity(state: dict, *, triggers: list[str] | None = None,
 
 
 def _record_mode(record: dict) -> str:
-    """SOL 记录模式；历史记录没有 `mode` 时按当时存放位置判定。"""
+    """记录的认知模式：CONSULT / PLAN 是历史名称，统一归入 THINK。"""
     mode = _text(record.get("mode")).upper()
-    if mode in ("REVIEW", "CONSULT", "PLAN"):
-        return mode
-    return "CONSULT" if record.get("advisory_id") else "REVIEW"
+    if mode == "REVIEW":
+        return "REVIEW"
+    if mode in ("THINK", "CONSULT", "PLAN"):
+        return "THINK"
+    return "THINK" if record.get("advisory_id") else "REVIEW"
 
 
 def _covers_contract(record: dict, contract_sha256: str) -> bool:
@@ -991,8 +993,9 @@ def _advice_command(mode: str, *, second_round: bool, trigger: str) -> str:
         command = ("copilot_dispatch.py sol-review --state <state> "
                    "--materials <materials.md>")
     else:
-        command = (f"copilot_dispatch.py sol-advisory --mode {mode} --state <state> "
-                   "--materials <materials.md> --question <本次要解决的具体问题>")
+        command = ("copilot_dispatch.py sol-think --state <state> "
+                   "--materials <materials.md> "
+                   "--question <本次真正需要 SOL 判断的事项>")
     if second_round:
         command += f" --force --trigger {trigger} --reason <为什么需要再判断>"
     return command
@@ -1000,15 +1003,17 @@ def _advice_command(mode: str, *, second_round: bool, trigger: str) -> str:
 
 def sol_advice(state: dict, *, calls: list[dict] | None = None,
                triggers: list[str] | None = None, gates_passed: bool = False,
-               user_request: bool = False, workspace: str = "") -> dict:
+               user_request: bool = False, review_requested: bool = False,
+               workspace: str = "") -> dict:
     """SOL 主动介入建议（只读建议，不是门禁，也不派生工作项）。
 
-    策略：
+    SOL 是默认认知引擎，但不是按阶段运行的流程：
+
     * 简单/局部任务（0 信号）→ 0 调用，即使进入 PASS/CLOSED 也不因阶段调用；
-    * 中高复杂任务在“已形成初步理解”（有计划或证据）后建议一次 CONSULT/PLAN；
-    * 同一合同已有有效结论且没有新的复杂度信号 → 复用，不重复付费；
-    * 只有出现新信号（方案推翻、风险升级、范围扩大、重开）才允许第二次调用；
-    * 收口阶段只在高风险或出现新信号时建议一次 REVIEW，普通任务不因阶段调用。
+    * 中高复杂任务在“已形成初步理解”（有计划或证据）后建议一次 THINK；
+    * 同一合同已有有效认知结论且没有升级型新信号 → 复用，不重复付费；
+    * 只有出现升级型信号（风险升级、方案失败重规划、任务重开）才允许追加；
+    * REVIEW 只在用户明确要求时建议一次，不由阶段或风险自动派生。
     """
     profile = task_complexity(state, triggers=triggers, workspace=workspace)
     if user_request:
@@ -1026,7 +1031,7 @@ def sol_advice(state: dict, *, calls: list[dict] | None = None,
     contract_sha = _text(state.get("contract_sha256"))
     same = [item for item in completed if _covers_contract(item, contract_sha)]
     covered = {mode: any(_record_mode(item) == mode for item in same)
-               for mode in ("CONSULT", "PLAN", "REVIEW")}
+               for mode in ("THINK", "REVIEW")}
     last = None
     if same:
         last = max(same, key=lambda item: _text(item.get("created_at")))
@@ -1037,6 +1042,7 @@ def sol_advice(state: dict, *, calls: list[dict] | None = None,
         new_codes = [code for code in profile["signal_codes"]
                      if code in SOL_ESCALATION_SIGNALS and code not in recorded]
     risk = _text(state.get("risk")).lower()
+    level = profile["level"]
     base = {
         "schema": SOL_ADVICE_SCHEMA,
         "complexity": profile,
@@ -1060,7 +1066,7 @@ def sol_advice(state: dict, *, calls: list[dict] | None = None,
         base["reason"] = ("任务处于 BLOCKED：先解除授权/决策/资源缺口；SOL 不提供本地事实，"
                           "也不能替代用户决定。")
         return base
-    if profile["level"] == "low":
+    if level == "low" and not user_request and not review_requested:
         base["reason"] = ("简单/局部任务（无中高复杂信号）：主代理自检、diff 与必要"
                           "测试闭环，SOL 保持 0 调用。")
         return base
@@ -1068,63 +1074,74 @@ def sol_advice(state: dict, *, calls: list[dict] | None = None,
         base["reason"] = ("尚未形成可判断的现场理解（没有计划或证据）；先调查并登记"
                           "计划/证据，再决定是否调用 SOL。")
         return base
-    if (covered["CONSULT"] or covered["PLAN"]) and not new_codes \
-            and not user_request:
-        if gates_passed and risk == "high" and not covered["REVIEW"]:
+    if review_requested:
+        if covered["REVIEW"] and not new_codes:
             base.update({
-                "action": "review", "recommended_action": "optional",
-                "mode": "REVIEW", "phase": "closure",
-                "reason": ("已有 SOL 咨询结论，G1–G3 已通过；高风险任务可按需执行"
-                           "一次独立复核（advisory，不是收口门禁）。"),
-                "command": _advice_command("REVIEW", second_round=False,
-                                           trigger=""),
+                "action": "reuse", "mode": "REVIEW",
+                "reason": "用户要求的独立复核已覆盖当前合同：直接复用，不重复调用。",
+            })
+            return base
+        # 只有已有 REVIEW 才是第二轮；已有 THINK 不要求 REVIEW 带 --force。
+        base.update({
+            "action": "review", "recommended_action": "recommended",
+            "mode": "REVIEW", "phase": "review",
+            "reason": ("用户明确要求独立复核：执行一次 SOL REVIEW（advisory）；"
+                       "结论仍是建议，不构成收口门禁。"),
+            "command": _advice_command("REVIEW", second_round=covered["REVIEW"],
+                                       trigger="new-risk" if new_codes
+                                       else "user-request"),
+        })
+        return base
+    if covered["THINK"]:
+        if new_codes and not user_request:
+            base.update({
+                "action": "think", "recommended_action": "recommended",
+                "mode": "THINK", "phase": "development",
+                "reason": ("出现新的认知信号（" + "、".join(new_codes)
+                           + "）：允许追加一次 SOL 判断；其余情况复用已有结论。"),
+                "command": _advice_command("THINK", second_round=True,
+                                           trigger=base["trigger"]),
+            })
+            return base
+        if user_request:
+            base.update({
+                "action": "think", "recommended_action": "recommended",
+                "mode": "THINK", "phase": "development",
+                "reason": ("用户明确要求 SOL 判断：直接调用一次（advisory）；"
+                           "即使已有结论也按用户要求执行。"),
+                "command": _advice_command("THINK", second_round=True,
+                                           trigger="user-request"),
             })
             return base
         base.update({
-            "action": "reuse", "mode": "CONSULT" if covered["CONSULT"] else "PLAN",
-            "reason": ("同一合同已有有效 SOL 结论且没有新的复杂度信号：直接复用，"
+            "action": "reuse", "mode": "THINK",
+            "reason": ("同一合同已有有效 SOL 认知结论且没有新的升级型信号：直接复用，"
                        "不重复调用。"),
         })
         return base
-    if covered["REVIEW"] and not new_codes and not user_request:
-        base.update({
-            "action": "reuse", "mode": "REVIEW",
-            "reason": ("已有覆盖当前合同的 SOL 复核结论且没有新信号：直接复用，"
-                       "不重复复核。"),
-        })
-        return base
     if gates_passed:
-        if risk == "high" or new_codes:
+        if risk == "high" or level == "high":
             base.update({
-                "action": "review", "recommended_action": "recommended",
-                "mode": "REVIEW", "phase": "closure",
-                "reason": ("G1–G3 已通过，任务风险或新增信号值得一次独立复核；"
-                           "复核结论只是建议，不改变 PASS 判定。"),
-                "command": _advice_command("REVIEW", second_round=bool(last),
-                                           trigger=base["trigger"]),
+                "action": "think", "recommended_action": "optional",
+                "mode": "THINK", "phase": "closure",
+                "reason": ("G1–G3 已通过；高风险或高复杂任务可在收口前做一次整体"
+                           "判断（advisory，可选，不改变 PASS 判定）。"),
+                "command": _advice_command("THINK", second_round=False, trigger=""),
             })
             return base
         base["reason"] = ("G1–G3 已通过且没有新的认知不确定性：不因阶段自动调用 "
                           "SOL。")
         return base
-    mode = "CONSULT" if profile["counts"]["plan_actions"] else "PLAN"
     base.update({
-        "action": mode.lower(),
+        "action": "think",
         "recommended_action": "recommended",
-        "mode": mode,
+        "mode": "THINK",
         "phase": "development",
-        "reason": (
-            "中高复杂任务已形成初步理解：建议调用一次 SOL "
-            + ("PLAN（先补齐规划/依赖/替代路线）" if mode == "PLAN" else
-               "CONSULT（比较方案、识别遗漏与风险）")
-            + "；是否采纳由主代理判断。"),
-        "command": _advice_command(mode, second_round=bool(last),
-                                   trigger=base["trigger"]),
+        "reason": ("中高复杂任务已形成初步理解：建议调用一次 SOL 做整体判断"
+                   "（问题本质、策略、取舍、风险与验证信号）；是否采纳由主代理判断。"),
+        "command": _advice_command("THINK", second_round=False, trigger=""),
     })
     if user_request:
         base["reason"] = ("用户明确要求 SOL 判断：直接调用一次（advisory）；"
-                          "即使已有结论也按用户要求执行。")
-    elif new_codes:
-        base["reason"] = ("出现新的认知信号（" + "、".join(new_codes)
-                          + "）：允许追加一次 SOL 判断；其余情况复用已有结论。")
+                          "不受复杂度判断限制。")
     return base

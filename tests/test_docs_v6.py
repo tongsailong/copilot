@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""v8.1 文档契约：Skill 入口、references、SOL 三模式与项目文档与代码一致。
+"""v8.4 文档契约：Skill 入口、references、SOL THINK/REVIEW 与项目文档与代码一致。
 
-这些断言保护“SOL 只提供建议、不是决策通道”，以及 v8.1 的关键运行契约
+这些断言保护“SOL 只提供认知输入、不是决策通道”，以及 v8.4 的关键运行契约
 （本地治理、PARTIAL 持续推进、正式 REVIEW opt-in、gpt-6.2-sol + high、零工具单轮、
-CONSULT/PLAN advisory 不入门禁、G4 退役）。
+THINK advisory 不入门禁、REVIEW 仅用户要求、G4 退役）。
 """
 from __future__ import annotations
 
@@ -80,15 +80,19 @@ class SkillEntryTests(unittest.TestCase):
         # 模型升级必须写进当前版本说明，并且不得残留旧模型为现行配置。
         self.assertIn("gpt-6.2-sol", self.doc)
         self.assertIn("reasoning.effort=\"high\"", self.doc)
-        self.assertIn("sol-advisory", self.doc)
+        # 当前命令面是 sol-think；sol-advisory 只允许作为历史版本说明出现。
+        self.assertIn("sol-think", self.doc)
+        self.assertIn("v8.4.0（SOL 默认认知引擎）", self.doc)
 
-    def test_consult_plan_are_advisory_not_gates(self):
+    def test_think_and_review_are_advisory_not_gates(self):
         self.assertIn("sol_advisories", self.doc)
-        self.assertIn("CONSULT", self.doc)
-        self.assertIn("PLAN", self.doc)
-        # 辅助分析不得成为门禁或自动工作项来源。
+        self.assertIn("THINK", self.doc)
+        self.assertIn("REVIEW", self.doc)
+        # 认知判断与复核都不得成为门禁或自动工作项来源。
         self.assertIn("不进入 Finding 台账", self.doc)
         self.assertIn("不影响 G1–G3", self.doc)
+        # REVIEW 只在用户明确要求时执行，不因风险或阶段自动派生。
+        self.assertIn("只在用户明确要求", self.doc)
 
     def test_lightweight_governance_and_partial_persistence(self):
         self.assertIn("不替代技术决策", self.doc)
@@ -136,7 +140,7 @@ class ReferenceTests(unittest.TestCase):
         self.assertIn("legacy-status", o["workflow.md"])
         self.assertIn("evidence_tampered", o["workflow.md"])
         self.assertIn("sol-review", o["workflow.md"])
-        self.assertIn("sol-advisory", o["workflow.md"])
+        self.assertIn("sol-think", o["workflow.md"])
         self.assertIn("sol_reviews", o["review.md"])
         self.assertIn("sol_advisories", o["review.md"])
         self.assertIn("gpt-6.2-sol", o["review.md"])
@@ -204,7 +208,7 @@ class ReadonlyProfileTests(unittest.TestCase):
 class ProjectDocTests(unittest.TestCase):
     def test_agents_md_points_to_v8_architecture(self):
         doc = text(os.path.join(ROOT, "AGENTS.md"))
-        self.assertIn("唯一远程调用是 SOL（REVIEW / CONSULT / PLAN）", doc)
+        self.assertIn("唯一远程调用是 SOL（THINK / REVIEW）", doc)
         self.assertIn("gpt-6.2-sol", doc)
         self.assertIn("PARTIAL 不是终点", doc)
         self.assertIn("legacy/tests", doc)
@@ -217,7 +221,7 @@ class ProjectDocTests(unittest.TestCase):
     def test_charter_and_roadmap_mark_sol_advisory_only(self):
         charter = text(os.path.join(ROOT, "docs", "PROJECT-CHARTER.md"))
         roadmap = text(os.path.join(ROOT, "docs", "ROADMAP.md"))
-        self.assertIn("v8.1.0 恢复建议性 CONSULT / PLAN", charter)
+        self.assertIn("v8.4.0 把 CONSULT / PLAN 并入默认认知引擎 THINK", charter)
         self.assertIn("唯一工程执行与技术决策主体", charter)
         self.assertIn("v7.0", roadmap)
         self.assertIn("v8.0", roadmap)

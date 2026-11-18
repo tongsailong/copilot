@@ -2,8 +2,9 @@
 
 本文是 Copilot 的**操作层**权威说明：命令、参数、退出码与标准回合流程。
 语义（阶段判定、派生规则、门禁细节）见 `runtime.md`、`review.md`、`agent-bridge.md`。
-除 `sol-review` 与 `sol-advisory` 外，所有命令都只读写本地任务状态文件，不发起网络或模型
-调用。两个 SOL 命令都是一次调用只发一次请求，不自动重试、不自动二审。
+除 `sol-think` 与 `sol-review` 外，所有命令都只读写本地任务状态文件，不发起网络或模型
+调用。两个 SOL 命令都是一次调用只发一次请求，不自动重试、不自动二审；THINK 失败只记录
+并降级，不阻断工程推进。
 
 ## 1. 状态文件
 
@@ -44,9 +45,9 @@ python3 -B scripts/copilot_dispatch.py <子命令> --state <state.json> [参数]
 | `decide` | 记录用户/任务决策 | `--text`、`--source`；**不能替代 PWW 接受** |
 | `block` / `unblock` | 记录/解除真实阻塞 | `block --reason ... --needs ...`；`unblock --reason ... [--block-id B...]`（多条未解除时必须指定） |
 | `closure-check` | 只读检查 G1–G3 | `--json` |
-| `review-admission` | SOL 主动介入建议的单一确定性入口（只读、不写状态、不是门禁）：先算任务复杂度与已有 SOL 覆盖，再结合 G1–G3 给出 `advice.action`（`none`/`reuse`/`consult`/`plan`/`review`）、建议模式与命令 | `--trigger security`（可重复）、`--reason`、`--user-request`、`--json`；返回 `decision`、`advice`、`complexity`、`recommended_action`/`recommended_mode`/`recommended_phase`、`sol_calls_total` |
-| `sol-review` | SOL 零工具单轮复核：材料 → 一次请求 → 结构化结果 → advisory findings；记录写入统一 `sol_calls` | `--materials <file>`、`--dry-run`、`--list`、`--json`、`--timeout`、`--max-output-tokens`、`--audit-log`（默认 `sol-audit.jsonl`）、`--output-dir`；再次复核：`--force --trigger <user-request\|scope-changed\|new-risk\|materials-omitted> --reason` |
-| `sol-advisory` | SOL 零工具单轮认知辅助（CONSULT / PLAN）：建议写入统一 `sol_calls`（历史 `sol_advisories` 只读兼容），不入门禁 | `--mode CONSULT\|PLAN`、`--materials <file>`、`--question`、`--dry-run`、`--list`、`--json`、`--timeout`、`--max-output-tokens`、`--audit-log`（默认 `sol-audit.jsonl`）、`--output-dir`；再次调用：`--force --trigger ... --reason` |
+| `review-admission` | SOL 主动介入建议的单一确定性入口（只读、不写状态、不是门禁）：先算任务复杂度与已有 SOL 覆盖，再结合 G1–G3 给出 `advice.action`（`none`/`reuse`/`think`/`review`）、建议模式与命令 | `--trigger security`（可重复）、`--reason`、`--user-request`、`--review-request`、`--json`；返回 `decision`、`advice`、`complexity`、`recommended_action`/`recommended_mode`/`recommended_phase`、`sol_calls_total` |
+| `sol-think` | SOL 默认认知引擎：材料 + 问题 → 一次请求 → 判断/策略/取舍/风险/优先级/验证信号；建议写入统一 `sol_calls`（`mode=THINK`），不入门禁；失败只登记并降级 | `--materials <file>`、`--question`、`--knowledge-file`、`--dry-run`、`--list`、`--json`、`--timeout`、`--max-output-tokens`、`--audit-log`（默认 `sol-audit.jsonl`）、`--output-dir`；再次调用：`--force --trigger <user-request\|scope-changed\|new-risk\|materials-omitted\|strategy-failed\|major-uncertainty> --reason` |
+| `sol-review` | SOL 零工具单轮独立复核（仅用户明确要求）：材料 → 一次请求 → advisory findings；记录写入统一 `sol_calls` | `--materials <file>`、`--knowledge-file`、`--dry-run`、`--list`、`--json`、`--timeout`、`--max-output-tokens`、`--audit-log`（默认 `sol-audit.jsonl`）、`--output-dir`；再次复核：`--force --trigger ... --reason` |
 | `agent-policy` | Agent 调度建议：主代理默认，Explore/general-purpose 按需（只读、不派发）。判定顺序：子代理不可用 → 主代理；写入冲突 → 主代理；`--research-only` → Explore（绝不交给全工具代理）；独立交付物需并发且有收益才建议 general-purpose；其余 → 主代理 | `--needs-independent-context`、`--parallel`、`--independent-deliverable`、`--write-conflict`、`--saves-time`、`--research-only`、`--subagent-unavailable`、`--json` |
 | `finding` | 查看 / 更新 Finding 台账（不触发复核） | `--list`；`--id F1 --status open\|fixed\|verified\|closed\|regressed\|dropped --evidence E1 --note`；`fixed`/`verified` 必须有证据 |
 | `review-metrics` | 统计统一 SOL 调用流（`sol.calls_total` / `sol.by_mode`）、准入门槛、停止标记与 Finding 计数 | `--state`；历史 G4 数据标记 `g4.retired` |

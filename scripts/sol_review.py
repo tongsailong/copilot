@@ -1,30 +1,32 @@
 #!/usr/bin/env python3
-"""SOL 一次性调用客户端：REVIEW / CONSULT / PLAN（零工具、单轮、建议性）。
+"""SOL 一次性调用客户端：THINK（默认认知引擎）/ REVIEW（用户要求的独立复核）。
 
-Copilot 的 SOL 通道只承担**认知辅助**，不承担决策或执行：
+Copilot 的 SOL 通道只承担**认知**，不承担决策或执行：
 
 * **零工具是能力级约束**，不靠提示词自律：出站请求体**永不包含** `tools` /
   `functions` / `parallel_tool_calls` 等工具定义，并显式 `tool_choice="none"`；
   上游响应只要出现 `message` / `reasoning` 之外的非良性 output 条目，即判安全
   事件、拒绝消费（退出码 5），绝不代执行。
 * **单轮**：一次调用只发一次 HTTP 请求。超时、429、网络错误、截断、身份不符、
-  格式异常都不自动重试、不换 Provider、不降级到其他链路；失败原因如实记录，
-  由主代理决定是否人工重新发起。
+  格式异常都不自动重试、不换 Provider、不降级到其他链路；失败原因如实记录。
+  THINK 失败按可降级处理（`copilot_dispatch.py sol-think` 记录后返回 0，主代理
+  继续），REVIEW 失败仍显式失败，因为它是用户明确要求的独立结论。
 * **模型与推理强度是硬门**：统一 `gpt-6.2-sol` + `reasoning.effort="high"`，
   上游 `model` 回显必须完全一致，`reasoning.effort` / `reasoning.mode` 回显
   也必须与请求一致（`standard`）；任何不一致都拒绝消费（退出码 9），
   不允许静默降级到 `medium`/`low` 或其他模型。
-* **三种只读模式**：REVIEW（独立复核，输出结构化 findings）、CONSULT（问题
-  分析、方案比较与风险识别）、PLAN（规划、依赖与替代路线建议）。三者都是
-  advisory：不修改文件、不执行命令、不读写台账、不调度子代理，也不构成收口
-  门禁；工程执行与技术决策始终由 ZCode 主代理负责。
+* **两种模式**：THINK 是默认认知引擎，输出判断、问题本质、策略、取舍、风险、
+  优先级、验证信号与再咨询条件；REVIEW 是用户明确要求时的一次独立复核，输出
+  结构化 findings。两者都是 advisory：不修改文件、不执行命令、不读写台账、
+  不调度子代理，也不构成收口门禁；工程执行与技术决策始终由 ZCode 主代理负责。
+  CONSULT / PLAN 已并入 THINK（v8.4），历史记录只读兼容，不再作为可选流程。
 * **按需调用**：由主代理判断是否有增量价值；没有 DECIDE 模式，没有强制调用，
-  没有固定轮次。
+  没有固定轮次，也不执行按阶段的重复流程。
 
 本模块不写任务状态：状态登记、单轮判定与 finding 合并由
-`copilot_dispatch.py sol-review` / `sol-advisory` 编排；这里只构建请求、
-发一次请求、解析与审计。单轮判定需要读取统一 SOL 记录时，通过
-`governance.iter_sol_calls` 只读复用，合并逻辑只有一份。
+`copilot_dispatch.py sol-think` / `sol-review` 编排；这里只构建请求、发一次请求、
+解析与审计。单轮判定需要读取统一 SOL 记录时，通过 `governance.iter_sol_calls`
+只读复用，合并逻辑只有一份。
 """
 from __future__ import annotations
 
@@ -42,7 +44,7 @@ import urllib.request
 from lib_common import redact as _redact_text
 
 REVIEW_SCHEMA = "copilot-sol-review/v1"
-ADVISORY_SCHEMA = "copilot-sol-advisory/v1"
+THINK_SCHEMA = "copilot-sol-think/v1"
 ADMISSION_SCHEMA = "copilot-sol-admission/v1"
 MODEL = "gpt-6.2-sol"
 BASE_URL = "http://127.0.0.1:8317/v1"
@@ -51,8 +53,11 @@ REASONING_EFFORT = "high"
 REASONING_MODE = "standard"
 # 所有 SOL 模式统一 high：不允许按角色降级，也不允许缺失时回退。
 PINNED_EFFORTS = ("high",)
-SOL_MODES = ("CONSULT", "PLAN", "REVIEW")
-ADVISORY_MODES = ("CONSULT", "PLAN")
+# THINK 是默认认知引擎；REVIEW 只保留给用户明确要求的独立复核。
+SOL_MODES = ("THINK", "REVIEW")
+# CONSULT / PLAN 已并入 THINK：只用于读取历史记录与旧调用方，不产生新流程。
+LEGACY_SOL_MODES = ("CONSULT", "PLAN")
+LEGACY_MODE_ALIASES = {"CONSULT": "THINK", "PLAN": "THINK"}
 API_KEY_ENV = "CUSTOM_127_API_KEY"
 ZCODE_PROVIDER_FILE = os.path.expanduser("~/.zcode/v2/provider_config.json")
 REASONIX_ENV_FILE = os.path.expanduser("~/.reasonix/.env")
@@ -61,6 +66,14 @@ DEFAULT_TIMEOUT = 300.0
 DEFAULT_MAX_OUTPUT_TOKENS = 24000
 MAX_MATERIALS_CHARS = 400_000
 WARN_MATERIALS_CHARS = 200_000
+# THINK 只接收主代理整理过的认知材料：目标、基线、已确认事实、已尝试方案、
+# 证据摘要与本次问题。完整仓库、冗长日志或重复报告应在本地消化。
+THINK_MAX_MATERIALS_CHARS = 120_000
+THINK_WARN_MATERIALS_CHARS = 60_000
+MATERIALS_LIMITS = {"THINK": THINK_MAX_MATERIALS_CHARS,
+                    "REVIEW": MAX_MATERIALS_CHARS}
+MATERIALS_WARN = {"THINK": THINK_WARN_MATERIALS_CHARS,
+                  "REVIEW": WARN_MATERIALS_CHARS}
 
 BENIGN_OUTPUT_TYPES = {"message", "reasoning"}
 TOOL_KEYS = ("tools", "functions", "parallel_tool_calls", "tool_resources",
@@ -74,10 +87,12 @@ VERDICTS = ("pass", "partial", "blocked")
 # 允许再次发起 SOL 复核的实质原因（首次复核不需要）。没有这些原因时，同一
 # 材料摘要直接复用已有结论，不同材料摘要也拒绝自动进入第二轮。
 RETRY_TRIGGERS = {
-    "user-request": "用户明确要求再次独立复核",
+    "user-request": "用户明确要求再次判断",
     "scope-changed": "变更范围发生实质变化",
     "new-risk": "出现新的关键风险，需要独立判断",
     "materials-omitted": "首次材料存在重大遗漏，需要补充后重新判断",
+    "strategy-failed": "原方案连续失败，需要改变整体策略",
+    "major-uncertainty": "出现超出当前判断能力的重大不确定性",
 }
 
 _FENCE = re.compile(r"```[ \t]*[A-Za-z0-9_+.-]*[ \t]*\r?\n?(.*?)```", re.S)
@@ -275,66 +290,51 @@ JSON 结构：
 - blocked：材料不足以判断。
 findings 按严重度排序；没有问题用空数组。你的结论是建议，不是工程决策。"""
 
-CONSULT_INSTRUCTIONS = """你是 Copilot 的独立技术顾问（SOL CONSULT）。你只能在材料范围内做一次性分析：
+THINK_INSTRUCTIONS = """你是 Copilot 的默认认知引擎（SOL THINK）。你只做一次性高价值判断：
 """ + _COMMON_RULES + """
+- 你不承担工程工作：不写代码、不阅读仓库、不跑测试、不维护台账、不做机械式逐行审查。
+- 不要输出逐文件改动清单、实施步骤流水账或重复的检查流程；只给判断与可采用的认知结果。
+- 你的建议是认知输入：ZCode 主代理决定是否采纳、如何实现、如何验证。
 
 JSON 结构：
 {
-  "schema": "copilot-sol-advisory/v1",
-  "mode": "CONSULT",
-  "summary": "结论摘要",
-  "analysis": ["关键判断与依据（可引用材料中的文件名/行号/片段）"],
-  "options": [
-    {"id": "O1", "title": "方案名",
-     "tradeoffs": "取舍与代价", "risks": "风险"}
-  ],
-  "risks": ["关键风险"],
-  "recommendation": "建议方向与适用条件（主代理自行决定是否采纳）",
+  "schema": "copilot-sol-think/v1",
+  "judgment": "核心判断（一句话结论）",
+  "essence": "问题本质与关键矛盾",
+  "strategy": "推荐策略与适用条件",
+  "tradeoffs": ["关键取舍：选择什么、放弃什么、代价是什么"],
+  "risks": ["主要风险、隐含依赖与可能遗漏"],
+  "priority": ["实施优先级与资源分配建议"],
+  "verify": ["需要重点关注的验证结果或信号"],
+  "reconsult": ["出现哪些新事实时应重新咨询"],
   "unverified": ["无法从材料确认的事项"]
 }
 
-要求：分析复杂问题、比较可选路线、识别关键风险；不确定时明确写入 unverified，
-不要替主代理做最终决定，也不要提出需要工具验证却没有材料依据的结论。"""
-
-PLAN_INSTRUCTIONS = """你是 Copilot 的独立规划顾问（SOL PLAN）。你只能在材料范围内给出规划建议：
-""" + _COMMON_RULES + """
-
-JSON 结构：
-{
-  "schema": "copilot-sol-advisory/v1",
-  "mode": "PLAN",
-  "summary": "规划结论摘要",
-  "analysis": ["关键判断与依据"],
-  "steps": [
-    {"id": "S1", "title": "步骤", "depends_on": ["S0"],
-     "risk": "该步骤的风险与验证点"}
-  ],
-  "risks": ["依赖或执行风险"],
-  "alternatives": ["替代路线及其适用条件"],
-  "recommendation": "建议的执行顺序与理由（主代理自行决定是否采纳）",
-  "unverified": ["无法从材料确认的事项"]
-}
-
-要求：给出可执行、依赖清晰的步骤建议，标注风险与替代路线；不要假定未提供的
-工程事实，不要把建议写成对主代理的强制指令。"""
+要求：判断要直接、明确、可供 ZCode 采用；材料不足时在 unverified 中说明，
+不要虚构工程事实，也不要把建议写成对主代理的强制指令。"""
 
 MODE_INSTRUCTIONS = {
+    "THINK": THINK_INSTRUCTIONS,
     "REVIEW": REVIEW_INSTRUCTIONS,
-    "CONSULT": CONSULT_INSTRUCTIONS,
-    "PLAN": PLAN_INSTRUCTIONS,
 }
 INSTRUCTIONS = REVIEW_INSTRUCTIONS  # 兼容既有调用方
 
 
 def normalize_mode(mode: str) -> str:
-    """归一大写并校验模式；未知模式失败关闭，不静默当作 REVIEW。"""
+    """归一大写并校验模式；未知模式失败关闭，不静默当作 REVIEW。
+
+    CONSULT / PLAN 是 v8.4 之前的历史模式：读取旧记录、旧调用方仍可用，但统一
+    归一到 THINK，不再产生两套正式流程。
+    """
     value = str(mode or "").strip().upper()
-    if value not in SOL_MODES:
-        raise SolUsageError(
-            "sol_mode_invalid",
-            f"未知 SOL 模式 {mode!r}；只接受 " + " / ".join(SOL_MODES)
-            + "（DECIDE 已退役，不恢复强制决策链）。")
-    return value
+    if value in SOL_MODES:
+        return value
+    if value in LEGACY_MODE_ALIASES:
+        return LEGACY_MODE_ALIASES[value]
+    raise SolUsageError(
+        "sol_mode_invalid",
+        f"未知 SOL 模式 {mode!r}；只接受 " + " / ".join(SOL_MODES)
+        + "（CONSULT/PLAN 已并入 THINK；DECIDE 已退役）。")
 
 
 def validate_effort(effort: str) -> str:
@@ -348,29 +348,43 @@ def validate_effort(effort: str) -> str:
         return value
     raise SolUsageError(
         "sol_effort_not_pinned",
-        f"推理强度 {effort!r} 被拒绝：CONSULT / PLAN / REVIEW 统一 high，"
+        f"推理强度 {effort!r} 被拒绝：SOL 统一 high，"
         "不允许降级到 low/medium，也不使用 xhigh/max。")
 
 
-def validate_materials(materials: object) -> str:
-    """材料前置校验：非空、字符上限；dry-run 与真实调用共用同一口径。"""
+def materials_limit(mode: str = "THINK") -> int:
+    """模式对应的材料字符上限；未知模式失败关闭。"""
+    resolved = normalize_mode(mode)
+    return MATERIALS_LIMITS[resolved]
+
+
+def validate_materials(materials: object, mode: str = "THINK") -> str:
+    """材料前置校验：非空、字符上限；dry-run 与真实调用共用同一口径。
+
+    THINK 的上限更紧：它只接收主代理整理过的认知材料，完整仓库、冗长日志与
+    重复报告应在本地消化，超限直接拒绝而不是静默截断。
+    """
+    resolved = normalize_mode(mode)
+    limit = MATERIALS_LIMITS[resolved]
     if not isinstance(materials, str) or not materials.strip():
-        raise SolUsageError("sol_materials_empty", "审查材料为空。")
-    if len(materials) > MAX_MATERIALS_CHARS:
+        raise SolUsageError("sol_materials_empty", "SOL 材料为空。")
+    if len(materials) > limit:
         raise SolUsageError(
             "sol_materials_too_large",
-            f"审查材料 {len(materials)} 字符超过上限 {MAX_MATERIALS_CHARS}；"
-            "请主代理整理必要材料后重试，不静默截断。")
+            f"SOL {resolved} 材料 {len(materials)} 字符超过上限 {limit}；"
+            + ("请精简为目标/基线/已确认事实/已尝试方案/证据摘要/本次问题后重试，"
+               "不静默截断。" if resolved == "THINK" else
+               "请主代理整理必要材料后重试，不静默截断。"))
     return materials
 
 
-def build_payload(materials: str, *, mode: str = "REVIEW",
+def build_payload(materials: str, *, mode: str = "THINK",
                   model: str = MODEL, effort: str = REASONING_EFFORT,
                   max_output_tokens: int | None = DEFAULT_MAX_OUTPUT_TOKENS,
                   instructions: str = "") -> dict:
     """构建 Responses API 请求体；工具字段一律不存在、推理强度固定 high。"""
-    validate_materials(materials)
     resolved_mode = normalize_mode(mode)
+    validate_materials(materials, resolved_mode)
     resolved_effort = validate_effort(effort)
     if not str(model or "").strip():
         raise SolUsageError("sol_model_missing", "模型 ID 为空。")
@@ -739,82 +753,39 @@ def parse_review_output(text: str) -> dict:
     return normalize_review(_parse_json_text(cleaned, REVIEW_SCHEMA))
 
 
-def _object_list(value: object, name: str,
-                 fields: tuple[str, ...]) -> list[dict]:
-    """严格对象数组：非数组或字段类型不符一律拒绝，不静默丢弃。"""
-    if value is None:
-        return []
-    if not isinstance(value, list):
-        raise SolResponseError(f"sol_{name}_invalid", f"{name} 必须是对象数组")
-    out: list[dict] = []
-    for index, item in enumerate(value, start=1):
-        if not isinstance(item, dict):
-            raise SolResponseError(
-                f"sol_{name}_invalid",
-                f"{name} 第 {index} 项不是对象（{type(item).__name__}）")
-        entry: dict = {}
-        for key in fields:
-            raw = item.get(key)
-            if key == "depends_on":
-                entry[key] = _string_list(raw, f"{name}_depends_on")
-                continue
-            if raw is None:
-                entry[key] = ""
-                continue
-            if not isinstance(raw, str):
-                raise SolResponseError(
-                    f"sol_{name}_invalid",
-                    f"{name} 第 {index} 项 {key} 必须是字符串")
-            entry[key] = raw.strip()
-        # 固定 ID：缺失时补 O<n>/S<n>，重复时保证唯一。
-        if "id" in entry and not entry["id"]:
-            entry["id"] = f"{name[0].upper()}{index}"
-        out.append(entry)
-    return out
+THINK_TEXT_FIELDS = ("judgment", "essence", "strategy")
+THINK_LIST_FIELDS = ("tradeoffs", "risks", "priority", "verify", "reconsult",
+                     "unverified")
 
 
-def normalize_advisory(data: dict, mode: str) -> dict:
-    """校验并归一化 CONSULT / PLAN 输出；schema 与 mode 必须与请求一致。"""
-    resolved_mode = normalize_mode(mode)
-    if resolved_mode not in ADVISORY_MODES:
-        raise SolUsageError(
-            "sol_mode_invalid", f"{resolved_mode} 不是辅助分析模式。")
-    if data.get("schema") != ADVISORY_SCHEMA:
+def normalize_think(data: dict) -> dict:
+    """校验并归一化 THINK 输出；schema 必须一致，核心判断不能为空。"""
+    if data.get("schema") != THINK_SCHEMA:
         raise SolResponseError("sol_schema_mismatch",
                                f"schema={data.get('schema')!r}")
-    returned = _text(data.get("mode")).upper()
-    if returned and returned != resolved_mode:
+    result: dict = {}
+    for key in THINK_TEXT_FIELDS:
+        value = data.get(key)
+        if value is None:
+            result[key] = ""
+        elif isinstance(value, str):
+            result[key] = value.strip()
+        else:
+            raise SolResponseError(
+                "sol_think_field_invalid", f"{key} 必须是字符串")
+    for key in THINK_LIST_FIELDS:
+        result[key] = _string_list(data.get(key), key)
+    if not result["judgment"] and not result["strategy"]:
         raise SolResponseError(
-            "sol_advisory_mode_mismatch",
-            f"请求模式 {resolved_mode}，回复模式 {returned}；拒绝消费。")
-    options = _object_list(data.get("options"), "options",
-                           ("id", "title", "tradeoffs", "risks"))
-    steps = _object_list(data.get("steps"), "steps",
-                         ("id", "title", "depends_on", "risk"))
-    for name, items in (("options", options), ("steps", steps)):
-        used: set[str] = set()
-        for index, item in enumerate(items, start=1):
-            if item["id"] in used:
-                item["id"] = f"{item['id']}-{index}"
-            used.add(item["id"])
-    return {
-        "mode": resolved_mode,
-        "summary": _text(data.get("summary")),
-        "analysis": _string_list(data.get("analysis"), "analysis"),
-        "options": options,
-        "steps": steps,
-        "risks": _string_list(data.get("risks"), "risks"),
-        "alternatives": _string_list(data.get("alternatives"), "alternatives"),
-        "recommendation": _text(data.get("recommendation")),
-        "unverified": _string_list(data.get("unverified"), "unverified"),
-    }
+            "sol_think_empty", "judgment 与 strategy 均为空：回复没有认知内容。")
+    return result
 
 
-def parse_advisory_output(text: str, mode: str) -> dict:
+def parse_think_output(text: str) -> dict:
     cleaned = str(text or "").lstrip("\ufeff").strip()
     if not cleaned:
         raise SolResponseError("sol_output_empty", "输出为空")
-    return normalize_advisory(_parse_json_text(cleaned, ADVISORY_SCHEMA), mode)
+    return normalize_think(_parse_json_text(cleaned, THINK_SCHEMA))
 
 
 # ── 发送（一次，不重试） ───────────────────────────────────────────────────
@@ -909,13 +880,13 @@ def _usage_summary(usage: object) -> dict | None:
     return summary
 
 
-def run_sol(materials: str, *, mode: str = "REVIEW", audit_log: str = "",
+def run_sol(materials: str, *, mode: str = "THINK", audit_log: str = "",
             model: str = MODEL, effort: str = REASONING_EFFORT,
             max_output_tokens: int | None = DEFAULT_MAX_OUTPUT_TOKENS,
             timeout: float = DEFAULT_TIMEOUT,
             transport=None, api_key: str | None = None,
             base_url: str | None = None, instructions: str = "") -> dict:
-    """发起一次 SOL 调用（REVIEW / CONSULT / PLAN）；任何异常都显式失败。"""
+    """发起一次 SOL 调用（THINK / REVIEW）；任何异常都显式失败。"""
     resolved_mode = normalize_mode(mode)
     payload = build_payload(
         materials, mode=resolved_mode, model=model, effort=effort,
@@ -1041,7 +1012,7 @@ def run_sol(materials: str, *, mode: str = "REVIEW", audit_log: str = "",
         if resolved_mode == "REVIEW":
             parsed = parse_review_output(text)
         else:
-            parsed = parse_advisory_output(text, resolved_mode)
+            parsed = parse_think_output(text)
     except SolResponseError as exc:
         _audit_safe(audit_log, {**audit_base, **common_audit, "ok": False,
                            "error": exc.code, "detail": exc.detail,
@@ -1050,7 +1021,7 @@ def run_sol(materials: str, *, mode: str = "REVIEW", audit_log: str = "",
         raise SolResponseError(exc.code, exc.detail) from None
     result = {
         "schema": (REVIEW_SCHEMA if resolved_mode == "REVIEW"
-                   else ADVISORY_SCHEMA),
+                   else THINK_SCHEMA),
         "mode": resolved_mode,
         "model": model,
         "model_resolved": model_resolved,
@@ -1090,21 +1061,22 @@ def run_sol(materials: str, *, mode: str = "REVIEW", audit_log: str = "",
         audit_extra = {"verdict": parsed["verdict"], "findings_count": counts}
     else:
         result.update({
-            "summary": parsed["summary"],
-            "analysis": parsed["analysis"],
-            "options": parsed["options"],
-            "steps": parsed["steps"],
+            "judgment": parsed["judgment"],
+            "essence": parsed["essence"],
+            "strategy": parsed["strategy"],
+            "tradeoffs": parsed["tradeoffs"],
             "risks": parsed["risks"],
-            "alternatives": parsed["alternatives"],
-            "recommendation": parsed["recommendation"],
+            "priority": parsed["priority"],
+            "verify": parsed["verify"],
+            "reconsult": parsed["reconsult"],
             "unverified": parsed["unverified"],
         })
         audit_extra = {
-            "analysis_items": len(parsed["analysis"]),
-            "options": len(parsed["options"]),
-            "steps": len(parsed["steps"]),
+            "tradeoffs": len(parsed["tradeoffs"]),
             "risks": len(parsed["risks"]),
-            "alternatives": len(parsed["alternatives"]),
+            "priority": len(parsed["priority"]),
+            "verify": len(parsed["verify"]),
+            "reconsult": len(parsed["reconsult"]),
         }
     audit_error = _audit_safe(audit_log, {**audit_base, **common_audit,
                                           **audit_extra, "ok": True,
@@ -1118,18 +1090,13 @@ def run_sol(materials: str, *, mode: str = "REVIEW", audit_log: str = "",
 
 
 def run_review(materials: str, **kwargs) -> dict:
-    """一次 SOL REVIEW（保持既有调用方签名）。"""
+    """一次 SOL REVIEW（用户明确要求的独立复核）。"""
     return run_sol(materials, mode="REVIEW", **kwargs)
 
 
-def run_advisory(materials: str, mode: str, **kwargs) -> dict:
-    """一次 SOL CONSULT / PLAN；REVIEW 必须走 `run_review` 以保持语义清晰。"""
-    resolved = normalize_mode(mode)
-    if resolved not in ADVISORY_MODES:
-        raise SolUsageError(
-            "sol_mode_invalid",
-            f"{resolved} 不是辅助分析模式；REVIEW 请使用 sol-review。")
-    return run_sol(materials, mode=resolved, **kwargs)
+def run_think(materials: str, **kwargs) -> dict:
+    """一次 SOL THINK（默认认知引擎）。"""
+    return run_sol(materials, mode="THINK", **kwargs)
 
 
 # ── 审计（只写脱敏元数据；正文由调用方存入任务目录） ──────────────────────
@@ -1165,7 +1132,7 @@ def _audit_safe(path: str, record: dict) -> str | None:
 # ── 材料、单轮判定与准入 ───────────────────────────────────────────────────
 # 提示词/策略版本：进入单轮判定键。提示词、共享上下文或判定规则实质变化时，
 # 旧结论不再被当成同一审查对象复用（缓存失效条件见 review_subject_sha256）。
-PROMPT_VERSION = "sol-prompt-v2"
+PROMPT_VERSION = "sol-prompt-v3"
 
 _EVIDENCE_LIMIT = 80
 _EVIDENCE_MAX_CHARS = 6000
@@ -1241,7 +1208,7 @@ def _action_lines(state: dict, *, limit: int = _ACTION_LIMIT) -> list[str]:
 
 
 def _context_lines(state: dict) -> list[str]:
-    """REVIEW / CONSULT / PLAN 共用的任务上下文：一份合同、一套条件与证据。"""
+    """THINK / REVIEW 共用的任务上下文：一份合同、一套条件与证据。"""
     contract = state.get("contract") or {}
     boundaries = str(contract.get("boundaries") or "").strip()
     return [
@@ -1278,12 +1245,10 @@ def _context_lines(state: dict) -> list[str]:
     ]
 
 
-def build_prompt(state: dict, materials: str, *, mode: str = "REVIEW",
+def build_prompt(state: dict, materials: str, *, mode: str = "THINK",
                  question: str = "") -> str:
-    """把共享任务上下文与主代理材料拼成一次完整上下文（三模式共用）。"""
+    """把共享任务上下文与主代理材料拼成一次完整上下文（两模式共用）。"""
     resolved = normalize_mode(mode)
-    if resolved not in SOL_MODES:
-        raise SolUsageError("sol_mode_invalid", f"{resolved} 不是 SOL 模式。")
     lines = [f"# Copilot SOL {resolved} 材料", "", *_context_lines(state)]
     if resolved == "REVIEW":
         lines += [
@@ -1294,23 +1259,31 @@ def build_prompt(state: dict, materials: str, *, mode: str = "REVIEW",
             "## 复核要求",
             "",
             "一次性审查以上材料：只报告有材料依据的问题，未知项写入 unverified；"
-            "按契约输出单个 JSON 对象。",
+            "按契约输出单个 JSON 对象。你的结论是建议，不是工程决策。",
             "",
         ]
     else:
         lines += [
-            "## 主代理的问题",
+            "## 本次需要判断的事项",
             "",
-            str(question or "").strip() or "(未提供，按材料给出总体建议)",
+            str(question or "").strip() or "(未提供，按材料给出总体判断)",
             "",
-            "## 主代理提供的材料",
+            "## 主代理整理的材料",
             "",
             materials.strip(),
             "",
-            f"## {resolved} 要求",
+            "## THINK 输入要求",
             "",
-            "一次性给出辅助分析：只基于材料，未知项写入 unverified；"
-            "按契约输出单个 JSON 对象。你的输出是建议，由 ZCode 主代理决定是否采纳。",
+            "材料应包含：任务目标、当前工程基线、已确认事实、关键问题与约束、"
+            "已尝试方案及结果、必要证据摘要。不要包含完整仓库、冗长日志、"
+            "重复报告或无关历史上下文；已确认的事实不要重复调查。",
+            "",
+            "## THINK 输出要求",
+            "",
+            "一次性给出认知结果：核心判断、问题本质、推荐策略、关键取舍、主要风险、"
+            "实施优先级、需要关注的验证信号与重新咨询的触发条件。未知项写入 "
+            "unverified；按契约输出单个 JSON 对象。你的输出是认知输入，"
+            "由 ZCode 主代理决定是否采纳以及如何实现。",
             "",
         ]
     return "\n".join(lines)
@@ -1372,11 +1345,19 @@ def review_subject_sha256(state: dict, materials: str, *, mode: str = "",
 
 
 def record_mode(record: dict) -> str:
-    """记录模式；历史记录可能没有 mode 字段，按当时存放位置判定。"""
+    """记录的认知模式：历史 CONSULT / PLAN 一律归入 THINK。
+
+    历史记录可能没有 mode 字段，按当时存放位置判定（`advisory_id` 表示辅助
+    分析，否则是复核）。归一后同一合同只认一次认知调用，不再按旧模式分别计数。
+    """
     mode = str(record.get("mode") or "").upper()
-    if mode in SOL_MODES:
-        return mode
-    return "CONSULT" if record.get("advisory_id") else "REVIEW"
+    if mode == "REVIEW":
+        return "REVIEW"
+    if mode in LEGACY_SOL_MODES:
+        return "THINK"
+    if mode == "THINK":
+        return "THINK"
+    return "THINK" if record.get("advisory_id") else "REVIEW"
 
 
 def completed_reviews(state: dict, records_key: str = "sol_calls") -> list[dict]:
@@ -1397,12 +1378,12 @@ def single_round_decision(state: dict, materials_sha256: str, *,
                           force: bool = False, reason: str = "",
                           trigger: str = "",
                           records_key: str = "sol_calls",
-                          mode: str = "REVIEW") -> dict:
+                          mode: str = "THINK") -> dict:
     """单轮判定：同一材料直接复用；任何再次调用都必须有实质原因。
 
-    辅助分析（CONSULT / PLAN）与复核（REVIEW）各自独立判定，不会互相复用或
-    互相覆盖；记录统一存放在 `sol_calls`，历史 `sol_reviews` /
-    `sol_advisories` 仍可只读复用。
+    认知（THINK，含历史 CONSULT / PLAN）与复核（REVIEW）各自独立判定，不会
+    互相复用；记录统一存放在 `sol_calls`，历史 `sol_reviews` / `sol_advisories`
+    仍可只读复用。
     """
     resolved_mode = normalize_mode(mode)
     records = [item for item in completed_reviews(state, records_key)
@@ -1434,10 +1415,10 @@ def single_round_decision(state: dict, materials_sha256: str, *,
 
 def admission(*, risk: str, triggers: list[str] | None = None,
               reason: str = "") -> dict:
-    """SOL 复核准入建议（只读建议，不是门禁）。
+    """SOL 介入的准入建议（只读建议，不是门禁）。
 
     简单/普通任务由主代理自检闭环；多模块改造、数据链路、安全与生产高风险、
-    用户明确要求时建议调用一次。SOL 是 advisory，不构成收口门禁。
+    用户明确要求时建议调用一次认知判断。SOL 是 advisory，不构成收口门禁。
     """
     import review_policy as RP
 
@@ -1460,11 +1441,11 @@ def admission(*, risk: str, triggers: list[str] | None = None,
             requested.append(value)
     if tier == "high":
         decision, scope = "recommended", "high-risk"
-        detail = ("高风险/安全/生产变更建议在最终验证后调用一次 SOL 复核；"
-                  "SOL 只提供独立审查意见，不证明宿主权限，也不构成收口门禁。")
+        detail = ("高风险/安全/生产变更建议在形成判断后调用一次 SOL 认知评估；"
+                  "SOL 只提供判断与风险意见，不证明宿主权限，也不构成收口门禁。")
     elif requested:
         decision, scope = "recommended", "triggered"
-        detail = "声明了实质风险因素，建议调用一次 SOL 复核；主代理自行决定。"
+        detail = "声明了实质风险因素，建议调用一次 SOL 认知判断；主代理自行决定。"
     elif tier == "low":
         decision, scope = "not_needed", "none"
         detail = "低风险改动（文案/样式/简单修复/小范围既有模式）：主代理自检闭环，无需 SOL。"

@@ -6,9 +6,8 @@
 * `drive`：读取状态 → 本地求值 → 命中 PASS 就收口；命中 BLOCKED/CLOSED 就停下
   报告；有可领取工作项就输出工作单并以 EXIT_EXECUTE 退出；PARTIAL 则本地派生
   下一步工作项后继续（不是任务终点）。
-* `ingest`：把 `native_agent.py` 生成的执行信封校验后回填状态。独立模型复核由
-  `sol_review.py` 的 SOL 零工具单轮复核承担；G4 原生复核信封已随 G4 退役，
-  本模块不再接受。
+* `ingest`：把 `native_agent.py` 生成的执行信封校验后回填状态。SOL 认知与用户要求的
+  独立复核由 `sol_review.py` 承担；G4 原生复核信封已随 G4 退役，本模块不再接受。
 
 退出码
 ------
@@ -151,9 +150,9 @@ def drive(args) -> int:
         phase = evaluation.get("phase")
         print(f"[{step}] {state.get('task_id')} → {phase}：{evaluation.get('reason')}")
         sol = evaluation.get("sol") or {}
-        # PASS 阶段 drive 会立即收口，此时再提示复核已无法执行；收口前的复核
-        # 建议由 `status` / `review-admission` 在收口前给出（见 SKILL.md 顺序）。
-        if phase != "PASS" and sol.get("action") in ("consult", "plan", "review"):
+        # PASS 阶段 drive 会立即收口，此时再提示 SOL 已无法执行；收口前的建议
+        # 由 `status` / `review-admission` 在收口前给出（见 SKILL.md 顺序）。
+        if phase != "PASS" and sol.get("action") in ("think", "review"):
             print(f"SOL {sol.get('mode')} 建议（{sol.get('recommended_action')}，"
                   f"复杂度 {(sol.get('complexity') or {}).get('level') or '-'}）："
                   f"{sol.get('reason')}")

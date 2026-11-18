@@ -232,7 +232,7 @@ def _default_state() -> dict:
         "contract": _default_contract(),
         "native_dispatch": None,
         "native_results": [],
-        # SOL 调用记录（REVIEW / CONSULT / PLAN）统一存放在 `sol_calls`。历史状态里的
+        # SOL 调用记录（THINK / REVIEW，历史 CONSULT / PLAN）统一存放在 `sol_calls`。历史状态里的
         # `sol_reviews` / `sol_advisories` 继续只读兼容，不再新增默认键，也不回写。
         "sol_calls": [],
         "review_admissions": [],
@@ -3268,20 +3268,21 @@ def review_admission(state: dict, *, triggers: list[str] | None = None,
                      code_scope_sha256: str = "",
                      files: list[dict] | None = None,
                      scope: str = "full", include_gates: bool = True,
-                     user_request: bool = False,
+                     user_request: bool = False, review_requested: bool = False,
                      workspace: str = "") -> dict:
     """SOL 主动介入准入建议（只读，不写状态）。
 
     这是“要不要调用 SOL”的**单一确定性入口**：先用本地 G1–G3 与台账事实判断
-    确定性门禁是否已通过，再结合任务认知复杂度给出 `CONSULT` / `PLAN` /
-    `REVIEW` 的建议。SOL 是 advisory，不构成收口门禁，也不证明宿主只读权限。
+    确定性门禁是否已通过，再结合任务认知复杂度给出一次 `THINK`（默认认知引擎）
+    或用户要求的 `REVIEW` 建议。SOL 是 advisory，不构成收口门禁，也不证明宿主
+    只读权限。
 
     - `decision`：风险等级策略建议（`not_needed` / `optional` / `recommended`），
       只反映风险与触发因素，保持历史输出兼容。
-    - `advice`：复杂度与覆盖判断（`none` / `reuse` / `consult` / `plan` /
-      `review`）＋建议模式、阶段、新信号与命令提示。
+    - `advice`：复杂度与覆盖判断（`none` / `reuse` / `think` / `review`）＋
+      建议模式、阶段、新信号与命令提示。
     - `recommended_action`：`advice.action` 的兼容视图；中高复杂任务在开发阶段
-      会得到 `recommended`（一次主动认知辅助），简单任务始终 `not_needed`。
+      会得到 `recommended`（一次主动认知判断），简单任务始终 `not_needed`。
     """
     import sol_review as SR
 
@@ -3290,14 +3291,16 @@ def review_admission(state: dict, *, triggers: list[str] | None = None,
     calls = [item for item in iter_sol_calls(state)
              if item.get("status") == "completed"]
     reviews = [item for item in calls if sol_call_mode(item) == "REVIEW"]
-    by_mode = {mode: len([item for item in calls if sol_call_mode(item) == mode])
+    # 历史 CONSULT / PLAN 记录按 THINK 计入：同一合同只认一次认知调用。
+    by_mode = {mode: len([item for item in calls
+                          if sol_ref_mode(item) == mode])
                for mode in SOL_MODES}
     target = str(target_sha256 or final_evidence_digest(state))
     check = closure_check(state) if include_gates else None
     advice = RP.sol_advice(
         state, calls=calls, triggers=triggers,
         gates_passed=bool(check and check["passed"]),
-        user_request=user_request,
+        user_request=user_request, review_requested=review_requested,
         workspace=str(workspace or state.get("workspace") or ""))
     result = {
         **decision,
@@ -3349,8 +3352,11 @@ def review_admission(state: dict, *, triggers: list[str] | None = None,
 # ── SOL 调用记录：单一权威流 `sol_calls` + 历史只读兼容 ──────────────────────
 SOL_CALLS_KEY = "sol_calls"
 LEGACY_SOL_KEYS = ("sol_reviews", "sol_advisories")
-SOL_MODES = ("REVIEW", "CONSULT", "PLAN")
-SOL_ADVISORY_MODES = ("CONSULT", "PLAN")
+# 新记录只允许 THINK / REVIEW；CONSULT / PLAN 是 v8.4 之前的历史模式，
+# 只用于读取旧状态与旧调用方（写入时仍兼容，但不再产生新流程）。
+SOL_MODES = ("THINK", "REVIEW")
+LEGACY_SOL_MODES = ("CONSULT", "PLAN")
+RECORD_SOL_MODES = SOL_MODES + LEGACY_SOL_MODES
 
 
 def sol_call_id(record: dict) -> str:
@@ -3363,11 +3369,19 @@ def sol_call_id(record: dict) -> str:
 
 
 def sol_call_mode(record: dict) -> str:
-    """记录模式；历史记录可能没有 mode 字段，按历史存放位置判定。"""
+    """记录中实际存储的模式（含历史 CONSULT / PLAN）；缺失时按存放位置判定。"""
     mode = str(record.get("mode") or "").upper()
-    if mode in SOL_MODES:
+    if mode in RECORD_SOL_MODES:
         return mode
     return "CONSULT" if record.get("advisory_id") else "REVIEW"
+
+
+def sol_ref_mode(record: dict) -> str:
+    """记录的认知模式：历史 CONSULT / PLAN 归入 THINK，用于覆盖与计数。"""
+    mode = sol_call_mode(record)
+    if mode == "REVIEW":
+        return "REVIEW"
+    return "THINK"
 
 
 def iter_sol_calls(state: dict) -> list[dict]:
@@ -3395,11 +3409,16 @@ def iter_sol_calls(state: dict) -> list[dict]:
 
 
 def list_sol_calls(state: dict, *, mode: str = "") -> list[dict]:
-    """只读返回统一 SOL 调用记录；`mode` 为空时返回全部模式。"""
+    """只读返回统一 SOL 调用记录；`mode` 为空时返回全部模式。
+
+    `mode=THINK` 同时命中历史 CONSULT / PLAN 记录；其他模式按存储值精确匹配。
+    """
     rows = iter_sol_calls(state)
     if not mode:
         return rows
     wanted = str(mode).upper()
+    if wanted == "THINK":
+        return [item for item in rows if sol_ref_mode(item) == "THINK"]
     return [item for item in rows if sol_call_mode(item) == wanted]
 
 
@@ -3408,26 +3427,31 @@ def list_sol_reviews(state: dict) -> list[dict]:
     return list_sol_calls(state, mode="REVIEW")
 
 
+def list_sol_think_calls(state: dict) -> list[dict]:
+    """只读返回认知判断记录（THINK 与历史 CONSULT / PLAN，含失败记录）。"""
+    return list_sol_calls(state, mode="THINK")
+
+
 def list_sol_advisories(state: dict) -> list[dict]:
-    """只读返回 CONSULT / PLAN 辅助分析记录（含失败记录）。"""
-    return [item for item in list_sol_calls(state)
-            if sol_call_mode(item) in SOL_ADVISORY_MODES]
+    """历史名称：等同 `list_sol_think_calls`。"""
+    return list_sol_think_calls(state)
 
 
 def record_sol_call(path: str, call: dict, *, mode: str = "",
                     materials_sha256: str = "", trigger: str = "",
                     reason: str = "") -> dict:
-    """登记一次已完成的 SOL 调用（REVIEW / CONSULT / PLAN 共用）。
+    """登记一次已完成的 SOL 调用（THINK / REVIEW 共用）。
 
     SOL 是建议层：REVIEW 的 findings 以 `advisory` 进入 Finding 台账，主代理
-    逐条核实后修复、定向验证或给出反证；CONSULT / PLAN 只留审计记录，不进入
-    台账、不改变完成条件、不影响 G1–G3。
+    逐条核实后修复、定向验证或给出反证；THINK 只留审计记录，不进入台账、
+    不改变完成条件、不影响 G1–G3。历史 CONSULT / PLAN 记录仍可写入（兼容
+    旧调用方），但新流程只产生 THINK。
     """
     state = load_state(path)
     _assert_open(state, "登记 SOL 调用", allow_blocked=True)
     record = {**call}
-    resolved = str(mode or record.get("mode") or "REVIEW").upper()
-    if resolved not in SOL_MODES:
+    resolved = str(mode or record.get("mode") or "THINK").upper()
+    if resolved not in RECORD_SOL_MODES:
         raise GovernanceError(f"未知 SOL 模式：{resolved}")
     record["mode"] = resolved
     record["call_id"] = str(record.get("call_id") or sol_call_id(record)
@@ -3461,9 +3485,11 @@ def record_sol_call(path: str, call: dict, *, mode: str = "",
         })
     else:
         detail.update({
-            "analysis_items": len(record.get("analysis") or []),
-            "options": len(record.get("options") or []),
-            "steps": len(record.get("steps") or []),
+            "judgment": str(record.get("judgment") or "")[:200],
+            "tradeoffs": len(record.get("tradeoffs") or []),
+            "risks": len(record.get("risks") or []),
+            "priority": len(record.get("priority") or []),
+            "verify": len(record.get("verify") or []),
         })
     state.setdefault(SOL_CALLS_KEY, []).append(record)
     _history(state, "sol_call_completed", detail)
@@ -3471,14 +3497,14 @@ def record_sol_call(path: str, call: dict, *, mode: str = "",
     return record
 
 
-def record_sol_call_failure(path: str, *, mode: str = "REVIEW",
+def record_sol_call_failure(path: str, *, mode: str = "THINK",
                             error_code: str = "", detail: str = "",
                             materials_sha256: str = "",
                             model: str = "") -> dict:
     """登记一次失败的 SOL 调用；失败不改变任务阶段，也不阻断主代理继续。"""
     state = load_state(path)
-    resolved = str(mode or "REVIEW").upper()
-    if resolved not in SOL_MODES:
+    resolved = str(mode or "THINK").upper()
+    if resolved not in RECORD_SOL_MODES:
         raise GovernanceError(f"未知 SOL 模式：{resolved}")
     record = {
         "schema": "copilot-sol-call-failure/v1",
@@ -3515,9 +3541,9 @@ def record_sol_review(path: str, review: dict, *,
 def record_sol_advisory(path: str, advisory: dict, *,
                         materials_sha256: str = "",
                         trigger: str = "", reason: str = "") -> dict:
-    """历史名称：等同 `record_sol_call(mode=CONSULT|PLAN)`，保留给既有调用方。"""
+    """历史名称：等同 `record_sol_call(mode=THINK|历史模式)`，保留给既有调用方。"""
     return record_sol_call(path, advisory,
-                           mode=str(advisory.get("mode") or "CONSULT"),
+                           mode=str(advisory.get("mode") or "THINK"),
                            materials_sha256=materials_sha256,
                            trigger=trigger, reason=reason)
 
@@ -3531,11 +3557,11 @@ def record_sol_review_failure(path: str, *, error_code: str, detail: str = "",
                                    materials_sha256=materials_sha256, model=model)
 
 
-def record_sol_advisory_failure(path: str, *, mode: str = "CONSULT",
+def record_sol_advisory_failure(path: str, *, mode: str = "THINK",
                                 error_code: str = "", detail: str = "",
                                 materials_sha256: str = "",
                                 model: str = "") -> dict:
-    """历史名称：等同 `record_sol_call_failure(mode=CONSULT|PLAN)`。"""
+    """历史名称：等同 `record_sol_call_failure(mode=THINK|历史模式)`。"""
     return record_sol_call_failure(path, mode=mode, error_code=error_code,
                                    detail=detail,
                                    materials_sha256=materials_sha256, model=model)
@@ -3878,8 +3904,7 @@ def review_metrics(state: dict, *, task_dir: str = "") -> dict:
     # 指标口径只有一套，不因历史存放位置不同而重复计数。
     sol_calls = iter_sol_calls(state)
     sol_reviews = [r for r in sol_calls if sol_call_mode(r) == "REVIEW"]
-    advisories = [r for r in sol_calls
-                  if sol_call_mode(r) in SOL_ADVISORY_MODES]
+    think_calls = [r for r in sol_calls if sol_ref_mode(r) == "THINK"]
     admissions = [item for item in state.get("review_admissions") or []
                   if isinstance(item, dict)]
     admission_triggers: dict[str, int] = {}
@@ -3957,7 +3982,7 @@ def review_metrics(state: dict, *, task_dir: str = "") -> dict:
             "calls_total": len(sol_calls),
             "by_mode": {
                 mode: len([r for r in sol_calls
-                           if sol_call_mode(r) == mode])
+                           if sol_ref_mode(r) == mode])
                 for mode in SOL_MODES},
             "total": len(sol_reviews),
             "completed": len([r for r in sol_reviews
@@ -3977,17 +4002,17 @@ def review_metrics(state: dict, *, task_dir: str = "") -> dict:
                 for severity in ("blocking", "major", "minor", "info")},
             "single_round": True,
         },
-        "sol_advisories": {
-            "total": len(advisories),
-            "completed": len([r for r in advisories
+        "sol_think": {
+            "total": len(think_calls),
+            "completed": len([r for r in think_calls
                               if r.get("status") == "completed"]),
-            "failed": len([r for r in advisories
+            "failed": len([r for r in think_calls
                            if r.get("status") == "failed"]),
             "modes": {
-                mode: len([r for r in advisories
+                mode: len([r for r in think_calls
                            if r.get("status") == "completed"
                            and str(r.get("mode") or "").upper() == mode])
-                for mode in ("CONSULT", "PLAN")},
+                for mode in ("THINK", "CONSULT", "PLAN")},
             "advisory_only": True,
         },
         "g4": {
@@ -4498,12 +4523,13 @@ def _evaluate_core(state: dict, *, cache: dict | None = None) -> dict:
 
 
 def sol_advice_summary(state: dict, *, gates_passed: bool = False,
-                       user_request: bool = False,
+                       user_request: bool = False, review_requested: bool = False,
                        triggers: list[str] | None = None) -> dict:
     """SOL 主动介入建议（只读）：复杂度 + 覆盖 + 新信号，不改变阶段与门禁。
 
-    简单任务返回 `action=none`；中高复杂任务在形成初步理解后返回一次
-    `consult`/`plan` 建议；已有有效结论且无新信号时返回 `reuse`。
+    简单任务返回 `action=none`；中高复杂任务在形成初步理解后返回一次 `think`
+    建议；已有有效结论且无升级型新信号时返回 `reuse`；`review` 只在用户明确
+    要求时给出。
     """
     return RP.sol_advice(
         state,
@@ -4512,6 +4538,7 @@ def sol_advice_summary(state: dict, *, gates_passed: bool = False,
         triggers=triggers,
         gates_passed=gates_passed,
         user_request=user_request,
+        review_requested=review_requested,
         workspace=str(state.get("workspace") or ""))
 
 
@@ -4526,7 +4553,7 @@ def evaluate(state: dict, *, cache: dict | None = None) -> dict:
         # SOL 建议只是提示：不派生工作项、不改变阶段、不影响门禁。
         advice = sol_advice_summary(state, gates_passed=(phase == "PASS"))
         result["sol"] = advice
-        if advice.get("action") in ("consult", "plan", "review"):
+        if advice.get("action") in ("think", "review"):
             prefix = "可选" if advice.get("recommended_action") == "optional" else "建议"
             command = advice.get("command") or ""
             if command:

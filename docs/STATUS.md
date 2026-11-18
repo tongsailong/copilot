@@ -1,7 +1,47 @@
 # STATUS
 
 更新：2026-11-18 CST。本文件只记录现场可核实的事实；规划与未完成事项单独标注。
-当前版本：v8.3.0（SOL 主动介入策略）。
+当前版本：v8.4.0（SOL 默认认知引擎）。
+
+## SOL 默认认知引擎（2026-11-18，v8.4.0）
+
+- **THINK 取代 CONSULT / PLAN**：`sol_review.SOL_MODES=("THINK","REVIEW")`；
+  `normalize_mode` 把历史 CONSULT / PLAN 归一到 THINK；`sol-advisory` 命令移除，
+  新入口为 `sol-think`。历史 `sol_advisories` / `sol_reviews` 只读兼容，历史认知记录
+  按 THINK 计入覆盖。
+- **路由**：`sol_advice.action` 收敛为 `none` / `reuse` / `think` / `review`；
+  高风险或收口阶段不再自动建议 REVIEW，`review-admission --review-request` 是用户要求
+  独立复核的唯一自动建议入口。
+- **输入预算**：THINK 材料上限 120,000 字符（提示 60,000），REVIEW 保持 400,000；
+  `build_prompt` 的 THINK 分支要求目标/基线/已确认事实/已尝试方案/证据摘要/本次问题。
+- **输出结构**：`copilot-sol-think/v1`（judgment / essence / strategy / tradeoffs /
+  risks / priority / verify / reconsult / unverified），严格类型校验。
+- **降级**：THINK 超时、429、网络、格式或身份失败只写入 `sol_calls` 失败记录并返回
+  `copilot-sol-think-degraded/v1`（退出码 0）；REVIEW 失败仍显式失败。
+- **验证**：活动测试 **535 项 OK**（约 37s，含新增 `tests/test_sol_think.py` 17 项）；
+  `legacy/tests` 853 项与 HEAD `1626801` 基线完全一致（failures 99 / errors 47 /
+  skipped 32）；`sync_runtime.py --check` 缺失 0 / 不同 0；运行时 `sol-think --dry-run`
+  实测 `mode=THINK`、`zero_tool=true`、`tool_keys_present=[]`、`prompt_version=sol-prompt-v3`。
+- **真实调用（2026-11-18，用户授权）**：`copilot_dispatch.py sol-think` 实际调用
+  `gpt-6.2-sol`，`reasoning.effort=high`、`reasoning.mode=standard` 回显一致
+  （`reasoning_verified=true`）；`tools_sent=false`、`tool_choice="none"`、
+  `zero_tool=true`、`attempts=1`、HTTP 200，延迟 55.8s，tokens input 1756 / output 1711 /
+  reasoning 386；返回符合 `copilot-sol-think/v1`（判断/本质/策略/取舍/风险/优先级/
+  验证信号/再咨询条件/未验证项齐全），记录 `SC31f97abfe6c297a283ce5674`。只发一次请求，
+  未重试、未触发额外 REVIEW。本轮变更提交并普通快进推送 origin/main。
+
+## 知识交接扩展（2026-11-18）
+
+- 新增 `scripts/knowledge_handoff.py`：只接受 Vault/Memory 卡片；`read` 摘录必须出现在
+  卡片正文中，`index-only`/`unverified` 不得冒充已读；最多 5 条，SOL 8,000 字符、
+  子 Agent 5,000 字符。
+- `sol-review`/`sol-advisory` 新增 `--knowledge-file`，校验后追加到 materials；dry-run
+  与 `sol_calls` 记录 `knowledge_file`、`knowledge_block_sha256`、`knowledge_entries`。
+- 验证：活动测试 **518 项 OK**（37.3s）；`sync_runtime.py --check` 缺失 0 / 不同 0；
+  场景 A（新会话 Read 卡片 + Copilot 交接 + SOL CONSULT 收到摘录）、B（无关任务 0 工具）、
+  C（跨会话复用 `code-quality-perf-cleanup-2026-11-18`）、D（Explore 显式交接、0 工具）
+  均完成。
+- 未改业务项目、Memory/Vault 正式知识；未提交/推送。
 
 ## SOL 主动介入策略（2026-11-18，v8.3.0）
 

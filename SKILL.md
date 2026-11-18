@@ -1,14 +1,14 @@
 ---
 name: copilot
-description: "Copilot v8.3 轻量协作治理：任务承接、合同与完成条件、状态与证据登记、PARTIAL 持续推进、SOL（gpt-6.2-sol，high，零工具）按需 CONSULT/PLAN/REVIEW 认知辅助。按确定性复杂度判断主动介入：简单任务 0 调用，中高复杂任务在形成初步理解后建议一次，只有新信号才追加；SOL 与 G1–G3 共用合同、条件与证据，统一记录在 sol_calls。SOL 只提供建议，不替代 ZCode 的技术决策与工程执行；G4 原生只读复核已退役，历史台账只读保留。"
+description: "Copilot v8.4 轻量协作治理：任务承接、合同与完成条件、状态与证据登记、PARTIAL 持续推进、SOL（gpt-6.2-sol，high，零工具）默认认知引擎 THINK。按确定性复杂度路由：简单任务 0 调用，中高复杂任务在形成初步理解后建议一次整体判断（判断/策略/取舍/风险/验证信号），只有升级型新信号才追加；REVIEW 仅在用户明确要求时执行。SOL 与 G1–G3 共用合同、条件与证据，统一记录在 sol_calls。SOL 只提供认知输入，ZCode 是唯一技术决策与工程执行主体；G4 原生只读复核已退役，历史台账只读保留。"
 when_to_use: >
   需要把多步骤工程任务纳入可追踪治理时：任务合同/完成条件需要固定、证据与审计需要绑定、
-  长任务需要 PARTIAL 持续推进与上下文恢复、复杂问题需要一次 SOL 零工具独立判断（CONSULT /
-  PLAN）或一次 SOL 独立复核（REVIEW）、用户要求正式 REVIEW、或需要只读查看历史 SOL 调用、
-  G4 记录与 REVIEW 台账。简单、单步、低风险任务直接由 ZCode 原生完成，不进入本 Skill。
+  长任务需要 PARTIAL 持续推进与上下文恢复、复杂问题需要一次 SOL 零工具整体判断（THINK）、
+  用户明确要求 SOL 判断或独立复核（REVIEW）、或需要只读查看历史 SOL 调用、G4 记录与
+  REVIEW 台账。简单、单步、低风险任务直接由 ZCode 原生完成，不进入本 Skill。
 ---
 
-# copilot：轻量协作治理（v8.3.0）
+# copilot：轻量协作治理（v8.4.0）
 
 Copilot 是运行在 ZCode 内的**协作治理层**，不是决策模型，也不是执行体。它负责把任务变成可
 追踪的合同、状态、证据与收口条件，并在任务没有真正完成时继续推进。
@@ -22,11 +22,12 @@ Copilot 是运行在 ZCode 内的**协作治理层**，不是决策模型，也�
   体现协作而强制调用子代理。
 - **内置子代理（按需）**：`Explore` 只做独立只读调查；`general-purpose` 只承担边界清晰、
   可独立交付且并行收益明显的工作。二者都由主代理拆分、控制范围并集成结果。
-- **SOL（一次性认知辅助与独立复核）**：经既有本机 CPA `127` 通道调用 `gpt-6.2-sol`
-  （`reasoning.effort=high`，`standard` 模式），**零工具、单轮**地阅读主代理一次性提交的
-  材料，按模式返回结构化结论：CONSULT（问题分析/方案比较/风险识别）、PLAN（规划、依赖与
-  替代路线建议）、REVIEW（独立复核 findings）。三者都是建议，不执行工程、不做技术决策、
-  不读写台账、不调度子代理，也不自动进入第二轮。
+- **SOL（默认认知引擎与用户要求的独立复核）**：经既有本机 CPA `127` 通道调用
+  `gpt-6.2-sol`（`reasoning.effort=high`，`standard` 模式），**零工具、单轮**地阅读主代理
+  一次性提交的精炼材料。默认模式是 **THINK**：输出核心判断、问题本质、推荐策略、关键取舍、
+  主要风险、实施优先级、需要关注的验证信号与重新咨询条件；**REVIEW** 只在用户明确要求时
+  输出结构化 findings。两者都是 advisory，不执行工程、不做技术决策、不读写台账、不调度
+  子代理，也不执行按阶段的重复流程。CONSULT / PLAN 已并入 THINK（v8.4），历史记录只读兼容。
 - **Copilot（本 Skill）**：任务承接、合同与完成条件、状态机、证据桥接、审计、PARTIAL 推进、
   收口门禁。**不做工程实施，不替代技术决策，不设置无意义的审批门。**
 - ~~**G4 只读复核**~~：**已正式退役**（v8.0.0）。G4 不再作为活动质量门禁，不再要求宿主
@@ -35,8 +36,8 @@ Copilot 是运行在 ZCode 内的**协作治理层**，不是决策模型，也�
 - **DesignWise**：设计方法与设计质量规范；具体设计执行仍由 ZCode 完成，Copilot 不另建流程。
 
 **原生 Reviewer 与 G4 复核均已退役。** v8 起 SOL 是唯一远程通道：
-`copilot_dispatch.py sol-review` 做独立复核（高风险任务建议执行一次，普通任务按风险决定），
-`copilot_dispatch.py sol-advisory --mode CONSULT|PLAN` 做按需认知辅助。SOL 结论是
+`copilot_dispatch.py sol-think` 是默认认知引擎（按复杂度建议一次整体判断），
+`copilot_dispatch.py sol-review` 只在用户明确要求时做一次独立复核。SOL 结论是
 **advisory**，不构成收口门禁，也不证明宿主只读权限。
 `native_agent.py review`、`review-context`、`capability`、review attempt 与
 `copilot-native-review/*` 信封已删除。历史 `call_gpt.py`、`review_ledger.py`、
@@ -50,11 +51,11 @@ Copilot 是运行在 ZCode 内的**协作治理层**，不是决策模型，也�
 1. 任务需要固定合同与完成条件，并在多轮之间保持状态（长任务、跨会话续跑）。
 2. 需要证据登记、SHA-256 完整性、审计留痕与可追溯收口。
 3. 任务处于 PARTIAL（还有工作要做），需要本地派生下一步而不是等待外部判断。
-4. 多模块改造、数据链路、安全或生产高风险变更，需要一次 SOL 独立复核；中高复杂任务在
-   形成初步理解后需要一次主动认知辅助（`review-admission` 给出复杂度与调用建议）。
-5. 高风险任务（生产数据、权限/安全策略、关键链路、不可逆操作）建议执行一次 SOL 单轮复核。
-6. 复杂问题存在多条技术路线、跨模块调用链或疑难故障，需要一次独立认知视角（CONSULT / PLAN）。
-7. 用户明确要求正式 REVIEW。
+4. 中高复杂任务（多模块、数据链路、安全或生产高风险）在形成初步理解后，需要一次 SOL
+   整体判断（`review-admission` 给出复杂度与调用建议）。
+5. 复杂问题存在多条技术路线、跨模块调用链或疑难故障，需要一次独立认知视角。
+6. 重大新证据（原方案失败、风险升级、任务重开）出现，需要一次定向再咨询。
+7. 用户明确要求 SOL 判断，或明确要求正式独立复核（REVIEW）。
 8. 用户要求只读查看历史 SOL 调用、REVIEW 台账或旧任务状态。
 
 不适用：单步查询、单文件小改、纯问答、简单命令确认——直接由 ZCode 完成，不建立任务状态。
@@ -67,34 +68,35 @@ start（合同 + 完成条件 + 风险 + 后端）
   → drive（本地求值：PASS 收口 / BLOCKED 停下 / 打印工作单）
   → ZCode 执行（主代理或原生子代理）
   → ingest / record / criterion / evidence（回填真实结果与原始证据）
-  → [中高复杂，按需] review-admission 判断复杂度 → sol-advisory 一次（CONSULT/PLAN）
-  → [收口前，高风险或新信号] sol-review 一次（独立复核）
-           → 主代理核实/采纳/修复/定向验证
+  → [中高复杂，按需] review-admission 判断复杂度 → sol-think 一次（THINK 整体判断）
+           → 主代理自主采纳/调整/否决，按现场事实实施与验证
+  → [仅用户明确要求] sol-review 一次（REVIEW 独立复核）
   → drive（继续直到 PASS 或真实 BLOCKED）
 ```
 
-除 `sol-review` 与 `sol-advisory` 外，所有命令只读写任务状态文件，不发起网络或模型调用。
-两个 SOL 命令都是一次调用只发一次请求，不自动重试、不自动二审。完整命令矩阵见
-`references/workflow.md`；阶段机与驱动语义见 `references/runtime.md`。
+除 `sol-think` 与 `sol-review` 外，所有命令只读写任务状态文件，不发起网络或模型调用。
+两个 SOL 命令都是一次调用只发一次请求，不自动重试、不自动二审；THINK 失败只记录并降级，
+不阻断工程推进。完整命令矩阵见 `references/workflow.md`；阶段机与驱动语义见
+`references/runtime.md`。
 
 ## 模式
 
-CONSULT / PLAN / REVIEW 既可以是主代理的本地工作模式，也可以按需转成 **SOL 辅助调用**；
-两者都不是审批节点，SOL 调用也不是决策入口。
+THINK / REVIEW 都是可选的 **SOL 调用**；工作项计划由 ZCode 本地决定，不经过 SOL。
+没有审批节点，SOL 调用也不是决策入口。
 
 | 模式 | 作用 | 是否阻塞任务 | 入口 |
 |---|---|---|---|
-| CONSULT | 本地问题分析、方案比较、风险识别；结论写入 `judgments` 仅作审计 | 否 | 主代理直接分析；需要留痕时 `judgment` |
-| PLAN | ZCode 的技术计划登记为工作项与依赖，供驱动与派发使用 | 否 | `plan` |
-| REVIEW | 正式复核结论登记；**仅在用户明确授权时进行** | 否（不是普通开发前置门） | `authorize-review` → `formal-review` |
-| SOL CONSULT / PLAN | 一次性零工具辅助分析；结论写入 `sol_advisories`，只作建议 | 否 | `sol-advisory --mode CONSULT|PLAN` |
-| SOL REVIEW | 一次性零工具独立审查；意见进入 Finding 台账供主代理核实 | 否 | `sol-review` |
+| 本地分析 | 主代理自行比较方案、识别风险；需要留痕时写 `judgment` | 否 | 主代理直接分析 |
+| 工作项计划 | ZCode 的技术计划登记为工作项与依赖，供驱动与派发使用 | 否 | `plan` |
+| 正式复核 | 正式复核结论登记；**仅在用户明确授权时进行** | 否（不是普通开发前置门） | `authorize-review` → `formal-review` |
+| SOL THINK | 默认认知引擎：一次整体判断；结论写入 `sol_calls`，只作认知输入 | 否 | `sol-think` |
+| SOL REVIEW | 用户明确要求的一次独立审查；意见进入 Finding 台账供主代理核实 | 否 | `sol-review` |
 
-- **PLAN 由 ZCode 决定**：计划内容、拆分粒度、依赖与执行顺序都是 ZCode 的技术决策；Copilot
-  只负责记录与校验（例如拒绝依赖环），不批准也不否决。
-- **SOL 只提供建议**：CONSULT / PLAN 是可选认知辅助，REVIEW 是可选独立审查。三者都不接管
-  工程执行、技术选型、收口判断或写操作；材料由主代理一次性准备，结论由主代理判断是否采纳。
-  不恢复 DECIDE，不设强制调用，也不因等待 SOL 停止已有工作。
+- **计划由 ZCode 决定**：计划内容、拆分粒度、依赖与执行顺序都是 ZCode 的技术决策；Copilot
+  只负责记录与校验（例如拒绝依赖环），不批准也不否决，也不交给 SOL 生成工程步骤。
+- **SOL 只提供认知输入**：THINK 与 REVIEW 都不接管工程执行、技术选型、收口判断或写操作；
+  材料由主代理一次性整理，结论由主代理核实后决定采纳、调整或否决。不恢复 DECIDE，不设
+  强制调用，也不因等待 SOL 停止已有工作。
 - **正式 REVIEW 不是门禁**：普通开发不需要正式 REVIEW，也不需要等待任何模型裁决。用户明确
   要求后，授权在同一任务合同内持续有效；范围或风险实质变化时重新确认。没有用户授权时不得
   伪造正式 REVIEW，也不得用自检冒充。
@@ -140,6 +142,8 @@ CONSULT / PLAN / REVIEW 既可以是主代理的本地工作模式，也可以�
 - 文件范围或起始路径；
 - **必要的项目背景与规则**——内置 `Explore` 的 `injectAgentsMd=false`，**不会自动注入
   AGENTS.md**，主代理必须把相关约束写进 prompt；
+- **历史决策/约束**——用 `knowledge_handoff.py build --target subagent` 生成交接块并放入
+  prompt；路径不能替代正文，子 Agent 不会自动读 Memory/Vault；
 - 预期证据：真实文件路径、行号、命令输出或代码片段。
 
 `Explore` 只调查、不修改工程文件；它的宿主工具集包含 `Bash`（可写/可执行），所以**不是
@@ -216,6 +220,9 @@ BLOCKED 表示**不能正常收口或继续受阻动作**，不表示无法记�
 
 - **先登记，后引用**：`evidence --add` 登记文件/内联文本/命令采集，记录 SHA-256、大小、
   路径与任务归属；`record` / `criterion` 只能引用本任务已登记且未归档的证据。
+- **Recall 证据**：`Recall: hit` 把同轮实际 Read 的卡路径登记为文件证据；`zero-hit` 把
+  有界检索命令/输出登记为 `--capture-cmd`；`skipped` 在 report/note 写明原因。回执文字
+  本身不是召回证据。
 - **文件型证据会重读校验**：G2 收口前重新计算文件摘要；文件被改动（`evidence_tampered`）、
   丢失（`evidence_file_missing`）或摘要不符都会失败关闭。历史证据不得被静默替换。
 - **命令采集走 `bridge_evidence.py`**：`evidence --capture-cmd` 复用既有脱敏、截断标记与
@@ -234,14 +241,14 @@ BLOCKED 表示**不能正常收口或继续受阻动作**，不表示无法记�
 - **执行信封审计事件**：执行信封回填写入 `native_result_ingested` 历史事件；被拒执行信封
   追加到任务目录 `review-attempts.jsonl`（只记错误码与绑定值，不记正文），供复盘统计
   “无效信封”而不必依赖终端输出。
-- **SOL 调用记录（单一权威流）**：v8.2 起 `sol-review` 与 `sol-advisory` 的成功与失败记录
-  统一写入状态 `sol_calls`（字段含 `call_id` / `mode` / `prompt_version` /
-  `evidence_digest` / `materials_sha256` / usage / 延迟）；原始输出仍按模式存入
-  `sol-reviews/<call_id>.raw.txt` 或 `sol-advisories/<call_id>.raw.txt`；审计统一写
-  `sol-audit.jsonl`（三模式共用，只记脱敏元数据：材料/请求/回复摘要、模型、推理强度回显、
-  请求/追踪 ID、usage、耗时、错误码），不记正文与凭据。三模式共用同一把 `.sol.lock`。
-  历史任务状态里的 `sol_reviews` / `sol_advisories` 继续**只读兼容**：`--list`、
-  `review-metrics`、`review-admission` 与单轮复用都会合并读取，不迁移、不改写、不重复计数。
+- **SOL 调用记录（单一权威流）**：`sol-think` 与 `sol-review` 的成功与失败记录统一写入
+  状态 `sol_calls`（字段含 `call_id` / `mode` / `prompt_version` / `evidence_digest` /
+  `materials_sha256` / usage / 延迟）；原始输出存入 `sol-think/<call_id>.raw.txt` 或
+  `sol-reviews/<call_id>.raw.txt`；审计统一写 `sol-audit.jsonl`（两模式共用，只记脱敏元数据：
+  材料/请求/回复摘要、模型、推理强度回显、请求/追踪 ID、usage、耗时、错误码），不记正文与
+  凭据。两模式共用同一把 `.sol.lock`。历史任务状态里的 `sol_reviews` / `sol_advisories`
+  继续**只读兼容**：`--list`、`review-metrics`、`review-admission` 与单轮复用都会合并读取，
+  历史 CONSULT / PLAN 按 THINK 计入覆盖，不迁移、不改写、不重复计数。
 - **SOL 与门禁共用上下文**：提示词自动注入任务目标、完整合同正文、完成条件、工作项状态与
   证据登记摘要（ID/摘要/大小/支持的条件/归档标记），主代理只需提供本次增量的材料与问题。
   单轮复用键包含提示词版本、模型与推理强度、目标、合同正文与边界、条件描述、证据集合摘要
@@ -317,11 +324,10 @@ verify 的结构化质量报告（`copilot-verify-result/v1`）走报告接入�
 - 执行方用 `native_agent.py execution` 生成 `copilot-native-result/v2`，绑定计划与执行方身份。
 - 执行信封由 `native_agent.py execution` 从宿主 metadata/rollout/DB 生成，绑定计划、
   执行方身份与证据 SHA-256；`copilot_auto.py ingest` 校验后回填。
-- **独立复核与认知辅助都走 SOL**：`copilot_dispatch.py sol-review`（REVIEW）与
-  `sol-advisory --mode CONSULT|PLAN` 都是零工具、单轮、advisory；不再有 review attempt、
-  宿主只读能力探测或 `copilot-native-review/*` 信封。需要独立意见时，主代理一次性准备材料
-  （目标/条件、规则、完整 diff、关键源码、数据与权限逻辑、测试结果、已知问题与高风险区域）
-  提交一次。
+- **认知与独立复核都走 SOL**：`copilot_dispatch.py sol-think`（THINK，默认）与
+  `sol-review`（REVIEW，用户明确要求）都是零工具、单轮、advisory；不再有 review attempt、
+  宿主只读能力探测或 `copilot-native-review/*` 信封。THINK 提交精炼的判断材料；REVIEW
+  提交完整 diff、关键源码、数据与权限逻辑、测试结果、已知问题与高风险区域，一次提交。
 - **历史兼容**：v7 及更早的状态里可能保留 `native_reviews` / `review_attempts` /
   `g4_attestations`。它们只读保留用于审计，不再被任何门禁、派生或 ingest 逻辑消费；
   不得手工改写历史记录，也不得把历史 G4 BLOCKED 当成当前任务状态。
@@ -329,20 +335,20 @@ verify 的结构化质量报告（`copilot-verify-result/v1`）走报告接入�
   `bind-execution` 都会拒绝没有 captured 策略的高风险任务；合同策略进入合同指纹，
   `required=false` 才允许测试层 N/A，调用方只能加严，不能删除或放宽合同要求。
 
-## 复核策略与收敛（v7）
+## SOL 认知与复核策略（v8.4）
 
-复核是风险控制手段，不是开发流程的必经节点。普通复核只有一条活动通道：
-**SOL 零工具单轮复核**（`copilot_dispatch.py sol-review`）。
+**SOL 是默认认知引擎，不是按阶段运行的流程。** ZCode 主代理是唯一工程执行与技术决策主体：
+SOL 给出判断、策略与风险，主代理自主采纳、调整或否决，并按现场事实实施与验证。
 
-### 主动介入与复杂度（v8.3）
+### 主动介入与复杂度
 
-**简单任务 0 调用；中高复杂任务主动调用 1 次；只有出现新的重大不确定性才追加调用。**
+**简单任务 0 调用；中高复杂任务主动调用 1 次；只有出现升级型新信号才追加调用。**
 判断是确定性的：只用状态里已有事实，不引入第二个模型、评分模型或新的门禁。
 
 `review-admission` 输出三个层次，全部只读、不写状态、不是门禁：
 
 - `complexity`：`low` / `medium` / `high` ＋ 命中的信号（见下表）；
-- `advice.action`：`none` / `reuse` / `consult` / `plan` / `review`，附建议模式、阶段与命令；
+- `advice.action`：`none` / `reuse` / `think` / `review`，附建议模式、阶段与命令；
 - `recommended_action`：`not_needed` / `optional` / `recommended` 兼容视图。
 
 | 信号 | 含义 |
@@ -354,80 +360,92 @@ verify 的结构化质量报告（`copilot-verify-result/v1`）走报告接入�
 | `interdependent` | 计划内工作项依赖边 ≥2 |
 | `replan-history` | 出现过 `AUTO-REPLAN`（方案失败后重规划） |
 | `reopened` | 任务曾重开 |
-| `user-request` | 用户明确要求 CONSULT / PLAN / REVIEW |
+| `user-request` | 用户明确要求 SOL 判断或独立复核 |
 
 - 0 个信号 → `low`：SOL 0 调用，即使进入 PASS/CLOSED 也不因阶段调用；
 - 1 个 → `medium`，≥2 个 → `high`：在有计划或证据（“已形成初步理解”）后建议**一次**
-  `PLAN`（还没有计划）或 `CONSULT`（已有计划，比较方案与风险）；
+  `THINK`；是否采纳由主代理判断；
 - 尚无可判断的现场（无计划、无证据）→ `none`：先调查，不做无上下文的空想；
-- 已覆盖且没有新信号 → `reuse`：直接复用已有结论，不重复付费；
+- 已覆盖且没有新信号 → `reuse`：直接复用已有认知结论，不重复付费；
 - 只有升级型信号（`risk-high` / `replan-history` / `reopened`）新出现，或合同被修订
   （合同指纹变化＝新范围），才允许追加一次，并给出 `--force --trigger ... --reason ...`。
   证据目录增加、工作项增减等结构变化不算新的认知对象。
-- 收口阶段：G1–G3 明确通过时**不因阶段自动调用**；只有高风险任务（或出现新信号）才给出
-  一次 REVIEW 建议（`optional` / `recommended`，advisory）。收口前的建议通过 `status` /
-  `review-admission` 获得——`drive` 命中 PASS 会立即收口，因此顺序是：最终验证 →
-  `review-admission`（需要时执行一次 SOL）→ `drive` 收口。
-- 用户明确要求 CONSULT / PLAN / REVIEW → 直接调用，不受复杂度判断限制（`--user-request`
-  可把这一事实写进准入建议）。
+- 收口阶段：G1–G3 明确通过时**不因阶段自动调用**；高风险或高复杂任务最多给一次
+  `optional` 的整体判断。REVIEW 只由用户明确要求触发（`review-admission --review-request`），
+  不由阶段或风险自动派生。收口前的建议通过 `status` / `review-admission` 获得——`drive`
+  命中 PASS 会立即收口，顺序是：最终验证 → `review-admission`（需要时执行一次 SOL）→
+  `drive` 收口。
+- 用户明确要求 SOL 判断 → 直接调用一次 THINK，不受复杂度判断限制（`--user-request`）。
 - 任务处于 BLOCKED 或已收口（CLOSED）时不建议新的 SOL 调用：阻塞只能由用户补齐授权/
   决策/资源解除，SOL 不提供本地事实。
-- **高风险任务**：建议在最终验证后执行一次 SOL 复核；SOL 是 advisory，不构成收口门禁，
-  也不证明宿主只读权限。G4 原生只读门禁已退役，不再有 `host_capability_missing` 或
-  G4 BLOCKED 状态。
 - 正式 REVIEW 仍只在用户明确授权时登记，不因风险等级推定授权。
 
-### CONSULT / PLAN 认知辅助（v8.1）
+### THINK 认知引擎（v8.4）
 
-SOL 除了独立复核，还提供两种可选的建议性认知辅助，由主代理判断是否值得一次调用：
+CONSULT / PLAN 已并入 THINK：SOL 只有一种默认认知调用，不再按模式重复同一份分析。
 
-| 场景 | 模式 | 期望产出 |
-|---|---|---|
-| 复杂问题存在多条技术路线、需要方案比较 | CONSULT | `analysis` / `options` / `risks` / `recommendation` |
-| 疑难故障、跨模块调用链、需要独立认知视角 | CONSULT | 关键判断与不确定项 `unverified` |
-| 复杂任务拆分、依赖关系与风险分析 | PLAN | `steps`（含 `depends_on`）/ `risks` / `alternatives` |
-| 方案可行性需要替代路线与顺序建议 | PLAN | `recommendation` 与适用条件 |
-
-- **入口**：`copilot_dispatch.py sol-advisory --state S --mode CONSULT|PLAN --materials M.md
-  [--question "..."]`；`--dry-run` 只校验请求，`--list` 只读查看。
-- **不适合调用**：简单修改、常规文档调整、已有明确方案的重复工作、能直接从源码或日志
-  得到答案的问题。不设固定轮次，不重复提交相同上下文和相同问题。
-- **治理边界**：结论写入 `sol_calls`（`mode=CONSULT|PLAN`，历史 `sol_advisories` 只读
-  兼容），不进入 Finding 台账、不改变完成条件、不影响 G1–G3；是否采纳、如何实施由 ZCode
-  主代理决定。
+- **入口**：`copilot_dispatch.py sol-think --state S --materials M.md --question "本次真正
+  需要判断的事项"`；`--dry-run` 只校验请求，`--list` 只读查看。
+- **输入（主代理整理）**：任务目标、当前工程基线、已确认事实、关键问题与约束、已尝试方案
+  及结果、必要证据摘要。**不要**提交完整仓库、冗长日志、重复报告或无关历史；已确认的事实
+  不要重复调查。THINK 材料上限 120,000 字符（提示阈值 60,000），超限拒绝而不是静默截断。
+- **输出（`copilot-sol-think/v1`）**：`judgment`（核心判断）、`essence`（问题本质）、
+  `strategy`（推荐策略）、`tradeoffs`（关键取舍）、`risks`（主要风险）、`priority`
+  （实施优先级）、`verify`（需要关注的验证信号）、`reconsult`（重新咨询触发条件）与
+  `unverified`。字段类型不符或没有判断内容时拒绝消费。
+- **重新咨询条件**：原方案连续失败需要改策略（`strategy-failed`）、出现新的关键风险
+  （`new-risk`）、任务目标/范围/约束实质变化（`scope-changed` / 合同修订）、材料有重大
+  遗漏（`materials-omitted`）、出现超出当前判断力的重大不确定性（`major-uncertainty`）。
+  没有新增信息或决策价值时不重复调用。
+- **治理边界**：结论写入 `sol_calls`（`mode=THINK`，历史 `sol_advisories` 只读兼容），
+  不进入 Finding 台账、不改变完成条件、不影响 G1–G3；是否采纳、如何实施由 ZCode 主代理决定。
 - **模型与推理强度**：所有 SOL 模式统一 `gpt-6.2-sol` + `reasoning.effort="high"`
   （`standard` 模式），不按角色降级，不允许静默回退到 `medium`/`low` 或其他模型；
   上游回显的 `model`、`reasoning.effort`、`reasoning.mode` 不一致时拒绝消费（退出码 9）。
 
 ### 单轮原则（硬约束）
 
-- **一次调用只发起一次 SOL 请求**。同一材料摘要（辅助分析还绑定模式与问题）再次调用直接
-  复用已有结论，不重复付费。REVIEW 与 CONSULT/PLAN 各自独立判定，不互相复用。
+- **一次调用只发起一次 SOL 请求**。同一材料摘要（THINK 还绑定问题）再次调用直接复用已有
+  结论，不重复付费。THINK 与 REVIEW 各自独立判定，不互相复用。
 - **不自动二审**：修复后由主代理核实、修复并做受影响的定向测试；不因 Minor/Info 新建
   第二轮，不与 SOL 反复辩论，不把 PASS 当“再跑一轮”的理由。
-- 只有用户明确要求、变更范围实质变化、出现新的关键风险、或首次材料存在重大遗漏时，才用
-  `--force --trigger <user-request|scope-changed|new-risk|materials-omitted> --reason ...`
-  再调用一次；必须换新材料并写明原因。
-- **失败收敛**：429、超时、网络错误、截断、响应格式异常、模型身份不符都记录真实原因并退出，
-  不自动重试、不切换 Provider、不派原生 Reviewer 顶替，也不阻断主代理继续开发。用户要求
-  必须完成独立复核而 SOL 不可用时，如实报告 BLOCKED，不伪造 PASS。
+- 再次调用必须用 `--force --trigger <原因类型> --reason ...`，并换新材料。
+- **失败收敛**：429、超时、网络错误、截断、响应格式异常、模型身份不符都记录真实原因，
+  不自动重试、不切换 Provider、不派原生 Reviewer 顶替。THINK 失败只记录并返回“可继续”，
+  主代理按已有信息继续推进；REVIEW 失败如实报告，不伪造 PASS。
 
-### 审查材料（由主代理一次性准备）
+### 审查材料（REVIEW 专用）
 
-必须包含：任务目标与完成条件、相关项目规则/关键决策、完整变更 Diff、必要的关键文件内容、
-关键调用链与数据流、已执行测试及结果、尚未解决的问题、需要重点关注的风险。不得只给简短摘要
-让 SOL 猜测。`sol-review` 自动注入合同/完成条件/目标，并把材料拼成一次完整上下文；超过
-400,000 字符直接拒绝（提示主代理整理），不静默截断。
+用户明确要求独立复核时，材料必须包含：任务目标与完成条件、相关项目规则/关键决策、完整
+变更 Diff、必要的关键文件内容、关键调用链与数据流、已执行测试及结果、尚未解决的问题、
+需要重点关注的风险。不得只给简短摘要让 SOL 猜测。`sol-review` 自动注入合同/完成条件/
+目标，并把材料拼成一次完整上下文；超过 400,000 字符直接拒绝（提示主代理整理），不静默截断。
 
-SOL 输出契约：总体结论 `verdict=pass|partial|blocked`；`findings` 按
+### 知识交接（Memory / Vault → SOL / 子 Agent）
+
+主 Agent 实际 Read 过的 Memory/Vault 卡片，用
+`python3 -B scripts/knowledge_handoff.py build --input handoff.json --output handoff.md`
+生成交接块；`read` 必须附卡片正文摘录，脚本会校验摘录确实出现在卡片中；
+`index-only`/`unverified` 必须如实标注，不得写成已确认。`read` 表示「主代理声明已读 +
+脚本核对摘录来源」，不证明宿主同轮工具调用；需要时用可选 `read_evidence` 记录会话/
+工具证据，由 Copilot 另行登记。只交接与当前任务直接相关的 1–5 条，不把整库或完整
+Memory 注入。
+
+- `sol-think` / `sol-review` 支持 `--knowledge-file handoff.json`，校验通过后把交接块
+  追加到 materials；不要再手工粘贴同一块。
+- 派发原生子 Agent 时，用 `--target subagent` 生成同一块并放入 prompt；子 Agent 不自动
+  继承 Memory/AGENTS，路径不能替代正文。
+- 涉及既往经验或已确认决策时，材料附卡片路径、核验时间与必要摘录；SOL 零工具，不能
+  假设它会自行读卡。
+
+REVIEW 输出契约：总体结论 `verdict=pass|partial|blocked`；`findings` 按
 `blocking/major/minor/info` 分级，每项带文件、位置、材料依据与建议；`unverified` 列出无法
 从材料确认的事项。PASS 与 blocking/major 或未验证项冲突时自动降级为 PARTIAL 并记录
 `verdict_adjusted`。
 
-辅助分析输出契约（`copilot-sol-advisory/v1`）：`mode`、`summary`、`analysis`，以及按模式的
-`options`（CONSULT）或 `steps`（PLAN），加 `risks`、`alternatives`（PLAN）、
-`recommendation`、`unverified`。schema 或 mode 与请求不一致、字段类型不符时拒绝消费，
-不做叙述猜测。
+THINK 输出契约（`copilot-sol-think/v1`）：`judgment`、`essence`、`strategy` 为字符串；
+`tradeoffs`、`risks`、`priority`、`verify`、`reconsult`、`unverified` 为字符串数组。
+schema 不一致、字段类型不符或判断为空时拒绝消费，不做叙述猜测。
 
 ### 输出消费与 Finding 台账
 
@@ -439,7 +457,7 @@ SOL 输出契约：总体结论 `verdict=pass|partial|blocked`；`findings` 按
   （仅 advisory 的 blocking/major 允许）。v7 及更早的 authoritative 记录仍只能修复并
   定向验证。
 - 未闭合的 blocking/major 阻断 G2（所有风险等级）；minor/info 不阻断、不派发新复核。
-- 原始输出保存在任务目录 `sol-reviews/`（CONSULT/PLAN 为 `sol-advisories/`），审计
+- 原始输出保存在任务目录 `sol-reviews/`（THINK 为 `sol-think/`），审计
   `sol-audit.jsonl` 只记脱敏元数据（材料/请求/回复摘要、模型、usage、耗时、失败原因），
   不记正文与凭据。
 
@@ -460,8 +478,8 @@ SOL 输出契约：总体结论 `verdict=pass|partial|blocked`；`findings` 按
   代码变化、跨关键路径的新问题或风险判断失效时，才按重入触发再调用一次 SOL；同一材料摘要
   直接复用已有结论。
 
-收敛顺序：**充分自检 → 稳定最终执行结果与证据 → 按风险调用一次 SOL（如有）→ 集中修复 →
-定向验证 → 收口**。SOL 不是收口前提：主代理判断材料是否具备、意见是否有增量价值。
+收敛顺序：**充分自检 → 稳定最终执行结果与证据 → 按认知价值调用一次 SOL THINK（如有）→
+集中修复 → 定向验证 → 收口**。SOL 不是收口前提：主代理判断材料是否具备、意见是否有增量价值。
 目标 1–2 轮收敛是性能目标，不是硬上限；不得为减少轮次而漏报或降低标准。
 
 ### 效率指标
@@ -502,7 +520,7 @@ SOL 输出契约：总体结论 `verdict=pass|partial|blocked`；`findings` 按
 |---|---|
 | 命令矩阵、证据登记、收口操作、只读交付清单、历史只读 | `references/workflow.md` |
 | 阶段机、`drive`/`ingest`、PARTIAL 派生、退出码 | `references/runtime.md` |
-| SOL 三模式、单轮复核、正式 REVIEW、缺陷分级、台账与历史 G4 记录 | `references/review.md` |
+| SOL THINK/REVIEW、单轮调用、正式 REVIEW、缺陷分级、台账与历史 G4 记录 | `references/review.md` |
 | 原生 Bridge v2 执行信封、错误码 | `references/agent-bridge.md` |
 | Agent 调度与内置 Explore/general-purpose 能力基线 | `copilot_dispatch.py agent-policy`；`references/agent-bridge.md` |
 | 历史 REVIEW 台账与旧审计（只读） | `references/review-ledger.md` |
@@ -510,21 +528,22 @@ SOL 输出契约：总体结论 `verdict=pass|partial|blocked`；`findings` 按
 
 ## 版本
 
-当前版本 **v8.3.0（SOL 主动介入策略）**。本版只改“什么时候调用 SOL”，不改状态机、
-G1–G3 与授权边界：
+当前版本 **v8.4.0（SOL 默认认知引擎）**。本版收敛 SOL 的调用面，不改状态机、G1–G3 与
+授权边界：
 
-- **确定性复杂度**：新增 `task_complexity` / `sol_advice`（`review_policy.py`），只用状态
-  事实（风险、声明触发因素、计划结构、证据目录、重规划/重开历史）判断 `low/medium/high`；
-  不引入第二个模型、评分模型或新门禁。
-- **主动介入**：中高复杂任务在形成计划或证据后，由 `review-admission` 与 `drive`/`status`
-  给出一次 `PLAN`/`CONSULT` 建议（含具体命令）；简单任务保持 0 调用，进入 PASS 也不因阶段
-  调用。建议不派生工作项、不改变阶段、不影响收口。
-- **覆盖与追加**：同一合同已有有效结论且没有升级型新信号（`risk-high` /
-  `replan-history` / `reopened`）时返回 `reuse`；结构变化（证据目录、工作项增减）不算新对象；
-  合同修订由合同指纹变化自然开启新范围。SOL 记录新增 `risk` / `complexity` /
-  `complexity_signals` 快照，追加判断只比较快照。
-- **收口顺序**：最终验证 → `review-admission`（需要时执行一次 SOL）→ `drive` 收口；PASS
-  时 drive 会立即收口，因此复核建议在收口前的 `status` / `review-admission` 中给出。
+- **THINK 成为默认认知引擎**：CONSULT / PLAN 并入 `sol-think`，只保留一种认知调用与一份
+  结构化输出（判断/本质/策略/取舍/风险/优先级/验证信号/再咨询条件）；历史记录只读兼容。
+- **REVIEW 只由用户明确要求**：不再因高风险或收口阶段自动建议独立复核；`review-admission
+  --review-request` 是唯一自动建议入口（仍只是建议）。
+- **按价值调用**：沿用确定性复杂度与覆盖判断；简单任务 0 调用，中高复杂任务形成初步理解后
+  一次，只有升级型新信号或合同修订才追加；`sol_advice.action` 为 `none`/`reuse`/`think`/
+  `review`。
+- **输入与输出收紧**：THINK 材料上限 120,000 字符（提示阈值 60,000），材料要求目标/基线/
+  已确认事实/已尝试方案/证据摘要/本次问题；输出不生成工程操作清单。
+- **降级不阻断**：THINK 超时、429、网络或格式失败只登记失败并返回 `status=unavailable`
+  （退出码 0），主代理按已有判断继续；REVIEW 失败仍如实失败，不伪造结论。
+- **知识交接**：新增 `knowledge_handoff.py` 与 SOL `--knowledge-file`；`read` 摘录必须来自
+  实际卡片，`index-only`/`unverified` 不得冒充已读；不改变状态机、G1–G3 或调用时机。
 - **不变量**：SOL 仍是 advisory、零工具、单轮、不自动重试；G1–G3 语义与 fail-closed 不变；
   G4 不存在；ZCode 仍是唯一工程执行与技术决策主体。
 

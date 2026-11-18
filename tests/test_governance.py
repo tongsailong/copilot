@@ -361,18 +361,23 @@ class HighRiskRetirementTests(unittest.TestCase):
         self.assertFalse([a for a in created
                           if str(a.get("id")).startswith("AUTO-G4")])
 
-    def test_high_risk_pass_suggests_sol_review_advisory(self):
+    def test_high_risk_pass_suggests_optional_think_not_review(self):
+        """高风险与 G1–G3 通过只给可选 THINK；REVIEW 只由用户明确要求触发。"""
         state = G.load_state(self.state)
         evaluate = G.evaluate(state)
         self.assertEqual(evaluate["phase"], "PASS")
         hints = "\n".join(evaluate.get("next_commands") or [])
-        self.assertIn("sol-review", hints)
+        self.assertIn("sol-think", hints)
+        self.assertNotIn("sol-review", hints)
         self.assertIn("advisory", hints)
-        # SOL 记录存在后不再重复提示。
-        state["sol_reviews"] = [{"status": "completed", "verdict": "pass"}]
+        # 已有认知结论后不再重复提示。
+        state["sol_calls"] = [{
+            "call_id": "SC1", "status": "completed", "mode": "THINK",
+            "contract_sha256": state.get("contract_sha256") or "",
+            "complexity_signals": ["risk-high"]}]
         evaluate = G.evaluate(state)
         hints = "\n".join(evaluate.get("next_commands") or [])
-        self.assertNotIn("sol-review", hints)
+        self.assertNotIn("sol-think", hints)
 
     def test_review_metrics_marks_g4_retired(self):
         metrics = G.review_metrics(G.load_state(self.state))

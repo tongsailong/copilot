@@ -3,13 +3,25 @@
 Copilot 是运行于 ZCode 内的**轻量协作治理 Skill**：用户侧 ChatGPT 负责需求与产品层目标、
 交接与验收；ZCode 原生 Agent（主代理）是工程执行与技术决策主体，负责现场调查、规划、实现、
 调试、测试与验证；Copilot 负责任务合同、完成条件、状态、证据、审计与收口门禁，并用 PARTIAL
-派生持续推进任务；独立质量审查与可选认知辅助（SOL REVIEW / CONSULT / PLAN）按需提供。
+派生持续推进任务；SOL 作为默认认知引擎按需提供判断，用户明确要求时可执行一次独立复核。
 
-**v8.3.0 SOL 主动介入策略**：触发判断从“风险标签 + 门禁是否全绿”升级为**确定性复杂度 +
-覆盖判断**——简单任务 0 调用；中高复杂任务（多模块、多依赖、高风险、重规划、重开等信号）
-在形成计划或证据后建议一次 `PLAN`/`CONSULT`；同一合同已有有效结论且无升级型新信号时直接
-复用，只有新出现的重大不确定性才允许追加一次。建议由 `review-admission`、`status` 与
-`drive` 展示，不派生工作项、不改变阶段、不影响 G1–G3。
+**v8.4.0 SOL 默认认知引擎**：CONSULT / PLAN 并入 `sol-think`（`THINK`），只保留一种认知
+调用与一份结构化输出（核心判断、问题本质、推荐策略、关键取舍、主要风险、实施优先级、
+验证信号、再咨询条件）。简单任务 0 调用；中高复杂任务在形成初步理解后建议一次，只有
+升级型新信号或合同修订才追加；REVIEW 只在用户明确要求时执行，不再由风险或收口阶段自动
+派生。THINK 材料上限 120,000 字符，失败只登记并降级（退出码 0），不阻断工程推进。
+
+**知识交接扩展（2026-11-18）**：新增 `scripts/knowledge_handoff.py`，把主 Agent 已实际
+Read 的 Memory/Vault 卡片渲染为带状态、核验时间与必要摘录的交接块；`sol-think` /
+`sol-review` 支持 `--knowledge-file`，`read` 摘录必须能在卡片正文中找到，
+`index-only`/`unverified` 不得冒充已读。`read` 是主代理声明 + 脚本核对来源，不证明
+宿主同轮工具调用；可选 `read_evidence` 记录会话/工具证据。
+子 Agent 使用同一工具生成 `--target subagent`
+块并由主 Agent 放入 prompt。
+
+**v8.3.0 SOL 主动介入（历史）**：触发判断从“风险标签 + 门禁是否全绿”升级为**确定性
+复杂度 + 覆盖判断**，简单任务 0 调用，中高复杂任务一次，只有升级型新信号才追加；v8.4
+把当时的 `PLAN`/`CONSULT` 两种模式并入 THINK。
 
 **v8.2.0 SOL 与 G1–G3 融合（历史）**：三种 SOL 模式共用一条调用管线、一份任务上下文
 （合同/条件/证据）与一份记录流（`sol_calls`，历史 `sol_reviews`/`sol_advisories` 只读兼容）、
@@ -65,9 +77,10 @@ copilot/
 ├── SKILL.md                 # Skill 入口与运行契约（分发）
 ├── scripts/                 # 运行时脚本（分发）
 │   ├── governance.py        # 本地治理引擎：合同、状态、阶段、G1–G3、PARTIAL 派生
-│   ├── copilot_dispatch.py  # CLI：任务、计划、证据、收口、SOL 复核/辅助分析、正式 REVIEW、历史只读
+│   ├── copilot_dispatch.py  # CLI：任务、计划、证据、收口、SOL 认知/复核、正式 REVIEW、历史只读
 │   ├── copilot_auto.py      # 驱动：drive（推进/工作单/派生）与 ingest（执行信封回填）
-│   ├── sol_review.py        # SOL 三模式（REVIEW/CONSULT/PLAN）：请求/解析/审计（唯一远程调用）
+│   ├── sol_review.py        # SOL 两模式（THINK/REVIEW）：请求/解析/审计（唯一远程调用）
+│   ├── knowledge_handoff.py # 知识交接块：校验 read 摘录来源并渲染 Memory/Vault → SOL/子 Agent
 │   ├── native_bridge.py     # Native Bridge v2 执行信封协议与校验
 │   ├── native_agent.py      # 从宿主运行记录生成正式执行信封
 │   ├── agent_policy.py      # Agent 调度建议（只读纯函数）

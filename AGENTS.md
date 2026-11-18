@@ -8,28 +8,32 @@
 
 Copilot 是运行于 ZCode 内的**轻量协作治理 Skill**：负责任务承接、合同与完成条件、状态机、
 证据桥接、审计、PARTIAL 持续推进与 G1–G3 收口。ZCode 原生 Agent 是唯一的工程执行与技术
-决策主体；用户侧 ChatGPT 负责需求与产品层目标、交接与验收；独立质量审查与可选认知辅助
-（SOL REVIEW / CONSULT / PLAN）由 `gpt-6.2-sol` 零工具单轮调用按需提供。
+决策主体；用户侧 ChatGPT 负责需求与产品层目标、交接与验收；SOL 作为默认认知引擎
+（THINK）按需提供整体判断，用户明确要求时执行一次独立复核（REVIEW），均由
+`gpt-6.2-sol` 零工具单轮调用完成。
 
+- **v8.4.0 起 SOL 收敛为默认认知引擎 THINK**：`SOL_MODES=("THINK","REVIEW")`；
+  CONSULT / PLAN 并入 THINK（历史别名只读兼容），`sol-advisory` 命令移除。THINK 输出
+  判断/本质/策略/取舍/风险/优先级/验证信号/再咨询条件；材料上限 120,000 字符；
+  THINK 失败只登记并降级（退出码 0），不阻断工程推进。REVIEW 只在用户明确要求时执行，
+  高风险与收口阶段不再自动建议；`review-admission --review-request` 是唯一自动建议入口。
 - **v8.3.0 起 SOL 触发改为确定性复杂度 + 覆盖判断**：`review_policy.task_complexity`
   只用状态事实（`risk-high`、声明触发因素、多模块证据、计划规模/依赖、重规划、重开）判断
   `low/medium/high`；简单任务 0 调用，中高复杂任务在形成计划或证据后由
-  `review-admission` / `status` / `drive` 建议一次 `PLAN`/`CONSULT`（给出命令，不派生工作项）。
+  `review-admission` / `status` / `drive` 建议一次 `THINK`（给出命令，不派生工作项）。
   同一合同已有有效结论且无升级型新信号（`risk-high` / `replan-history` / `reopened`）时复用；
   结构变化不诱发重复调用。建议不改变阶段、不影响 G1–G3；`drive` 命中 PASS 立即收口，收口前
-  的复核建议在 `status` / `review-admission` 中给出。
-- **v8.2.0 起 SOL 三模式融合为统一按需认知能力**：REVIEW / CONSULT / PLAN 共用
-  `build_prompt`（自动注入合同正文、完成条件、工作项与证据登记）、`_run_sol_channel` →
-  `run_sol` → `record_sol_call` 管线；记录统一写入 `sol_calls`，审计统一
-  `sol-audit.jsonl`，互斥统一 `.sol.lock`，记录 ID 统一 `SC`。历史 `sol_reviews` /
-  `sol_advisories` 只读兼容，不迁移、不改写、不重复计数。`review-admission` 在门禁仍有
-  缺口时返回 `recommended_action=not_needed`（确定性优先）。G1–G3 语义、advisory 边界、
-  单轮与授权规则不变。
-- **v8.1.0 起 SOL 升级为 `gpt-6.2-sol` 并恢复建议性 CONSULT / PLAN**：所有 SOL 模式统一
+  的建议在 `status` / `review-admission` 中给出。
+- **v8.2.0 起 SOL 共用统一管线**：THINK / REVIEW 共用 `build_prompt`（自动注入合同正文、
+  完成条件、工作项与证据登记）、`_run_sol_channel` → `run_sol` → `record_sol_call` 管线；
+  记录统一写入 `sol_calls`，审计统一 `sol-audit.jsonl`，互斥统一 `.sol.lock`，记录 ID
+  统一 `SC`。历史 `sol_reviews` / `sol_advisories` 只读兼容，不迁移、不改写、不重复计数。
+  `review-admission` 在门禁仍有缺口时返回 `recommended_action=not_needed`（确定性优先）。
+  G1–G3 语义、advisory 边界、单轮与授权规则不变。
+- **v8.1.0 起 SOL 升级为 `gpt-6.2-sol`**：所有 SOL 模式统一
   Responses API `/v1/responses`、`reasoning.effort="high"`、`reasoning.mode="standard"`、
-  零工具、单轮；不按角色降级，不回退 `gpt-6.1-sol` 或其他模型/别名。CONSULT / PLAN 只写入
-  SOL 记录（v8.2 起为 `sol_calls`），不进入 Finding 台账、不影响 G1–G3、不阻断任务；
-  DECIDE 不恢复。
+  零工具、单轮；不按角色降级，不回退 `gpt-6.1-sol` 或其他模型/别名。THINK 只写入
+  SOL 记录（`sol_calls`），不进入 Finding 台账、不影响 G1–G3、不阻断任务；DECIDE 不恢复。
 - **v8.0.0 起 G4 原生只读复核正式退役**：删除 `g4_attest.py`、`g4_shadow.py`、
   `test_execution.py`、原生复核信封与 `native_agent.py review/review-context/capability`。
   不再产生 `g4_eligible`、G4 PASS、G4 BLOCKED、`AUTO-G4*` 或 `host_capability_missing`；
@@ -51,7 +55,7 @@ Copilot 是运行于 ZCode 内的**轻量协作治理 Skill**：负责任务承�
 ## 2. 角色职责
 
 顶层协作角色按 `docs/PROJECT-CHARTER.md`：用户、ChatGPT（用户侧）、Copilot、ZCode 原生
-Agent、SOL（REVIEW / CONSULT / PLAN）、DesignWise。Executor 是 ZCode 工程执行体系内的子角色，
+Agent、SOL（THINK / REVIEW）、DesignWise。Executor 是 ZCode 工程执行体系内的子角色，
 不是与顶层角色并列的职责；G4 只读复核已退役。
 
 | 角色 | 职责 | 关键限制 |
@@ -59,9 +63,9 @@ Agent、SOL（REVIEW / CONSULT / PLAN）、DesignWise。Executor 是 ZCode 工�
 | ZCode 主代理 | 默认执行主体：现场调查、工程规划、技术选型、实现、调试、测试、集成与交付；按需派发子代理 | 不擅自改变产品目标、业务规则或授权范围；不为体现协作强制调用子代理 |
 | 内置 `Explore` | 独立只读调查：跨模块/调用链/改动前风险/独立上下文检查 | 工具集含 `Bash`，不是只读沙箱；不注入 AGENTS.md，主代理必须提供范围与项目背景；不修改工程文件 |
 | 内置 `general-purpose` | 边界清晰、可独立交付、并行收益明显的子任务 | `tools=["*"]` 并继承 MCP；主代理负责拆分、冲突检查、集成与验收；不能当作只读复核者 |
-| Copilot 状态层 | 合同、条件、状态、证据登记、G1–G3、PARTIAL 派生、收口、审计 | 是本地脚本与状态，不是模型；除显式 `sol-review` / `sol-advisory` 外不调用模型、不实施工程、不替代技术决策、门禁不得绕过 |
-| SOL REVIEW | 一次性零工具独立审查；结论写入统一 `sol_calls`（历史 `sol_reviews` 只读兼容）与 Finding 台账（advisory） | 只做 REVIEW；不执行工程、不做技术决策、不自动二审；结论只是建议，不构成收口门禁 |
-| SOL CONSULT / PLAN | 一次性零工具认知辅助；结论写入统一 `sol_calls`（历史 `sol_advisories` 只读兼容，advisory） | 只做分析与规划建议；不执行工程、不写状态、不进入 Finding 台账、不影响 G1–G3；不恢复 DECIDE |
+| Copilot 状态层 | 合同、条件、状态、证据登记、G1–G3、PARTIAL 派生、收口、审计 | 是本地脚本与状态，不是模型；除显式 `sol-think` / `sol-review` 外不调用模型、不实施工程、不替代技术决策、门禁不得绕过 |
+| SOL THINK | 默认认知引擎：一次零工具整体判断（判断/本质/策略/取舍/风险/优先级/验证信号）；结论写入统一 `sol_calls`（历史 `sol_advisories` 只读兼容，advisory） | 只做认知判断；不执行工程、不做技术决策、不写状态、不进入 Finding 台账、不影响 G1–G3；失败只降级不阻断 |
+| SOL REVIEW | 用户明确要求时的一次零工具独立审查；结论写入统一 `sol_calls`（历史 `sol_reviews` 只读兼容）与 Finding 台账（advisory） | 只做 REVIEW；不执行工程、不做技术决策、不自动二审；结论只是建议，不构成收口门禁，也不由阶段或风险自动派生 |
 | 正式 REVIEW | 用户明确要求时的治理记录 | 不是普通开发前置门禁；无授权不得伪造 |
 | ~~G4 复核~~ | **v8.0.0 已正式退役**；历史记录只读保留 | 不再参与准入、派生或收口；不得把历史 BLOCKED 改写成 PASS |
 
@@ -72,7 +76,7 @@ Agent、SOL（REVIEW / CONSULT / PLAN）、DesignWise。Executor 是 ZCode 工�
 
 ## 3. 模型路由规则
 
-- **唯一远程调用是 SOL（REVIEW / CONSULT / PLAN）**：只有 `scripts/sol_review.py` 可以导入
+- **唯一远程调用是 SOL（THINK / REVIEW）**：只有 `scripts/sol_review.py` 可以导入
   网络客户端、读取本机 CPA 凭据与包含 `gpt-6.2-sol` 模型名；`governance.py`、
   `copilot_dispatch.py`、`copilot_auto.py`、`native_bridge.py`、`native_agent.py` 不得导入
   网络客户端或已退役的 SOL 模块（`call_gpt` / `review_ledger` / `reply_protocol`）。SOL 只
@@ -124,10 +128,10 @@ Agent、SOL（REVIEW / CONSULT / PLAN）、DesignWise。Executor 是 ZCode 工�
   `pending_call`、`quota`、`round_seq`、`budget`、`pass_pending` 等远程判定字段。
 - **PARTIAL 不是终点**：必须本地派生工作项（`AUTO-C<n>` / `AUTO-R-<id>` / `AUTO-FIX-<F>` /
   `AUTO-VERIFY-<F>` / `AUTO-REPLAN` / `AUTO-NEXT`）并继续推进，直到 PASS 或真实 BLOCKED。
-  G4 退役后不再派生 `AUTO-G4*`；SOL 复核由主代理按风险决定，不是阻塞性工作项。v8.3 起
-  SOL 以建议+命令形式呈现（`advice.action`），不派生 `AUTO-SOL*` 工作项，也不因等待 SOL
-  停止。禁止因轮次、Token、内部费用、等待模型、重复评审、子 Agent PARTIAL、首次方案失败或
-  普通测试失败停止。
+  G4 退役后不再派生 `AUTO-G4*`；SOL 认知由主代理按复杂度决定，不是阻塞性工作项。v8.4 起
+  SOL 以建议+命令形式呈现（`advice.action` 为 `think`/`review`），不派生 `AUTO-SOL*`
+  工作项，也不因等待 SOL 停止。禁止因轮次、Token、内部费用、等待模型、重复评审、
+  子 Agent PARTIAL、首次方案失败或普通测试失败停止。
 - `execution_backend` 默认 `legacy`，native 为显式 opt-in；既有协议决定不得擅改。
 - **Agent 调度按 `SKILL.md`**：主代理直接执行为默认；`Explore` 只做独立只读调查（不注入
   AGENTS.md，必须提供范围与背景）；`general-purpose` 只承担边界清晰的独立交付物。
@@ -135,17 +139,18 @@ Agent、SOL（REVIEW / CONSULT / PLAN）、DesignWise。Executor 是 ZCode 工�
 - **G4 已退役**：不再有宿主只读载体要求、权限探测或独立取证门禁；`Explore` 含 Bash、
   `general-purpose` 为 `tools=["*"]`，都只能按普通子代理使用。
 - G1–G3 保持 fail-closed：证据不足、绑定不符、门禁未过时必须失败关闭，不得用
-  “看起来合理”替代验证；SOL 复核 PASS 也不等于证据、测试或授权判断。
+  “看起来合理”替代验证；SOL 判断或复核结论也不等于证据、测试或授权判断。
 - 执行/复核必须绑定 task / contract / plan / dispatch / work_item /
   `execution_result_sha256`；证据须先登记且属于本任务，文件型证据会重读校验摘要。
-- SOL 复核只提供建议（advisory），由主代理核实、修复并做定向验证；不得把 SOL 结论当作
-  文件读取证明、宿主权限审计或收口依据。CONSULT / PLAN 同样只是建议，不进入 Finding 台账、
-  不影响 G1–G3，也不得被当作工程决策。
+- SOL 只提供认知输入（advisory），由主代理核实、修复并做定向验证；不得把 SOL 结论当作
+  文件读取证明、宿主权限审计或收口依据。THINK 不进入 Finding 台账、不影响 G1–G3，也不得
+  被当作工程决策。
 - 正式 REVIEW 仅在用户明确授权时登记；授权在同一任务合同内持续有效，不得成为普通开发
   门禁，也不得用自检冒充。
 - SOL 一次调用只发一次请求：失败（429/5xx/超时/网络/截断/格式/模型身份/推理强度或模式
-  不符）如实记录后由主代理继续，不自动重试、不换 Provider、不派原生 Reviewer 顶替；只有
-  用户明确要求完成独立复核时才按 BLOCKED 报告。
+  不符）如实记录，不自动重试、不换 Provider、不派原生 Reviewer 顶替。THINK 失败按
+  `status=unavailable` 降级，主代理继续；REVIEW 失败返回真实非零退出码，只有用户明确
+  要求完成独立复核时才按 BLOCKED 报告。
 - 不跳过 G1–G3、收口与证据校验；未过门不得标记 CLOSED 或 PASS。测试默认使用本地夹具，
   只有显式真实 E2E 才调用既有授权配置。
 - 不重做状态机、门禁、自动驱动或证据协议；需要变更时先说明影响并取得授权。
