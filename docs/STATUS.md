@@ -1,7 +1,83 @@
 # STATUS
 
-更新：2026-11-17 CST。本文件只记录现场可核实的事实；规划与未完成事项单独标注。
-当前版本：v8.0.1（G4 退役 + SOL 安全/效率加固）。
+更新：2026-11-18 CST。本文件只记录现场可核实的事实；规划与未完成事项单独标注。
+当前版本：v8.1.0（GPT-6.2 SOL + 按需 CONSULT / PLAN）。
+
+## GPT-6.2 SOL 升级与按需认知辅助（2026-11-18，v8.1.0）
+
+基线：HEAD `20db0ba`（v8.0.1，`origin/main` 一致，工作区干净）。**本轮只做源码/测试/文档与
+运行时同步，未提交、未推送。**
+
+### 真实 API 调用（本机 CPA `127.0.0.1:8317`，`/v1/responses`）
+
+| 模式 | 记录 ID | model_resolved | reasoning | usage（in/out/reasoning/total） | 延迟 | 结果 |
+|---|---|---|---|---|---|---|
+| 探针（最小请求） | — | `gpt-6.2-sol` | `effort=high`, `mode=standard` | 24 / 5 / 0 / 29 | 2.5s | HTTP 200 |
+| REVIEW | `SR83dd3ef8e096691dd4954fbb` | `gpt-6.2-sol` | `high` / `standard` | 656 / 510 / 220 / 1166 | 13.1s | verdict `blocked`（材料不足以判断 C1，如实写入 unverified） |
+| CONSULT | `SA733acd0064b6fd76494b4768` | `gpt-6.2-sol` | `high` / `standard` | 644 / 655 / 0 / 1299 | 23.5s | `options` 2 条 + `risks` + `recommendation` |
+| PLAN | `SAde96f3d5cc5d04dc950eab7d` | `gpt-6.2-sol` | `high` / `standard` | 640 / 1216 / 90 / 1856 | 33.2s | `steps` 4 条（含 `depends_on`）+ `risks` |
+
+- 推理强度证据：响应 `reasoning` 字段回显 `{"effort":"high","mode":"standard"}`，三条都记录
+  `reasoning_verified=true`；请求体审计记录 `reasoning_effort=high`、`reasoning_mode=standard`。
+- 追踪：`response_id`（`resp_…`）与 CPA `trace_id`（`X-Cpa-Trace-Id`）写入状态与审计；CPA 未
+  返回 `X-Request-Id`，`request_id` 为空（如实记录，不伪造）。
+- 零工具：请求体 `payload_keys` 只有 `model/input/instructions/reasoning/max_output_tokens/
+  store/stream/tool_choice`，`tool_keys_present=[]`、`unsupported_params_present=[]`。
+- 单轮复用：同材料再次调用 REVIEW / CONSULT 直接返回已有记录，未新增请求。
+- 首次 REVIEW 曾因把 GPT-6.2 固定回显的全零 `tool_usage` 误判为工具使用而失败
+  （`SRf3f693b9e211fb28310e3c6c`，审计 `ok=false`，HTTP 200）；改为只对非零用量/工具定义
+  拒绝后重试成功。该失败记录与 usage 保留在状态与审计中。
+- 验证任务状态在仓库外临时目录 `/tmp/copilot-sol-verify-20261118/`，未纳入仓库、未提交。
+- CPA 日志旁证（`~/.local/opt/EasyCLIProxyAPI/oauth/logs/core-start-output.log`）：
+  `POST /v1/responses` 在 10:02:02（20.02s）、10:02:59（13.07s）、10:03:28（23.46s）、
+  10:04:06（33.14s）均为 HTTP 200，与审计 `elapsed_ms` 对应；日志不含模型名，模型身份仍以
+  响应回显与 trace ID 为准。
+
+### 范围与设计取舍
+
+- **仅非流式**：请求固定 `stream=false`，未实现流式解析；SOL 是一次性建议，不需要增量输出。
+- **不自动重试/退避**：保持仓库既有的“一次调用一次请求”硬约束与“不重复付费”原则。429/5xx/
+  超时/网络失败如实登记并退出，由主代理在材料或范围实质变化时用
+  `--force --trigger <...> --reason` 显式重新发起（本地有限、可审计的人工重试路径），
+  不引入自动重试、Provider 切换或 `AUTO-*` 派生。
+- **治理记录**：本轮另有仓库外治理任务 `task-v81-sol-upgrade-20261118`（G1–G3 PASS、
+  `CLOSED`，verdict=pass），证据为活动/定向测试输出、真实 API 摘要、运行时同步复查、
+  基线清单校验与 legacy 基线对比；状态与证据在 `/tmp/copilot-v81-governance-20261118/`，
+  未提交。
+
+### 已实施
+
+- `scripts/sol_review.py`：`MODEL="gpt-6.2-sol"`；`validate_effort` 只接受 `high`；
+  CONSULT / PLAN / REVIEW 三种模式提示词与输出契约；`run_sol` / `run_review` /
+  `run_advisory`；不支持采样参数守卫；`reasoning` 回显校验（effort/mode 不一致拒绝，
+  缺失记 `reasoning_verified=false`）；非零工具用量与工具定义拒绝；请求/追踪 ID 采集。
+- `scripts/copilot_dispatch.py`：新增 `sol-advisory --mode CONSULT|PLAN`（零工具、单轮、
+  `--question`、`--dry-run`、`--list`）；REVIEW 与 advisory 共用一次调用路径与失败/pending
+  恢复；版本 `8.1.0`。
+- `scripts/governance.py`：新增 `sol_advisories` 状态与 `record_sol_advisory` /
+  `record_sol_advisory_failure` / `list_sol_advisories`；`review_metrics` 增加 advisory 计数。
+  辅助分析不进入 Finding 台账、不影响 G1–G3。
+- 测试：`tests/test_sol_review_v7.py`（模型/推理强度/三模式/回显/工具回显/CLI/advisory
+  状态）、`tests/test_architecture.py`（唯一远程模块、三模式、无 DECIDE、无执行入口）、
+  `tests/test_docs_v6.py`（文档契约）。
+
+### 验证
+
+- 定向：`tests.test_sol_review_v7` + `tests.test_architecture` + `tests.test_docs_v6`
+  96 tests OK。
+- 活动测试：452 tests OK。
+- **历史回归（重要事实）**：`legacy/tests` 在本机基线 `20db0ba` 上就是
+  `853 tests, failures=99, errors=47, skipped=32`，原因包括 v5 时期 `references/role.md`
+  等文档已退役、`legacy/call_gpt.py` 仍按旧路径读取。本轮用 `git archive HEAD` 导出干净
+  基线并逐条对比：失败/错误用例集合与本轮完全相同（146 条，`diff` 为空），因此本轮**没有
+  新增 legacy 回归**；这些是基线既有的历史环境失败，未在本轮修复（超出本任务范围）。
+- 运行时：`--apply` 写入 9 个文件并预编译 13 个；`--check` 缺失 0、不同 0、多出 0；
+  `--baseline` 更新为 20 个受管理文件。用运行时副本执行 `sol-advisory --dry-run` 成功返回
+  `gpt-6.2-sol` / `high` / 零工具。
+- **未验证**：CPA 内部上游路由与是否内部重试（只能校验响应回显 model/reasoning 与 trace
+  ID）；官方 GPT-6.2 文档 URL 在本机不可达（WebFetch 403、DeepSeek Fetch 404），兼容性以
+  真实接口行为核实；多轮 `previous_response_id` 未实现（按任务要求保持单请求）；大材料
+  （接近 400,000 字符）与并发压测未做。
 
 ## SOL 安全与效率加固（2026-11-17，v8.0.1）
 

@@ -7,13 +7,15 @@ v1 信封（SOL 通道时代）已退役，出现即 `schema_retired`。
 > `native_agent.py review` / `review-context` / `capability`、review attempt 与
 > `g4_attest`/`g4_shadow`/`test_execution` 已删除。独立复核请使用
 > `copilot_dispatch.py sol-review`（零工具、单轮、advisory）；历史复核记录只读保留。
+> v8.1.0 起 SOL 统一 `gpt-6.2-sol` + `reasoning.effort=high`，并新增建议性
+> `sol-advisory --mode CONSULT|PLAN`（同样零工具、单轮、不入门禁）。
 
 ## 1. 角色与边界
 
 | 角色 | 职责 | 约束 |
 |---|---|---|
 | Executor | 执行单个工作项，产出结果与原始证据 | 必须是原生子代理（`kind=subagent`），带 Agent/Child Session 身份与 profile 快照 |
-| SOL | 独立模型复核（advisory） | 由 `sol_review.py` 零工具单轮调用；不读写文件、不证明宿主权限、不构成收口门禁 |
+| SOL（REVIEW / CONSULT / PLAN） | 独立复核与认知辅助（advisory） | 由 `sol_review.py` 零工具单轮调用；不读写文件、不证明宿主权限、不构成收口门禁 |
 
 Copilot 不派发 Agent、不调用模型、不写别人的会话。它只校验宿主已产生的记录并回填状态。
 `native_agent.py` 从真实 `metadata.json`、宿主 SQLite（`tool_usage`/`part`/`session_entry`）

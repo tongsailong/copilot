@@ -1,14 +1,14 @@
 ---
 name: copilot
-description: "Copilot v8 轻量协作治理：任务承接、合同与完成条件、状态与证据登记、PARTIAL 持续推进、SOL 零工具单轮复核与 G1–G3 收口。SOL 只做一次性独立审查，不替代 ZCode 的技术决策与工程执行；G4 原生只读复核已退役，历史台账只读保留。"
+description: "Copilot v8.1 轻量协作治理：任务承接、合同与完成条件、状态与证据登记、PARTIAL 持续推进、SOL（gpt-6.2-sol，high，零工具）按需 CONSULT/PLAN/REVIEW 认知辅助与 G1–G3 收口。SOL 只提供建议，不替代 ZCode 的技术决策与工程执行；G4 原生只读复核已退役，历史台账只读保留。"
 when_to_use: >
   需要把多步骤工程任务纳入可追踪治理时：任务合同/完成条件需要固定、证据与审计需要绑定、
-  长任务需要 PARTIAL 持续推进与上下文恢复、需要一次 SOL 零工具独立复核、用户要求正式
-  REVIEW、或需要只读查看历史 SOL 调用、G4 记录与 REVIEW 台账。简单、单步、低风险任务直接
-  由 ZCode 原生完成，不进入本 Skill。
+  长任务需要 PARTIAL 持续推进与上下文恢复、复杂问题需要一次 SOL 零工具独立判断（CONSULT /
+  PLAN）或一次 SOL 独立复核（REVIEW）、用户要求正式 REVIEW、或需要只读查看历史 SOL 调用、
+  G4 记录与 REVIEW 台账。简单、单步、低风险任务直接由 ZCode 原生完成，不进入本 Skill。
 ---
 
-# copilot：轻量协作治理（v8.0.1）
+# copilot：轻量协作治理（v8.1.0）
 
 Copilot 是运行在 ZCode 内的**协作治理层**，不是决策模型，也不是执行体。它负责把任务变成可
 追踪的合同、状态、证据与收口条件，并在任务没有真正完成时继续推进。
@@ -22,9 +22,11 @@ Copilot 是运行在 ZCode 内的**协作治理层**，不是决策模型，也�
   体现协作而强制调用子代理。
 - **内置子代理（按需）**：`Explore` 只做独立只读调查；`general-purpose` 只承担边界清晰、
   可独立交付且并行收益明显的工作。二者都由主代理拆分、控制范围并集成结果。
-- **SOL（一次性独立复核）**：经既有本机 CPA `127` 通道调用 `gpt-6.1-sol`，**零工具、单轮**
-  地阅读主代理提交的完整材料，返回结构化问题清单。它只提供意见，不执行工程、不做技术决策，
-  也不自动进入第二轮。
+- **SOL（一次性认知辅助与独立复核）**：经既有本机 CPA `127` 通道调用 `gpt-6.2-sol`
+  （`reasoning.effort=high`，`standard` 模式），**零工具、单轮**地阅读主代理一次性提交的
+  材料，按模式返回结构化结论：CONSULT（问题分析/方案比较/风险识别）、PLAN（规划、依赖与
+  替代路线建议）、REVIEW（独立复核 findings）。三者都是建议，不执行工程、不做技术决策、
+  不读写台账、不调度子代理，也不自动进入第二轮。
 - **Copilot（本 Skill）**：任务承接、合同与完成条件、状态机、证据桥接、审计、PARTIAL 推进、
   收口门禁。**不做工程实施，不替代技术决策，不设置无意义的审批门。**
 - ~~**G4 只读复核**~~：**已正式退役**（v8.0.0）。G4 不再作为活动质量门禁，不再要求宿主
@@ -32,9 +34,10 @@ Copilot 是运行在 ZCode 内的**协作治理层**，不是决策模型，也�
   追溯，不参与新任务的准入、派生或收口；不得把历史 G4 BLOCKED 改写成 PASS。
 - **DesignWise**：设计方法与设计质量规范；具体设计执行仍由 ZCode 完成，Copilot 不另建流程。
 
-**原生 Reviewer 与 G4 复核均已退役。** v8 起独立模型复核只由
-`copilot_dispatch.py sol-review` 的 SOL 零工具单轮复核承担：高风险任务建议执行一次，
-普通任务按风险决定；SOL 结论是 **advisory**，不构成收口门禁，也不证明宿主只读权限。
+**原生 Reviewer 与 G4 复核均已退役。** v8 起 SOL 是唯一远程通道：
+`copilot_dispatch.py sol-review` 做独立复核（高风险任务建议执行一次，普通任务按风险决定），
+`copilot_dispatch.py sol-advisory --mode CONSULT|PLAN` 做按需认知辅助。SOL 结论是
+**advisory**，不构成收口门禁，也不证明宿主只读权限。
 `native_agent.py review`、`review-context`、`capability`、review attempt 与
 `copilot-native-review/*` 信封已删除。历史 `call_gpt.py`、`review_ledger.py`、
 `reply_protocol.py` 实现存档在 `legacy/`，历史调用记录、G4 记录、REVIEW 裁决、任务台账、
@@ -49,8 +52,9 @@ Copilot 是运行在 ZCode 内的**协作治理层**，不是决策模型，也�
 3. 任务处于 PARTIAL（还有工作要做），需要本地派生下一步而不是等待外部判断。
 4. 多模块改造、数据链路、安全或生产高风险变更，需要一次 SOL 独立复核。
 5. 高风险任务（生产数据、权限/安全策略、关键链路、不可逆操作）建议执行一次 SOL 单轮复核。
-6. 用户明确要求正式 REVIEW。
-7. 用户要求只读查看历史 SOL 调用、REVIEW 台账或旧任务状态。
+6. 复杂问题存在多条技术路线、跨模块调用链或疑难故障，需要一次独立认知视角（CONSULT / PLAN）。
+7. 用户明确要求正式 REVIEW。
+8. 用户要求只读查看历史 SOL 调用、REVIEW 台账或旧任务状态。
 
 不适用：单步查询、单文件小改、纯问答、简单命令确认——直接由 ZCode 完成，不建立任务状态。
 
@@ -62,29 +66,33 @@ start（合同 + 完成条件 + 风险 + 后端）
   → drive（本地求值：PASS 收口 / BLOCKED 停下 / 打印工作单）
   → ZCode 执行（主代理或原生子代理）
   → ingest / record / criterion / evidence（回填真实结果与原始证据）
-  → [按需] sol-review（一次性零工具独立复核）→ 主代理核实/修复/定向验证
+  → [按需] sol-advisory（CONSULT/PLAN 认知辅助）或 sol-review（独立复核）
+           → 主代理核实/采纳/修复/定向验证
   → drive（继续直到 PASS 或真实 BLOCKED）
 ```
 
-除 `sol-review` 外，所有命令只读写任务状态文件，不发起网络或模型调用。`sol-review` 一次
-调用只发一次请求，不自动重试、不自动二审。完整命令矩阵见 `references/workflow.md`；阶段机
-与驱动语义见 `references/runtime.md`。
+除 `sol-review` 与 `sol-advisory` 外，所有命令只读写任务状态文件，不发起网络或模型调用。
+两个 SOL 命令都是一次调用只发一次请求，不自动重试、不自动二审。完整命令矩阵见
+`references/workflow.md`；阶段机与驱动语义见 `references/runtime.md`。
 
 ## 模式
 
-CONSULT / PLAN / REVIEW 是**本地工作模式**，不是审批节点，也不是远程调用入口。
+CONSULT / PLAN / REVIEW 既可以是主代理的本地工作模式，也可以按需转成 **SOL 辅助调用**；
+两者都不是审批节点，SOL 调用也不是决策入口。
 
 | 模式 | 作用 | 是否阻塞任务 | 入口 |
 |---|---|---|---|
 | CONSULT | 本地问题分析、方案比较、风险识别；结论写入 `judgments` 仅作审计 | 否 | 主代理直接分析；需要留痕时 `judgment` |
 | PLAN | ZCode 的技术计划登记为工作项与依赖，供驱动与派发使用 | 否 | `plan` |
 | REVIEW | 正式复核结论登记；**仅在用户明确授权时进行** | 否（不是普通开发前置门） | `authorize-review` → `formal-review` |
+| SOL CONSULT / PLAN | 一次性零工具辅助分析；结论写入 `sol_advisories`，只作建议 | 否 | `sol-advisory --mode CONSULT|PLAN` |
 | SOL REVIEW | 一次性零工具独立审查；意见进入 Finding 台账供主代理核实 | 否 | `sol-review` |
 
 - **PLAN 由 ZCode 决定**：计划内容、拆分粒度、依赖与执行顺序都是 ZCode 的技术决策；Copilot
   只负责记录与校验（例如拒绝依赖环），不批准也不否决。
-- **SOL 只做 REVIEW**：不恢复 CONSULT / PLAN 远程职责，不让 SOL 接管工程执行、技术选型或
-  收口判断；SOL 的 material 由主代理一次性准备，结论只作为建议。
+- **SOL 只提供建议**：CONSULT / PLAN 是可选认知辅助，REVIEW 是可选独立审查。三者都不接管
+  工程执行、技术选型、收口判断或写操作；材料由主代理一次性准备，结论由主代理判断是否采纳。
+  不恢复 DECIDE，不设强制调用，也不因等待 SOL 停止已有工作。
 - **正式 REVIEW 不是门禁**：普通开发不需要正式 REVIEW，也不需要等待任何模型裁决。用户明确
   要求后，授权在同一任务合同内持续有效；范围或风险实质变化时重新确认。没有用户授权时不得
   伪造正式 REVIEW，也不得用自检冒充。
@@ -227,7 +235,12 @@ BLOCKED 表示**不能正常收口或继续受阻动作**，不表示无法记�
 - **SOL 复核审计**：`sol-review` 成功时把结构化结果写入状态 `sol_reviews`、原始输出存入任务
   目录 `sol-reviews/<review_id>.raw.txt`，失败把真实错误码与材料摘要写入 `sol_reviews`
   （`status=failed`）与 `history`；`sol-review-audit.jsonl` 只记脱敏元数据（材料/请求/回复
-  摘要、模型、usage、耗时、错误码），不记正文与凭据。相同材料再次调用直接复用，不重复请求。
+  摘要、模型、推理强度回显、请求/追踪 ID、usage、耗时、错误码），不记正文与凭据。相同材料
+  再次调用直接复用，不重复请求。
+- **SOL 辅助分析审计**：`sol-advisory` 成功写入状态 `sol_advisories`、原始输出存入
+  `sol-advisories/<advisory_id>.raw.txt`，审计写入 `sol-advisory-audit.jsonl`；失败写入
+  `sol_advisories`（`status=failed`）与 `history`。辅助分析不进入 Finding 台账、不改变完成
+  条件、不影响 G1–G3，也不阻断任务。
 
 ## 三道门与收口
 
@@ -299,10 +312,11 @@ verify 的结构化质量报告（`copilot-verify-result/v1`）走报告接入�
 - 执行方用 `native_agent.py execution` 生成 `copilot-native-result/v2`，绑定计划与执行方身份。
 - 执行信封由 `native_agent.py execution` 从宿主 metadata/rollout/DB 生成，绑定计划、
   执行方身份与证据 SHA-256；`copilot_auto.py ingest` 校验后回填。
-- **独立复核走 SOL**：`copilot_dispatch.py sol-review` 零工具、单轮、advisory；不再有
-  review attempt、宿主只读能力探测或 `copilot-native-review/*` 信封。需要独立意见时，
-  主代理一次性准备材料（目标/条件、规则、完整 diff、关键源码、数据与权限逻辑、测试结果、
-  已知问题与高风险区域）提交一次。
+- **独立复核与认知辅助都走 SOL**：`copilot_dispatch.py sol-review`（REVIEW）与
+  `sol-advisory --mode CONSULT|PLAN` 都是零工具、单轮、advisory；不再有 review attempt、
+  宿主只读能力探测或 `copilot-native-review/*` 信封。需要独立意见时，主代理一次性准备材料
+  （目标/条件、规则、完整 diff、关键源码、数据与权限逻辑、测试结果、已知问题与高风险区域）
+  提交一次。
 - **历史兼容**：v7 及更早的状态里可能保留 `native_reviews` / `review_attempts` /
   `g4_attestations`。它们只读保留用于审计，不再被任何门禁、派生或 ingest 逻辑消费；
   不得手工改写历史记录，也不得把历史 G4 BLOCKED 当成当前任务状态。
@@ -333,9 +347,31 @@ verify 的结构化质量报告（`copilot-verify-result/v1`）走报告接入�
   G4 BLOCKED 状态。
 - 正式 REVIEW 仍只在用户明确授权时登记，不因风险等级推定授权。
 
+### CONSULT / PLAN 认知辅助（v8.1）
+
+SOL 除了独立复核，还提供两种可选的建议性认知辅助，由主代理判断是否值得一次调用：
+
+| 场景 | 模式 | 期望产出 |
+|---|---|---|
+| 复杂问题存在多条技术路线、需要方案比较 | CONSULT | `analysis` / `options` / `risks` / `recommendation` |
+| 疑难故障、跨模块调用链、需要独立认知视角 | CONSULT | 关键判断与不确定项 `unverified` |
+| 复杂任务拆分、依赖关系与风险分析 | PLAN | `steps`（含 `depends_on`）/ `risks` / `alternatives` |
+| 方案可行性需要替代路线与顺序建议 | PLAN | `recommendation` 与适用条件 |
+
+- **入口**：`copilot_dispatch.py sol-advisory --state S --mode CONSULT|PLAN --materials M.md
+  [--question "..."]`；`--dry-run` 只校验请求，`--list` 只读查看。
+- **不适合调用**：简单修改、常规文档调整、已有明确方案的重复工作、能直接从源码或日志
+  得到答案的问题。不设固定轮次，不重复提交相同上下文和相同问题。
+- **治理边界**：结论写入 `sol_advisories`，不进入 Finding 台账、不改变完成条件、不影响
+  G1–G3；是否采纳、如何实施由 ZCode 主代理决定。
+- **模型与推理强度**：所有 SOL 模式统一 `gpt-6.2-sol` + `reasoning.effort="high"`
+  （`standard` 模式），不按角色降级，不允许静默回退到 `medium`/`low` 或其他模型；
+  上游回显的 `model`、`reasoning.effort`、`reasoning.mode` 不一致时拒绝消费（退出码 9）。
+
 ### 单轮原则（硬约束）
 
-- **一次复核只发起一次 SOL 请求**。同一材料摘要再次调用直接复用已有结论，不重复付费。
+- **一次调用只发起一次 SOL 请求**。同一材料摘要（辅助分析还绑定模式与问题）再次调用直接
+  复用已有结论，不重复付费。REVIEW 与 CONSULT/PLAN 各自独立判定，不互相复用。
 - **不自动二审**：修复后由主代理核实、修复并做受影响的定向测试；不因 Minor/Info 新建
   第二轮，不与 SOL 反复辩论，不把 PASS 当“再跑一轮”的理由。
 - 只有用户明确要求、变更范围实质变化、出现新的关键风险、或首次材料存在重大遗漏时，才用
@@ -356,6 +392,11 @@ SOL 输出契约：总体结论 `verdict=pass|partial|blocked`；`findings` 按
 `blocking/major/minor/info` 分级，每项带文件、位置、材料依据与建议；`unverified` 列出无法
 从材料确认的事项。PASS 与 blocking/major 或未验证项冲突时自动降级为 PARTIAL 并记录
 `verdict_adjusted`。
+
+辅助分析输出契约（`copilot-sol-advisory/v1`）：`mode`、`summary`、`analysis`，以及按模式的
+`options`（CONSULT）或 `steps`（PLAN），加 `risks`、`alternatives`（PLAN）、
+`recommendation`、`unverified`。schema 或 mode 与请求不一致、字段类型不符时拒绝消费，
+不做叙述猜测。
 
 ### 输出消费与 Finding 台账
 
@@ -428,29 +469,35 @@ SOL 输出契约：总体结论 `verdict=pass|partial|blocked`；`findings` 按
 |---|---|
 | 命令矩阵、证据登记、收口操作、只读交付清单、历史只读 | `references/workflow.md` |
 | 阶段机、`drive`/`ingest`、PARTIAL 派生、退出码 | `references/runtime.md` |
-| SOL 单轮复核、正式 REVIEW、缺陷分级、台账与历史 G4 记录 | `references/review.md` |
+| SOL 三模式、单轮复核、正式 REVIEW、缺陷分级、台账与历史 G4 记录 | `references/review.md` |
 | 原生 Bridge v2 执行信封、错误码 | `references/agent-bridge.md` |
 | Agent 调度与内置 Explore/general-purpose 能力基线 | `copilot_dispatch.py agent-policy`；`references/agent-bridge.md` |
 | 历史 REVIEW 台账与旧审计（只读） | `references/review-ledger.md` |
-| 版本沿革、G4 退役与 v7 SOL 恢复记录 | `references/history.md` |
+| 版本沿革、G4 退役与 SOL 升级记录 | `references/history.md` |
 
 ## 版本
 
-当前版本 **v8.0.1（Security & Efficiency Hardening）**。本版只收紧安全与可靠性，不改变
-任务合同、G1–G3 与授权边界：
+当前版本 **v8.1.0（GPT-6.2 SOL + 按需认知辅助）**。本版升级模型并恢复可选的辅助认知能力，
+不改变任务合同、G1–G3、授权边界与工程执行主体：
 
-- **凭据与材料不外泄**：拒绝端点、上游错误正文、模型回显、传输异常等错误详情统一脱敏并
-  限长；本机 CPA 出口在解析凭据与发送前无条件校验（显式 `base_url` 也不能绕过）；本机请求
-  显式禁用环境代理，避免 `Authorization` 被转发。
-- **不重复付费**：远程已成功但审计/原始输出/状态落盘失败时，审计失败不再把成功结果误报为
-  失败；先落可恢复结果再登记状态，同材料下次调用直接恢复登记；并发 `sol-review` 用任务级
-  互斥锁避免重复请求。
-- **台账幂等与可驳回**：同一 `review_sha` 重复合并完全幂等，不把已 `fixed`/`verified` 的条目
-  回滚；advisory 复核不能把已解决的 authoritative finding 单方面提级为不可驳回的阻断，而是
-  单独登记一条可驳回的 advisory 提级条目。
-- **效率**：dry-run 与真实调用共用材料校验；非 dry-run 不再重复构建 payload；材料超限在
-  dry-run 阶段就失败。
-- **文档一致**：活动错误/帮助文案统一为 G1–G3；正式 REVIEW 的独立性说明改为 SOL 路径。
+- **模型升级**：统一 `gpt-6.2-sol`（Responses API `/v1/responses`，本机 CPA `127` 出口）；
+  不再使用 `gpt-6.1-sol`，不静默回退其他模型或别名。
+- **推理强度固定 high**：CONSULT / PLAN / REVIEW 全部 `reasoning.effort="high"`、
+  `reasoning.mode="standard"`；拒绝 `low`/`medium`/`xhigh`/`max`，也不允许 Provider 覆盖。
+  上游回显 `model` / `reasoning.effort` / `reasoning.mode` 不一致即拒绝消费（退出码 9）。
+- **兼容 GPT-6.2 Responses API**：不发送 `temperature`/`top_p`/`top_logprobs`/`logprobs`
+  等推理模型不支持的采样参数；不使用 `include` 的 logprobs；保持单请求、`store=false`，
+  不引入 `previous_response_id` 多轮会话。
+- **恢复 CONSULT / PLAN（建议性）**：新增 `sol-advisory --mode CONSULT|PLAN`，零工具、
+  单轮、advisory；结论写入 `sol_advisories`，不进入 Finding 台账、不影响 G1–G3、不阻断任务。
+- **职责边界不变**：ZCode 主代理仍是唯一工程执行与技术决策主体；SOL 不恢复 DECIDE、不强制
+  调用、不执行命令、不读写台账、不调度子代理；正式 REVIEW 仍只按用户授权登记。
+- **可追溯性**：审计与任务记录新增请求 ID / CPA trace ID / 响应 ID、推理强度回显与
+  `reasoning_verified` 标记；无法取得回显时如实标记未验证，不推测为成功。
+- **错误收敛不变**：一次调用一次请求，不自动重试、不换 Provider；429/5xx/超时/网络/结构
+  异常/身份或参数不符都如实记录，且不阻断主代理继续开发。
+
+v8.0.1（历史）只收紧 SOL 安全与可靠性，不改变任务合同、G1–G3 与授权边界：
 
 v8.0.0（历史）正式退役 G4 原生只读复核，把独立质量审查统一交给 SOL 零工具单轮复核：
 

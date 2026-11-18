@@ -3,8 +3,29 @@
 > 本文件记录版本沿革与 SOL 通道变化过程，供追溯，**不是当前规则来源**。现行规则见
 > `SKILL.md`、`references/workflow.md`、`runtime.md`、`review.md`、`agent-bridge.md`。
 > **SOL 决策通道已于 v6.0.0（2026-11-12）退役；v7.0.0（2026-11-17）只恢复一次性 REVIEW
-> （零工具、单轮、建议性）；v8.0.0（2026-11-17）正式退役 G4 原生只读复核**。下文涉及
-> SOL 与 G4 的段落按时间标注是否为历史事实描述。
+> （零工具、单轮、建议性）；v8.0.0（2026-11-17）正式退役 G4 原生只读复核；v8.1.0
+> （2026-11-18）升级 `gpt-6.2-sol` 并恢复建议性 CONSULT / PLAN**。下文涉及 SOL 与 G4
+> 的段落按时间标注是否为历史事实描述。
+
+## v8.1.0（2026-11-18）GPT-6.2 SOL Edition
+
+- **模型升级**：SOL 统一 `gpt-6.2-sol`（Responses API `/v1/responses`，本机 CPA `127`
+  出口），不再使用 `gpt-6.1-sol`，不静默回退其他模型或别名。
+- **推理强度**：CONSULT / PLAN / REVIEW 统一 `reasoning.effort="high"`、
+  `reasoning.mode="standard"`；`validate_effort` 只接受 high，拒绝 low/medium/xhigh/max。
+  上游回显 `model` / `reasoning.effort` / `reasoning.mode` 不一致即拒绝消费（退出码 9）；
+  回显缺失时记录 `reasoning_verified=false`，不推测成功。
+- **恢复建议性 CONSULT / PLAN**：新增 `copilot_dispatch.py sol-advisory --mode
+  CONSULT|PLAN`；输出 `copilot-sol-advisory/v1`，写入状态 `sol_advisories` 与
+  `sol-advisories/`，审计 `sol-advisory-audit.jsonl`。不进入 Finding 台账、不影响 G1–G3、
+  不阻断任务；DECIDE 不恢复。
+- **Responses API 兼容**：不发送 `temperature`/`top_p`/`top_logprobs`/`logprobs`，不请求
+  logprobs include；保持单请求（`store=false`，无 `previous_response_id`）。响应中的
+  `tools`/`tool_usage` 回显非空按安全事件拒绝。
+- **可追溯性**：审计与任务记录新增 `request_id` / `trace_id`（CPA）/ `response_id`、
+  `reasoning_resolved` 与 `reasoning_verified`。
+- **不变**：零工具、单轮、不自动重试/换 Provider/二审；G1–G3、证据完整性、PWW 接受、
+  授权边界与 ZCode 唯一工程执行/技术决策主体均不变。
 
 ## v8.0.0（2026-11-17）G4 Retirement Edition
 

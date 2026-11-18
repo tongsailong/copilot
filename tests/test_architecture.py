@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""v8 架构约束回归：SOL 是唯一远程复核通道，且零工具、单轮。"""
+"""v8.1 架构约束回归：SOL 是唯一远程通道，三模式均零工具、单轮、建议性。"""
 from __future__ import annotations
 
 import ast
@@ -21,7 +21,7 @@ ACTIVE = ("governance.py", "copilot_dispatch.py", "copilot_auto.py",
           "bridge_evidence.py", "lib_common.py", "review_policy.py",
           "host_records.py", "code_scope.py", "code_scope_capture.py",
           "sol_review.py")
-# v8 唯一允许访问网络与凭据的活动模块。其他模块只能通过它间接复核。
+# v8.1 唯一允许访问网络与凭据的活动模块。其他模块只能通过它间接调用 SOL。
 NETWORK_MODULE = "sol_review.py"
 # v8 起 G4 活动机制已退役；这些模块不得重新出现在活动 scripts/。
 RETIRED_MODULES = ("g4_attest.py", "g4_shadow.py", "test_execution.py",
@@ -79,19 +79,28 @@ class RemoteReviewBoundaryTests(unittest.TestCase):
             if name == NETWORK_MODULE:
                 continue
             text = source(name)
-            for needle in ("gpt-6.1-sol", "/v1/responses", "CPA_",
-                           "provider_config.json", "resolve_api_key",
+            for needle in ("gpt-6.2-sol", "gpt-6.1-sol", "/v1/responses",
+                           "CPA_", "provider_config.json", "resolve_api_key",
                            "read_zcode_provider_key"):
                 self.assertNotIn(needle, text, f"{name} 不应包含 {needle}")
 
-    def test_sol_review_is_review_only(self):
+    def test_sol_is_advisory_only_across_three_modes(self):
         text = source(NETWORK_MODULE)
         self.assertIn("tool_choice", text)
-        self.assertIn("gpt-6.1-sol", text)
-        # 不恢复 CONSULT/PLAN 模式；只有 REVIEW 通道。
-        self.assertNotIn("MODE_ROUTES", text)
-        self.assertNotIn("def consult", text)
-        self.assertNotIn("def plan_", text)
+        self.assertIn("gpt-6.2-sol", text)
+        # 模型升级必须真正切换，不得保留旧模型名或静默回退。
+        self.assertNotIn("gpt-6.1-sol", text)
+        self.assertIn('SOL_MODES = ("CONSULT", "PLAN", "REVIEW")', text)
+        self.assertIn('REASONING_EFFORT = "high"', text)
+        self.assertIn('PINNED_EFFORTS = ("high",)', text)
+        # DECIDE 不恢复；SOL 不接管工程执行或决策（文案可提退役，但不得成为模式）。
+        self.assertNotIn('"DECIDE"', text)
+        self.assertNotIn("'DECIDE'", text)
+        for banned in ("subprocess", "os.system", "os.exec", "eval(",
+                       "exec("):
+            self.assertNotIn(banned, text, f"sol_review.py 不应包含 {banned}")
+        # 没有工具定义键被写入 payload：只允许出现在拒绝名单里。
+        self.assertIn('TOOL_KEYS = ("tools", "functions"', text)
 
     def test_retired_sol_implementations_are_archived(self):
         for name in ("call_gpt.py", "review_ledger.py", "reply_protocol.py"):

@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""v7 SOL 零工具单轮复核：请求不变量、解析、失败收敛、单轮与 G4 边界。"""
+"""SOL 零工具单轮调用（REVIEW / CONSULT / PLAN）：请求不变量、解析、失败收敛、单轮与边界。
+
+v8.1.0 起模型升级为 `gpt-6.2-sol`，推理强度统一 `high`；CONSULT / PLAN 是
+建议性认知辅助（`sol_advisories`），不进入 Finding 台账、不影响 G1–G3。
+"""
 from __future__ import annotations
 
 import hashlib
@@ -35,15 +39,39 @@ def reply(**overrides) -> str:
     return json.dumps(payload, ensure_ascii=False)
 
 
+def advisory(mode: str = "CONSULT", **overrides) -> str:
+    payload = {
+        "schema": SR.ADVISORY_SCHEMA,
+        "mode": mode,
+        "summary": "建议摘要",
+        "analysis": ["调用链简单，无并发写入"],
+        "options": [{"id": "O1", "title": "保持现状",
+                     "tradeoffs": "成本低", "risks": "无"}],
+        "steps": [{"id": "S1", "title": "先加测试",
+                   "depends_on": [], "risk": "低"}],
+        "risks": ["缺少集成测试"],
+        "alternatives": ["先小范围灰度"],
+        "recommendation": "先补定向测试再合并",
+        "unverified": [],
+    }
+    payload.update(overrides)
+    return json.dumps(payload, ensure_ascii=False)
+
+
 def response(text: str, *, model: str = SR.MODEL, status: str = "completed",
              output_type: str = "message", extra_output: list | None = None,
-             http_status: int = 200) -> dict:
+             http_status: int = 200, reasoning: dict | None = None,
+             request_id: str = "", trace_id: str = "") -> dict:
     output = [{"type": output_type, "status": "completed",
                "content": [{"type": "output_text", "text": text}]}]
     output.extend(extra_output or [])
-    return {"model": model, "status": status, "output": output,
-            "usage": {"input_tokens": 10, "output_tokens": 20},
-            "_http_status": http_status}
+    payload = {"model": model, "status": status, "output": output,
+               "usage": {"input_tokens": 10, "output_tokens": 20},
+               "_http_status": http_status,
+               "_request_id": request_id, "_trace_id": trace_id}
+    payload["reasoning"] = ({"effort": "high", "mode": "standard"}
+                            if reasoning is None else reasoning)
+    return payload
 
 
 class ZeroToolTests(unittest.TestCase):
@@ -53,7 +81,50 @@ class ZeroToolTests(unittest.TestCase):
         self.assertNotIn("functions", payload)
         self.assertEqual(payload["tool_choice"], "none")
         self.assertEqual(payload["reasoning"], {"effort": "high"})
-        self.assertEqual(payload["model"], "gpt-6.1-sol")
+        self.assertEqual(payload["model"], "gpt-6.2-sol")
+        self.assertEqual(SR.MODEL, "gpt-6.2-sol")
+
+    def test_payload_omits_unsupported_sampling_params(self):
+        payload = SR.build_payload("材料")
+        for key in ("temperature", "top_p", "top_logprobs", "logprobs",
+                    "include", "frequency_penalty", "presence_penalty"):
+            self.assertNotIn(key, payload)
+        with self.assertRaises(SR.SolUsageError) as ctx:
+            SR.assert_responses_api_compat({"temperature": 0.2})
+        self.assertEqual(ctx.exception.code, "sol_unsupported_param")
+
+    def test_effort_is_pinned_to_high_for_every_mode(self):
+        for mode in SR.SOL_MODES:
+            with self.subTest(mode=mode):
+                payload = SR.build_payload("材料", mode=mode)
+                self.assertEqual(payload["reasoning"], {"effort": "high"})
+                self.assertEqual(payload["model"], "gpt-6.2-sol")
+                self.assertEqual(payload["tool_choice"], "none")
+                self.assertNotIn("tools", payload)
+        for effort in ("medium", "low", "xhigh", "max", ""):
+            with self.subTest(effort=effort):
+                with self.assertRaises(SR.SolUsageError):
+                    SR.build_payload("材料", effort=effort)
+
+    def test_mode_instructions_are_distinct_and_zero_tool(self):
+        consult = SR.build_payload("材料", mode="CONSULT")["instructions"]
+        plan = SR.build_payload("材料", mode="PLAN")["instructions"]
+        review = SR.build_payload("材料", mode="REVIEW")["instructions"]
+        self.assertNotEqual(consult, plan)
+        self.assertNotEqual(consult, review)
+        self.assertIn("CONSULT", consult)
+        self.assertIn("PLAN", plan)
+        self.assertIn("REVIEW", review)
+        for text in (consult, plan, review):
+            self.assertIn("没有、也不能使用任何工具", text)
+            self.assertIn("zcode", text.lower())
+
+    def test_unknown_mode_fails_closed(self):
+        for mode in ("DECIDE", "decide", "", "REVIEWER"):
+            with self.subTest(mode=mode):
+                with self.assertRaises(SR.SolUsageError):
+                    SR.build_payload("材料", mode=mode)
+        self.assertNotIn("DECIDE", SR.SOL_MODES)
 
     def test_injected_tools_fail_closed(self):
         for key in ("tools", "functions", "parallel_tool_calls"):
@@ -75,8 +146,34 @@ class ZeroToolTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertNotIn("tools", calls[0])
         self.assertEqual(calls[0]["tool_choice"], "none")
+        self.assertEqual(calls[0]["reasoning"], {"effort": "high"})
         self.assertTrue(result["zero_tool"])
         self.assertEqual(result["attempts"], 1)
+
+    def test_run_advisory_sends_exactly_one_zero_tool_high_request(self):
+        for mode in SR.ADVISORY_MODES:
+            with self.subTest(mode=mode):
+                calls = []
+
+                def fake(url, key, body, timeout):
+                    calls.append(body)
+                    return response(advisory(mode))
+
+                result = SR.run_advisory("材料", mode, transport=fake,
+                                         api_key="k")
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(calls[0]["model"], "gpt-6.2-sol")
+                self.assertEqual(calls[0]["reasoning"], {"effort": "high"})
+                self.assertNotIn("tools", calls[0])
+                self.assertEqual(calls[0]["tool_choice"], "none")
+                self.assertEqual(result["mode"], mode)
+                self.assertTrue(result["zero_tool"])
+
+    def test_run_advisory_rejects_review_mode(self):
+        with self.assertRaises(SR.SolUsageError):
+            SR.run_advisory("材料", "REVIEW",
+                            transport=lambda *a: response(reply()),
+                            api_key="k")
 
 
 class ParseTests(unittest.TestCase):
@@ -125,6 +222,42 @@ class ParseTests(unittest.TestCase):
                     SR.parse_review_output(text)
 
 
+class AdvisoryParseTests(unittest.TestCase):
+    def test_consult_and_plan_are_parsed(self):
+        consult = SR.parse_advisory_output(advisory("CONSULT"), "CONSULT")
+        self.assertEqual(consult["mode"], "CONSULT")
+        self.assertEqual([item["id"] for item in consult["options"]], ["O1"])
+        plan = SR.parse_advisory_output(
+            "```json\n" + advisory("PLAN") + "\n```", "PLAN")
+        self.assertEqual(plan["mode"], "PLAN")
+        self.assertEqual([item["id"] for item in plan["steps"]], ["S1"])
+
+    def test_mode_and_schema_must_match(self):
+        cases = {
+            "schema": (json.dumps({"schema": "other", "mode": "CONSULT"}),
+                       "CONSULT"),
+            "mode_swapped": (advisory("PLAN"), "CONSULT"),
+            "invalid_mode": (advisory("CONSULT"), "DECIDE"),
+        }
+        for name, (text, mode) in cases.items():
+            with self.subTest(name=name):
+                with self.assertRaises((SR.SolResponseError, SR.SolUsageError)):
+                    SR.parse_advisory_output(text, mode)
+
+    def test_advisory_fields_are_strict(self):
+        cases = {
+            "analysis_object": advisory(analysis=[{"x": 1}]),
+            "risks_string": advisory(risks="风险"),
+            "options_object": advisory(options={"id": "O1"}),
+            "option_field": advisory(options=[{"id": "O1", "title": 3}]),
+            "steps_depends_on": advisory(steps=[{"id": "S1", "depends_on": "S0"}]),
+        }
+        for name, text in cases.items():
+            with self.subTest(name=name):
+                with self.assertRaises(SR.SolResponseError):
+                    SR.parse_advisory_output(text, "CONSULT")
+
+
 class FailureTests(unittest.TestCase):
     def test_identity_mismatch_is_rejected(self):
         with self.assertRaises(SR.SolIdentityError):
@@ -141,6 +274,64 @@ class FailureTests(unittest.TestCase):
         with self.assertRaises(SR.SolResponseError):
             SR.run_review("材料", transport=lambda *a: response(
                 reply(), status="incomplete"), api_key="k")
+
+    def test_reasoning_effort_echo_mismatch_is_rejected(self):
+        with self.assertRaises(SR.SolReasoningError) as ctx:
+            SR.run_review("材料", transport=lambda *a: response(
+                reply(), reasoning={"effort": "medium", "mode": "standard"}),
+                api_key="k")
+        self.assertEqual(ctx.exception.code, "sol_reasoning_effort_mismatch")
+
+    def test_reasoning_mode_override_is_rejected(self):
+        with self.assertRaises(SR.SolReasoningError) as ctx:
+            SR.run_review("材料", transport=lambda *a: response(
+                reply(), reasoning={"effort": "high", "mode": "pro"}),
+                api_key="k")
+        self.assertEqual(ctx.exception.code, "sol_reasoning_mode_mismatch")
+
+    def test_reasoning_echo_is_recorded_when_verified(self):
+        result = SR.run_review(
+            "材料", transport=lambda *a: response(
+                reply(), request_id="req-1", trace_id="trace-1"), api_key="k")
+        self.assertTrue(result["reasoning_verified"])
+        self.assertEqual(result["reasoning_resolved"]["effort"], "high")
+        self.assertEqual(result["reasoning_mode"], "standard")
+        self.assertEqual(result["reasoning_effort"], "high")
+        self.assertEqual(result["request_id"], "req-1")
+        self.assertEqual(result["trace_id"], "trace-1")
+
+    def test_echoed_tools_are_a_security_event(self):
+        def fake(*args):
+            payload = response(reply())
+            payload["tools"] = [{"type": "function", "name": "shell"}]
+            return payload
+
+        with self.assertRaises(SR.SolToolCallError):
+            SR.run_review("材料", transport=fake, api_key="k")
+
+    def test_zero_tool_usage_echo_is_not_an_event(self):
+        # GPT-6.2 固定回显 tools=[] 与全零 tool_usage；这不是工具使用。
+        def fake(*args):
+            payload = response(reply())
+            payload["tools"] = []
+            payload["tool_usage"] = {
+                "image_gen": {"input_tokens": 0, "output_tokens": 0,
+                              "input_tokens_details": {"text_tokens": 0}},
+                "web_search": {"num_requests": 0},
+            }
+            return payload
+
+        result = SR.run_review("材料", transport=fake, api_key="k")
+        self.assertEqual(result["verdict"], "pass")
+
+    def test_nonzero_tool_usage_is_an_event(self):
+        def fake(*args):
+            payload = response(reply())
+            payload["tool_usage"] = {"web_search": {"num_requests": 1}}
+            return payload
+
+        with self.assertRaises(SR.SolToolCallError):
+            SR.run_review("材料", transport=fake, api_key="k")
 
     def test_failure_is_not_retried(self):
         calls = []
@@ -223,6 +414,37 @@ class SingleRoundTests(unittest.TestCase):
             state, "b" * 64, force=True, trigger="scope-changed",
             reason="范围扩大")
         self.assertEqual(allowed["action"], "call")
+
+    def test_modes_do_not_share_or_reuse_records(self):
+        review_only = {
+            "sol_reviews": [{"status": "completed", "mode": "REVIEW",
+                             "materials_sha256": "a" * 64,
+                             "review_id": "SR1"}],
+            "sol_advisories": [],
+        }
+        # 同一材料已 REVIEW ≠ CONSULT/PLAN 已调用：各自独立首次调用。
+        for mode in SR.ADVISORY_MODES:
+            with self.subTest(mode=mode):
+                decision = SR.single_round_decision(
+                    review_only, "a" * 64, records_key="sol_advisories",
+                    mode=mode)
+                self.assertEqual(decision["action"], "call")
+        state = {
+            **review_only,
+            "sol_advisories": [{"status": "completed", "mode": "CONSULT",
+                                "materials_sha256": "b" * 64,
+                                "advisory_id": "SA1"}],
+        }
+        reuse = SR.single_round_decision(
+            state, "b" * 64, records_key="sol_advisories", mode="CONSULT")
+        self.assertEqual(reuse["action"], "reuse")
+        self.assertEqual(reuse["review"]["advisory_id"], "SA1")
+        # CONSULT 的结论不能被 PLAN 复用（PLAN 首次调用仍需自己的一次请求）。
+        self.assertEqual(SR.single_round_decision(
+            state, "b" * 64, records_key="sol_advisories",
+            mode="PLAN")["action"], "call")
+        review_reuse = SR.single_round_decision(state, "a" * 64)
+        self.assertEqual(review_reuse["action"], "reuse")
 
 
 class StateIntegrationTests(unittest.TestCase):
@@ -317,6 +539,33 @@ class StateIntegrationTests(unittest.TestCase):
         state = G.load_state(self.state_path)
         self.assertEqual(G.evaluate(state)["phase"], "BLOCKED")
         self.assertTrue(state["sol_reviews"])
+
+    def test_advisory_is_advisory_only(self):
+        record = {
+            "schema": SR.ADVISORY_SCHEMA, "advisory_id": "SA" + "a" * 24,
+            "mode": "CONSULT", "summary": "建议", "analysis": ["分析"],
+            "options": [], "steps": [], "risks": ["风险"],
+            "alternatives": [], "recommendation": "建议先补测试",
+            "unverified": [], "completed_at": G.now_iso(),
+        }
+        G.record_sol_advisory(self.state_path, record,
+                              materials_sha256="c" * 64)
+        state = G.load_state(self.state_path)
+        self.assertEqual(state["sol_advisories"][-1]["status"], "completed")
+        # 不进入 Finding 台账、不影响阶段、不改变 G1–G3。
+        self.assertEqual(G.list_findings(state)["items"], [])
+        self.assertEqual(G.evaluate(state)["phase"], "PARTIAL")
+        check = G.closure_check(state)
+        self.assertEqual(set(check["gates"]), {"G1", "G2", "G3"})
+
+    def test_advisory_failure_is_recorded_without_blocking(self):
+        failure = G.record_sol_advisory_failure(
+            self.state_path, mode="PLAN", error_code="sol_timeout",
+            detail="300s", materials_sha256="d" * 64)
+        self.assertEqual(failure["status"], "failed")
+        state = G.load_state(self.state_path)
+        self.assertEqual(state["sol_advisories"][-1]["error"], "sol_timeout")
+        self.assertEqual(G.evaluate(state)["phase"], "PARTIAL")
 
 
 class AdmissionTests(unittest.TestCase):
@@ -467,8 +716,75 @@ class CliTests(unittest.TestCase):
         payload = json.loads(proc.stdout)
         self.assertTrue(payload["zero_tool"])
         self.assertEqual(payload["tool_keys_present"], [])
-        self.assertEqual(payload["model"], "gpt-6.1-sol")
+        self.assertEqual(payload["model"], "gpt-6.2-sol")
+        self.assertEqual(payload["reasoning_effort"], "high")
+        self.assertEqual(payload["unsupported_params_present"], [])
         self.assertEqual(open(self.state, "rb").read(), before)
+
+    def test_advisory_dry_run_is_zero_tool_and_does_not_write(self):
+        before = open(self.state, "rb").read()
+        for mode in SR.ADVISORY_MODES:
+            with self.subTest(mode=mode):
+                proc = F.run_cli("copilot_dispatch.py", "sol-advisory",
+                                 "--state", self.state, "--mode", mode,
+                                 "--materials", self.materials,
+                                 "--question", "该方案是否可行？",
+                                 "--dry-run", "--json")
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                payload = json.loads(proc.stdout)
+                self.assertEqual(payload["mode"], mode)
+                self.assertEqual(payload["model"], "gpt-6.2-sol")
+                self.assertEqual(payload["reasoning_effort"], "high")
+                self.assertTrue(payload["zero_tool"])
+                self.assertEqual(payload["tool_keys_present"], [])
+        self.assertEqual(open(self.state, "rb").read(), before)
+
+    def test_advisory_record_is_stored_outside_findings(self):
+        import argparse
+        import contextlib
+        import io
+        import copilot_dispatch as CD
+        result = {
+            "schema": SR.ADVISORY_SCHEMA, "mode": "CONSULT",
+            "model": SR.MODEL, "model_resolved": SR.MODEL,
+            "reasoning_effort": "high", "reasoning_mode": "standard",
+            "reasoning_resolved": {"effort": "high"}, "reasoning_verified": True,
+            "zero_tool": True, "attempts": 1, "request_id": "req-1",
+            "trace_id": "trace-1", "response_id": "resp-1",
+            "materials_sha256": "e" * 64, "materials_chars": 10,
+            "request_sha256": "r" * 64, "reply_text": advisory("CONSULT"),
+            "reply_sha256": "a" * 64, "reply_chars": 10, "usage": {},
+            "usage_available": True, "latency_ms": 1, "summary": "建议",
+            "analysis": ["分析"], "options": [], "steps": [], "risks": [],
+            "alternatives": [], "recommendation": "先补测试", "unverified": [],
+            "completed_at": G.now_iso(),
+        }
+        args = argparse.Namespace(
+            state=self.state, mode="CONSULT", materials=self.materials,
+            question="该方案是否可行？", reason="", trigger="", force=False,
+            dry_run=False, list=False, json=True, timeout=5,
+            max_output_tokens=100, audit_log="", output_dir="")
+        out = io.StringIO()
+        with mock.patch("sol_review.run_advisory", return_value=dict(result)), \
+                contextlib.redirect_stdout(out):
+            self.assertEqual(CD.cmd_sol_advisory(args), 0)
+        state = G.load_state(self.state)
+        self.assertEqual(state["sol_advisories"][-1]["mode"], "CONSULT")
+        self.assertEqual(state["sol_advisories"][-1]["request_id"], "req-1")
+        self.assertEqual(state["sol_reviews"], [])
+        self.assertEqual(G.list_findings(state)["items"], [])
+        self.assertTrue(os.path.isdir(os.path.join(self.dir, "sol-advisories")))
+
+    def test_advisory_list_is_read_only(self):
+        G.record_sol_advisory_failure(
+            self.state, mode="PLAN", error_code="sol_quota",
+            materials_sha256="f" * 64)
+        proc = F.run_cli("copilot_dispatch.py", "sol-advisory", "--state",
+                         self.state, "--mode", "PLAN", "--list", "--json")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        payload = json.loads(proc.stdout)
+        self.assertEqual(len(payload["sol_advisories"]), 1)
+        self.assertEqual(payload["sol_advisories"][0]["mode"], "PLAN")
 
     def test_same_materials_reuse_without_network(self):
         import argparse

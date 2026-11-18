@@ -3,7 +3,14 @@
 Copilot 是运行于 ZCode 内的**轻量协作治理 Skill**：用户侧 ChatGPT 负责需求与产品层目标、
 交接与验收；ZCode 原生 Agent（主代理）是工程执行与技术决策主体，负责现场调查、规划、实现、
 调试、测试与验证；Copilot 负责任务合同、完成条件、状态、证据、审计与收口门禁，并用 PARTIAL
-派生持续推进任务；独立质量审查由 SOL 零工具单轮复核按风险提供。
+派生持续推进任务；独立质量审查与可选认知辅助（SOL REVIEW / CONSULT / PLAN）按需提供。
+
+**v8.1.0 SOL 升级 GPT-6.2**：SOL 统一 `gpt-6.2-sol`（Responses API `/v1/responses`，既有
+本机 CPA `127` 出口）、`reasoning.effort="high"`、`standard` 模式、零工具、单轮；不按角色
+降级推理强度，不静默回退旧模型或别名，上游回显的模型/推理强度/模式不一致即拒绝消费。新增
+`copilot_dispatch.py sol-advisory --mode CONSULT|PLAN` 提供建议性问题分析与规划辅助，结论写入
+`sol_advisories`，不进入 Finding 台账、不影响 G1–G3、不阻断任务；DECIDE 不恢复，ZCode 仍是
+唯一工程执行与技术决策主体。
 
 **v8.0.1 安全与效率加固**：SOL 错误详情统一脱敏限长，本机 CPA 出口在解析凭据前无条件
 校验并禁用环境代理；远程成功后审计/落盘失败不再被误报为调用失败，可恢复结果避免同材料
@@ -19,7 +26,7 @@ finding 单方面提级为不可驳回阻断。dry-run 与真实调用共用材�
 审计，不参与新任务准入或收口。
 
 **v7.0.0 起独立模型复核走 SOL 零工具单轮复核**：主代理完成开发、自检与测试后，按风险
-调用 `copilot_dispatch.py sol-review` 一次；SOL（既有本机 CPA `127` 通道的 `gpt-6.1-sol`）
+调用 `copilot_dispatch.py sol-review` 一次；SOL（既有本机 CPA `127` 通道的 `gpt-6.2-sol`）
 只阅读材料并返回结构化问题清单，工具定义不会出现在请求体中（并显式
 `tool_choice="none"`）。一次复核只发一次请求；失败不重试、不换 Provider。SOL 是 advisory，
 不构成收口门禁，也不证明宿主只读权限；修复与验证仍由主代理完成。
@@ -29,9 +36,9 @@ finding 单方面提级为不可驳回阻断。dry-run 与真实调用共用材�
 代码快照、`git_root` 结果在单次命令内复用，工作区只扫描一次；工作区根与 HEAD 合并为一次
 `rev-parse`。门禁、漂移检测与证据绑定规则不变。
 
-**v6.0.0 起 SOL 决策通道退役**（v7 只恢复 REVIEW，不恢复 CONSULT/PLAN）：不再有远程模型
-决策依赖，不再有等待 SOL 返回的状态门禁，也不新增其他远程大模型充当强制决策节点。历史调用
-记录、REVIEW 裁决、任务台账与证据原样保留，可只读查看。角色边界见
+**v6.0.0 起 SOL 决策通道退役**（v7 恢复一次性 REVIEW，v8.1 恢复建议性 CONSULT/PLAN）：
+不再有远程模型决策依赖，不再有等待 SOL 返回的状态门禁，也不新增其他远程大模型充当强制
+决策节点。历史调用记录、REVIEW 裁决、任务台账与证据原样保留，可只读查看。角色边界见
 `docs/PROJECT-CHARTER.md`。
 
 本仓库是**唯一源码**；`~/.zcode/skills/copilot` 是构建产物，只允许从本仓库单向下发。
@@ -48,9 +55,9 @@ copilot/
 ├── SKILL.md                 # Skill 入口与运行契约（分发）
 ├── scripts/                 # 运行时脚本（分发）
 │   ├── governance.py        # 本地治理引擎：合同、状态、阶段、G1–G3、PARTIAL 派生
-│   ├── copilot_dispatch.py  # CLI：任务、计划、证据、收口、正式 REVIEW、历史只读
+│   ├── copilot_dispatch.py  # CLI：任务、计划、证据、收口、SOL 复核/辅助分析、正式 REVIEW、历史只读
 │   ├── copilot_auto.py      # 驱动：drive（推进/工作单/派生）与 ingest（执行信封回填）
-│   ├── sol_review.py        # SOL 零工具单轮复核：请求/解析/审计（唯一远程调用）
+│   ├── sol_review.py        # SOL 三模式（REVIEW/CONSULT/PLAN）：请求/解析/审计（唯一远程调用）
 │   ├── native_bridge.py     # Native Bridge v2 执行信封协议与校验
 │   ├── native_agent.py      # 从宿主运行记录生成正式执行信封
 │   ├── agent_policy.py      # Agent 调度建议（只读纯函数）

@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""v7 文档契约：Skill 入口、references、SOL 单轮复核与项目文档与代码一致。
+"""v8.1 文档契约：Skill 入口、references、SOL 三模式与项目文档与代码一致。
 
-这些断言保护“SOL 只做一次性 REVIEW、不是决策通道”，以及 v7 的关键运行契约
-（本地治理、PARTIAL 持续推进、正式 REVIEW opt-in、单轮复核、G4 fail-closed）。
+这些断言保护“SOL 只提供建议、不是决策通道”，以及 v8.1 的关键运行契约
+（本地治理、PARTIAL 持续推进、正式 REVIEW opt-in、gpt-6.2-sol + high、零工具单轮、
+CONSULT/PLAN advisory 不入门禁、G4 退役）。
 """
 from __future__ import annotations
 
@@ -70,13 +71,24 @@ class SkillEntryTests(unittest.TestCase):
         self.assertIn("SOL 零工具单轮复核", self.doc)
         self.assertIn("legacy-status", self.doc)
         self.assertNotIn("唯一正式 GPT/SOL 入口", self.doc)
-        # SOL 只做 REVIEW：不得在文档里恢复 CONSULT/PLAN 远程职责或决策门禁。
+        # SOL 只是建议：不得恢复决策通道或 DECIDE。
         self.assertNotIn("SOL 决策通道已退役。", self.doc)
+        self.assertNotIn('"DECIDE"', self.doc)
         for line in self.doc.splitlines():
-            if "gpt-6.1-sol" in line:
+            if "gpt-6.2-sol" in line:
                 self.assertNotIn("决策通道", line)
-                self.assertNotIn("CONSULT", line)
-                self.assertNotIn("PLAN", line)
+        # 模型升级必须写进当前版本说明，并且不得残留旧模型为现行配置。
+        self.assertIn("gpt-6.2-sol", self.doc)
+        self.assertIn("reasoning.effort=\"high\"", self.doc)
+        self.assertIn("sol-advisory", self.doc)
+
+    def test_consult_plan_are_advisory_not_gates(self):
+        self.assertIn("sol_advisories", self.doc)
+        self.assertIn("CONSULT", self.doc)
+        self.assertIn("PLAN", self.doc)
+        # 辅助分析不得成为门禁或自动工作项来源。
+        self.assertIn("不进入 Finding 台账", self.doc)
+        self.assertIn("不影响 G1–G3", self.doc)
 
     def test_lightweight_governance_and_partial_persistence(self):
         self.assertIn("不替代技术决策", self.doc)
@@ -124,7 +136,10 @@ class ReferenceTests(unittest.TestCase):
         self.assertIn("legacy-status", o["workflow.md"])
         self.assertIn("evidence_tampered", o["workflow.md"])
         self.assertIn("sol-review", o["workflow.md"])
+        self.assertIn("sol-advisory", o["workflow.md"])
         self.assertIn("sol_reviews", o["review.md"])
+        self.assertIn("sol_advisories", o["review.md"])
+        self.assertIn("gpt-6.2-sol", o["review.md"])
         self.assertIn("单轮", o["review.md"])
         self.assertIn("零工具", o["review.md"])
         self.assertIn("已正式退役", o["review.md"])
@@ -153,11 +168,13 @@ class ReferenceTests(unittest.TestCase):
             self.assertIn("历史文档", doc, f"{name} 缺少退役横幅")
             self.assertIn("退役", doc, f"{name} 未说明退役")
 
-    def test_history_records_v6_and_v7(self):
+    def test_history_records_v6_and_v8(self):
         doc = text(os.path.join(REFERENCES, "history.md"))
         self.assertIn("v6.0.0（2026-11-12）", doc)
         self.assertIn("SOL 决策通道已于 v6.0.0", doc)
         self.assertIn("v7.0.0（2026-11-17）", doc)
+        self.assertIn("v8.1.0", doc)
+        self.assertIn("gpt-6.2-sol", doc)
         self.assertIn("SOL 零工具单轮复核", doc)
         self.assertIn("legacy/", doc)
 
@@ -174,6 +191,7 @@ class ReadonlyProfileTests(unittest.TestCase):
         self.assertNotIn("copilot-native-review/v2", doc)
         self.assertNotIn("plan_id", doc)
         self.assertNotIn("gpt-6.1-sol", doc)
+        self.assertNotIn("gpt-6.2-sol", doc)
         self.assertNotIn("round_id", doc)
 
     def test_legacy_profiles_are_gone(self):
@@ -186,7 +204,8 @@ class ReadonlyProfileTests(unittest.TestCase):
 class ProjectDocTests(unittest.TestCase):
     def test_agents_md_points_to_v8_architecture(self):
         doc = text(os.path.join(ROOT, "AGENTS.md"))
-        self.assertIn("唯一远程调用是 SOL REVIEW", doc)
+        self.assertIn("唯一远程调用是 SOL（REVIEW / CONSULT / PLAN）", doc)
+        self.assertIn("gpt-6.2-sol", doc)
         self.assertIn("PARTIAL 不是终点", doc)
         self.assertIn("legacy/tests", doc)
         self.assertIn("native_review_retired", doc)
@@ -195,13 +214,14 @@ class ProjectDocTests(unittest.TestCase):
         self.assertNotIn("SOL 固定", doc)
         self.assertNotIn("唯一正式 GPT/SOL 入口", doc)
 
-    def test_charter_and_roadmap_mark_sol_review_only(self):
+    def test_charter_and_roadmap_mark_sol_advisory_only(self):
         charter = text(os.path.join(ROOT, "docs", "PROJECT-CHARTER.md"))
         roadmap = text(os.path.join(ROOT, "docs", "ROADMAP.md"))
-        self.assertIn("只恢复 REVIEW", charter)
+        self.assertIn("v8.1.0 恢复建议性 CONSULT / PLAN", charter)
         self.assertIn("唯一工程执行与技术决策主体", charter)
         self.assertIn("v7.0", roadmap)
         self.assertIn("v8.0", roadmap)
+        self.assertIn("v8.1", roadmap)
 
     def test_status_and_decisions_record_versions(self):
         status = text(os.path.join(ROOT, "docs", "STATUS.md"))
@@ -212,6 +232,8 @@ class ProjectDocTests(unittest.TestCase):
         self.assertIn("v7.0.0", decisions)
         self.assertIn("SOL 零工具单轮", decisions)
         self.assertIn("v8.0.0", decisions)
+        self.assertIn("v8.1.0", decisions)
+        self.assertIn("gpt-6.2-sol", decisions)
         self.assertIn("G4", decisions)
 
     def test_readme_presents_sol_review_as_active(self):

@@ -1029,6 +1029,30 @@
     - **未放宽**：G1–G3、fail-closed、证据完整性、PWW 接受、单轮与零工具不变量、授权与
       安全边界均不变；本版不新增远程调用、Provider 或强制 REVIEW 节点。
 
+60. **v8.1.0：SOL 升级 GPT-6.2、固定 high 推理强度、恢复建议性 CONSULT / PLAN（2026-11-18，用户任务授权）。**
+    依据：用户《Copilot SOL 升级至 GPT-6.2 SOL，恢复按需认知辅助能力》任务书；本机 CPA
+    `127.0.0.1:8317` 的 `/v1/models` 列表与真实最小探针（HTTP 200，回显
+    `model=gpt-6.2-sol`、`reasoning={effort:"high", mode:"standard"}`，请求 ID 与 usage
+    可取得）。官方文档 URL 在本机不可达（WebFetch 403、DeepSeek Fetch 404），因此兼容性以
+    真实接口行为与请求/响应字段核实，不据不可达文档推测。
+    - **模型身份**：活动模块统一 `MODEL="gpt-6.2-sol"`；不再使用 `gpt-6.1-sol`、别名或
+      静默回退；上游 `model` 回显必须与请求完全一致。
+    - **推理强度**：`PINNED_EFFORTS=("high",)`，`validate_effort` 只接受 high（缺失与
+      low/medium/xhigh/max 一律拒绝）；CONSULT / PLAN / REVIEW 统一 `reasoning.effort=high`，
+      `reasoning.mode=standard`（不显式发送 mode，按模型默认）。上游回显 effort/mode
+      不一致时按参数覆盖事件拒绝消费；回显缺失记录 `reasoning_verified=false`，不推测成功。
+    - **Responses API 兼容**：不发送 `temperature`/`top_p`/`top_logprobs`/`logprobs`，
+      不请求 logprobs include；保持单请求 `store=false`、不使用 `previous_response_id`。
+      响应回显非空 `tools`/`tool_usage` 视为安全事件。
+    - **恢复 CONSULT / PLAN 为可选认知辅助**：新增 `sol-advisory --mode CONSULT|PLAN`，
+      零工具、单轮、advisory；记录写入 `sol_advisories`、原始输出 `sol-advisories/`、审计
+      `sol-advisory-audit.jsonl`；不进入 Finding 台账、不影响 G1–G3、不阻断任务、不自动
+      派生工作项。DECIDE 不恢复，SOL 不接受强制调用或决策职责。
+    - **可追溯性**：审计与任务记录新增 `request_id`、`trace_id`（CPA X-Cpa-Trace-Id）、
+      `response_id`、`reasoning_resolved` 与 `reasoning_verified`。
+    - **不变**：ZCode 主代理仍是唯一工程执行与技术决策主体；零工具、单轮、不自动重试/换
+      Provider/二审；G1–G3、证据完整性、PWW 接受、正式 REVIEW 授权规则与安全边界不变。
+
 ## 建议（未采纳）
 
 > 以下为 v5 时期记录，保留原文；其中涉及 `call_gpt.py`、SOL 预算或远程 REVIEW 的建议

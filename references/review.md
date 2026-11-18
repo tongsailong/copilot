@@ -1,17 +1,34 @@
-# review：SOL 单轮复核、正式 REVIEW 与已退役的 G4
+# review：SOL 三模式（REVIEW / CONSULT / PLAN）、正式 REVIEW 与已退役的 G4
 
-本文说明当前几类“复核”，以及各自的触发条件、证据要求与失败处理；G4 历史记录只读保留。
+本文说明当前几类“复核与认知辅助”，以及各自的触发条件、证据要求与失败处理；G4 历史记录
+只读保留。
 
 **一句话区分：**
 
 - **普通自检**：ZCode 自己做，不登记为复核，不构成任何门禁依据。
-- **SOL 复核**：按需一次性调用 `gpt-6.1-sol`（零工具、单轮）；结论是建议，不是门禁。
+- **SOL 复核（REVIEW）**：按需一次性调用 `gpt-6.2-sol`（零工具、单轮、high）；结论是建议，
+  不是门禁。
+- **SOL 认知辅助（CONSULT / PLAN）**：可选的一次性问题分析或规划建议，结论只写入
+  `sol_advisories`，不进入台账、不影响门禁。
 - **正式 REVIEW**：用户明确要求时才做，是一个治理记录，**不是普通开发的强制前置门**。
 - ~~**G4 复核**~~：v8.0.0 已正式退役，不再是门禁；历史记录只读保留用于审计。
 
-## 0. SOL 零工具单轮复核（v7 普通复核的唯一通道）
+## 0. SOL 零工具单轮调用（v8.1：REVIEW / CONSULT / PLAN）
 
-### 触发
+### 模型与推理强度
+
+- 统一 `gpt-6.2-sol`（Responses API `/v1/responses`，既有本机 CPA `127` 出口）。
+- 所有模式统一 `reasoning.effort="high"`、`reasoning.mode="standard"`：不按角色降级，
+  不接受 `low`/`medium`/`xhigh`/`max`，也不允许配置缺失时静默回退。
+- 不发送 GPT-6.2 推理模型不支持的采样参数（`temperature`/`top_p`/`top_logprobs`/
+  `logprobs`），不请求 `include` 的 logprobs；保持单请求（`store=false`，不使用
+  `previous_response_id` 多轮会话）。
+- 上游回显 `model`、`reasoning.effort`、`reasoning.mode` 必须与请求一致；不一致按身份/
+  参数覆盖事件拒绝消费（退出码 9）。回显存在且一致时记录 `reasoning_verified=true`；
+  上游未回显时如实记为未验证，不推测为成功。
+- 审计与任务记录保留 `request_id` / `trace_id`（CPA trace）/ `response_id`、usage 与延迟。
+
+### 触发（REVIEW）
 
 风险驱动，不强制：简单任务不调用；普通功能按需；多模块改造、广告/归因/数据链路、安全与
 生产高风险建议调用一次；用户明确要求 REVIEW 时调用一次。`review-admission` 只给建议
@@ -27,20 +44,21 @@ python3 -B scripts/copilot_dispatch.py sol-review --state <state.json> \
 - `--materials` 由主代理一次性准备：目标、完成条件、相关规则/决策、完整 Diff、关键文件、
   调用链、测试结果、未解决问题与风险点。命令会自动注入合同/目标/条件；超过 400,000 字符
   拒绝而不是静默截断。
-- 请求发往既有本机 CPA `127` 出口的 `gpt-6.1-sol`，`reasoning.effort=high`；不新增
-  Provider、账户或密钥。
+- 请求发往既有本机 CPA `127` 出口的 `gpt-6.2-sol`，`reasoning.effort=high`、
+  `reasoning.mode=standard`；不新增 Provider、账户或密钥。
 - **零工具**：请求体不含 `tools`/`functions`/`parallel_tool_calls`，`tool_choice="none"`；
-  上游出现 `message`/`reasoning` 之外的 output 条目即判安全事件并拒绝。
-- `--dry-run` 只构建并校验请求（零工具、材料大小），不发请求、不写状态。
+  上游出现 `message`/`reasoning` 之外的 output 条目、回显非空 `tools`/`tool_usage`，即判
+  安全事件并拒绝。
+- `--dry-run` 只构建并校验请求（零工具、模型、推理强度、材料大小），不发请求、不写状态。
 
 ### 单轮与失败
 
 - 一次调用只发一次请求。相同材料摘要再次调用直接复用已有结论，不重复付费。
 - 再次复核必须 `--force --trigger <user-request|scope-changed|new-risk|materials-omitted>
   --reason <说明>`，并换新材料。
-- 超时、429、网络、截断、响应格式、模型身份不符：记录真实原因与 `sol_reviews`
-  失败记录，返回非零退出码；不自动重试、不换 Provider、不派原生 Reviewer 顶替。
-  主代理继续开发；只有用户明确要求必须完成独立复核时才按 BLOCKED 报告。
+- 超时、429/5xx、网络、截断、响应格式、模型身份、推理强度/模式回显不符：记录真实原因与
+  `sol_reviews` 失败记录，返回非零退出码；不自动重试、不换 Provider、不派原生 Reviewer
+  顶替。主代理继续开发；只有用户明确要求必须完成独立复核时才按 BLOCKED 报告。
 
 ### 输出
 
@@ -57,6 +75,38 @@ SOL 没有工具、不能核验宿主权限，也不证明文件读取；SOL 的
 `native_reviews`，不会产生 `g4_eligible`，不改变 G1–G3 的结果。高风险任务建议执行一次，
 但 SOL 未执行、失败或给出 partial 都不阻断主代理继续推进（用户明确要求必须完成独立复核
 而 SOL 不可用时除外）。
+
+## 0.5 SOL 认知辅助：CONSULT / PLAN（v8.1）
+
+### 适用
+
+- **CONSULT**：复杂技术问题分析、疑难故障诊断建议、多方案比较、关键技术风险识别。
+- **PLAN**：复杂任务规划建议、可行性分析、依赖与风险分析、替代路线建议。
+- **不适用**：简单修改、常规文档、已有明确方案的重复工作、能直接从源码或日志得到答案的
+  问题。不设固定轮次，不重复提交相同上下文与相同问题。
+
+### 调用
+
+```bash
+python3 -B scripts/copilot_dispatch.py sol-advisory --state <state.json> \
+  --mode CONSULT --materials <materials.md> --question "该方案的关键风险是什么？"
+```
+
+- `--mode` 只接受 `CONSULT` / `PLAN`；REVIEW 走 `sol-review`。
+- `--question` 由主代理给出具体问题；材料与合同/目标/条件会一起注入。
+- 零工具、单轮、`gpt-6.2-sol` + `high`，与 REVIEW 使用同一通道与同一安全约束。
+- `--dry-run` 校验请求（模式、模型、推理强度、零工具、材料大小）；`--list` 只读查看记录。
+
+### 输出
+
+- `copilot-sol-advisory/v1`：`mode`、`summary`、`analysis`，加 `options`（CONSULT）或
+  `steps`（PLAN，含 `depends_on`）、`risks`、`alternatives`、`recommendation`、
+  `unverified`。schema 或 mode 与请求不一致、字段类型不符时拒绝消费。
+- 结果写入状态 `sol_advisories`，原始输出存 `sol-advisories/`，审计
+  `sol-advisory-audit.jsonl`（仅脱敏元数据）。
+- **治理边界**：不进入 Finding 台账、不改变完成条件、不影响 G1–G3、不阻断任务；是否采纳、
+  如何实施由 ZCode 主代理决定。相同材料 + 模式 + 问题再次调用直接复用结论。
+- **单轮与失败**：与 REVIEW 相同；辅助分析失败只登记真实原因，主代理继续工作。
 
 ## 1. 正式 REVIEW（opt-in）
 

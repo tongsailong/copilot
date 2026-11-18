@@ -2,8 +2,8 @@
 
 本文是 Copilot 的**操作层**权威说明：命令、参数、退出码与标准回合流程。
 语义（阶段判定、派生规则、门禁细节）见 `runtime.md`、`review.md`、`agent-bridge.md`。
-除 `sol-review` 外，所有命令都只读写本地任务状态文件，不发起网络或模型调用。
-`sol-review` 一次调用只发一次 SOL 请求，不自动重试、不自动二审。
+除 `sol-review` 与 `sol-advisory` 外，所有命令都只读写本地任务状态文件，不发起网络或模型
+调用。两个 SOL 命令都是一次调用只发一次请求，不自动重试、不自动二审。
 
 ## 1. 状态文件
 
@@ -46,6 +46,7 @@ python3 -B scripts/copilot_dispatch.py <子命令> --state <state.json> [参数]
 | `closure-check` | 只读检查 G1–G3 | `--json` |
 | `review-admission` | SOL 复核准入建议（只读、不写状态、不是门禁） | `--trigger security`（可重复）、`--reason`、`--json`；返回 `not_needed`/`optional`/`recommended` |
 | `sol-review` | SOL 零工具单轮复核：材料 → 一次请求 → 结构化结果 → advisory findings | `--materials <file>`、`--dry-run`、`--list`、`--json`、`--timeout`、`--max-output-tokens`、`--audit-log`、`--output-dir`；再次复核：`--force --trigger <user-request\|scope-changed\|new-risk\|materials-omitted> --reason` |
+| `sol-advisory` | SOL 零工具单轮认知辅助（CONSULT / PLAN）：建议写入 `sol_advisories`，不入门禁 | `--mode CONSULT\|PLAN`、`--materials <file>`、`--question`、`--dry-run`、`--list`、`--json`、`--timeout`、`--max-output-tokens`、`--audit-log`、`--output-dir`；再次调用：`--force --trigger ... --reason` |
 | `agent-policy` | Agent 调度建议：主代理默认，Explore/general-purpose 按需（只读、不派发）。判定顺序：子代理不可用 → 主代理；写入冲突 → 主代理；`--research-only` → Explore（绝不交给全工具代理）；独立交付物需并发且有收益才建议 general-purpose；其余 → 主代理 | `--needs-independent-context`、`--parallel`、`--independent-deliverable`、`--write-conflict`、`--saves-time`、`--research-only`、`--subagent-unavailable`、`--json` |
 | `finding` | 查看 / 更新 Finding 台账（不触发复核） | `--list`；`--id F1 --status open\|fixed\|verified\|closed\|regressed\|dropped --evidence E1 --note`；`fixed`/`verified` 必须有证据 |
 | `review-metrics` | 统计 SOL 单轮复核、准入门槛、停止标记与 Finding 计数 | `--state`；历史 G4 数据标记 `g4.retired` |

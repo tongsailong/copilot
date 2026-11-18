@@ -233,6 +233,7 @@ def _default_state() -> dict:
         "native_dispatch": None,
         "native_results": [],
         "sol_reviews": [],
+        "sol_advisories": [],
         "review_admissions": [],
         "review_stops": [],
         "finding_ledger": {
@@ -3340,6 +3341,73 @@ def record_sol_review(path: str, review: dict, *,
     return record
 
 
+def list_sol_advisories(state: dict) -> list[dict]:
+    """只读返回本任务的 SOL 辅助分析记录（CONSULT / PLAN，含失败记录）。"""
+    return [item for item in state.get("sol_advisories") or []
+            if isinstance(item, dict)]
+
+
+def record_sol_advisory(path: str, advisory: dict, *,
+                        materials_sha256: str = "",
+                        trigger: str = "", reason: str = "") -> dict:
+    """登记一次成功的 SOL 辅助分析（CONSULT / PLAN）。
+
+    辅助分析是纯建议：不进入 Finding 台账、不改变完成条件、不影响 G1–G3，
+    只作为主代理决策参考与审计留痕。
+    """
+    state = load_state(path)
+    _assert_open(state, "登记 SOL 辅助分析", allow_blocked=True)
+    record = {**advisory}
+    record["status"] = "completed"
+    record["mode"] = str(record.get("mode") or "CONSULT").upper()
+    record["materials_sha256"] = (materials_sha256
+                                  or str(advisory.get("materials_sha256") or ""))
+    record["trigger"] = str(trigger or "")
+    record["reason"] = str(reason or "")[:1000]
+    record["created_at"] = str(advisory.get("completed_at") or now_iso())
+    state.setdefault("sol_advisories", []).append(record)
+    _history(state, "sol_advisory_completed", {
+        "advisory_id": record.get("advisory_id") or "",
+        "mode": record["mode"],
+        "materials_sha256": record["materials_sha256"],
+        "analysis_items": len(record.get("analysis") or []),
+        "options": len(record.get("options") or []),
+        "steps": len(record.get("steps") or []),
+        "trigger": record["trigger"],
+    })
+    save_state(path, state)
+    return record
+
+
+def record_sol_advisory_failure(path: str, *, mode: str = "CONSULT",
+                                error_code: str = "", detail: str = "",
+                                materials_sha256: str = "",
+                                model: str = "") -> dict:
+    """登记一次失败的 SOL 辅助分析；失败不改变任务阶段，也不阻断主代理。"""
+    state = load_state(path)
+    record = {
+        "schema": "copilot-sol-advisory-failure/v1",
+        "advisory_id": "SA" + secrets.token_hex(12),
+        "task_id": str(state.get("task_id") or ""),
+        "mode": str(mode or "CONSULT").upper(),
+        "status": "failed",
+        "error": str(error_code or "sol_error"),
+        "detail": str(detail or "")[:2000],
+        "materials_sha256": str(materials_sha256 or ""),
+        "model": model,
+        "created_at": now_iso(),
+    }
+    state.setdefault("sol_advisories", []).append(record)
+    _history(state, "sol_advisory_failed", {
+        "advisory_id": record["advisory_id"],
+        "mode": record["mode"],
+        "error": record["error"],
+        "materials_sha256": record["materials_sha256"],
+    })
+    save_state(path, state)
+    return record
+
+
 def record_sol_review_failure(path: str, *, error_code: str, detail: str = "",
                               materials_sha256: str = "",
                               model: str = "") -> dict:
@@ -3700,6 +3768,8 @@ def review_metrics(state: dict, *, task_dir: str = "") -> dict:
     """
     sol_reviews = [r for r in state.get("sol_reviews") or []
                    if isinstance(r, dict)]
+    advisories = [r for r in state.get("sol_advisories") or []
+                  if isinstance(r, dict)]
     admissions = [item for item in state.get("review_admissions") or []
                   if isinstance(item, dict)]
     admission_triggers: dict[str, int] = {}
@@ -3791,6 +3861,19 @@ def review_metrics(state: dict, *, task_dir: str = "") -> dict:
                               if r.get("status") == "completed")
                 for severity in ("blocking", "major", "minor", "info")},
             "single_round": True,
+        },
+        "sol_advisories": {
+            "total": len(advisories),
+            "completed": len([r for r in advisories
+                              if r.get("status") == "completed"]),
+            "failed": len([r for r in advisories
+                           if r.get("status") == "failed"]),
+            "modes": {
+                mode: len([r for r in advisories
+                           if r.get("status") == "completed"
+                           and str(r.get("mode") or "").upper() == mode])
+                for mode in ("CONSULT", "PLAN")},
+            "advisory_only": True,
         },
         "g4": {
             "retired": True,

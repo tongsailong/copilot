@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Copilot 任务治理 CLI（ZCode Autonomous Development Edition）。
 
-Copilot 做轻量协作治理：任务合同、工作项、证据、审计与本地 G1–G3。除
-`sol-review`（一次性 SOL 零工具复核）外，所有命令只读写任务状态，不调用模型；
+Copilot 做轻量协作治理：任务合同、工作项、证据、审计与本地 G1–G3。
+除 `sol-review`（一次性零工具复核）与 `sol-advisory`（一次性零工具
+CONSULT / PLAN 辅助分析）外，所有命令只读写任务状态，不调用模型；
 SOL 的结论只是建议，工程执行与技术决策始终由 ZCode 主代理完成。
 
 常用命令::
@@ -16,9 +17,10 @@ SOL 的结论只是建议，工程执行与技术决策始终由 ZCode 主代理
     copilot_dispatch.py closure-check --state S
     copilot_dispatch.py closure --state S --close
     copilot_dispatch.py sol-review --state S --materials M.md
+    copilot_dispatch.py sol-advisory --state S --mode CONSULT --materials M.md
     copilot_dispatch.py legacy-status --state old.json --audit-log old.jsonl --ledger ledger.json
 
-历史 v1/v2 SOL 状态与审计只能通过 `legacy-status` 只读查看，v7 不会驱动它们。
+历史 v1/v2 SOL 状态与审计只能通过 `legacy-status` 只读查看，v6+ 不会驱动它们。
 """
 from __future__ import annotations
 
@@ -38,7 +40,7 @@ import agent_policy as AP  # noqa: E402
 import review_policy as RP  # noqa: E402
 import sol_review as SR  # noqa: E402
 
-__version__ = "8.0.1"
+__version__ = "8.1.0"
 
 
 class CLIError(Exception):
@@ -529,13 +531,15 @@ def _write_atomic(path: str, text: str) -> str:
     return path
 
 
-def _pending_result_path(task_dir: str, digest: str) -> str:
-    return os.path.join(task_dir, "sol-reviews", f"pending-{digest}.json")
+def _pending_result_path(task_dir: str, digest: str,
+                         subdir: str = "sol-reviews") -> str:
+    return os.path.join(task_dir, subdir, f"pending-{digest}.json")
 
 
-def _load_pending_result(task_dir: str, digest: str) -> dict | None:
+def _load_pending_result(task_dir: str, digest: str,
+                         subdir: str = "sol-reviews") -> dict | None:
     """读取已取得响应但尚未登记完成的 SOL 结果，避免再次付费。"""
-    path = _pending_result_path(task_dir, digest)
+    path = _pending_result_path(task_dir, digest, subdir)
     try:
         with open(path, "r", encoding="utf-8") as fh:
             value = json.load(fh)
@@ -550,60 +554,169 @@ def _load_pending_result(task_dir: str, digest: str) -> dict | None:
     return value
 
 
-def cmd_sol_review(args) -> int:
-    """SOL 零工具单轮复核：材料 → 一次请求 → 结构化结果 → 建议性 findings。"""
+def _invoke_sol_once(*, state_path: str, task_dir: str, prompt: str,
+                     digest: str, mode: str, args, audit_log: str,
+                     audit_subdir: str) -> tuple[dict | None, int]:
+    """共享的一次调用路径：pending 恢复 → 一次请求 → 落可恢复结果。
+
+    返回 `(result, exit_code)`；result 为 None 表示失败且已打印真实原因。
+    只有 REVIEW 走 `run_review`，CONSULT/PLAN 走 `run_advisory`。
+    """
+    recovered = False
+    result = _load_pending_result(task_dir, digest, audit_subdir)
+    if result is not None:
+        recovered = True
+        print("发现已取得、尚未登记完成的 SOL 结果：直接恢复登记，"
+              "不重复发起请求。", file=sys.stderr)
+    else:
+        try:
+            if mode == "REVIEW":
+                result = SR.run_review(
+                    prompt, audit_log=audit_log,
+                    max_output_tokens=args.max_output_tokens,
+                    timeout=args.timeout)
+            else:
+                result = SR.run_advisory(
+                    prompt, mode, audit_log=audit_log,
+                    max_output_tokens=args.max_output_tokens,
+                    timeout=args.timeout)
+        except SR.SolError as exc:
+            if mode == "REVIEW":
+                G.record_sol_review_failure(
+                    state_path, error_code=exc.code, detail=exc.detail,
+                    materials_sha256=digest, model=SR.MODEL)
+            else:
+                G.record_sol_advisory_failure(
+                    state_path, mode=mode, error_code=exc.code,
+                    detail=exc.detail, materials_sha256=digest,
+                    model=SR.MODEL)
+            print(f"SOL {mode} 失败 [{exc.code}]：{exc.detail or ''}",
+                  file=sys.stderr)
+            print("已记录真实失败原因，未自动重试、未切换 Provider；"
+                  "主代理可继续开发，或按需人工重新发起。", file=sys.stderr)
+            return None, exc.exit_code
+        # 远程已成功：先落一份可恢复结果，再写状态。状态/审计落盘失败时，
+        # 下一次同材料调用直接恢复这份结果，不会再次付费。
+        try:
+            _write_atomic(
+                _pending_result_path(task_dir, digest, audit_subdir),
+                json.dumps(result, ensure_ascii=False, sort_keys=True))
+        except CLIError as exc:
+            print(f"警告：无法写入待登记结果（不影响本次登记）：{exc}",
+                  file=sys.stderr)
+    result["recovered_from_pending"] = recovered
+    return result, 0
+
+
+def _sol_channel_config(mode: str) -> dict:
+    """REVIEW 与 CONSULT/PLAN 的通道差异（记录键、目录、锁与文案）。"""
+    if mode == "REVIEW":
+        return {
+            "records_key": "sol_reviews",
+            "subdir": "sol-reviews",
+            "audit_name": "sol-review-audit.jsonl",
+            "lock_name": ".sol-review.lock",
+            "id_prefix": "SR",
+            "label": "复核",
+            "dry_run_schema": "copilot-sol-review-dry-run/v1",
+            "closed_note": "任务已收口；新复核需先由用户授权 reopen",
+        }
+    return {
+        "records_key": "sol_advisories",
+        "subdir": "sol-advisories",
+        "audit_name": "sol-advisory-audit.jsonl",
+        "lock_name": ".sol-advisory.lock",
+        "id_prefix": "SA",
+        "label": "辅助分析",
+        "dry_run_schema": "copilot-sol-advisory-dry-run/v1",
+        "closed_note": "任务已收口；新的辅助分析需先由用户授权 reopen",
+    }
+
+
+def _sol_list(args, state: dict, mode: str, cfg: dict) -> int:
+    records = (G.list_sol_reviews(state) if mode == "REVIEW"
+               else G.list_sol_advisories(state))
+    if args.json:
+        _print({"task_id": state.get("task_id"), cfg["records_key"]: records})
+    else:
+        print(f"SOL {cfg['label']}记录：{len(records)} 条")
+        for item in records:
+            ident = item.get("review_id") or item.get("advisory_id")
+            detail = (f"verdict={item.get('verdict')}"
+                      if mode == "REVIEW"
+                      else f"mode={item.get('mode')}")
+            print(f"- {ident} [{item.get('status')}] {detail} "
+                  f"{item.get('created_at') or ''}")
+    return 0
+
+
+def _sol_reuse_or_refuse(decision: dict, args, mode: str, cfg: dict) -> int | None:
+    if decision["action"] == "refuse":
+        raise CLIError(f"[{decision['code']}] {decision['note']}")
+    if decision["action"] != "reuse":
+        return None
+    existing = decision["review"]
+    if args.json:
+        _print(existing)
+    else:
+        ident = existing.get("review_id") or existing.get("advisory_id")
+        detail = (f"verdict={existing.get('verdict')}" if mode == "REVIEW"
+                  else f"mode={existing.get('mode')}")
+        print(f"SOL {cfg['label']}已完成：{ident} {detail}")
+        print(decision["note"])
+    return 0
+
+
+def _run_sol_channel(args, mode: str) -> int:
+    """SOL 三模式共用的一次调用路径；模式差异只在提示词与记录结构。"""
     path = _state_path(args)
     state = G.load_state(path)
     if G.is_legacy_state(state):
-        raise CLIError("v1/v2 SOL 历史状态只读；请为新任务创建 v7 状态。")
+        raise CLIError("v1/v2 SOL 历史状态只读；请为新任务创建 v6+ 状态。")
+    cfg = _sol_channel_config(mode)
     if args.list:
-        records = G.list_sol_reviews(state)
-        if args.json:
-            _print({"task_id": state.get("task_id"), "sol_reviews": records})
-        else:
-            print(f"SOL 复核记录：{len(records)} 条")
-            for item in records:
-                print(f"- {item.get('review_id')} [{item.get('status')}] "
-                      f"verdict={item.get('verdict') or '-'} "
-                      f"{item.get('created_at') or ''}")
-        return 0
+        return _sol_list(args, state, mode, cfg)
     if not args.materials:
-        raise CLIError("sol-review 需要 --materials（或 --list）。")
+        raise CLIError(
+            ("sol-review" if mode == "REVIEW" else "sol-advisory")
+            + " 需要 --materials（或 --list）。")
     materials = _read_text(args.materials)
     if not materials.strip():
-        raise CLIError("审查材料为空。")
+        raise CLIError("材料为空。")
+    question = str(getattr(args, "question", "") or "")
 
     def prepare(current: dict) -> tuple[str, str, str, dict]:
-        prompt_text = SR.build_materials(current, materials)
+        if mode == "REVIEW":
+            prompt_text = SR.build_materials(current, materials)
+            subject = SR.review_subject_sha256(current, materials)
+        else:
+            prompt_text = SR.build_advisory_prompt(
+                current, materials, mode=mode, question=question)
+            subject = SR.review_subject_sha256(
+                current, materials, mode=mode, question=question)
         if len(prompt_text) > SR.WARN_MATERIALS_CHARS:
-            print(f"提示：审查材料 {len(prompt_text)} 字符，较大；"
+            print(f"提示：材料 {len(prompt_text)} 字符，较大；"
                   f"上限 {SR.MAX_MATERIALS_CHARS}，超限会拒绝而不是静默截断。",
                   file=sys.stderr)
-        subject = SR.review_subject_sha256(current, materials)
         context = SR.review_digest(prompt_text)
-        verdict = SR.single_round_decision(
+        decision = SR.single_round_decision(
             current, subject, force=bool(args.force),
-            reason=args.reason, trigger=args.trigger)
-        return prompt_text, subject, context, verdict
+            reason=args.reason, trigger=args.trigger,
+            records_key=cfg["records_key"], mode=mode)
+        return prompt_text, subject, context, decision
 
     if args.dry_run:
         prompt, digest, _context, decision = prepare(state)
-        if decision["action"] == "refuse":
-            raise CLIError(f"[{decision['code']}] {decision['note']}")
-        if decision["action"] == "reuse":
-            existing = decision["review"]
-            if args.json:
-                _print(existing)
-            else:
-                print(f"SOL 复核已完成：{existing.get('review_id')} "
-                      f"verdict={existing.get('verdict')}")
-                print(decision["note"])
-            return 0
+        outcome = _sol_reuse_or_refuse(decision, args, mode, cfg)
+        if outcome is not None:
+            return outcome
         payload = SR.build_payload(
-            prompt, max_output_tokens=args.max_output_tokens)
+            prompt, mode=mode, max_output_tokens=args.max_output_tokens)
         info = {
-            "schema": "copilot-sol-review-dry-run/v1",
+            "schema": cfg["dry_run_schema"],
+            "mode": mode,
             "model": SR.MODEL,
+            "reasoning_effort": payload["reasoning"]["effort"],
             "endpoint": SR.resolve_base_url() + SR.ENDPOINT,
             "materials_sha256": digest,
             "materials_chars": len(prompt),
@@ -611,96 +724,72 @@ def cmd_sol_review(args) -> int:
             "payload_keys": sorted(payload),
             "tool_keys_present": [key for key in payload
                                   if key in SR.TOOL_KEYS],
+            "unsupported_params_present": [
+                key for key in payload if key in SR.UNSUPPORTED_PARAMS],
             "max_output_tokens": payload.get("max_output_tokens"),
         }
         if args.json:
             _print(info)
         else:
-            print(f"SOL 复核预检：model={info['model']} "
+            print(f"SOL {mode} 预检：model={info['model']} "
+                  f"effort={info['reasoning_effort']} "
                   f"materials={info['materials_chars']} 字符 sha={digest[:16]}…")
             print("零工具：请求体不含 tools/functions；tool_choice=none")
         return 0
 
     task_dir = os.path.dirname(os.path.abspath(path))
-    # 跨进程互斥：同一任务同时只允许一个 sol-review 走“检查—调用—登记”临界区，
-    # 避免两个并发进程在完成记录写入前各自发起一次付费请求。
-    with G.task_lock(task_dir):
+    # 跨进程互斥：同一任务同一通道只允许一个调用走“检查—调用—登记”临界区，
+    # 避免并发进程在完成记录写入前各自发起一次付费请求。
+    with G.task_lock(task_dir, cfg["lock_name"]):
         state = G.load_state(path)
         prompt, digest, context_sha, decision = prepare(state)
-        if decision["action"] == "refuse":
-            raise CLIError(f"[{decision['code']}] {decision['note']}")
-        if decision["action"] == "reuse":
-            existing = decision["review"]
-            if args.json:
-                _print(existing)
-            else:
-                print(f"SOL 复核已完成：{existing.get('review_id')} "
-                      f"verdict={existing.get('verdict')}")
-                print(decision["note"])
-            return 0
+        outcome = _sol_reuse_or_refuse(decision, args, mode, cfg)
+        if outcome is not None:
+            return outcome
         if (state.get("closure") or {}).get("closed"):
-            raise CLIError("任务已收口；新复核需先由用户授权 reopen"
-                           "（--list 仍可只读查看）。")
+            raise CLIError(cfg["closed_note"] + "（--list 仍可只读查看）。")
         audit_log = args.audit_log or os.path.join(
-            task_dir, "sol-review-audit.jsonl")
-        result = _load_pending_result(task_dir, digest)
-        recovered = result is not None
-        if recovered:
-            print("发现已取得、尚未登记完成的 SOL 结果：直接恢复登记，"
-                  "不重复发起请求。", file=sys.stderr)
-        else:
-            try:
-                result = SR.run_review(
-                    prompt, audit_log=audit_log,
-                    max_output_tokens=args.max_output_tokens,
-                    timeout=args.timeout)
-            except SR.SolError as exc:
-                G.record_sol_review_failure(
-                    path, error_code=exc.code, detail=exc.detail,
-                    materials_sha256=digest, model=SR.MODEL)
-                print(f"SOL 复核失败 [{exc.code}]：{exc.detail or ''}",
-                      file=sys.stderr)
-                print("已记录真实失败原因，未自动重试、未切换 Provider；"
-                      "主代理可继续开发，或按需人工重新发起。", file=sys.stderr)
-                return exc.exit_code
-            # 远程已成功：先落一份可恢复结果，再写状态。状态/审计落盘失败时，
-            # 下一次同材料调用直接恢复这份结果，不会再次付费。
-            try:
-                _write_atomic(_pending_result_path(task_dir, digest),
-                              json.dumps(result, ensure_ascii=False,
-                                         sort_keys=True))
-            except CLIError as exc:
-                print(f"警告：无法写入待登记结果（不影响本次登记）：{exc}",
-                      file=sys.stderr)
+            task_dir, cfg["audit_name"])
+        result, code = _invoke_sol_once(
+            state_path=path, task_dir=task_dir, prompt=prompt,
+            digest=digest, mode=mode, args=args, audit_log=audit_log,
+            audit_subdir=cfg["subdir"])
+        if result is None:
+            return code
         reply_text = result.pop("reply_text", "")
         result["reply_sha256"] = result.get("reply_sha256") or ""
-        output_dir = args.output_dir or os.path.join(task_dir, "sol-reviews")
-        review_id = "SR" + secrets.token_hex(12)
+        output_dir = args.output_dir or os.path.join(task_dir, cfg["subdir"])
+        record_id = cfg["id_prefix"] + secrets.token_hex(12)
         raw_path = ""
         raw_error = ""
         try:
             raw_path = _write_atomic(
-                os.path.join(output_dir, f"{review_id}.raw.txt"),
+                os.path.join(output_dir, f"{record_id}.raw.txt"),
                 reply_text + "\n")
         except CLIError as exc:
             raw_error = str(exc)
             print(f"警告：原始输出写入失败（结构化结果仍登记）：{exc}",
                   file=sys.stderr)
-        record = {
-            "schema": SR.REVIEW_SCHEMA,
-            "review_id": review_id,
+        common = {
             "task_id": state.get("task_id") or "",
             "contract_sha256": state.get("contract_sha256") or "",
-            "work_item_id": "",
             "status": "completed",
+            "mode": mode,
             "model": result["model"],
             "model_resolved": result.get("model_resolved"),
             "reasoning_effort": result.get("reasoning_effort"),
+            "reasoning_mode": result.get("reasoning_mode"),
+            "reasoning_resolved": result.get("reasoning_resolved"),
+            "reasoning_verified": result.get("reasoning_verified"),
+            # 只保留路由摘要：不回显 userinfo、查询参数或凭据。
             "endpoint": SR.resolve_base_url() + SR.ENDPOINT,
             "materials_sha256": result["materials_sha256"],
             "context_sha256": context_sha,
             "materials_chars": result["materials_chars"],
             "request_sha256": result.get("request_sha256"),
+            "request_id": result.get("request_id") or "",
+            "trace_id": result.get("trace_id") or "",
+            "response_id": result.get("response_id") or "",
             "reply_sha256": result.get("reply_sha256"),
             "reply_chars": result.get("reply_chars"),
             "reply_path": raw_path,
@@ -708,33 +797,56 @@ def cmd_sol_review(args) -> int:
             "usage": result.get("usage"),
             "usage_available": result.get("usage_available"),
             "latency_ms": result.get("latency_ms"),
-            "verdict": result["verdict"],
             "summary": result.get("summary"),
-            "findings": result.get("findings") or [],
-            "findings_count": result.get("findings_count") or {},
             "unverified": result.get("unverified") or [],
-            "materials_reviewed": result.get("materials_reviewed") or [],
-            "verdict_adjusted": result.get("verdict_adjusted") or [],
             "audit_written": result.get("audit_written", True),
             "audit_error": result.get("audit_error") or "",
-            "recovered_from_pending": recovered,
+            "recovered_from_pending": result.get("recovered_from_pending", False),
             "zero_tool": True,
             "attempts": 1,
             "completed_at": result.get("completed_at"),
         }
-        record = G.record_sol_review(
-            path, record, materials_sha256=digest,
-            trigger=decision.get("trigger") or "",
-            reason=decision.get("reason") or "")
+        if mode == "REVIEW":
+            record = {
+                **common,
+                "schema": SR.REVIEW_SCHEMA,
+                "review_id": record_id,
+                "work_item_id": "",
+                "verdict": result["verdict"],
+                "findings": result.get("findings") or [],
+                "findings_count": result.get("findings_count") or {},
+                "materials_reviewed": result.get("materials_reviewed") or [],
+                "verdict_adjusted": result.get("verdict_adjusted") or [],
+            }
+            record = G.record_sol_review(
+                path, record, materials_sha256=digest,
+                trigger=decision.get("trigger") or "",
+                reason=decision.get("reason") or "")
+        else:
+            record = {
+                **common,
+                "schema": SR.ADVISORY_SCHEMA,
+                "advisory_id": record_id,
+                "analysis": result.get("analysis") or [],
+                "options": result.get("options") or [],
+                "steps": result.get("steps") or [],
+                "risks": result.get("risks") or [],
+                "alternatives": result.get("alternatives") or [],
+                "recommendation": result.get("recommendation") or "",
+            }
+            record = G.record_sol_advisory(
+                path, record, materials_sha256=digest,
+                trigger=decision.get("trigger") or "",
+                reason=decision.get("reason") or "")
         try:
-            os.unlink(_pending_result_path(task_dir, digest))
+            os.unlink(_pending_result_path(task_dir, digest, cfg["subdir"]))
         except OSError:
             pass
         if args.json:
             _print(record)
-        else:
+        elif mode == "REVIEW":
             counts = record.get("findings_count") or {}
-            print(f"SOL 复核完成：{review_id} verdict={record['verdict']}")
+            print(f"SOL 复核完成：{record_id} verdict={record['verdict']}")
             print("findings：" + "，".join(
                 f"{key}={counts.get(key, 0)}"
                 for key in ("blocking", "major", "minor", "info")))
@@ -746,7 +858,35 @@ def cmd_sol_review(args) -> int:
                       f"错误 {record.get('audit_error') or '-'}。", file=sys.stderr)
             print("说明：SOL 只提供建议；主代理核实、修复并用定向测试验证，"
                   "不自动发起第二轮复核。")
+        else:
+            print(f"SOL {mode} 完成：{record_id}")
+            print(f"摘要：{record.get('summary') or '(无)'}")
+            print("产出：" + "，".join([
+                f"analysis={len(record.get('analysis') or [])}",
+                f"options={len(record.get('options') or [])}",
+                f"steps={len(record.get('steps') or [])}",
+                f"risks={len(record.get('risks') or [])}"]))
+            if record.get("unverified"):
+                print(f"未验证事项：{len(record['unverified'])} 条（见结果 JSON）")
+            print(f"原始输出：{raw_path or '(写入失败，见结构化结果)'}")
+            if not record.get("audit_written", True):
+                print("警告：审计日志写入失败；辅助分析结果已登记，"
+                      f"错误 {record.get('audit_error') or '-'}。", file=sys.stderr)
+            print("说明：SOL 只提供建议；是否采纳、如何执行由主代理决定。")
         return 0
+
+
+def cmd_sol_review(args) -> int:
+    """SOL 零工具单轮复核：材料 → 一次请求 → 结构化结果 → 建议性 findings。"""
+    return _run_sol_channel(args, "REVIEW")
+
+
+def cmd_sol_advisory(args) -> int:
+    """SOL 零工具单轮辅助分析（CONSULT / PLAN）：建议性认知辅助，不入门禁。"""
+    mode = SR.normalize_mode(getattr(args, "mode", "CONSULT"))
+    if mode not in SR.ADVISORY_MODES:
+        raise CLIError("sol-advisory 只接受 CONSULT 或 PLAN；REVIEW 用 sol-review。")
+    return _run_sol_channel(args, mode)
 
 
 def cmd_agent_policy(args) -> int:
@@ -1315,6 +1455,37 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--output-dir", default="",
                    help="原始输出目录；默认任务目录 sol-reviews/")
     p.set_defaults(func=cmd_sol_review)
+
+    p = sub.add_parser(
+        "sol-advisory",
+        help="SOL 零工具单轮辅助分析（CONSULT / PLAN）：建议性，不入门禁")
+    p.add_argument("--state", required=True)
+    p.add_argument("--mode", default="CONSULT",
+                   choices=SR.ADVISORY_MODES,
+                   help="CONSULT=问题分析/方案比较/风险识别；PLAN=规划与依赖建议")
+    p.add_argument("--materials", default="",
+                   help="主代理整理的材料文件（- 表示 stdin）；--list 时可省略")
+    p.add_argument("--question", default="",
+                   help="主代理要 SOL 回答的具体问题（可选）")
+    p.add_argument("--reason", default="", help="再次调用的具体原因")
+    p.add_argument("--trigger", default="",
+                   choices=("", *sorted(SR.RETRY_TRIGGERS)),
+                   help="再次调用的实质原因类型")
+    p.add_argument("--force", action="store_true",
+                   help="已有同模式结论且材料不同时，允许按 --trigger/--reason 再调用一次")
+    p.add_argument("--dry-run", action="store_true",
+                   help="只构建并校验请求（零工具/模型/推理强度），不发请求、不写状态")
+    p.add_argument("--list", action="store_true", help="只读列出辅助分析记录")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--timeout", type=float, default=SR.DEFAULT_TIMEOUT,
+                   help="单次请求超时秒数（不重试）")
+    p.add_argument("--max-output-tokens", type=int,
+                   default=SR.DEFAULT_MAX_OUTPUT_TOKENS)
+    p.add_argument("--audit-log", default="",
+                   help="审计日志路径；默认任务目录 sol-advisory-audit.jsonl")
+    p.add_argument("--output-dir", default="",
+                   help="原始输出目录；默认任务目录 sol-advisories/")
+    p.set_defaults(func=cmd_sol_advisory)
 
     p = sub.add_parser("agent-policy",
                        help="只读调度建议：主代理默认，Explore/general-purpose 按需")
