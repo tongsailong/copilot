@@ -1,7 +1,8 @@
 # 项目章程：Copilot × ZCode 原生 Agent 协作系统
 
 本文件固定协作职责，不随阶段推进变化；能力与进度见 `ROADMAP.md`、`STATUS.md`。
-现行协作文档基线为 ChatGPT 自定义指令 v5.5.1 与用户级 `AGENTS.md`。
+现行协作基线是 ChatGPT 自定义指令（唯一权威治理基线）与用户级 `AGENTS.md`；本仓库不保存
+其副本、不维护版本映射，ChatGPT 规则变化时只做受影响的增量同步。
 
 ## 角色分工（v8.0.0）
 

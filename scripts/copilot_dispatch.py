@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Copilot v7 任务治理 CLI（ZCode Autonomous Development Edition）。
+"""Copilot 任务治理 CLI（ZCode Autonomous Development Edition）。
 
 Copilot 做轻量协作治理：任务合同、工作项、证据、审计与本地 G1–G3。除
 `sol-review`（一次性 SOL 零工具复核）外，所有命令只读写任务状态，不调用模型；
@@ -1142,7 +1142,7 @@ def cmd_legacy_status(args) -> int:
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         prog="copilot_dispatch.py",
-        description="Copilot v6 本地任务治理（不调用任何模型）")
+        description="Copilot 本地任务治理（不调用任何模型）")
     ap.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     sub = ap.add_subparsers(dest="command", required=True)
 

@@ -14,7 +14,9 @@ Copilot 是运行在 ZCode 内的**协作治理层**，不是决策模型，也�
 追踪的合同、状态、证据与收口条件，并在任务没有真正完成时继续推进。
 
 - **用户**：业务目标、优先级、关键取舍与授权。
-- **ChatGPT（用户侧）**：需求理解、产品与业务判断、目标定义、产品层方案、验收。
+- **ChatGPT（用户侧）**：唯一权威治理基线——需求理解、产品与业务判断、目标定义、产品层
+  方案、角色分工、授权原则与最终验收；原文只在 ChatGPT 设置维护，本 Skill 不保存其副本、
+  不维护版本映射或对齐表。
 - **ZCode 原生 Agent（主代理）**：唯一的工程执行与技术决策主体——调查、规划、实现、调试、
   测试、验证，自主选择技术路线，不需要任何远程模型批准。**默认由主代理直接执行**，不为了
   体现协作而强制调用子代理。
@@ -431,7 +433,6 @@ SOL 输出契约：总体结论 `verdict=pass|partial|blocked`；`findings` 按
 | Agent 调度与内置 Explore/general-purpose 能力基线 | `copilot_dispatch.py agent-policy`；`references/agent-bridge.md` |
 | 历史 REVIEW 台账与旧审计（只读） | `references/review-ledger.md` |
 | 版本沿革、G4 退役与 v7 SOL 恢复记录 | `references/history.md` |
-| 角色与历史 SOL 指令（只作历史） | `references/role.md`、`role-consult.md` / `role-plan.md` / `role-review.md` / `role-map.md` |
 
 ## 版本
 
@@ -678,5 +679,6 @@ v6.3 基于 10 个真实任务的复核复盘（ad-strategy 7 轮复核、Honor 
 已随旧机制一并退役；本节只作版本沿革。**
 G1–G4、证据完整性、宿主记录与 fail-closed 语义未放宽；新增能力不扩大任何授权。
 v5.x 及以前的 SOL 决策通道、轮次/预算状态机与远程 REVIEW 裁决已退役；历史文档保留但明确
-标注为历史，不再作为当前规则。协作语义基线为用户级 `AGENTS.md` 与 ChatGPT 自定义指令
-v5.4.0；本 Skill 不与基线冲突。
+标注为历史，不再作为当前规则。协作语义基线是 ChatGPT 自定义指令（唯一权威）与用户级
+`AGENTS.md`；本 Skill 只维护轻量治理规则，不保存其副本、不维护版本映射，按规则变化做
+增量同步。

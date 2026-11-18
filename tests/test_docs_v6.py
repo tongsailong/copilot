@@ -19,8 +19,7 @@ READONLY_PROFILE = os.path.join(ROOT, ".zcode", "agents",
                                 "independent-readonly.md")
 LEGACY_PROFILE = os.path.join(ROOT, ".zcode", "agents", "reviewer.md")
 ACTIVE_REFS = ("workflow.md", "runtime.md", "review.md", "agent-bridge.md")
-HISTORICAL_REFS = ("role.md", "role-consult.md", "role-plan.md", "role-review.md",
-                   "role-map.md", "review-ledger.md")
+HISTORICAL_REFS = ("review-ledger.md",)
 DISPATCH = os.path.join(ROOT, "scripts", "copilot_dispatch.py")
 
 
