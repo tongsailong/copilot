@@ -1083,6 +1083,35 @@
     - **未验证**：本轮未发起真实 GPT-6.2 调用（请求构造与响应管线仅新增上下文字段，复用
       2026-11-18 的真实调用证据）；融合后一次真实 REVIEW/CONSULT 的端到端耗时未复测。
 
+62. **v8.3.0：SOL 触发策略改为确定性复杂度 + 覆盖判断（2026-11-18，用户任务授权）。**
+    依据：用户《Copilot SOL 主动介入策略优化升级》任务书；现场核对 v8.2.0 源码实测确认
+    “多模块/高风险任务在整个开发期 `recommended_action` 恒为 `not_needed`，`drive` 无任何
+    SOL 提示”，即 SOL 的触发只依赖风险标签与门禁全绿，缺少复杂度与覆盖判断。
+    - **复杂度只用品格事实**：新增 `review_policy.task_complexity`，信号为 `risk-high`、
+      `declared-trigger`、`multi-module`、`multi-action`、`interdependent`、
+      `replan-history`、`reopened`。不引入第二个 LLM、不引入评分模型；只统计计划内工作项，
+      治理派生的 `AUTO-*` 与历史 `g4-review` 项不计入。
+    - **分级与动作**：0 信号 `low`（SOL 0 调用，PASS 也不因阶段调用）；1 个 `medium`；
+      ≥2 个 `high`。中高复杂任务在“已形成初步理解”（有计划或证据）后建议一次 `PLAN`
+      （无计划）或 `CONSULT`（有计划）；没有现场上下文时先调查，不做无上下文调用。
+    - **覆盖与追加**：以合同指纹判定覆盖；只有升级型信号（`risk-high` /
+      `replan-history` / `reopened`）新出现或合同修订才允许追加一次，并要求
+      `--force --trigger new-risk|scope-changed --reason`。结构变化（证据目录、工作项增减）
+      不算新对象。调用记录新增 `risk` / `complexity` / `complexity_signals` 快照，追加判断
+      只比较快照（旧记录缺快照时按已覆盖处理，升级不重复付费）。
+    - **未采纳**：(a) 把代码快照或计划 sha 放进复用键——代码每轮都在变、计划常增量登记，
+      会诱发“每次改动再问一遍”，与“减少重复调用”冲突；范围变化由合同指纹与升级信号表达。
+      (b) 用复杂度决定是否收口或派生工作项——那会把 advisory 变成门禁。
+    - **展示位置**：`review-admission`（文本与 JSON：`advice` / `complexity` /
+      `recommended_mode` / `recommended_phase`）、`evaluate` 的 `sol` 字段、`drive` 工作单前
+      与 `status` 的下一步。不写状态、不改变阶段、不影响 G1–G3。
+    - **收口顺序**：`drive` 命中 PASS 会立即收口，因此收口前的 REVIEW 建议只在 PASS 之前
+      的 `status` / `review-admission` 中给出；`drive` 在 PASS 步不再打印无法执行的复核提示。
+    - **不变**：SOL advisory、零工具、单轮、不自动重试；G1–G3 与 fail-closed；G4 不存在；
+      ZCode 唯一工程执行与技术决策主体；正式 REVIEW 授权规则。
+    - **未验证**：本轮未发起真实 GPT-6.2 调用（触发策略是本地确定性判断，真实调用链未改）；
+      建议触发后的一次真实 CONSULT 端到端耗时未复测。
+
 ## 建议（未采纳）
 
 > 以下为 v5 时期记录，保留原文；其中涉及 `call_gpt.py`、SOL 预算或远程 REVIEW 的建议

@@ -5,9 +5,15 @@ Copilot 是运行于 ZCode 内的**轻量协作治理 Skill**：用户侧 ChatGP
 调试、测试与验证；Copilot 负责任务合同、完成条件、状态、证据、审计与收口门禁，并用 PARTIAL
 派生持续推进任务；独立质量审查与可选认知辅助（SOL REVIEW / CONSULT / PLAN）按需提供。
 
-**v8.2.0 SOL 与 G1–G3 融合**：三种 SOL 模式共用一条调用管线、一份任务上下文（合同/条件/
-证据）与一份记录流（`sol_calls`，历史 `sol_reviews`/`sol_advisories` 只读兼容）、统一审计
-`sol-audit.jsonl`；`review-admission` 先算本地 G1–G3，门禁有缺口时不建议调用 SOL。
+**v8.3.0 SOL 主动介入策略**：触发判断从“风险标签 + 门禁是否全绿”升级为**确定性复杂度 +
+覆盖判断**——简单任务 0 调用；中高复杂任务（多模块、多依赖、高风险、重规划、重开等信号）
+在形成计划或证据后建议一次 `PLAN`/`CONSULT`；同一合同已有有效结论且无升级型新信号时直接
+复用，只有新出现的重大不确定性才允许追加一次。建议由 `review-admission`、`status` 与
+`drive` 展示，不派生工作项、不改变阶段、不影响 G1–G3。
+
+**v8.2.0 SOL 与 G1–G3 融合（历史）**：三种 SOL 模式共用一条调用管线、一份任务上下文
+（合同/条件/证据）与一份记录流（`sol_calls`，历史 `sol_reviews`/`sol_advisories` 只读兼容）、
+统一审计 `sol-audit.jsonl`；`review-admission` 先算本地 G1–G3。
 
 **v8.1.0 SOL 升级 GPT-6.2（历史）**：SOL 统一 `gpt-6.2-sol`（Responses API `/v1/responses`，既有
 本机 CPA `127` 出口）、`reasoning.effort="high"`、`standard` 模式、零工具、单轮；不按角色

@@ -1,7 +1,85 @@
 # STATUS
 
 更新：2026-11-18 CST。本文件只记录现场可核实的事实；规划与未完成事项单独标注。
-当前版本：v8.2.0（SOL 与 G1–G3 融合）。
+当前版本：v8.3.0（SOL 主动介入策略）。
+
+## SOL 主动介入策略（2026-11-18，v8.3.0）
+
+基线：HEAD `ad27c2f`（`origin/main` 一致、工作区干净），运行时 v8.2.0 受管理 20 文件、
+`--check` 缺失 0 / 不同 0。
+
+### 基线审计（现场实测，不是按文档推断）
+
+用同一构造脚本在本仓库 v8.2.0 上实测七种任务形态：
+
+- 简单低风险（1 工作项）、普通中风险（1–3 工作项）、多模块复杂（5 工作项 + 依赖）、
+  高风险（2–5 工作项）在**开发期**全部得到 `recommended_action=not_needed`；
+  原因：`review_admission` 只在 G1–G3 全绿时采用风险建议，门禁一旦有缺口（开发期必然）
+  就一律 `not_needed`。
+- `evaluate()` 在 RUNNING/PARTIAL 不含任何 SOL 字段；`drive` 不提示；只有 PASS +
+  `risk=high` 时在 `next_commands` 追加一句可选提示（`drive` 命中 PASS 会直接收口，
+  该提示实际不可执行）。
+- 没有复杂度判断；没有“已咨询过”的覆盖判断（记录一次 CONSULT 后准入仍返回 `not_needed`）。
+- 单轮去重只依赖 `materials_sha256`（提示词版本/模型/强度/目标/合同/条件/证据/材料）。
+
+### 实施
+
+- **复杂度**：`review_policy.task_complexity` 只用状态事实给出 `low/medium/high` 与信号：
+  `risk-high`、`declared-trigger`（8 个准入触发因素）、`multi-module`（证据跨 ≥2 个
+  相对工作区目录）、`multi-action`（计划内工作项 ≥4）、`interdependent`（依赖边 ≥2）、
+  `replan-history`（`AUTO-REPLAN`）、`reopened`（`closure.reopen_history`）。只统计计划内
+  工作项，治理派生的 `AUTO-*` 与历史 `g4-review` 项不计入；工作区外的证据不计入模块数。
+- **建议**：`review_policy.sol_advice` 返回 `none` / `reuse` / `consult` / `plan` /
+  `review` ＋ `recommended_action` / `mode` / `phase` / `new_signals` / `command`。
+  中高复杂任务在“有计划或证据”后建议一次 PLAN（无计划）或 CONSULT（有计划）；没有现场
+  上下文时返回 `none`（先调查）。
+- **覆盖**：按 `contract_sha256` 判定覆盖；只有升级型信号（`risk-high` /
+  `replan-history` / `reopened`）新出现或合同被修订才允许追加一次，命令带
+  `--force --trigger new-risk|scope-changed --reason`。结构变化（证据目录、工作项增减）
+  不诱发重复调用；旧记录缺 `complexity_signals` 时按已覆盖处理。
+- **展示**：`review-admission`（文本 + JSON `advice` / `recommended_mode` /
+  `recommended_phase` / `complexity`）、`evaluate()` 的 `sol` 字段、`drive` 工作单前的
+  提示与 `status` 的下一步。不派生工作项、不改变 phase、不影响 G1–G3。
+- **记录**：SOL 调用记录新增 `risk` / `complexity` / `complexity_signals` 快照，追加判断
+  只比较快照。
+- **收口顺序**：`drive` 命中 PASS 即收口，因此收口前的 REVIEW 建议在 PASS 之前的
+  `status` / `review-admission` 给出；`drive` 在 PASS 步不再打印无法执行的复核提示。
+- **未采纳**：代码快照或计划 sha 进入复用键（代码每轮变化、计划常增量登记，会诱发
+  “每次改动再问一遍”）；用复杂度决定收口或派生工作项（会把 advisory 变成门禁）。
+
+### 测试
+
+- 活动测试：基线 `469 OK / 34.5s` → 本轮 `501 OK / 39.4s`（新增
+  `tests/test_sol_trigger.py` 32 项：复杂度分类、简单任务 0 调用、中高复杂主动介入、
+  重复抑制、实质变化重调、G1–G3 不自动调用、失败继续、advisory 语义、用户显式请求、
+  BLOCKED/CLOSED 不建议、无 G4、`sol_calls` 历史兼容）。
+- 历史回归：`legacy/tests` 853 项，失败/错误 146 条；与基线 worktree（`083fe2e`）逐条
+  比对**集合完全相同**（`diff` 为空），无新增回归。
+- 运行时副本手动验证：简单任务 `none`、跨模块任务 `consult`、同材料 `sol-advisory`
+  复用（exit 0、零请求）、SOL 结论不改变 `closure-check`。
+
+### 性能（同机 A/B，baseline = `git worktree` 于 `083fe2e`）
+
+| 指标 | 基线 | v8.3.0 | 差异 |
+|---|---|---|---|
+| `review_admission`（进程内，中位数） | 0.24ms | 0.26ms | +0.02ms |
+| `evaluate`（进程内） | ≈0.0ms | ≈0.1ms | +0.1ms |
+| CLI 墙钟（`status` / `closure-check` / `review-admission` / `review-metrics` / `sol-review --list` / `drive`） | 72–132ms | 73–132ms | −1.4 ~ +6.9ms（批次间噪声 ≤9ms） |
+
+新增开销只发生在内存中的字典遍历：不加 `git` 调用、不读文件、不发起网络。SOL 单次调用
+的提示词与请求体不变——本轮只改“是否建议调用”。
+
+### 运行时同步
+
+`sync_runtime.py --apply` 写入 8 个文件（SKILL.md + 3 references + 4 scripts），
+`--check` 缺失 0 / 不同 0 / 多出 0；`review_policy.py`、`governance.py`、
+`copilot_dispatch.py`、`copilot_auto.py`、`SKILL.md` 的 SHA-256 与源码一致。
+
+### 未验证
+
+- 本轮未发起真实 GPT-6.2 调用（触发策略是本地确定性判断，调用链、请求构造与模型参数
+  未改）；“建议→实际调用”的真实延迟沿用 2026-11-18 的 v8.2 实测数据。
+- 建议是否**减少**真实项目的重复调用，需要后续真实任务统计才有证据。
 
 ## SOL 与 G1–G3 融合（2026-11-18，v8.2.0）
 

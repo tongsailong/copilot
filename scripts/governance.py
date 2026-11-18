@@ -3267,17 +3267,21 @@ def review_admission(state: dict, *, triggers: list[str] | None = None,
                      reason: str = "", target_sha256: str = "",
                      code_scope_sha256: str = "",
                      files: list[dict] | None = None,
-                     scope: str = "full", include_gates: bool = True) -> dict:
-    """SOL 认知辅助准入建议（只读，不写状态）。
+                     scope: str = "full", include_gates: bool = True,
+                     user_request: bool = False,
+                     workspace: str = "") -> dict:
+    """SOL 主动介入准入建议（只读，不写状态）。
 
     这是“要不要调用 SOL”的**单一确定性入口**：先用本地 G1–G3 与台账事实判断
-    是否存在必须先修的机械缺口，再按风险等级给出 `CONSULT` / `PLAN` / `REVIEW`
-    的建议。SOL 是 advisory，不构成收口门禁，也不证明宿主只读权限。
+    确定性门禁是否已通过，再结合任务认知复杂度给出 `CONSULT` / `PLAN` /
+    `REVIEW` 的建议。SOL 是 advisory，不构成收口门禁，也不证明宿主只读权限。
 
     - `decision`：风险等级策略建议（`not_needed` / `optional` / `recommended`），
-      只反映风险与触发因素，便于与历史输出兼容。
-    - `recommended_action`：结合当前确定性门禁后的最终建议。门禁仍有缺口时一律
-      `not_needed`（本地工作单优先，SOL 不提供本地事实），门禁全绿时才回到风险建议。
+      只反映风险与触发因素，保持历史输出兼容。
+    - `advice`：复杂度与覆盖判断（`none` / `reuse` / `consult` / `plan` /
+      `review`）＋建议模式、阶段、新信号与命令提示。
+    - `recommended_action`：`advice.action` 的兼容视图；中高复杂任务在开发阶段
+      会得到 `recommended`（一次主动认知辅助），简单任务始终 `not_needed`。
     """
     import sol_review as SR
 
@@ -3289,6 +3293,12 @@ def review_admission(state: dict, *, triggers: list[str] | None = None,
     by_mode = {mode: len([item for item in calls if sol_call_mode(item) == mode])
                for mode in SOL_MODES}
     target = str(target_sha256 or final_evidence_digest(state))
+    check = closure_check(state) if include_gates else None
+    advice = RP.sol_advice(
+        state, calls=calls, triggers=triggers,
+        gates_passed=bool(check and check["passed"]),
+        user_request=user_request,
+        workspace=str(workspace or state.get("workspace") or ""))
     result = {
         **decision,
         "target_sha256": target,
@@ -3311,11 +3321,16 @@ def review_admission(state: dict, *, triggers: list[str] | None = None,
         } if calls else None),
         "ledger": RP.ledger_summary(state),
         "code_scope_checked": bool(code_scope_sha256 or files),
+        "advice": advice,
+        # 兼容视图：旧的 not_needed / optional / recommended 三值保持不变，
+        # 但判断依据从“只有风险 + 门禁”升级为“复杂度 + 覆盖 + 门禁”。
+        "recommended_action": advice["recommended_action"],
+        "recommended_mode": advice["mode"],
+        "recommended_phase": advice["phase"],
     }
     if not include_gates:
+        result["recommended_reason"] = advice["reason"]
         return result
-    # 确定性优先：门禁缺口是本地事实，调用模型前必须先把它们当成可执行工作项。
-    check = closure_check(state)
     gate_codes = {
         name: sorted({str(item.get("code") or "") for item in check["gates"][name]["reasons"]})
         for name in ("G1", "G2", "G3")
@@ -3325,14 +3340,9 @@ def review_admission(state: dict, *, triggers: list[str] | None = None,
         "passed": bool(check["passed"]),
         "codes": gate_codes,
     }
-    if open_codes:
-        result["recommended_action"] = "not_needed"
-        result["recommended_reason"] = (
-            "确定性门禁仍有缺口（" + "、".join(sorted(set(open_codes)))
-            + "）：先按本地工作单修复，SOL 不提供本地事实。")
-    else:
-        result["recommended_action"] = decision["decision"]
-        result["recommended_reason"] = decision["detail"]
+    result["recommended_reason"] = advice["reason"]
+    if open_codes and advice["action"] in ("none", "reuse"):
+        result["deterministic_gaps"] = sorted(set(open_codes))
     return result
 
 
@@ -4475,14 +4485,6 @@ def _evaluate_core(state: dict, *, cache: dict | None = None) -> dict:
                       + "、".join(quality.get("accepted_ids") or []) + "）")
         commands = ["copilot_auto.py drive --state <state>（收口）",
                     "或 copilot_dispatch.py closure --state <state> --close"]
-        # 高风险任务建议一次 SOL 独立复核；advisory，不改变 PASS 判定。
-        if str(state.get("risk") or "").lower() == "high" and not [
-                item for item in iter_sol_calls(state)
-                if isinstance(item, dict) and item.get("status") == "completed"
-                and sol_call_mode(item) == "REVIEW"]:
-            commands.append(
-                "可选：copilot_dispatch.py sol-review --state <state> --materials "
-                "<materials.md>（高风险建议一次独立复核，advisory）")
         return {
             "phase": "PASS", "reason": reason,
             "actions": [], "stalled": [], "gate": check, "criteria": criteria,
@@ -4495,12 +4497,41 @@ def _evaluate_core(state: dict, *, cache: dict | None = None) -> dict:
     }
 
 
+def sol_advice_summary(state: dict, *, gates_passed: bool = False,
+                       user_request: bool = False,
+                       triggers: list[str] | None = None) -> dict:
+    """SOL 主动介入建议（只读）：复杂度 + 覆盖 + 新信号，不改变阶段与门禁。
+
+    简单任务返回 `action=none`；中高复杂任务在形成初步理解后返回一次
+    `consult`/`plan` 建议；已有有效结论且无新信号时返回 `reuse`。
+    """
+    return RP.sol_advice(
+        state,
+        calls=[item for item in iter_sol_calls(state)
+               if isinstance(item, dict) and item.get("status") == "completed"],
+        triggers=triggers,
+        gates_passed=gates_passed,
+        user_request=user_request,
+        workspace=str(state.get("workspace") or ""))
+
+
 def evaluate(state: dict, *, cache: dict | None = None) -> dict:
     """本地阶段求值；附带非阻断提醒（不影响 phase 与 G1–G3）。"""
     result = _evaluate_core(state, cache=cache)
     warnings = contract_source_warnings(state)
     if warnings:
         result["warnings"] = warnings
+    phase = result.get("phase")
+    if phase in ("RUNNING", "PARTIAL", "PASS"):
+        # SOL 建议只是提示：不派生工作项、不改变阶段、不影响门禁。
+        advice = sol_advice_summary(state, gates_passed=(phase == "PASS"))
+        result["sol"] = advice
+        if advice.get("action") in ("consult", "plan", "review"):
+            prefix = "可选" if advice.get("recommended_action") == "optional" else "建议"
+            command = advice.get("command") or ""
+            if command:
+                result.setdefault("next_commands", []).insert(
+                    0, f"{prefix}：{command}（SOL {advice['mode']}，advisory）")
     return result
 
 

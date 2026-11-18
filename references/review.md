@@ -24,10 +24,43 @@
   `done_criteria_text` 与边界）、完成条件、工作项状态与证据登记摘要（ID、类型、摘要前缀、
   大小、支持的条件、归档标记，上限 80 条 / 6000 字符）。主代理只需提供本次增量的材料与
   具体问题，不必重复粘贴门禁已有事实。
-- `review-admission` 是“要不要调用 SOL”的单一确定性入口：先计算本地 G1–G3 与台账，
-  门禁仍有缺口时 `recommended_action=not_needed`（先修机械缺口）；门禁全绿后才按风险等级
-  返回 `optional` / `recommended`（`decision` 保留风险策略原义，便于兼容旧输出）。
+- `review-admission` 是“要不要调用 SOL”的单一确定性入口：先算本地任务复杂度（只用状态
+  事实）与已有 SOL 覆盖，再结合 G1–G3 给出建议；`decision` 保留风险策略原义以便兼容旧输出。
 - 简单任务与普通任务默认不调用 SOL；没有自动触发、没有固定轮次。
+
+### 主动介入策略（v8.3）
+
+**简单任务 0 调用；中高复杂任务主动调用 1 次；只有出现新的重大不确定性才追加调用。**
+
+| 复杂度 | 信号数 | 默认动作 |
+|---|---|---|
+| `low` | 0 | SOL 0 调用（进入 PASS 也不因阶段调用） |
+| `medium` | 1 | 形成计划/证据后建议一次 `PLAN`（无计划）或 `CONSULT`（有计划） |
+| `high` | ≥2 | 同上，建议优先在规划/方案阶段收敛判断 |
+
+信号（`complexity.signal_codes`）：`risk-high`、`declared-trigger`（security / permissions /
+core-logic / data-integrity / architecture / global-execution / production / release）、
+`multi-module`（证据跨 ≥2 个模块目录）、`multi-action`（计划工作项 ≥4）、
+`interdependent`（依赖边 ≥2）、`replan-history`（AUTO-REPLAN）、`reopened`、
+`user-request`（用户明确要求）。
+
+- **时机**：在形成计划或登记证据（“已形成初步理解”）之后，不要在没有任何现场上下文时调用；
+  `review-admission` 与 `drive`/`status` 会打印建议与完整命令，但**不派生工作项、不改变阶段**。
+- **覆盖**：同一合同（`contract_sha256` 相同）已有 CONSULT/PLAN（或 REVIEW）结论，且没有
+  升级型新信号时返回 `reuse`，直接复用结论。
+- **追加**：只有升级型信号（`risk-high` / `replan-history` / `reopened`）新出现，或合同被
+  修订（合同指纹变化＝新范围）才允许再调用一次，并给 `--force --trigger
+  <new-risk|scope-changed> --reason ...`。证据目录增加、工作项增减属于结构变化，不算新的
+  认知对象——避免“每次都再问一遍”。
+- **收口**：G1–G3 通过不触发调用；仅高风险任务或出现新信号时给一次 REVIEW 建议
+  （advisory）。`drive` 命中 PASS 会立即收口，因此收口前的复核建议在 `status` /
+  `review-admission` 中给出，顺序是：最终验证 → `review-admission` →（需要时 SOL）→ 收口。
+- **用户明确要求**：直接调用，不受复杂度判断限制；`review-admission --user-request` 把该事实
+  写入建议（`user-request` 信号，最高优先级）。
+- **BLOCKED / CLOSED 不建议调用**：阻塞只能由用户补齐授权/决策/资源解除，SOL 不提供本地
+  事实；已收口的任务需要继续时先由用户授权 `reopen`。
+- **记录快照**：SOL 记录写入 `risk` / `complexity` / `complexity_signals`，追加判断只比较
+  调用时刻的信号快照，不需要重新推理，也不会因升级前的旧记录重复付费。
 
 ### 模型与推理强度
 
@@ -46,7 +79,7 @@
 
 风险驱动，不强制：简单任务不调用；普通功能按需；多模块改造、广告/归因/数据链路、安全与
 生产高风险建议调用一次；用户明确要求 REVIEW 时调用一次。`review-admission` 只给建议
-（`not_needed` / `optional` / `recommended`），不写状态、不阻塞。
+（`not_needed` / `optional` / `recommended`）与建议模式，不写状态、不阻塞。
 
 ### 调用
 

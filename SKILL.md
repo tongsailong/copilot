@@ -1,6 +1,6 @@
 ---
 name: copilot
-description: "Copilot v8.2 轻量协作治理：任务承接、合同与完成条件、状态与证据登记、PARTIAL 持续推进、SOL（gpt-6.2-sol，high，零工具）按需 CONSULT/PLAN/REVIEW 认知辅助，与 G1–G3 共用合同、条件与证据，统一记录在 sol_calls。SOL 只提供建议，不替代 ZCode 的技术决策与工程执行；G4 原生只读复核已退役，历史台账只读保留。"
+description: "Copilot v8.3 轻量协作治理：任务承接、合同与完成条件、状态与证据登记、PARTIAL 持续推进、SOL（gpt-6.2-sol，high，零工具）按需 CONSULT/PLAN/REVIEW 认知辅助。按确定性复杂度判断主动介入：简单任务 0 调用，中高复杂任务在形成初步理解后建议一次，只有新信号才追加；SOL 与 G1–G3 共用合同、条件与证据，统一记录在 sol_calls。SOL 只提供建议，不替代 ZCode 的技术决策与工程执行；G4 原生只读复核已退役，历史台账只读保留。"
 when_to_use: >
   需要把多步骤工程任务纳入可追踪治理时：任务合同/完成条件需要固定、证据与审计需要绑定、
   长任务需要 PARTIAL 持续推进与上下文恢复、复杂问题需要一次 SOL 零工具独立判断（CONSULT /
@@ -8,7 +8,7 @@ when_to_use: >
   G4 记录与 REVIEW 台账。简单、单步、低风险任务直接由 ZCode 原生完成，不进入本 Skill。
 ---
 
-# copilot：轻量协作治理（v8.2.0）
+# copilot：轻量协作治理（v8.3.0）
 
 Copilot 是运行在 ZCode 内的**协作治理层**，不是决策模型，也不是执行体。它负责把任务变成可
 追踪的合同、状态、证据与收口条件，并在任务没有真正完成时继续推进。
@@ -50,7 +50,8 @@ Copilot 是运行在 ZCode 内的**协作治理层**，不是决策模型，也�
 1. 任务需要固定合同与完成条件，并在多轮之间保持状态（长任务、跨会话续跑）。
 2. 需要证据登记、SHA-256 完整性、审计留痕与可追溯收口。
 3. 任务处于 PARTIAL（还有工作要做），需要本地派生下一步而不是等待外部判断。
-4. 多模块改造、数据链路、安全或生产高风险变更，需要一次 SOL 独立复核。
+4. 多模块改造、数据链路、安全或生产高风险变更，需要一次 SOL 独立复核；中高复杂任务在
+   形成初步理解后需要一次主动认知辅助（`review-admission` 给出复杂度与调用建议）。
 5. 高风险任务（生产数据、权限/安全策略、关键链路、不可逆操作）建议执行一次 SOL 单轮复核。
 6. 复杂问题存在多条技术路线、跨模块调用链或疑难故障，需要一次独立认知视角（CONSULT / PLAN）。
 7. 用户明确要求正式 REVIEW。
@@ -66,7 +67,8 @@ start（合同 + 完成条件 + 风险 + 后端）
   → drive（本地求值：PASS 收口 / BLOCKED 停下 / 打印工作单）
   → ZCode 执行（主代理或原生子代理）
   → ingest / record / criterion / evidence（回填真实结果与原始证据）
-  → [按需] sol-advisory（CONSULT/PLAN 认知辅助）或 sol-review（独立复核）
+  → [中高复杂，按需] review-admission 判断复杂度 → sol-advisory 一次（CONSULT/PLAN）
+  → [收口前，高风险或新信号] sol-review 一次（独立复核）
            → 主代理核实/采纳/修复/定向验证
   → drive（继续直到 PASS 或真实 BLOCKED）
 ```
@@ -332,19 +334,44 @@ verify 的结构化质量报告（`copilot-verify-result/v1`）走报告接入�
 复核是风险控制手段，不是开发流程的必经节点。普通复核只有一条活动通道：
 **SOL 零工具单轮复核**（`copilot_dispatch.py sol-review`）。
 
-### 风险驱动，不强制
+### 主动介入与复杂度（v8.3）
 
-| 任务类型 | SOL 调用策略 |
+**简单任务 0 调用；中高复杂任务主动调用 1 次；只有出现新的重大不确定性才追加调用。**
+判断是确定性的：只用状态里已有事实，不引入第二个模型、评分模型或新的门禁。
+
+`review-admission` 输出三个层次，全部只读、不写状态、不是门禁：
+
+- `complexity`：`low` / `medium` / `high` ＋ 命中的信号（见下表）；
+- `advice.action`：`none` / `reuse` / `consult` / `plan` / `review`，附建议模式、阶段与命令；
+- `recommended_action`：`not_needed` / `optional` / `recommended` 兼容视图。
+
+| 信号 | 含义 |
 |---|---|
-| 简单文案、小 Bug、简单 UI | 不调用 |
-| 普通功能开发 | 按需调用 |
-| 多模块重大改造 | 建议调用一次 |
-| 广告、归因、数据链路 | 建议调用一次 |
-| 安全及生产高风险变更 | 按风险调用一次 |
-| 用户明确要求 REVIEW | 调用一次 |
+| `risk-high` | 任务风险为 high（不可逆/生产/安全影响） |
+| `declared-trigger` | 准入时声明了 security / permissions / core-logic / data-integrity / architecture / global-execution / production / release |
+| `multi-module` | 已登记证据跨越 ≥2 个模块目录 |
+| `multi-action` | 计划内工作项 ≥4 |
+| `interdependent` | 计划内工作项依赖边 ≥2 |
+| `replan-history` | 出现过 `AUTO-REPLAN`（方案失败后重规划） |
+| `reopened` | 任务曾重开 |
+| `user-request` | 用户明确要求 CONSULT / PLAN / REVIEW |
 
-- `review-admission` 只返回建议（`not_needed` / `optional` / `recommended`），不写状态、
-  不是门禁。主代理按风险、复杂度与潜在收益自主决定。
+- 0 个信号 → `low`：SOL 0 调用，即使进入 PASS/CLOSED 也不因阶段调用；
+- 1 个 → `medium`，≥2 个 → `high`：在有计划或证据（“已形成初步理解”）后建议**一次**
+  `PLAN`（还没有计划）或 `CONSULT`（已有计划，比较方案与风险）；
+- 尚无可判断的现场（无计划、无证据）→ `none`：先调查，不做无上下文的空想；
+- 已覆盖且没有新信号 → `reuse`：直接复用已有结论，不重复付费；
+- 只有升级型信号（`risk-high` / `replan-history` / `reopened`）新出现，或合同被修订
+  （合同指纹变化＝新范围），才允许追加一次，并给出 `--force --trigger ... --reason ...`。
+  证据目录增加、工作项增减等结构变化不算新的认知对象。
+- 收口阶段：G1–G3 明确通过时**不因阶段自动调用**；只有高风险任务（或出现新信号）才给出
+  一次 REVIEW 建议（`optional` / `recommended`，advisory）。收口前的建议通过 `status` /
+  `review-admission` 获得——`drive` 命中 PASS 会立即收口，因此顺序是：最终验证 →
+  `review-admission`（需要时执行一次 SOL）→ `drive` 收口。
+- 用户明确要求 CONSULT / PLAN / REVIEW → 直接调用，不受复杂度判断限制（`--user-request`
+  可把这一事实写进准入建议）。
+- 任务处于 BLOCKED 或已收口（CLOSED）时不建议新的 SOL 调用：阻塞只能由用户补齐授权/
+  决策/资源解除，SOL 不提供本地事实。
 - **高风险任务**：建议在最终验证后执行一次 SOL 复核；SOL 是 advisory，不构成收口门禁，
   也不证明宿主只读权限。G4 原生只读门禁已退役，不再有 `host_capability_missing` 或
   G4 BLOCKED 状态。
@@ -365,8 +392,9 @@ SOL 除了独立复核，还提供两种可选的建议性认知辅助，由主�
   [--question "..."]`；`--dry-run` 只校验请求，`--list` 只读查看。
 - **不适合调用**：简单修改、常规文档调整、已有明确方案的重复工作、能直接从源码或日志
   得到答案的问题。不设固定轮次，不重复提交相同上下文和相同问题。
-- **治理边界**：结论写入 `sol_advisories`，不进入 Finding 台账、不改变完成条件、不影响
-  G1–G3；是否采纳、如何实施由 ZCode 主代理决定。
+- **治理边界**：结论写入 `sol_calls`（`mode=CONSULT|PLAN`，历史 `sol_advisories` 只读
+  兼容），不进入 Finding 台账、不改变完成条件、不影响 G1–G3；是否采纳、如何实施由 ZCode
+  主代理决定。
 - **模型与推理强度**：所有 SOL 模式统一 `gpt-6.2-sol` + `reasoning.effort="high"`
   （`standard` 模式），不按角色降级，不允许静默回退到 `medium`/`low` 或其他模型；
   上游回显的 `model`、`reasoning.effort`、`reasoning.mode` 不一致时拒绝消费（退出码 9）。
@@ -482,7 +510,25 @@ SOL 输出契约：总体结论 `verdict=pass|partial|blocked`；`findings` 按
 
 ## 版本
 
-当前版本 **v8.2.0（SOL 与 G1–G3 融合）**。本版把 SOL 收敛为 Copilot 内部统一的按需认知
+当前版本 **v8.3.0（SOL 主动介入策略）**。本版只改“什么时候调用 SOL”，不改状态机、
+G1–G3 与授权边界：
+
+- **确定性复杂度**：新增 `task_complexity` / `sol_advice`（`review_policy.py`），只用状态
+  事实（风险、声明触发因素、计划结构、证据目录、重规划/重开历史）判断 `low/medium/high`；
+  不引入第二个模型、评分模型或新门禁。
+- **主动介入**：中高复杂任务在形成计划或证据后，由 `review-admission` 与 `drive`/`status`
+  给出一次 `PLAN`/`CONSULT` 建议（含具体命令）；简单任务保持 0 调用，进入 PASS 也不因阶段
+  调用。建议不派生工作项、不改变阶段、不影响收口。
+- **覆盖与追加**：同一合同已有有效结论且没有升级型新信号（`risk-high` /
+  `replan-history` / `reopened`）时返回 `reuse`；结构变化（证据目录、工作项增减）不算新对象；
+  合同修订由合同指纹变化自然开启新范围。SOL 记录新增 `risk` / `complexity` /
+  `complexity_signals` 快照，追加判断只比较快照。
+- **收口顺序**：最终验证 → `review-admission`（需要时执行一次 SOL）→ `drive` 收口；PASS
+  时 drive 会立即收口，因此复核建议在收口前的 `status` / `review-admission` 中给出。
+- **不变量**：SOL 仍是 advisory、零工具、单轮、不自动重试；G1–G3 语义与 fail-closed 不变；
+  G4 不存在；ZCode 仍是唯一工程执行与技术决策主体。
+
+v8.2.0（历史）把 SOL 收敛为 Copilot 内部统一的按需认知
 能力，不新增治理层、不恢复 G4、不改变 ZCode 唯一工程执行与技术决策主体：
 
 - **一份任务上下文**：SOL 提示词自动注入同一份合同正文、完成条件、工作项状态与证据登记，

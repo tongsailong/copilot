@@ -27,6 +27,28 @@ import re
 LEDGER_SCHEMA = "copilot-finding-ledger/v1"
 ADMISSION_SCHEMA = "copilot-review-admission/v1"
 STOP_SCHEMA = "copilot-review-stop/v1"
+COMPLEXITY_SCHEMA = "copilot-task-complexity/v1"
+SOL_ADVICE_SCHEMA = "copilot-sol-advice/v1"
+
+# 任务认知复杂度只使用状态里已有的确定性事实：不引入第二个模型，也不引入
+# 评分模型。每个信号都对应一条可复核的现场证据；0 个信号即低复杂度。
+COMPLEXITY_LEVELS = ("low", "medium", "high")
+COMPLEXITY_SIGNALS = {
+    "risk-high": "高风险或不可逆影响",
+    "declared-trigger": "声明了架构/安全/数据链路类风险",
+    "multi-module": "证据跨越多个模块或目录",
+    "multi-action": "工作项数量明显超过普通局部修改",
+    "interdependent": "多个工作项相互依赖",
+    "replan-history": "曾出现方案失败并重新规划",
+    "reopened": "任务曾重开",
+    "user-request": "用户明确要求 CONSULT / PLAN / REVIEW",
+}
+
+# 只有“升级型”信号才算认知对象发生实质变化、允许第二次调用。结构型信号
+# （工作项数量、依赖、目录、声明的触发因素）只用于判断复杂度：开发过程中证据
+# 目录或计划条目增加不代表需要重新判断；范围变化走合同修订（合同指纹变化即
+# 旧结论不再覆盖）。
+SOL_ESCALATION_SIGNALS = ("risk-high", "replan-history", "reopened")
 
 # 台账状态：fixed 只是“已改”，verified 才表示修复被定向验证；只有
 # verified/closed/dropped 不再阻断。regressed 表示已修复问题又复现。
@@ -821,3 +843,288 @@ def reentry_decision(state: dict, *, target: str,
                 REENTRY_TRIGGERS[item] for item in effective),
             "triggers": requested, "stop_id": stop.get("stop_id"),
             "reason": _text(reason)[:1000]}
+
+
+# ── SOL 主动介入：任务认知复杂度与调用建议 ──────────────────────────────────
+#
+# 目标不是增加调用量，而是让真正值得认知推理的任务在**足够了解现场之后**主动获得
+# 一次 SOL 帮助，同时让简单任务保持 0 调用。判断只使用状态里已有的事实：
+# 风险、声明的触发因素、计划结构、证据目录、重规划与重开历史。SOL 仍是 advisory，
+# 这里的任何建议都不参与 G1–G3，也不产生阻塞性工作项。
+def _action_list(state: dict, *, plan_only: bool = False) -> list[dict]:
+    """工作项视图；`plan_only` 只保留 ZCode 登记的计划项（排除治理派生项）。"""
+    out = []
+    for item in state.get("actions") or []:
+        if not isinstance(item, dict):
+            continue
+        ident = _text(item.get("id"))
+        origin = _text(item.get("origin"))
+        if origin == "g4-review":
+            continue  # v7 历史高风险任务遗留的工作项，不参与新判断
+        if plan_only and (ident.startswith("AUTO-") or not _text(item.get("plan_id"))):
+            continue
+        out.append(item)
+    return out
+
+
+def _dependency_edges(actions: list[dict]) -> int:
+    total = 0
+    known = {_text(item.get("id")) for item in actions}
+    for item in actions:
+        for dep in item.get("depends_on") or []:
+            if _text(dep) in known:
+                total += 1
+    return total
+
+
+def _module_dirs(state: dict, workspace: str = "") -> list[str]:
+    """证据所在的模块目录：优先相对任务工作区，无法归属的不计入。"""
+    root = ""
+    if _text(workspace):
+        root = os.path.realpath(os.path.expanduser(workspace))
+    dirs = set()
+    for entry in state.get("evidence") or []:
+        if not isinstance(entry, dict) or entry.get("dropped"):
+            continue
+        hint = _text(entry.get("path_hint"))
+        if not hint or hint.startswith("<"):
+            continue
+        folder = os.path.dirname(os.path.abspath(hint))
+        if root:
+            folder = os.path.relpath(folder, root)
+        if folder in (".", "") or folder.startswith(".."):
+            continue
+        dirs.add(folder)
+    return sorted(dirs)
+
+
+def task_complexity(state: dict, *, triggers: list[str] | None = None,
+                    workspace: str = "") -> dict:
+    """确定性的任务认知复杂度：只用状态事实，不调用任何模型。
+
+    低复杂度（0 个信号）＝简单/局部改动：SOL 默认 0 调用。
+    1 个信号＝中等复杂度：值得一次主动认知辅助。
+    2 个及以上＝高复杂度：优先在规划/方案阶段用一次 CONSULT 或 PLAN 收敛判断。
+    """
+    codes: list[str] = []
+    details: dict[str, str] = {}
+
+    def add(code: str, detail: str) -> None:
+        if code not in codes:
+            codes.append(code)
+            details[code] = detail
+
+    risk = _text(state.get("risk")).lower()
+    risk = "medium" if risk == "normal" else risk
+    if risk == "high":
+        add("risk-high", "task.risk=high")
+    requested = []
+    for item in triggers or []:
+        value = _text(item).lower()
+        if value and value not in requested and value in ADMISSION_TRIGGERS:
+            requested.append(value)
+    if requested:
+        add("declared-trigger", "触发因素：" + "、".join(requested))
+
+    actions = _action_list(state, plan_only=True)
+    edges = _dependency_edges(actions)
+    modules = _module_dirs(state, workspace)
+    if len(actions) >= 4:
+        add("multi-action", f"计划工作项 {len(actions)} 个")
+    if edges >= 2:
+        add("interdependent", f"工作项依赖边 {edges} 条")
+    if len(modules) >= 2:
+        add("multi-module", "证据目录：" + "、".join(modules[:4]))
+    if any(_text(item.get("origin")) == "replan"
+           or _text(item.get("id")).startswith("AUTO-REPLAN")
+           for item in _action_list(state)):
+        add("replan-history", "存在 AUTO-REPLAN 记录")
+    if (state.get("closure") or {}).get("reopen_history"):
+        add("reopened", "closure.reopen_history 非空")
+
+    count = len(codes)
+    level = "low" if count == 0 else ("medium" if count == 1 else "high")
+    understood = bool(actions) or bool(state.get("plans")) or \
+        bool([item for item in state.get("evidence") or []
+              if isinstance(item, dict) and not item.get("dropped")])
+    return {
+        "schema": COMPLEXITY_SCHEMA,
+        "level": level,
+        "signals": [{"code": code, "detail": details[code]} for code in codes],
+        "signal_codes": codes,
+        "counts": {
+            "plan_actions": len(actions),
+            "dependency_edges": edges,
+            "modules": len(modules),
+            "criteria": len((state.get("contract") or {}).get("criteria") or []),
+            "evidence": len([item for item in state.get("evidence") or []
+                             if isinstance(item, dict) and not item.get("dropped")]),
+        },
+        "readiness": {"understood": understood},
+    }
+
+
+def _record_mode(record: dict) -> str:
+    """SOL 记录模式；历史记录没有 `mode` 时按当时存放位置判定。"""
+    mode = _text(record.get("mode")).upper()
+    if mode in ("REVIEW", "CONSULT", "PLAN"):
+        return mode
+    return "CONSULT" if record.get("advisory_id") else "REVIEW"
+
+
+def _covers_contract(record: dict, contract_sha256: str) -> bool:
+    """记录是否覆盖当前合同；历史记录缺少合同时按覆盖处理（宁可不重复付费）。"""
+    recorded = _text(record.get("contract_sha256"))
+    if not recorded:
+        return True
+    return recorded == _text(contract_sha256)
+
+
+def _retry_trigger(new_codes: list[str]) -> str:
+    if "replan-history" in new_codes or "risk-high" in new_codes:
+        return "new-risk"
+    return "scope-changed"
+
+
+def _advice_command(mode: str, *, second_round: bool, trigger: str) -> str:
+    if mode == "REVIEW":
+        command = ("copilot_dispatch.py sol-review --state <state> "
+                   "--materials <materials.md>")
+    else:
+        command = (f"copilot_dispatch.py sol-advisory --mode {mode} --state <state> "
+                   "--materials <materials.md> --question <本次要解决的具体问题>")
+    if second_round:
+        command += f" --force --trigger {trigger} --reason <为什么需要再判断>"
+    return command
+
+
+def sol_advice(state: dict, *, calls: list[dict] | None = None,
+               triggers: list[str] | None = None, gates_passed: bool = False,
+               user_request: bool = False, workspace: str = "") -> dict:
+    """SOL 主动介入建议（只读建议，不是门禁，也不派生工作项）。
+
+    策略：
+    * 简单/局部任务（0 信号）→ 0 调用，即使进入 PASS/CLOSED 也不因阶段调用；
+    * 中高复杂任务在“已形成初步理解”（有计划或证据）后建议一次 CONSULT/PLAN；
+    * 同一合同已有有效结论且没有新的复杂度信号 → 复用，不重复付费；
+    * 只有出现新信号（方案推翻、风险升级、范围扩大、重开）才允许第二次调用；
+    * 收口阶段只在高风险或出现新信号时建议一次 REVIEW，普通任务不因阶段调用。
+    """
+    profile = task_complexity(state, triggers=triggers, workspace=workspace)
+    if user_request:
+        # 用户显式要求是最高优先级事实：不受复杂度判断限制，但仍只是 advisory。
+        codes = list(profile["signal_codes"])
+        if "user-request" not in codes:
+            codes.append("user-request")
+            profile["signals"].append({"code": "user-request",
+                                       "detail": COMPLEXITY_SIGNALS["user-request"]})
+        profile["signal_codes"] = codes
+        profile["level"] = "high"
+
+    completed = [item for item in calls or []
+                 if isinstance(item, dict) and item.get("status") == "completed"]
+    contract_sha = _text(state.get("contract_sha256"))
+    same = [item for item in completed if _covers_contract(item, contract_sha)]
+    covered = {mode: any(_record_mode(item) == mode for item in same)
+               for mode in ("CONSULT", "PLAN", "REVIEW")}
+    last = None
+    if same:
+        last = max(same, key=lambda item: _text(item.get("created_at")))
+    # 旧记录没有信号快照时不做差异判断：按“已覆盖”处理，避免升级后重复付费。
+    new_codes: list[str] = []
+    if last is not None and "complexity_signals" in last:
+        recorded = {_text(code) for code in last.get("complexity_signals") or []}
+        new_codes = [code for code in profile["signal_codes"]
+                     if code in SOL_ESCALATION_SIGNALS and code not in recorded]
+    risk = _text(state.get("risk")).lower()
+    base = {
+        "schema": SOL_ADVICE_SCHEMA,
+        "complexity": profile,
+        "covered": covered,
+        "new_signals": new_codes,
+        "second_round": bool(last is not None),
+        "trigger": _retry_trigger(new_codes) if last is not None else "",
+        "action": "none",
+        "recommended_action": "not_needed",
+        "mode": "",
+        "phase": "none",
+        "reason": "",
+        "command": "",
+    }
+    if bool((state.get("closure") or {}).get("closed")):
+        base["reason"] = "任务已收口：不再建议新的 SOL 调用（需继续时先由用户授权 reopen）。"
+        return base
+    if any(not block.get("resolved_at")
+           for block in state.get("blocks") or [] if isinstance(block, dict)):
+        # 阻塞只能由用户补齐授权/决策/资源解除；SOL 不提供本地事实，也不能解除阻塞。
+        base["reason"] = ("任务处于 BLOCKED：先解除授权/决策/资源缺口；SOL 不提供本地事实，"
+                          "也不能替代用户决定。")
+        return base
+    if profile["level"] == "low":
+        base["reason"] = ("简单/局部任务（无中高复杂信号）：主代理自检、diff 与必要"
+                          "测试闭环，SOL 保持 0 调用。")
+        return base
+    if not profile["readiness"]["understood"]:
+        base["reason"] = ("尚未形成可判断的现场理解（没有计划或证据）；先调查并登记"
+                          "计划/证据，再决定是否调用 SOL。")
+        return base
+    if (covered["CONSULT"] or covered["PLAN"]) and not new_codes \
+            and not user_request:
+        if gates_passed and risk == "high" and not covered["REVIEW"]:
+            base.update({
+                "action": "review", "recommended_action": "optional",
+                "mode": "REVIEW", "phase": "closure",
+                "reason": ("已有 SOL 咨询结论，G1–G3 已通过；高风险任务可按需执行"
+                           "一次独立复核（advisory，不是收口门禁）。"),
+                "command": _advice_command("REVIEW", second_round=False,
+                                           trigger=""),
+            })
+            return base
+        base.update({
+            "action": "reuse", "mode": "CONSULT" if covered["CONSULT"] else "PLAN",
+            "reason": ("同一合同已有有效 SOL 结论且没有新的复杂度信号：直接复用，"
+                       "不重复调用。"),
+        })
+        return base
+    if covered["REVIEW"] and not new_codes and not user_request:
+        base.update({
+            "action": "reuse", "mode": "REVIEW",
+            "reason": ("已有覆盖当前合同的 SOL 复核结论且没有新信号：直接复用，"
+                       "不重复复核。"),
+        })
+        return base
+    if gates_passed:
+        if risk == "high" or new_codes:
+            base.update({
+                "action": "review", "recommended_action": "recommended",
+                "mode": "REVIEW", "phase": "closure",
+                "reason": ("G1–G3 已通过，任务风险或新增信号值得一次独立复核；"
+                           "复核结论只是建议，不改变 PASS 判定。"),
+                "command": _advice_command("REVIEW", second_round=bool(last),
+                                           trigger=base["trigger"]),
+            })
+            return base
+        base["reason"] = ("G1–G3 已通过且没有新的认知不确定性：不因阶段自动调用 "
+                          "SOL。")
+        return base
+    mode = "CONSULT" if profile["counts"]["plan_actions"] else "PLAN"
+    base.update({
+        "action": mode.lower(),
+        "recommended_action": "recommended",
+        "mode": mode,
+        "phase": "development",
+        "reason": (
+            "中高复杂任务已形成初步理解：建议调用一次 SOL "
+            + ("PLAN（先补齐规划/依赖/替代路线）" if mode == "PLAN" else
+               "CONSULT（比较方案、识别遗漏与风险）")
+            + "；是否采纳由主代理判断。"),
+        "command": _advice_command(mode, second_round=bool(last),
+                                   trigger=base["trigger"]),
+    })
+    if user_request:
+        base["reason"] = ("用户明确要求 SOL 判断：直接调用一次（advisory）；"
+                          "即使已有结论也按用户要求执行。")
+    elif new_codes:
+        base["reason"] = ("出现新的认知信号（" + "、".join(new_codes)
+                          + "）：允许追加一次 SOL 判断；其余情况复用已有结论。")
+    return base

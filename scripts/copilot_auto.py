@@ -150,6 +150,16 @@ def drive(args) -> int:
         evaluation = G.evaluate(state, cache=cache)
         phase = evaluation.get("phase")
         print(f"[{step}] {state.get('task_id')} → {phase}：{evaluation.get('reason')}")
+        sol = evaluation.get("sol") or {}
+        # PASS 阶段 drive 会立即收口，此时再提示复核已无法执行；收口前的复核
+        # 建议由 `status` / `review-admission` 在收口前给出（见 SKILL.md 顺序）。
+        if phase != "PASS" and sol.get("action") in ("consult", "plan", "review"):
+            print(f"SOL {sol.get('mode')} 建议（{sol.get('recommended_action')}，"
+                  f"复杂度 {(sol.get('complexity') or {}).get('level') or '-'}）："
+                  f"{sol.get('reason')}")
+            if sol.get("command"):
+                print(f"  可选调用：{sol['command']}")
+            print("  说明：SOL 只是 advisory；不影响阶段、门禁与收口判定。")
         if phase == "CLOSED":
             print(G.render_status(state, evaluation, cache=cache))
             return EXIT_DONE

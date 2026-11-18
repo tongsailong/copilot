@@ -11,6 +11,13 @@ Copilot 是运行于 ZCode 内的**轻量协作治理 Skill**：负责任务承�
 决策主体；用户侧 ChatGPT 负责需求与产品层目标、交接与验收；独立质量审查与可选认知辅助
 （SOL REVIEW / CONSULT / PLAN）由 `gpt-6.2-sol` 零工具单轮调用按需提供。
 
+- **v8.3.0 起 SOL 触发改为确定性复杂度 + 覆盖判断**：`review_policy.task_complexity`
+  只用状态事实（`risk-high`、声明触发因素、多模块证据、计划规模/依赖、重规划、重开）判断
+  `low/medium/high`；简单任务 0 调用，中高复杂任务在形成计划或证据后由
+  `review-admission` / `status` / `drive` 建议一次 `PLAN`/`CONSULT`（给出命令，不派生工作项）。
+  同一合同已有有效结论且无升级型新信号（`risk-high` / `replan-history` / `reopened`）时复用；
+  结构变化不诱发重复调用。建议不改变阶段、不影响 G1–G3；`drive` 命中 PASS 立即收口，收口前
+  的复核建议在 `status` / `review-admission` 中给出。
 - **v8.2.0 起 SOL 三模式融合为统一按需认知能力**：REVIEW / CONSULT / PLAN 共用
   `build_prompt`（自动注入合同正文、完成条件、工作项与证据登记）、`_run_sol_channel` →
   `run_sol` → `record_sol_call` 管线；记录统一写入 `sol_calls`，审计统一
@@ -117,8 +124,10 @@ Agent、SOL（REVIEW / CONSULT / PLAN）、DesignWise。Executor 是 ZCode 工�
   `pending_call`、`quota`、`round_seq`、`budget`、`pass_pending` 等远程判定字段。
 - **PARTIAL 不是终点**：必须本地派生工作项（`AUTO-C<n>` / `AUTO-R-<id>` / `AUTO-FIX-<F>` /
   `AUTO-VERIFY-<F>` / `AUTO-REPLAN` / `AUTO-NEXT`）并继续推进，直到 PASS 或真实 BLOCKED。
-  G4 退役后不再派生 `AUTO-G4*`；SOL 复核由主代理按风险决定，不是阻塞性工作项。禁止因轮次、
-  Token、内部费用、等待模型、重复评审、子 Agent PARTIAL、首次方案失败或普通测试失败停止。
+  G4 退役后不再派生 `AUTO-G4*`；SOL 复核由主代理按风险决定，不是阻塞性工作项。v8.3 起
+  SOL 以建议+命令形式呈现（`advice.action`），不派生 `AUTO-SOL*` 工作项，也不因等待 SOL
+  停止。禁止因轮次、Token、内部费用、等待模型、重复评审、子 Agent PARTIAL、首次方案失败或
+  普通测试失败停止。
 - `execution_backend` 默认 `legacy`，native 为显式 opt-in；既有协议决定不得擅改。
 - **Agent 调度按 `SKILL.md`**：主代理直接执行为默认；`Explore` 只做独立只读调查（不注入
   AGENTS.md，必须提供范围与背景）；`general-purpose` 只承担边界清晰的独立交付物。

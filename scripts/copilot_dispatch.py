@@ -40,7 +40,7 @@ import agent_policy as AP  # noqa: E402
 import review_policy as RP  # noqa: E402
 import sol_review as SR  # noqa: E402
 
-__version__ = "8.2.0"
+__version__ = "8.3.0"
 
 
 class CLIError(Exception):
@@ -492,26 +492,37 @@ def cmd_finding(args) -> int:
 
 
 def cmd_review_admission(args) -> int:
-    """SOL 认知辅助准入建议（只读，不是门禁；确定性门禁优先）。"""
+    """SOL 主动介入建议（只读，不是门禁；复杂度 + 覆盖 + 门禁事实）。"""
     path = _state_path(args)
     state = G.load_state(path)
     try:
         decision = G.review_admission(
-            state, triggers=args.trigger, reason=args.reason)
+            state, triggers=args.trigger, reason=args.reason,
+            user_request=bool(getattr(args, "user_request", False)))
     except (RP.ReviewPolicyError, SR.SolUsageError) as exc:
         raise CLIError(str(exc)) from None
     if args.json:
         _print(decision)
     else:
-        print(f"SOL 复核准入：{decision['decision']}"
-              f"（tier={decision.get('tier') or decision['risk']}）")
-        print(decision.get("detail") or "")
+        advice = decision.get("advice") or {}
+        complexity = advice.get("complexity") or {}
+        signals = [item.get("code") for item in complexity.get("signals") or []]
+        print(f"任务复杂度：{complexity.get('level') or '-'}"
+              f"（信号：{', '.join(signals) if signals else '无'}）")
+        print(f"SOL 建议：{advice.get('action') or '-'}"
+              f"（mode={advice.get('mode') or '-'}，phase={advice.get('phase') or '-'}）")
+        print(advice.get("reason") or "")
+        if advice.get("new_signals"):
+            print("新增信号：" + ", ".join(advice["new_signals"]))
+        if advice.get("command"):
+            print("调用：" + advice["command"])
+        if decision.get("recommended_action"):
+            print(f"最终建议：{decision['recommended_action']}")
+        print(f"风险策略：{decision['decision']}"
+              f"（tier={decision.get('tier') or decision['risk']}）"
+              f" — {decision.get('detail') or ''}")
         if decision.get("triggers"):
             print("触发因素：" + ", ".join(decision["triggers"]))
-        action = decision.get("recommended_action")
-        if action:
-            print(f"结合当前门禁的最终建议：{action}")
-            print(decision.get("recommended_reason") or "")
         print(f"已有 SOL 调用：{decision.get('sol_calls_total', 0)} 次"
               f"（REVIEW {decision.get('sol_reviews_total', 0)}）")
         print("说明：SOL 是建议性独立审查（advisory），不是收口门禁；单轮调用，不自动二审。")
@@ -775,11 +786,19 @@ def _run_sol_channel(args, mode: str) -> int:
                   file=sys.stderr)
         # 统一的调用记录：三模式共享同一状态流与同一字段口径；模式差异只在
         # 结果字段（REVIEW 的 findings / CONSULT-PLAN 的分析结构）。
+        # `complexity_signals` 是调用时刻的复杂度快照：后续判断“是否出现新的
+        # 认知信号”只需要比较快照，不需要重新推理。
+        complexity = RP.task_complexity(
+            state, triggers=None,
+            workspace=str(state.get("workspace") or ""))
         record = {
             # 原始输出文件名与统一记录 ID 必须一致，审计才能按 call_id 直接定位。
             "call_id": record_id,
             "task_id": state.get("task_id") or "",
             "contract_sha256": state.get("contract_sha256") or "",
+            "risk": state.get("risk") or "",
+            "complexity": complexity["level"],
+            "complexity_signals": complexity["signal_codes"],
             "status": "completed",
             "mode": mode,
             "prompt_version": SR.PROMPT_VERSION,
@@ -1423,11 +1442,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_review_metrics)
 
     p = sub.add_parser("review-admission",
-                       help="SOL 复核准入建议（只读；不是门禁、不写状态）")
+                       help="SOL 主动介入建议（只读；不是门禁、不写状态）")
     p.add_argument("--state", required=True)
     p.add_argument("--trigger", action="append", default=[],
                    help="实质风险触发因素（如 security/core-logic/data-integrity）")
     p.add_argument("--reason", default="", help="准入原因")
+    p.add_argument("--user-request", action="store_true",
+                   help="用户明确要求 CONSULT/PLAN/REVIEW：直接建议一次调用")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_review_admission)
 

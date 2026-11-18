@@ -5,7 +5,26 @@
 > **SOL 决策通道已于 v6.0.0（2026-11-12）退役；v7.0.0（2026-11-17）只恢复一次性 REVIEW
 > （零工具、单轮、建议性）；v8.0.0（2026-11-17）正式退役 G4 原生只读复核；v8.1.0
 > （2026-11-18）升级 `gpt-6.2-sol` 并恢复建议性 CONSULT / PLAN；v8.2.0（2026-11-18）
-> 把三模式融合为 Copilot 内部统一按需认知能力**。
+> 把三模式融合为 Copilot 内部统一按需认知能力；v8.3.0（2026-11-18）把“什么时候调用
+> SOL”升级为确定性复杂度判断与主动介入**。
+
+## v8.3.0（2026-11-18）SOL 主动介入策略
+
+- **问题**：v8.2 的准入只有“风险标签 + 门禁是否全绿”，门禁一旦有缺口就一律
+  `not_needed`，导致多模块、跨层、高风险任务在整个开发期都不会调用 SOL；`evaluate` 只在
+  PASS 且 `risk=high` 时给一句可选提示。没有复杂度判断，也没有“已咨询过”的覆盖判断。
+- **复杂度**：新增 `review_policy.task_complexity`，只用状态事实：`risk-high`、
+  `declared-trigger`、`multi-module`（证据跨 ≥2 目录）、`multi-action`（计划 ≥4）、
+  `interdependent`（依赖边 ≥2）、`replan-history`、`reopened`。0 信号 low，1 个 medium，
+  ≥2 个 high；只统计计划内工作项，治理派生的 `AUTO-*` 不计入。
+- **主动介入**：`review_policy.sol_advice` 给出 `none` / `reuse` / `consult` / `plan` /
+  `review`，绑定建议模式与阶段；`review-admission`、`evaluate`（`sol` 字段）与
+  `drive`/`status` 展示，不派生工作项、不改变阶段。
+- **覆盖与追加**：按合同指纹判定覆盖；升级型信号（`risk-high` / `replan-history` /
+  `reopened`）新出现或合同修订才允许追加一次；结构变化不诱发重复调用。调用记录新增
+  `risk` / `complexity` / `complexity_signals` 快照。
+- **不变量**：G1–G3 与 fail-closed 不变；SOL advisory、零工具、单轮、不自动重试；G4 不存在；
+  ZCode 唯一工程执行与技术决策主体。
 
 ## v8.2.0（2026-11-18）SOL 与 G1–G3 融合
 
