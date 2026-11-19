@@ -595,7 +595,7 @@ class PwwCliTests(PwwFixture):
     def test_cli_end_to_end_pww_accept_close(self):
         report = self.write_report()
         proc = self.ingest_cli(report)
-        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.returncode, 10, proc.stdout + proc.stderr)
         self.assertIn("已自动登记用户接受条件", proc.stdout)
         self.assertIn("PASS_WITH_WARNINGS", proc.stdout)
 
@@ -643,8 +643,9 @@ class PwwCliTests(PwwFixture):
         report = self.write_report()
         first = self.ingest_cli(report)
         second = self.ingest_cli(report)
-        self.assertEqual(first.returncode, 0, first.stderr)
-        self.assertEqual(second.returncode, 0, second.stderr)
+        # 报告登记不结束任务：仍需按续跑判定继续/收口，因此返回 EXIT_CONTINUE。
+        self.assertEqual(first.returncode, 10, first.stdout + first.stderr)
+        self.assertEqual(second.returncode, 10, second.stdout + second.stderr)
         self.assertIn("幂等", second.stdout)
         state = G.load_state(self.state_path)
         self.assertEqual(len(state["quality_reports"]), 1)

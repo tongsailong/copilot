@@ -177,6 +177,12 @@ def drive(args) -> int:
             return EXIT_DONE
         if phase == "BLOCKED":
             print(G.render_status(state, evaluation, cache=cache))
+            # continuation() 对 BLOCKED 恒给出 required=False；若这里仍要求继续，
+            # 说明求值口径不一致（例如阻塞范围标记错误），报错而不是空转到上限。
+            if (evaluation.get("continuation") or {}).get("required"):
+                raise AutoError(
+                    "阶段为 BLOCKED 但续跑判定仍要求继续："
+                    "请检查阻塞范围（--work-item）与完成条件归属。")
             return EXIT_WAIT
         if phase == "PASS":
             closure = G.close_task(path, cache=cache)
@@ -189,6 +195,9 @@ def drive(args) -> int:
                       "（原始结论保留，不改写为 PASS）")
             return EXIT_DONE
         if phase == "RUNNING":
+            cont = evaluation.get("continuation") or {}
+            if cont.get("required"):
+                print(f"续跑：{cont.get('action')} —— {cont.get('reason')}")
             ready = G.ready_actions(state)
             if not ready:
                 print("阶段为 RUNNING 但没有可领取工作项；重新求值。")

@@ -12,6 +12,14 @@ Copilot 是运行于 ZCode 内的**轻量协作治理 Skill**：负责任务承�
 （THINK）按需提供整体判断，用户明确要求时执行一次独立复核（REVIEW），均由
 `gpt-6.2-sol` 零工具单轮调用完成。
 
+- **v8.5.0 起 PARTIAL 是强制续跑的连续执行状态**：`evaluate` 输出 `continuation`
+  （`required/action=execute|derive|close|wait|none`）；`record`/`rerun`/`criterion`/
+  `report`/`block`/`unblock` 以 `EXIT_CONTINUE=10` 提示仍有下一步，阶段报告不再能以
+  退出码 0 结束任务；`drive` 只在 `required=false` 时以 11 等待。阻塞按工作项成立
+  （`block --work-item ... [--criterion ...]`），单项缺授权不冻结其余工作，
+  `unblock` 自动恢复冻结项；任务级 `--scope task` 只在目标/资源整体不可推进时使用。
+  整体 BLOCKED 需要全部剩余工作受阻且无可推进条件。任务必须经 `start`/`drive` 进入
+  状态机，自由文本报告不构成任务。G1–G3、SOL 语义与授权边界不变。
 - **v8.4.0 起 SOL 收敛为默认认知引擎 THINK**：`SOL_MODES=("THINK","REVIEW")`；
   CONSULT / PLAN 并入 THINK（历史别名只读兼容），`sol-advisory` 命令移除。THINK 输出
   判断/本质/策略/取舍/风险/优先级/验证信号/再咨询条件；材料上限 120,000 字符；
@@ -132,6 +140,8 @@ Agent、SOL（THINK / REVIEW）、DesignWise。Executor 是 ZCode 工程执行�
   `pending_call`、`quota`、`round_seq`、`budget`、`pass_pending` 等远程判定字段。
 - **PARTIAL 不是终点**：必须本地派生工作项（`AUTO-C<n>` / `AUTO-R-<id>` / `AUTO-FIX-<F>` /
   `AUTO-VERIFY-<F>` / `AUTO-REPLAN` / `AUTO-NEXT`）并继续推进，直到 PASS 或真实 BLOCKED。
+  v8.5 起 `continuation.required=true`（含报告后的 `derive`/`execute`/`close`）一律继续，
+  不得以阶段报告或 `report` 收束回合；单项阻塞只冻结该项，不得扩大成整任务 BLOCKED。
   G4 退役后不再派生 `AUTO-G4*`；SOL 认知由主代理按复杂度决定，不是阻塞性工作项。v8.4 起
   SOL 以建议+命令形式呈现（`advice.action` 为 `think`/`review`），不派生 `AUTO-SOL*`
   工作项，也不因等待 SOL 停止。禁止因轮次、Token、内部费用、等待模型、重复评审、

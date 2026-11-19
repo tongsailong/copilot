@@ -7,7 +7,19 @@
 > （2026-11-18）升级 `gpt-6.2-sol` 并恢复建议性 CONSULT / PLAN；v8.2.0（2026-11-18）
 > 把三模式融合为 Copilot 内部统一按需认知能力；v8.3.0（2026-11-18）把“什么时候调用
 > SOL”升级为确定性复杂度判断与主动介入；v8.4.0（2026-11-18）把 CONSULT / PLAN 并入
-> 默认认知引擎 THINK，REVIEW 只在用户明确要求时执行**。
+> 默认认知引擎 THINK，REVIEW 只在用户明确要求时执行；v8.5.0（2026-11-19）把 PARTIAL
+> 改为强制续跑的连续执行状态，并把阻塞收窄到工作项范围**。
+
+## v8.5.0（2026-11-19）PARTIAL 强制续跑与按工作项阻塞
+
+- **背景**：`ad-opt-sdk-2026-11-19` 未建立状态机，以自由文本阶段报告收束；机制上任何
+  未解除 block 都会冻结全部工作，`report` 恒返回 0。
+- **续跑判定**：`evaluate` 输出 `continuation`；`record`/`rerun`/`criterion`/`report`/
+  `block`/`unblock` 以 `EXIT_CONTINUE=10` 提示仍有下一步；`drive` 只在真实等待时退出 11。
+- **按工作项阻塞**：`block --work-item` / `--criterion` / `--scope task`；单项缺授权不再
+  冻结整个任务；`unblock` 自动恢复冻结项；整体 BLOCKED 需全部剩余工作受阻。
+- **派生收敛**：阻塞条件不派生 `AUTO-C<n>`；已有 `AUTO-REPLAN` 时不再重试同一路径。
+- **不变量**：G1–G3、SOL 语义、授权边界、G4 退役状态不变。
 
 ## v8.4.0（2026-11-18）SOL 默认认知引擎 THINK
 

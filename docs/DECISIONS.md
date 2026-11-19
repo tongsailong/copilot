@@ -1612,3 +1612,26 @@
       `--verify-baseline` 是可重复的只读校验。
     - **不变量**：不改变 Provider/模型/凭据、G1–G3、授权边界；不恢复 G4、不强制 Reviewer、
       不新增自定义子 Agent；未跟踪知识交接文件保持原样，不删除、不纳入本轮提交。
+
+60. **PARTIAL 是连续执行状态；阻塞按工作项成立；阶段报告不是终点（2026-11-19，v8.5.0，用户专项评审）。**
+    依据：用户《Copilot Skill 专项评审与升级：彻底解决 PARTIAL 提前停止问题》；复盘任务
+    `ad-opt-sdk-2026-11-19`（`.copilot-tasks/ad-opt-sdk-2026-11-19/` 只有自由文本报告，
+    无 state/contract/plan，未调用 `start`/`drive`；报告以“需要用户决策”收束）。
+    - **根因三层**：规则层缺少强制入口与“报告后必须再求值”；机制层任何未解除 block 都会
+      让 `ready_actions` 返回空并短路为 BLOCKED，`block` 无工作项范围，`report` 恒返回 0；
+      执行层把 Copilot 当命名约定，未建状态、未 drive。
+    - **语义修正**：PARTIAL = 仍有未完成但可继续的工作，是连续执行状态；PASS = 目标达成、
+      证据充分；BLOCKED 只在剩余工作真的缺少授权/决策/资源/外部条件时成立。
+    - **continuation 判定**：`evaluate` 附带 `required/action(execute|derive|close|wait|none)/
+      executable/derivable/blocked_items/dependency_blocked/next_command/reason`；
+      `record`/`rerun`/`criterion`/`report`/`block`/`unblock` 以 `EXIT_CONTINUE=10` 提示
+      仍有下一步；`drive` 仅在 `required=false` 时以 11 等待。
+    - **按工作项阻塞**：`block --work-item A2 [--criterion C2]` 只冻结 A2 与下游依赖，
+      其余工作继续；`--scope task` 仅用于目标/资源整体不可推进；整体 BLOCKED 需要“全部
+      剩余工作受阻且无可推进的未闭合条件”。`unblock` 把冻结项恢复为 pending。
+    - **派生收敛**：被卡住的条件不派生 `AUTO-C<n>`；替代路线（`AUTO-REPLAN`）执行中不再
+      派生同路径的下一次尝试（最多 3 次）；替代路线已结束而缺口仍在时派生新的
+      `AUTO-REPLAN`，要求说明上一路线为何未闭合，不用通用 `AUTO-NEXT` 兜底。
+    - **不变量**：G1–G3 与 fail-closed 不变；G4 不存在、不恢复；不新增自定义子 Agent、
+      不强制 Reviewer、不设人为轮次/Token/复核数量停止条件；ZCode 仍是唯一执行与技术决策
+      主体；`start`/`drive` 是任务进入状态机的唯一入口。

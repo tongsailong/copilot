@@ -43,7 +43,7 @@ python3 -B scripts/copilot_dispatch.py <子命令> --state <state.json> [参数]
 | `accept` | 登记用户对 PWW 的明确接受 | `--report <report_id>`（仅一份可省）、`--accept W1,R1`、`--by user`（必填）、`--quote "<用户原话>"`（必填）、`--note`；部分接受保持 pending |
 | `quality` | 查看质量结论与接受状态 | `--json` |
 | `decide` | 记录用户/任务决策 | `--text`、`--source`；**不能替代 PWW 接受** |
-| `block` / `unblock` | 记录/解除真实阻塞 | `block --reason ... --needs ...`；`unblock --reason ... [--block-id B...]`（多条未解除时必须指定） |
+| `block` / `unblock` | 记录/解除真实阻塞 | `block --reason ... --needs ... (--work-item A2 [--work-item A3] [--criterion C2] | --scope task)`；`unblock --reason ... [--block-id B...]`（多条未解除时必须指定）；解除后被冻结工作项自动恢复 `pending` |
 | `closure-check` | 只读检查 G1–G3 | `--json` |
 | `review-admission` | SOL 主动介入建议的单一确定性入口（只读、不写状态、不是门禁）：先算任务复杂度与已有 SOL 覆盖，再结合 G1–G3 给出 `advice.action`（`none`/`reuse`/`think`/`review`）、建议模式与命令 | `--trigger security`（可重复）、`--reason`、`--user-request`、`--review-request`、`--json`；返回 `decision`、`advice`、`complexity`、`recommended_action`/`recommended_mode`/`recommended_phase`、`sol_calls_total` |
 | `sol-think` | SOL 默认认知引擎：材料 + 问题 → 一次请求 → 判断/策略/取舍/风险/优先级/验证信号；建议写入统一 `sol_calls`（`mode=THINK`），不入门禁；失败只登记并降级 | `--materials <file>`、`--question`、`--knowledge-file`、`--dry-run`、`--list`、`--json`、`--timeout`、`--max-output-tokens`、`--audit-log`（默认 `sol-audit.jsonl`）、`--output-dir`；再次调用：`--force --trigger <user-request\|scope-changed\|new-risk\|materials-omitted\|strategy-failed\|major-uncertainty> --reason` |
@@ -186,11 +186,21 @@ python3 -B scripts/copilot_auto.py ingest --state <state.json> [--result-file f]
 - `PASS` → 自动 `close_task`，退出码 0；
 - `RUNNING` → 打印工作单（goal / constraints / expected_evidence / 状态回填命令），
   原生后端且工作项属于计划时写出 `dispatch.json`，退出码 10；
-- `BLOCKED` → 打印状态，退出码 11；`CLOSED` → 打印状态，退出码 0；
+- `BLOCKED` → 打印状态；所有剩余工作真实阻塞时退出码 11，`CLOSED` → 退出码 0；
 - `PARTIAL` → 本地派生工作项并继续循环，不等待任何外部判断；
 - 内部错误（派生失败、信封被拒、连续 32 步未收敛）→ 退出码 12，状态保留。
 
 `--max-actions N` 只控制一次工作单输出几项，不是任务上限。
+
+### 续跑判定与回填命令
+
+`record` / `rerun` / `criterion` / `report` / `block` / `unblock` 写入后都会重新求值并打印
+续跑判定：
+
+- 仍有可执行/可派生工作（或已 PASS 待收口）→ 退出码 10，打印下一步命令；
+- 已收口或所有剩余工作真实阻塞 → 退出码 0；
+- **报告是进度记录，不是任务终点**：`report` 不再以 0 表示"任务结束"；主代理必须按
+  `continuation` 继续，不能据一次报告结束回合。
 
 ### `ingest`
 
@@ -285,9 +295,9 @@ python3 -B scripts/copilot_dispatch.py legacy-status --ledger review-ledger.json
 
 | 场景 | 退出码 |
 |---|---|
-| 命令成功 / `drive` 已收口 | 0 |
-| `drive` 有待执行工作单 | 10 |
-| `drive` 等待用户（BLOCKED） | 11 |
+| 命令成功 / `drive` 已收口 / 已收口或全部剩余工作真实阻塞时的回填命令 | 0 |
+| `drive` 有待执行工作单；回填/报告后仍有下一步（`EXIT_CONTINUE`） | 10 |
+| `drive` 等待用户（所有剩余工作真实阻塞） | 11 |
 | 校验失败、信封被拒、内部错误 | 12 |
 | 参数错误 | 2 |
 
@@ -309,3 +319,5 @@ python3 -B scripts/copilot_dispatch.py legacy-status --ledger review-ledger.json
 - 不删除证据或历史记录来“让检查通过”；用新证据和新工作项推进。
 - `drive` 返回 12 时先检查状态与错误码，不要把它当作任务失败或 BLOCKED。
 - `block` 只用于真实缺少授权/决策/资源/外部条件；其余情况继续派生工作。
+- 授权按动作生效：缺 commit 只阻塞 commit，缺 push 只阻塞 push；用 `--work-item` 精确范围，
+  不要用 `--scope task` 冻结仍有可执行工作的任务。

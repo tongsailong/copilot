@@ -69,12 +69,17 @@ class LegacyCliTests(unittest.TestCase):
             fh.write("done\n")
         self.assertEqual(F.run_cli("copilot_dispatch.py", "evidence", "--state", self.state,
                                    "--add", "--id", "E1", "--file", evidence).returncode, 0)
-        self.assertEqual(F.run_cli("copilot_dispatch.py", "record", "--state", self.state,
-                                   "--id", "A1", "--status", "done",
-                                   "--result", "完成", "--evidence", "E1").returncode, 0)
-        self.assertEqual(F.run_cli("copilot_dispatch.py", "criterion", "--state", self.state,
-                                   "--id", "C1", "--status", "met",
-                                   "--evidence", "E1").returncode, 0)
+        # 回填后仍有续跑判定：record/criterion 用 EXIT_CONTINUE 提示继续，而不是
+        # 让调用方把一次回填当成任务终点。
+        proc = F.run_cli("copilot_dispatch.py", "record", "--state", self.state,
+                         "--id", "A1", "--status", "done",
+                         "--result", "完成", "--evidence", "E1")
+        self.assertEqual(proc.returncode, 10, proc.stdout + proc.stderr)
+        self.assertIn("续跑", proc.stdout)
+        proc = F.run_cli("copilot_dispatch.py", "criterion", "--state", self.state,
+                         "--id", "C1", "--status", "met", "--evidence", "E1")
+        self.assertEqual(proc.returncode, 10, proc.stdout + proc.stderr)
+        self.assertIn("close", proc.stdout)
 
         proc = F.run_cli("copilot_dispatch.py", "closure-check", "--state", self.state,
                          "--json")
@@ -127,12 +132,15 @@ class LegacyCliTests(unittest.TestCase):
 
     def test_block_and_unblock_cli(self):
         self.assertEqual(self.start().returncode, 0)
+        # 无工作项可指向时只能声明任务级阻塞；解阻后未闭合条件立即要求续跑。
         self.assertEqual(F.run_cli("copilot_dispatch.py", "block", "--state", self.state,
-                                   "--reason", "缺授权", "--needs", "用户授权").returncode, 0)
+                                   "--reason", "缺授权", "--needs", "用户授权",
+                                   "--scope", "task").returncode, 0)
         self.assertEqual(F.run_cli("copilot_auto.py", "drive",
                                    "--state", self.state).returncode, 11)
-        self.assertEqual(F.run_cli("copilot_dispatch.py", "unblock", "--state", self.state,
-                                   "--reason", "用户已授权").returncode, 0)
+        proc = F.run_cli("copilot_dispatch.py", "unblock", "--state", self.state,
+                         "--reason", "用户已授权")
+        self.assertEqual(proc.returncode, 10, proc.stdout + proc.stderr)
 
     def test_status_alias_reports_phase(self):
         self.assertEqual(self.start().returncode, 0)
@@ -164,11 +172,13 @@ class LegacyCliTests(unittest.TestCase):
         self.assertEqual(self.start().returncode, 0)
         self.assertEqual(F.run_cli(
             "copilot_dispatch.py", "block", "--state", self.state,
-            "--reason", "缺授权", "--needs", "用户授权").returncode, 0)
+            "--reason", "缺授权", "--needs", "用户授权",
+            "--scope", "task").returncode, 0)
         first = read_json(self.state)["blocks"][0]["block_id"]
         self.assertEqual(F.run_cli(
             "copilot_dispatch.py", "block", "--state", self.state,
-            "--reason", "缺资源", "--needs", "外部资源").returncode, 0)
+            "--reason", "缺资源", "--needs", "外部资源",
+            "--scope", "task").returncode, 0)
         second = read_json(self.state)["blocks"][1]["block_id"]
 
         proc = F.run_cli("copilot_dispatch.py", "unblock",
@@ -181,9 +191,12 @@ class LegacyCliTests(unittest.TestCase):
         active = [b for b in read_json(self.state)["blocks"]
                   if not b.get("resolved_at")]
         self.assertEqual([b["block_id"] for b in active], [second])
-        self.assertEqual(F.run_cli(
+        # 全部阻塞解除后仍未闭合条件：必须继续派生，而不是停在 0。
+        proc = F.run_cli(
             "copilot_dispatch.py", "unblock", "--state", self.state,
-            "--reason", "资源已到", "--block-id", second).returncode, 0)
+            "--reason", "资源已到", "--block-id", second)
+        self.assertEqual(proc.returncode, 10, proc.stdout + proc.stderr)
+        self.assertIn("必须继续", proc.stdout)
 
     def test_formal_review_amendment_cli(self):
         self.assertEqual(self.start().returncode, 0)
@@ -306,9 +319,10 @@ class NativeCliTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("幂等", proc.stdout)
 
-        self.assertEqual(F.run_cli("copilot_dispatch.py", "criterion", "--state", self.state,
-                                   "--id", "C1", "--status", "met",
-                                   "--evidence", "E1").returncode, 0)
+        proc = F.run_cli("copilot_dispatch.py", "criterion", "--state", self.state,
+                         "--id", "C1", "--status", "met", "--evidence", "E1")
+        self.assertEqual(proc.returncode, 10, proc.stdout + proc.stderr)
+        self.assertIn("close", proc.stdout)
 
         # G4 退役：证据与条件齐备后直接收口，不再派生 AUTO-G4。
         proc = F.run_cli("copilot_auto.py", "drive", "--state", self.state,

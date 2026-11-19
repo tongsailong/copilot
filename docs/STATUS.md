@@ -1,7 +1,32 @@
 # STATUS
 
-更新：2026-11-18 CST。本文件只记录现场可核实的事实；规划与未完成事项单独标注。
-当前版本：v8.4.0（SOL 默认认知引擎）。
+更新：2026-11-19 CST。本文件只记录现场可核实的事实；规划与未完成事项单独标注。
+当前版本：v8.5.0（PARTIAL 强制续跑与按工作项阻塞）。
+
+## PARTIAL 续跑修复（2026-11-19，v8.5.0）
+
+现场基线：`HEAD=f8a97b9`；源码工作区含本轮修改的 `governance.py`、`copilot_dispatch.py`、
+`copilot_auto.py`、`review_policy.py`，以及未跟踪的知识交接与新测试文件。
+
+- **根因证据**：`ad-opt-sdk-2026-11-19` 任务目录只有 `report.md` 与截图，无
+  `state.json`/`contract.md`/`plan.json`；会话记录中无 `start`/`drive` 调用；报告以
+  “需要用户决策”结束。完整证据见
+  `~/.zcode/copilot-runs/copilot-continuation-2026-11-19/A1-root-cause.md`。
+- **机制修改**：`evaluate` 输出 `continuation`；`record`/`rerun`/`criterion`/`report`/
+  `block`/`unblock` 返回 `EXIT_CONTINUE=10`；`block` 支持 `--work-item`/`--criterion`/
+  `--scope task`，`unblock` 恢复冻结项；`derive_work` 跳过被卡住的条件，替代路线执行中
+  停止同路径重试，替代路线结束而缺口仍在时派生新的 `AUTO-REPLAN`；依赖被阻塞的下游工作
+  计入“剩余工作受阻”。
+- **测试**：新增 `tests/test_continuation.py`（27 项，覆盖用户要求的 15 个场景，含
+  “REPLAN 已结束 + 条件未闭合仍给出具体下一步”与“部分解除阻塞后不得继续声称 BLOCKED”两项
+  状态迁移回归）；`python3 -B -m unittest discover -s tests -p 'test_*.py'` 570 项通过
+  （manifest 基线在同步步骤重建）；`legacy/tests` 失败集合与 `HEAD=f8a97b9` 完全一致
+  （146 项，无新增回归）。
+- **SOL REVIEW（用户明确要求，一次）**：`SCb338ed575c71466495d5088d` →
+  `verdict=partial`；F1（major）“已完成的 REPLAN 抑制派生”已核实并按上条修正（新增
+  `test_11b`）；F2（minor）“drive 的 BLOCKED 检查只保证输出自洽”不改门禁，改为用
+  `test_12d` 在求值层验证部分解除阻塞后的状态迁移。
+- **未验证**：真实宿主会话中的提前停止复发验证尚未执行；本轮未 commit / push。
 
 ## 全面评审与加固（2026-11-18，v8.4.0 基线）
 

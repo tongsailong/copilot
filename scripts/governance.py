@@ -1145,17 +1145,66 @@ def _tracked_actions(state: dict) -> list[dict]:
     return out
 
 
+def _active_blocks(state: dict) -> list[dict]:
+    return [b for b in state.get("blocks") or [] if not b.get("resolved_at")]
+
+
+def _task_blocks(state: dict) -> list[dict]:
+    """任务级阻塞：整条任务暂停，没有工作项范围。
+
+    只有目标/合同/资源整体不可推进时才允许；单条操作的授权缺口必须用
+    `work_items` 关联到具体工作项，不能冻结其余工作。
+    """
+    return [b for b in _active_blocks(state) if not b.get("work_items")]
+
+
+def _item_block_map(state: dict) -> dict[str, dict]:
+    """工作项 id → 阻塞记录（只含未解除的项级阻塞）。"""
+    out: dict[str, dict] = {}
+    for block in _active_blocks(state):
+        for aid in block.get("work_items") or []:
+            out.setdefault(str(aid), block)
+    return out
+
+
+def _blocked_work_items(state: dict) -> list[dict]:
+    """仍处于活动状态、且被项级阻塞冻结的工作项。"""
+    mapping = _item_block_map(state)
+    out = []
+    for action in _tracked_actions(state):
+        aid = str(action.get("id") or "")
+        if aid not in mapping:
+            continue
+        if str(action.get("status") or "") in TERMINAL:
+            continue
+        out.append(action)
+    return out
+
+
+def _blocked_criteria(state: dict) -> set[str]:
+    """被未解除工作项阻塞一并冻结的完成条件 id。"""
+    out: set[str] = set()
+    for block in _active_blocks(state):
+        for cid in block.get("criteria") or []:
+            out.add(str(cid))
+    return out
+
+
 def ready_actions(state: dict) -> list[dict]:
     if bool((state.get("closure") or {}).get("closed")):
         return []
-    if any(not b.get("resolved_at") for b in state.get("blocks") or []):
+    # 任务级阻塞冻结全部工作；项级阻塞只冻结被标记的工作项。
+    if _task_blocks(state):
         return []
+    blocked_ids = set(_item_block_map(state))
     actions = _tracked_actions(state)
     done = {a["id"] for a in actions
             if str(a.get("status") or "") == "done"}
     out = []
     for action in actions:
         if str(action.get("status") or "") != "pending":
+            continue
+        if str(action.get("id") or "") in blocked_ids:
             continue
         if all(dep in done for dep in action.get("depends_on") or []):
             out.append(action)
@@ -1164,9 +1213,17 @@ def ready_actions(state: dict) -> list[dict]:
 
 def stalled_actions(state: dict) -> list[tuple[dict, str]]:
     out: list[tuple[dict, str]] = []
+    blocked_ids = set(_item_block_map(state))
     actions = _tracked_actions(state)
     by_id = {a["id"]: a for a in actions}
     for action in actions:
+        aid = str(action.get("id") or "")
+        # 项级阻塞是已登记的真实阻塞，不是停摆：由 continuation 单独呈现，
+        # 不派生恢复工作项，也不把它的下游依赖算作停摆。
+        if aid in blocked_ids:
+            continue
+        if any(dep in blocked_ids for dep in action.get("depends_on") or []):
+            continue
         status = str(action.get("status") or "")
         if status in ("running", "failed", "blocked"):
             out.append((action, f"{status}：需重新 record 或说明真实阻塞"))
@@ -1369,7 +1426,16 @@ def record_judgment(path: str, status: str, summary: str, *,
     return entry
 
 
-def add_block(path: str, reason: str, needs: str) -> dict:
+def add_block(path: str, reason: str, needs: str,
+              *, work_items: list[str] | None = None,
+              criteria: list[str] | None = None) -> dict:
+    """登记真实阻塞。
+
+    `work_items` 非空时只冻结这些工作项（其余工作继续推进），这是授权缺口
+    （commit / push / 部署 / 生产数据 / 付费 / 用户决策）的默认用法；不指定
+    工作项即任务级阻塞，只在目标或资源整体不可推进时使用。`criteria` 用于声明
+    这些工作项同时卡住的完成条件，避免对不可执行的缺口重复派生工作项。
+    """
     state = load_state(path)
     # 已有阻塞时仍要允许登记第二个真实阻塞；否则只能改写旧记录或丢失事实。
     _assert_open(state, "记录阻塞", allow_blocked=True)
@@ -1377,10 +1443,30 @@ def add_block(path: str, reason: str, needs: str) -> dict:
     needs = (needs or "").strip()
     if not reason or not needs:
         raise GovernanceError("BLOCKED 必须同时说明原因（--reason）与所需条件（--needs）。")
+    items: list[str] = []
+    for raw in work_items or []:
+        aid = str(raw or "").strip()
+        if not aid or aid in items:
+            continue
+        _by_id(state, aid)
+        items.append(aid)
+    criterion_ids: list[str] = []
+    known = {str(c.get("criterion_id") or "")
+             for c in (state.get("contract") or {}).get("criteria") or []}
+    for raw in criteria or []:
+        cid = str(raw or "").strip()
+        if not cid or cid in criterion_ids:
+            continue
+        if cid not in known:
+            raise GovernanceError(f"不存在完成条件：{cid}。")
+        criterion_ids.append(cid)
     block = {
         "block_id": "B" + _sha256_text(
             canonical_json([state.get("task_id"), len(state.get("blocks") or []),
                             reason]))[:16],
+        "scope": "work-items" if items else "task",
+        "work_items": items,
+        "criteria": criterion_ids,
         "reason": reason[:MAX_REPORT_CHARS],
         "needs": needs[:MAX_REPORT_CHARS],
         "created": now_iso(),
@@ -1389,7 +1475,20 @@ def add_block(path: str, reason: str, needs: str) -> dict:
         "resolution": "",
     }
     state.setdefault("blocks", []).append(block)
-    _history(state, "block_added", {"block_id": block["block_id"], "reason": reason[:200]})
+    now = now_iso()
+    for aid in items:
+        action = _by_id(state, aid)
+        if str(action.get("status") or "") in TERMINAL:
+            continue
+        action["status"] = "blocked"
+        action["blocked_by"] = block["block_id"]
+        action["blocked_reason"] = block["reason"]
+        action["blocked_needs"] = block["needs"]
+        action["updated"] = now
+    _history(state, "block_added", {"block_id": block["block_id"],
+                                    "scope": block["scope"],
+                                    "work_items": items,
+                                    "reason": reason[:200]})
     save_state(path, state)
     return block
 
@@ -1423,10 +1522,32 @@ def resolve_block(path: str, reason: str, block_id: str = "") -> dict:
         block["resolved_by"] = "zcode"
         block["resolution"] = reason[:MAX_REPORT_CHARS]
     ids = [str(b.get("block_id") or "") for b in target]
+    # 项级阻塞解除后，被它冻结的工作项恢复可执行；这是「用户授权更新后对应
+    # 工作项恢复」的唯一入口，不需要重新建工作项。
+    resumed: list[str] = []
+    now = now_iso()
+    for block in target:
+        for aid in block.get("work_items") or []:
+            try:
+                action = _by_id(state, aid)
+            except GovernanceError:
+                continue
+            if str(action.get("status") or "") != "blocked":
+                continue
+            if str(action.get("blocked_by") or "") != str(block.get("block_id") or ""):
+                continue
+            action["status"] = "pending"
+            action["blocked_by"] = None
+            action["blocked_reason"] = ""
+            action["blocked_needs"] = ""
+            action["updated"] = now
+            resumed.append(aid)
     _history(state, "block_resolved", {"count": len(target), "block_ids": ids,
+                                       "resumed_work_items": resumed,
                                        "reason": reason[:200]})
     save_state(path, state)
-    return {"resolved": len(target), "block_ids": ids, "reason": reason}
+    return {"resolved": len(target), "block_ids": ids, "resumed": resumed,
+            "reason": reason}
 
 
 def add_decision(path: str, text: str, *, source: str = "user") -> dict:
@@ -4176,10 +4297,6 @@ def _unmet_criteria(state: dict) -> list[dict]:
             if str(c.get("status") or "pending") != "met"]
 
 
-def _active_blocks(state: dict) -> list[dict]:
-    return [b for b in state.get("blocks") or [] if not b.get("resolved_at")]
-
-
 def _derive_id(state: dict, base: str) -> str:
     used = {str(a.get("id") or "") for a in state.get("actions") or []}
     if base not in used:
@@ -4233,17 +4350,29 @@ def derive_work(state: dict, *, reason: str = "partial",
                 return
         attempts = previous_attempts(base_id) if base_id.startswith(
             ("AUTO-C", "AUTO-R-", "AUTO-FIX-", "AUTO-VERIFY-")) else []
-        if len(attempts) >= 3 and not any(
-                str(a.get("id") or "") == "AUTO-REPLAN"
-                and str(a.get("status") or "") in ("pending", "running")
-                for a in state.get("actions") or []):
+        if len(attempts) >= 3:
+            # 替代路线正在执行时不再派生同路径尝试：等它产出结果。
+            # 替代路线已结束但缺口仍未闭合时，不再把下一步留给通用 AUTO-NEXT：
+            # 派生新的 REPLAN，要求说明上一路线为何未闭合并再换一条实质不同的路线。
+            # 只有“已结束的 REPLAN”不会掩盖缺口，未闭合条件仍会持续派生工作项。
+            replans = [a for a in state.get("actions") or []
+                       if str(a.get("id") or "").startswith("AUTO-REPLAN")]
+            if any(str(a.get("status") or "") in ("pending", "running")
+                   for a in replans):
+                return
+            prior_note = ""
+            if replans:
+                prior_note = ("上一替代路线未闭合：" + "；".join(
+                    f"{a.get('id')}[{a.get('status')}] {str(a.get('result') or '')[:160]}"
+                    for a in replans[-3:]) +
+                    "。请先说明它为何仍未闭合，再选择实质不同的新路线。")
             replan = {
                 "id": _derive_id(state, "AUTO-REPLAN"),
                 "title": "无进展：重新分析根因并选择替代路线",
                 "assignee": "zcode",
                 "goal": (f"{base_id} 已派生 {len(attempts)} 次仍未闭合。已尝试："
-                         + "；".join(attempts) +
-                         "。请分析根因，选择与已失败方案实质不同的替代路线；"
+                         + "；".join(attempts) + "。" + prior_note +
+                         "请分析根因，选择与已失败方案实质不同的替代路线；"
                          "不得机械重复同一失败路径，也不得降低验收标准。"),
                 "constraints": "\n".join(base_constraints)[:2000],
                 "expected_evidence": "根因分析、已尝试方案、失败原因、替代方案与新的执行结果",
@@ -4262,6 +4391,8 @@ def derive_work(state: dict, *, reason: str = "partial",
             _history(state, "work_derived", {"id": replan["id"],
                                              "origin": "replan",
                                              "reason": reason})
+            # 只派生替代路线，不再追加第 4 次同路径尝试。
+            return
         aid = _derive_id(state, base_id)
         action = {
             "id": aid,
@@ -4298,8 +4429,13 @@ def derive_work(state: dict, *, reason: str = "partial",
 
     unmet = _unmet_criteria(state)
     accept_derived = False
+    blocked_cids = _blocked_criteria(state)
     for criterion in unmet[:MAX_DERIVED_PER_CALL]:
         cid = str(criterion.get("criterion_id") or "")
+        # 已随工作项一起声明的阻塞条件不再派生：缺授权/决策时重复派生只会
+        # 制造无法执行的工作单。
+        if cid in blocked_cids:
+            continue
         acceptance = criterion.get("acceptance")
         if isinstance(acceptance, dict):
             # 接受条件只能对应生效中的 PWW 报告且绑定仍当前；否则由 AUTO-QUALITY
@@ -4425,6 +4561,50 @@ def derive_work(state: dict, *, reason: str = "partial",
     return created
 
 
+def _blocked_items_summary(state: dict) -> list[dict]:
+    mapping = _item_block_map(state)
+    out = []
+    for action in _blocked_work_items(state):
+        aid = str(action.get("id") or "")
+        block = mapping.get(aid) or {}
+        out.append({
+            "id": aid,
+            "title": str(action.get("title") or ""),
+            "block_id": str(block.get("block_id") or ""),
+            "reason": str(block.get("reason") or ""),
+            "needs": str(block.get("needs") or ""),
+        })
+    return out
+
+
+def _dependency_blocked_ids(state: dict) -> set[str]:
+    """项级阻塞 + 因依赖被阻塞工作项而无法执行的下游工作项。"""
+    blocked = set(_item_block_map(state))
+    actions = {str(a.get("id") or ""): a for a in _tracked_actions(state)}
+    changed = True
+    while changed:
+        changed = False
+        for aid, action in actions.items():
+            if aid in blocked:
+                continue
+            if str(action.get("status") or "") in TERMINAL:
+                continue
+            deps = [str(d) for d in action.get("depends_on") or []]
+            if any(dep in blocked for dep in deps):
+                blocked.add(aid)
+                changed = True
+    return blocked
+
+
+def _all_remaining_blocked(state: dict) -> bool:
+    """剩余活动工作项全部受阻（直接阻塞或其依赖被阻塞），没有可执行工作。"""
+    blocked_ids = _dependency_blocked_ids(state)
+    active = [a for a in _tracked_actions(state)
+              if str(a.get("status") or "") not in TERMINAL]
+    return bool(active) and all(str(a.get("id") or "") in blocked_ids
+                                for a in active)
+
+
 def _evaluate_core(state: dict, *, cache: dict | None = None) -> dict:
     """本地阶段求值；返回 phase、work、gate、next_commands 与说明。"""
     if bool((state.get("closure") or {}).get("closed")):
@@ -4434,19 +4614,22 @@ def _evaluate_core(state: dict, *, cache: dict | None = None) -> dict:
             "criteria": _criteria_summary(state),
             "next_commands": ["任务已收口；如需继续，先由用户授权 reopen。"],
         }
-    blocks = _active_blocks(state)
-    if blocks:
-        block = blocks[0]
+    task_blocks = _task_blocks(state)
+    if task_blocks:
+        block = task_blocks[0]
         return {
             "phase": "BLOCKED",
-            "reason": block.get("reason") or "存在未解除的阻塞",
+            "reason": block.get("reason") or "存在未解除的任务级阻塞",
             "needs": block.get("needs") or "",
             "block_id": block.get("block_id"),
+            "blocked_items": _blocked_items_summary(state),
             "actions": [], "stalled": [], "gate": None,
             "criteria": _criteria_summary(state),
             "next_commands": [
-                f"copilot_dispatch.py unblock --state <state> --reason <依据>",
+                "copilot_dispatch.py unblock --state <state> --reason <依据>",
                 "或由用户补齐所需授权/决策/资源后解除阻塞",
+                "提示：只缺单项授权时应当用 block --work-item 登记，"
+                "不要用任务级阻塞冻结其余工作",
             ],
         }
 
@@ -4465,16 +4648,45 @@ def _evaluate_core(state: dict, *, cache: dict | None = None) -> dict:
         return {
             "phase": "RUNNING", "reason": "存在可领取的工作项",
             "actions": [a.get("id") for a in ready], "stalled": [],
+            "blocked_items": _blocked_items_summary(state),
             "gate": None, "criteria": criteria,
             "next_commands": ["copilot_auto.py drive --state <state>",
                               "或 copilot_dispatch.py next --state <state>"],
         }
+    blocked_items = _blocked_items_summary(state)
     unmet = _unmet_criteria(state)
-    if unmet:
+    blocked_cids = _blocked_criteria(state)
+    open_unmet = [c for c in unmet
+                  if str(c.get("criterion_id") or "") not in blocked_cids]
+    if blocked_items and _all_remaining_blocked(state) and not open_unmet:
+        # 只剩被项级阻塞的工作、且没有被卡住的未闭合条件：这才是真正的整体
+        # BLOCKED。还有可推进的未闭合条件时先派生 AUTO-C，宁可继续也不提前停。
+        direct = {item["id"] for item in blocked_items}
+        downstream = sorted(_dependency_blocked_ids(state) - direct)
+        needs = "；".join(f"{item['id']}: {item['needs']}" for item in blocked_items)
+        return {
+            "phase": "BLOCKED",
+            "reason": "所有剩余工作均受阻：" + "、".join(
+                item["id"] for item in blocked_items)
+                + (f"（下游依赖无法开始：{'、'.join(downstream)}）"
+                   if downstream else ""),
+            "needs": needs,
+            "block_id": blocked_items[0]["block_id"],
+            "blocked_items": blocked_items,
+            "dependency_blocked": downstream,
+            "actions": [], "stalled": [], "gate": None, "criteria": criteria,
+            "next_commands": [
+                "copilot_dispatch.py unblock --state <state> --block-id <id> "
+                "--reason <依据>",
+                "或由用户补齐所需授权/决策/资源后逐条解除阻塞",
+            ],
+        }
+    if open_unmet:
         return {
             "phase": "PARTIAL", "reason": "仍有未闭合完成条件",
             "actions": [], "stalled": [{"id": a.get("id"), "reason": why}
                                        for a, why in stalled],
+            "blocked_items": blocked_items,
             "gate": None, "criteria": criteria,
             "next_commands": ["copilot_auto.py drive --state <state>（本地派生下一步并退出 EXECUTE）"],
         }
@@ -4483,6 +4695,7 @@ def _evaluate_core(state: dict, *, cache: dict | None = None) -> dict:
             "phase": "PARTIAL", "reason": "存在停摆工作项",
             "actions": [], "stalled": [{"id": a.get("id"), "reason": why}
                                        for a, why in stalled],
+            "blocked_items": blocked_items,
             "gate": None, "criteria": criteria,
             "next_commands": ["copilot_auto.py drive --state <state>（本地派生恢复工作项）"],
         }
@@ -4497,14 +4710,95 @@ def _evaluate_core(state: dict, *, cache: dict | None = None) -> dict:
                     "或 copilot_dispatch.py closure --state <state> --close"]
         return {
             "phase": "PASS", "reason": reason,
-            "actions": [], "stalled": [], "gate": check, "criteria": criteria,
+            "actions": [], "stalled": [], "blocked_items": blocked_items,
+            "gate": check, "criteria": criteria,
             "next_commands": commands,
         }
     return {
         "phase": "PARTIAL", "reason": "G1–G3 未通过",
-        "actions": [], "stalled": [], "gate": check, "criteria": criteria,
+        "actions": [], "stalled": [], "blocked_items": blocked_items,
+        "gate": check, "criteria": criteria,
         "next_commands": ["copilot_auto.py drive --state <state>（按门禁缺口派生工作项）"],
     }
+
+
+def _dry_derive_ids(state: dict, *, cache: dict | None = None) -> list[str]:
+    """在状态副本上试派生，返回 derive_work 会创建的工作项 id（不落盘）。"""
+    try:
+        clone = json.loads(json.dumps(state))
+        created = derive_work(clone, cache=cache)
+    except (GovernanceError, ValueError, TypeError):
+        return []
+    return [str(item.get("id") or "") for item in created if item.get("id")]
+
+
+def continuation(state: dict, *, cache: dict | None = None,
+                 evaluation: dict | None = None) -> dict:
+    """续跑判定（只读）：任务是否还有必须继续执行的下一步。
+
+    `required=True` 表示本次回填/报告之后还有可执行动作（执行工作项、派生下一步
+    或收口），不得把它当作任务终点；`required=False` 只有三种情况：已收口、
+    已完成待收口以外无动作（PASS 归入必须收口）、或所有剩余工作真实阻塞。
+
+    判定只使用本地状态，不调用任何模型。
+    """
+    ev = evaluation if evaluation is not None else evaluate(state, cache=cache)
+    phase = str(ev.get("phase") or "")
+    base = {
+        "phase": phase,
+        "required": False,
+        "action": "none",
+        "executable": [],
+        "derivable": [],
+        "blocked_items": ev.get("blocked_items") or [],
+        "dependency_blocked": ev.get("dependency_blocked") or [],
+        "next_command": "",
+        "reason": "",
+    }
+    if phase == "CLOSED":
+        base["reason"] = "任务已收口，无需继续"
+        return base
+    if phase == "BLOCKED":
+        blocked = base["blocked_items"]
+        base["action"] = "wait"
+        base["reason"] = ("所有剩余工作真实阻塞："
+                          + "、".join(item["id"] for item in blocked)
+                          if blocked else "存在任务级阻塞")
+        base["next_command"] = ("copilot_dispatch.py unblock --state <state> "
+                                "--block-id <id> --reason <依据>")
+        return base
+    if phase == "PASS":
+        base.update({
+            "required": True,
+            "action": "close",
+            "next_command": "copilot_auto.py drive --state <state>（G1–G3 已通过，立即收口）",
+            "reason": "完成条件与 G1–G3 已通过：收口是下一步，不是等待用户",
+        })
+        return base
+    ready = [str(a.get("id") or "") for a in ready_actions(state)]
+    if ready:
+        base.update({
+            "required": True,
+            "action": "execute",
+            "executable": ready,
+            "next_command": "copilot_auto.py drive --state <state>",
+            "reason": "存在可领取工作项：继续执行，不要结束回合",
+        })
+        return base
+    derivable = _dry_derive_ids(state, cache=cache)
+    if derivable:
+        base.update({
+            "required": True,
+            "action": "derive",
+            "derivable": derivable,
+            "next_command": "copilot_auto.py drive --state <state>（派生下一步并执行）",
+            "reason": "任务仍处于 PARTIAL 且可派生下一步工作项：继续推进",
+        })
+        return base
+    base["reason"] = "没有可执行工作；检查合同、证据与阻塞口径"
+    base["next_command"] = "copilot_dispatch.py next --state <state>"
+    return base
+
 
 
 def sol_advice_summary(state: dict, *, gates_passed: bool = False,
@@ -4544,6 +4838,8 @@ def evaluate(state: dict, *, cache: dict | None = None) -> dict:
             if command:
                 result.setdefault("next_commands", []).insert(
                     0, f"{prefix}：{command}（SOL {advice['mode']}，advisory）")
+    # 续跑判定：忽略它不会改变状态，但阶段报告与工作项回填必须据此继续。
+    result["continuation"] = continuation(state, cache=cache, evaluation=result)
     return result
 
 
@@ -4610,7 +4906,11 @@ def render_status(state: dict, evaluation: dict | None = None, *,
                          f"{action.get('title')}")
     blocks = _active_blocks(state)
     if blocks:
-        lines.append(f"阻塞：{blocks[0].get('reason')}（需要：{blocks[0].get('needs')}）")
+        for block in blocks:
+            scope = ("任务级" if not block.get("work_items")
+                     else "工作项 " + "、".join(block.get("work_items") or []))
+            lines.append(f"阻塞[{scope}]：{block.get('reason')}"
+                         f"（需要：{block.get('needs')}）")
     reason = ev.get("gate") or ev.get("reason")
     if ev.get("gate") is not None:
         gate = ev["gate"]
@@ -4626,10 +4926,27 @@ def render_status(state: dict, evaluation: dict | None = None, *,
     if warnings:
         lines.append("提醒（不阻断）：")
         lines.extend(f"- {item}" for item in warnings)
+    cont = ev.get("continuation") or {}
+    if cont:
+        if cont.get("required"):
+            lines.append(f"续跑：必须继续（{cont.get('action')}）——{cont.get('reason')}")
+        elif cont.get("action") == "wait":
+            lines.append(f"续跑：等待外部条件——{cont.get('reason')}")
+        if cont.get("blocked_items"):
+            lines.append("被阻塞工作项：")
+            lines.extend(
+                f"- {item.get('id')}（{item.get('block_id')}）："
+                f"{item.get('reason')}（需要：{item.get('needs')}）"
+                for item in cont.get("blocked_items") or [])
+        if cont.get("dependency_blocked"):
+            lines.append("等待阻塞解除后才能开始：" +
+                         "、".join(cont.get("dependency_blocked") or []))
     next_commands = ev.get("next_commands") or []
     if next_commands:
         lines.append("下一步：")
         lines.extend(f"- {cmd}" for cmd in next_commands)
+        if cont.get("required"):
+            lines.append("- 以上动作未执行前，不得结束回合或以报告收束任务。")
     return "\n".join(lines)
 
 

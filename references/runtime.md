@@ -23,24 +23,47 @@
 
 ## 2. 阶段判定顺序
 
-`evaluate(state)` 按固定顺序判定，命中即返回：
+`evaluate(state)` 按固定顺序判定，命中即返回，并在结果中附带 `continuation`：
 
 | 顺序 | 条件 | 阶段 | 说明 |
 |---|---|---|---|
 | 1 | `closure.closed` 为真 | CLOSED | 已收口；继续需用户授权 `reopen` |
-| 2 | 存在未解除的 block | BLOCKED | 输出原因与 `needs`，退出码 11 |
+| 2 | 存在未解除的**任务级** block | BLOCKED | 输出原因与 `needs`，退出码 11 |
 | 3 | 合同缺失或条件未确认 | PARTIAL | 派生 `AUTO-CONTRACT` |
 | 4 | 存在可领取工作项 | RUNNING | 输出工作单，退出码 10 |
-| 5 | 仍有未闭合条件 | PARTIAL | 派生 `AUTO-C<n>` |
-| 6 | 存在停摆工作项 | PARTIAL | 派生恢复项 |
-| 7 | G1–G3 全部通过 | PASS | 收口为 CLOSED |
-| 8 | 其他门禁未过 | PARTIAL | 按缺口派生 |
+| 5 | 全部剩余工作受阻且无可推进条件 | BLOCKED | 项级阻塞覆盖所有剩余工作；退出码 11 |
+| 6 | 仍有未闭合（未被阻塞）条件 | PARTIAL | 派生 `AUTO-C<n>` |
+| 7 | 存在停摆工作项 | PARTIAL | 派生恢复项 |
+| 8 | G1–G3 全部通过 | PASS | 收口为 CLOSED |
+| 9 | 其他门禁未过 | PARTIAL | 按缺口派生 |
 
-- **可领取（ready）**：`status=pending` 且所有 `depends_on` 已完成。
+- **项级阻塞不短路**：`ready_actions` 只跳过被 `work_items` 冻结的工作项及其无法开始的
+  下游依赖，其它工作照常可领取；只有 `--scope task` 的阻塞才冻结全部工作。
+- **可领取（ready）**：`status=pending`、不在项级阻塞名单、且所有 `depends_on` 已完成。
 - **停摆（stalled）**：`running`/`failed`/`blocked` 的遗留项；或 `pending` 但依赖不存在、
-  依赖已 `dropped`/`failed`/`blocked`。
+  依赖已 `dropped`/`failed`/`blocked`。被项级阻塞的项及其下游不算停摆（已登记的真实阻塞）。
+- **整体 BLOCKED 的条件**：全部非终态工作项直接阻塞或因依赖无法开始，且没有未被 `criteria`
+  声明的未闭合条件；否则先派生 `AUTO-C<n>`（宁可继续也不提前停）。
 - **PARTIAL 永远有出口**：即使没有 ready 项、没有未闭合条件、没有停摆项，也会派生
   `AUTO-NEXT` 要求重新核对目标、证据与真实阻塞。
+
+### continuation 判定
+
+`continuation(state)` 只读状态，输出 `phase` / `required` / `action` / `executable` /
+`derivable` / `blocked_items` / `dependency_blocked` / `next_command` / `reason`：
+
+| 局面 | action | required |
+|---|---|---|
+| CLOSED | `none` | false |
+| 所有剩余工作真实阻塞 | `wait` | false |
+| PASS | `close` | true |
+| 有 ready 项 | `execute` | true |
+| 无 ready 但可派生（dry-run 预演） | `derive` | true |
+| 无 ready 且无可派生 | `none` | false |
+
+`evaluate`、`next`、`status`、`drive`、`record`、`rerun`、`criterion`、`report`、`block`、
+`unblock` 都使用同一判定。`EXIT_CONTINUE=10` 表示"还有下一步"，不能据此结束回合；
+`EXIT_WAIT=11` 只在 `required=false` 的真实等待时使用。
 
 ## 3. PARTIAL 派生规则
 
@@ -56,13 +79,18 @@
 | 停摆工作项 `A1` | `AUTO-R-A1` | 分析失败根因并重试/调整/记录真实阻塞 |
 | Finding 台账有 `open`/`regressed` 的 blocking/major | `AUTO-FIX-<F>` | 修根因、登记修复证据并标记 fixed，不直接重跑完整复核 |
 | Finding 已 `fixed` 但未验证 | `AUTO-VERIFY-<F>` | 只跑对应定向测试/检查，登记证据并标记 verified |
-| `AUTO-C*` / `AUTO-R-*` 已派生 ≥3 次仍不闭合 | `AUTO-REPLAN` | 根因分析 + 实质不同的替代路线 |
+| `AUTO-C*` / `AUTO-R-*` 已派生 ≥3 次仍不闭合 | `AUTO-REPLAN` | 根因分析 + 实质不同的替代路线；替代路线执行中不派生同路径尝试，替代路线已结束而缺口仍在时派生新的 `AUTO-REPLAN` |
 | 无其他缺口 | `AUTO-NEXT` | 明确下一步最小可执行动作 |
 | 存在连续失败工作项 | `AUTO-REPLAN` | 同上 |
 
 - 重名时用 `-R2`、`-R3` 递增（`_derive_id`），不覆盖已有工作项。
 - 同一缺口已有 `pending`/`running` 工作项时不再派生第二条；重复调用 `drive` 或多个入口
   同时求值不会把 `AUTO-C1` 复制成 `-R2`/`-R3`。
+- 已随 `block --criterion` 声明为阻塞的完成条件不再派生 `AUTO-C<n>`，避免制造无法执行的
+  工作单；解除阻塞后自动恢复派生。
+- 已有 `pending`/`running` 的 `AUTO-REPLAN` 时，同一缺口不再派生第 4 次同路径尝试，等替代
+  路线产出结果；替代路线已结束（`done`/`failed`/`dropped`）而缺口仍未闭合时，派生新的
+  `AUTO-REPLAN` 并要求说明上一路线为何未闭合，不由通用 `AUTO-NEXT` 兜底静默续跑。
 - G4 退役后不再派生 `AUTO-G4*`；按复杂度主动建议的是 THINK，REVIEW 只在用户明确要求
   时执行；两者都不是阻塞性工作项。
 - 失败/停摆的 `AUTO-C*` 项不再额外派生恢复项，避免同一缺口两份工作单。
@@ -74,7 +102,8 @@
 
 1. 读取状态 → `evaluate`；
 2. CLOSED → 打印状态，退出 0；
-3. BLOCKED → 打印原因与 `needs`，退出 11；
+3. BLOCKED → 打印原因与 `needs`；若 `continuation.required` 为真（口径不一致）抛出内部
+   错误，否则退出 11；
 4. PASS → `close_task`，退出 0；
 5. RUNNING → 取前 `--max-actions` 个 ready 项打印工作单；`backend=native` 且工作项属于
    已登记计划时，经 `native_bridge.build_dispatch` 写出 `dispatch.json`，退出 10；
@@ -82,6 +111,10 @@
    并把上一轮未结束的迭代标记为 `ENDED`）并保存，比较 `progress_digest`；若派生结果为空，
    退出 12；
 7. 循环最多 32 步，超限退出 12 并保留状态。
+
+回填类命令（`record` / `rerun` / `criterion` / `report` / `block` / `unblock`）在写入后
+调用同一 `continuation` 判定：仍须执行时返回 10，并把下一步命令与工作项打印出来；只有
+已收口或所有剩余工作真实阻塞时返回 0。
 
 **进展摘要 `progress_digest`**：由工作项状态/结果摘要/证据引用、条件状态/证据引用、
 证据 id 与摘要、收口状态计算。派生前后摘要不变且没有 `AUTO-NEXT` 时输出警告；同一缺口
@@ -125,6 +158,18 @@
 - 需要用户决策且无法由现场证据推出；
 - 缺少必要资源（设备、凭据、外部环境）；
 - 真实外部限制（服务商限流/配额、网络、安全边界）。
+
+**按动作与工作项登记**：缺 commit 授权只阻塞 commit 工作项，缺 push 授权只阻塞 push；
+其它工作继续。用法：
+
+```bash
+copilot_dispatch.py block --state S --reason "未获 push 授权" --needs "用户授权 push" \
+    --work-item A2 --criterion C2
+```
+
+`--criterion` 声明同时被卡住的完成条件（避免反复派生 `AUTO-C<n>`）；`--work-item` 可重复，
+只冻结这些项及其下游依赖。`--scope task` 会冻结全部工作，仅当目标或资源整体不可推进时使用。
+`unblock --block-id` 解除后，被冻结工作项恢复为 `pending`，立即重新进入可执行。
 
 以下**不得**作为 BLOCKED 理由：轮次/预算/费用阈值、等待远程模型、重复评审、内部状态流转、
 子 Agent 返回 PARTIAL、首次方案失败、普通测试失败、可自行补齐的证据不足。

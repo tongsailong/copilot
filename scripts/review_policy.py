@@ -869,9 +869,10 @@ def sol_advice(state: dict, *, calls: list[dict] | None = None,
     if bool((state.get("closure") or {}).get("closed")):
         base["reason"] = "任务已收口：不再建议新的 SOL 调用（需继续时先由用户授权 reopen）。"
         return base
-    if any(not block.get("resolved_at")
+    if any(not block.get("resolved_at") and not block.get("work_items")
            for block in state.get("blocks") or [] if isinstance(block, dict)):
-        # 阻塞只能由用户补齐授权/决策/资源解除；SOL 不提供本地事实，也不能解除阻塞。
+        # 任务级阻塞只能由用户补齐授权/决策/资源解除；SOL 不提供本地事实，也不能
+        # 解除阻塞。项级阻塞只冻结对应工作项，其余工作照常推进，不因此停用 SOL。
         base["reason"] = ("任务处于 BLOCKED：先解除授权/决策/资源缺口；SOL 不提供本地事实，"
                           "也不能替代用户决定。")
         return base

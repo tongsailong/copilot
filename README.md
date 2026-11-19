@@ -5,6 +5,12 @@ Copilot 是运行于 ZCode 内的**轻量协作治理 Skill**：用户侧 ChatGP
 调试、测试与验证；Copilot 负责任务合同、完成条件、状态、证据、审计与收口门禁，并用 PARTIAL
 派生持续推进任务；SOL 作为默认认知引擎按需提供判断，用户明确要求时可执行一次独立复核。
 
+**v8.5.0 PARTIAL 强制续跑**：`continuation` 判定进入 `next`/`status`/`drive` 以及
+`record`/`rerun`/`criterion`/`report`/`block`/`unblock`；仍有原始授权内的可执行工作时返回
+`EXIT_CONTINUE=10`，阶段报告不再是任务终点。阻塞按工作项成立（`block --work-item`），
+单项缺授权不冻结其余工作；`--criterion` 声明被卡住的条件，`unblock` 自动恢复被冻结项；
+只有全部剩余工作真实受阻时才整体 BLOCKED。G1–G3、SOL 语义与授权边界不变。
+
 **v8.4.0 SOL 默认认知引擎**：CONSULT / PLAN 并入 `sol-think`（`THINK`），只保留一种认知
 调用与一份结构化输出（核心判断、问题本质、推荐策略、关键取舍、主要风险、实施优先级、
 验证信号、再咨询条件）。简单任务 0 调用；中高复杂任务在形成初步理解后建议一次，只有

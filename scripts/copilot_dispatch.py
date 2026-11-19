@@ -43,7 +43,7 @@ import review_policy as RP  # noqa: E402
 import sol_review as SR  # noqa: E402
 import knowledge_handoff as KH  # noqa: E402
 
-__version__ = "8.4.0"
+__version__ = "8.5.0"
 
 
 class CLIError(Exception):
@@ -158,6 +158,35 @@ def _brief(state: dict) -> str:
     return G.render_status(state, ev, cache=cache)
 
 
+EXIT_CONTINUE = 10
+
+
+def _print_continuation(path: str) -> int:
+    """回填类命令的统一续跑判定：仍有可执行工作时返回 10。
+
+    阶段报告与工作项回填都是进度记录，不是任务终点。退出码 10 沿用 `drive`
+    的口径（有待执行工作），调用方必须继续而不是收束回合。
+    """
+    state = G.load_state(path)
+    ev = G.evaluate(state)
+    cont = ev.get("continuation") or {}
+    if cont.get("required"):
+        print(f"续跑：必须继续（{cont.get('action')}）—— {cont.get('reason')}")
+        if cont.get("executable"):
+            print("可执行工作项：" + "、".join(cont["executable"]))
+        if cont.get("derivable"):
+            print("可派生工作项：" + "、".join(cont["derivable"]))
+        if cont.get("next_command"):
+            print(f"下一步：{cont.get('next_command')}")
+        print("提示：该动作未完成前不要结束回合；报告与阶段结论都不是任务终点。")
+        return EXIT_CONTINUE
+    if cont.get("action") == "wait":
+        print(f"续跑：等待外部条件 —— {cont.get('reason')}")
+        return 0
+    print(f"续跑：无需继续（{cont.get('reason')}）")
+    return 0
+
+
 # ── 命令实现 ───────────────────────────────────────────────────────────────
 def cmd_start(args) -> int:
     contract = _read_text(args.contract_file) if args.contract_file else ""
@@ -213,14 +242,14 @@ def cmd_record(args) -> int:
     print(f"{action['id']} → {action['status']}"
           + (f"；证据 {', '.join(action['evidence_ids'])}"
              if action["evidence_ids"] else ""))
-    return 0
+    return _print_continuation(_state_path(args))
 
 
 def cmd_rerun(args) -> int:
     action = G.rerun_action(_state_path(args), args.id, reason=args.reason or "")
     print(f"{action['id']} → pending（第 {action['rerun_count']} 次重开）；"
           "旧结果已保存在 rerun_history。")
-    return 0
+    return _print_continuation(_state_path(args))
 
 
 def cmd_criterion(args) -> int:
@@ -230,7 +259,7 @@ def cmd_criterion(args) -> int:
     print(f"{criterion['criterion_id']} → {criterion['status']}"
           + (f"；证据 {', '.join(r['id'] for r in criterion['evidence_refs'])}"
              if criterion["evidence_refs"] else ""))
-    return 0
+    return _print_continuation(_state_path(args))
 
 
 def cmd_judgment(args) -> int:
@@ -288,11 +317,12 @@ def cmd_report(args) -> int:
             print("警告：PWW 报告没有可接受的 W/R；按 fail-closed 处理。")
         if summary:
             print("报告已登记：已随质量报告一并写入（同一保存轮次）。")
-        return 0
+        return _print_continuation(path)
     entry = G.add_report(path, summary,
                          blocked=bool(args.blocked), reason=args.reason or "")
     print(f"报告已登记：sha256={entry['report_sha256'][:16]}…")
-    return 0
+    print("注意：报告是进度记录，不是任务终点；以续跑判定为准。")
+    return _print_continuation(path)
 
 
 def cmd_accept(args) -> int:
@@ -361,11 +391,29 @@ def cmd_decide(args) -> int:
 
 
 def cmd_block(args) -> int:
-    block = G.add_block(_state_path(args), args.reason, args.needs)
-    print(f"已进入 BLOCKED：{block['block_id']}")
+    items = list(getattr(args, "work_item", None) or [])
+    scope = str(getattr(args, "scope", "") or "").strip()
+    if not items and scope != "task":
+        raise CLIError(
+            "block 必须指定作用范围：--work-item <id>（推荐，只阻塞该工作项）"
+            " 或 --scope task（仅当目标/资源整体不可推进时才允许）。"
+            "单条授权缺口（commit / push / 部署 / 生产数据 / 付费 / 用户决策）"
+            "不得冻结整个任务。")
+    if items and scope == "task":
+        raise CLIError("--work-item 与 --scope task 不能同时使用。")
+    block = G.add_block(_state_path(args), args.reason, args.needs,
+                        work_items=items,
+                        criteria=list(getattr(args, "criterion", None) or []))
+    if block.get("work_items"):
+        print(f"已阻塞工作项：{', '.join(block['work_items'])}（{block['block_id']}）")
+    else:
+        print(f"已进入任务级 BLOCKED：{block['block_id']}")
+    if block.get("criteria"):
+        print(f"同时卡住的完成条件：{', '.join(block['criteria'])}")
     print(f"原因：{block['reason']}")
     print(f"所需条件：{block['needs']}")
-    return 0
+    print("提示：未阻塞的工作项继续执行；不要因单项阻塞结束回合。")
+    return _print_continuation(_state_path(args))
 
 
 def cmd_unblock(args) -> int:
@@ -374,7 +422,9 @@ def cmd_unblock(args) -> int:
     print(f"已解除 {result['resolved']} 条阻塞：{result['reason']}")
     if result.get("block_ids"):
         print("block_id：" + ", ".join(result["block_ids"]))
-    return 0
+    if result.get("resumed"):
+        print("已恢复工作项：" + ", ".join(result["resumed"]) + "（重新进入可执行）")
+    return _print_continuation(_state_path(args))
 
 
 def cmd_evidence(args) -> int:
@@ -1496,6 +1546,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--state", required=True)
     p.add_argument("--reason", required=True)
     p.add_argument("--needs", required=True)
+    p.add_argument("--work-item", action="append", default=[],
+                   help="只阻塞指定工作项（可重复）；授权缺口默认用它")
+    p.add_argument("--criterion", action="append", default=[],
+                   help="同时卡住的完成条件（可重复）；避免该条件被反复派生")
+    p.add_argument("--scope", choices=["task"], default="",
+                   help="任务级阻塞；仅当目标/资源整体不可推进时使用")
     p.set_defaults(func=cmd_block)
 
     p = sub.add_parser("unblock", help="解除阻塞")
