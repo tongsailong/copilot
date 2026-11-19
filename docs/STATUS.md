@@ -28,6 +28,27 @@
   `test_12d` 在求值层验证部分解除阻塞后的状态迁移。
 - **未验证**：真实宿主会话中的提前停止复发验证尚未执行；本轮未 commit / push。
 
+## v8.5.0 发布与宿主端到端验收（2026-11-20）
+
+- **提交**：`00bc903`（`feat(copilot): harden partial continuation and scoped blocking`），
+  16 个文件（15 修改 + `tests/test_continuation.py` 新增），+1133/−101；未跟踪的
+  `scripts/knowledge_handoff.py` 与 `tests/test_knowledge_handoff.py` 按既有指令保持不纳入。
+- **推送**：`origin/main` `f8a97b9..00bc903` 普通快进；本地 `HEAD`、`@{u}`、`origin/main`
+  三方同为 `00bc903`，ahead/behind `0/0`。
+- **运行时同步**：`--apply` 0 个文件（已一致）、`--check` 缺失 0/不同 0、
+  `--verify-baseline` 通过；运行时 `scripts/governance.py`、`SKILL.md` 与源码 sha256 相同，
+  `copilot_dispatch.py __version__=8.5.0`。
+- **宿主 E2E（隔离临时任务，两个独立宿主会话代理，未改业务仓库）**：
+  1. 分项阻塞链路：`block --work-item A2 --criterion C2` 仅冻结 A2 且 `drive` 继续下发 A1；
+     `record`/`criterion`/`unblock` 返回 10；外部凭据出现后 `unblock` 恢复 A2；
+     最终 `PASS`/`CLOSED`，G1–G3 全 PASS。
+  2. PARTIAL 报告链路：A1 done、C1 未核销时 `report` 返回 **10** 并给出 `AUTO-C1`；
+     同一回合继续派生执行、`criterion` 10、`drive` 0 收口；最终 `CLOSED`/`verdict=pass`。
+- **宿主限制（未完成项）**：GUI 新会话（`sess_424eee40…`）在首次工具调用处停在宿主
+  `needs_attention: approval`，未获人工点击前无法继续；E2E 由宿主子会话代理完成，
+  不是同一 GUI 会话。未绕过宿主审批。
+- **未验证**：GUI 根会话内的同链路观察（受上述审批门限制）。
+
 ## 全面评审与加固（2026-11-18，v8.4.0 基线）
 
 现场基线：`HEAD=2035755`、`origin/main=2035755`、运行时与源码受管理文件一致；工作区保留
