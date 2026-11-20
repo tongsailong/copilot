@@ -1,7 +1,40 @@
 # STATUS
 
 更新：2026-11-20 CST。本文件只记录现场可核实的事实；规划与未完成事项单独标注。
-当前版本：v9.1.0（SOL 采纳记录与证据关联）。
+当前版本：v9.2.0（ZCode 原生恢复衔接与上下文瘦身）。
+
+## ZCode 原生恢复衔接与上下文瘦身（2026-11-20，v9.2.0，未提交）
+
+现场基线：`HEAD=0b64f62`。本轮改动**未提交、未推送**（任务边界：commit/push 另行确认），
+未跟踪的 `scripts/knowledge_handoff.py`、`tests/test_knowledge_handoff.py` 保持原样。
+
+- **SessionStart 恢复注入**：`copilot_stop_guard.py` 新增 `session-start` 子命令，只处理
+  `source=resume|compact`；只对本会话已绑定且 `continuation.required=true` 的任务输出一段
+  只读快照（任务/阶段/原因、未闭合条件、下一条命令、可粘贴续接命令）。不绑定任务、不写
+  state/session、不消费 Stop 次数；`startup`/`clear`、其它会话、已收口、无任务一律静默；
+  任何异常退出 0（fail-open）。`install`/`uninstall` 同时维护 `Stop` 与 `SessionStart`
+  （matcher `resume|compact`），幂等且只动这两个条目。
+- **SKILL.md 瘦身**：版本沿革外移到 `references/history.md`，并把原先内联但 history 缺失的
+  v6.3–v6.12.0、v8.0.1 补回该文件；SKILL.md 84,291 → 56,707 B（−32.7%），现行规则、
+  G1–G3、授权边界与命令面未删减。
+- **测试**：`python3 -B -m unittest discover -s tests -p 'test_*.py'` **684 项 OK**（新增 12 项
+  SessionStart/安装测试）；`legacy/tests` 853 项（skip 32）99 failures + 47 errors = 146，
+  与 `git archive HEAD` 归档运行的失败/错误用例名逐条 diff 为空。
+- **同步**：`--apply` 写入 5 个受管理文件，`--check` 缺失 0/不同 0；`--baseline` 重建 21 个
+  Git 跟踪项（未跟踪的 `knowledge_handoff.py` 未写入），`--verify-baseline` 通过；
+  运行时 `copilot_dispatch.py __version__=9.2.0`。
+- **隔离 E2E**（`/tmp/copilot-e2e2`，运行时脚本）：未完成时 Stop 守卫 exit 2、
+  resume/compact 注入含任务 id 与 C1/C2；`startup`/`clear`/其它会话/收口后均输出 0 字节；
+  收口 `closure-check` G1–G3 PASS，state 损坏时 `session-start` 静默 exit 0。
+- **度量**：Stop 守卫 81.4 ms、session-start 80.2 ms、`status` 137.3 ms（7 次中位数），
+  与升级前同一量级；正文本地估算 19.4k → 13.0k tokens/会话（0.23 token/byte 估算）。
+- **SOL**：本任务 CONSULT `SC16677c9af5891518dd968f5e`（59.4s，`gpt-6.2-sol`、`high`、
+  零工具）已按 `modified` 登记采纳结论与差异；未调用 PLAN/REVIEW。
+- **本机安装**：用户级 `~/.zcode/cli/config.json` 已含 `Stop` 与新增
+  `SessionStart(resume|compact)` 条目，安装前备份 `config.json.bak-20261120223622`，
+  `mcp`/`plugins` 等其它配置未变；新会话启动时加载。
+- **未验证 / 限制**：宿主真实 `resume`/`compact` 事件尚未在本会话内复现（钩子命令按宿主
+  输入形状直接在隔离工作区验证）；未在 GUI 新会话复跑；未提交、未推送。
 
 ## SOL 采纳记录与证据关联（2026-11-20，v9.1.0）
 

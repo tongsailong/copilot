@@ -443,6 +443,36 @@ class HookInstallTests(unittest.TestCase):
         self.assertIn("copilot_stop_guard.py",
                       json.dumps(payload["hooks"]["events"]["Stop"]))
 
+    def test_install_writes_session_start_entry_and_is_idempotent(self):
+        os.makedirs(os.path.dirname(self.config_path), exist_ok=True)
+        proc = self.run_cli("install", "--workspace", self.workspace, "--apply")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        events = self.read_config()["hooks"]["events"]
+        self.assertEqual(len(events["SessionStart"]), 1)
+        group = events["SessionStart"][0]
+        self.assertEqual(group.get("matcher"), "resume|compact")
+        self.assertIn("session-start", json.dumps(group, ensure_ascii=False))
+        before = read_bytes(self.config_path)
+        again = self.run_cli("install", "--workspace", self.workspace, "--apply")
+        self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
+        self.assertEqual(before, read_bytes(self.config_path),
+                         "重复安装不应改写配置或新增备份")
+
+    def test_uninstall_removes_only_our_session_start_entry(self):
+        os.makedirs(os.path.dirname(self.config_path), exist_ok=True)
+        unrelated = {"matcher": "resume",
+                     "hooks": [{"type": "command", "command": "echo other"}]}
+        with open(self.config_path, "w", encoding="utf-8") as fh:
+            json.dump({"hooks": {"enabled": True, "events": {
+                "SessionStart": [unrelated]}}}, fh)
+        self.run_cli("install", "--workspace", self.workspace, "--apply")
+        self.assertEqual(len(self.read_config()["hooks"]["events"]["SessionStart"]), 2)
+        proc = self.run_cli("uninstall", "--workspace", self.workspace, "--apply")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        events = self.read_config()["hooks"]["events"]
+        self.assertEqual(events["SessionStart"], [unrelated])
+        self.assertEqual(events["Stop"], [])
+
     def test_install_requires_a_target(self):
         proc = self.run_cli("install", "--apply")
         self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
@@ -477,6 +507,119 @@ class HookInstallTests(unittest.TestCase):
         with open(user_config, encoding="utf-8") as fh:
             data = json.load(fh)
         self.assertEqual(data["hooks"]["events"]["Stop"], [])
+
+
+class SessionStartRecoveryTests(StopGuardBase):
+    """SessionStart 恢复注入：只补上下文，不绑定、不写状态、失败放行。
+
+    ZCode 只在 `resume` / `compact` 真正丢失上下文时注入；`startup` 不推断旧任务，
+    `clear` 尊重用户清空。未绑定当前会话的任务不披露任何任务内容。
+    """
+
+    def run_session_start(self, *, source: str = "resume",
+                          payload: dict | None = None,
+                          session: str | None = SESSION,
+                          cwd: str | None = None, env: dict | None = None):
+        data = dict(payload or {"cwd": cwd or self.workspace})
+        data.setdefault("source", source)
+        return self.run_guard(args=["session-start"], payload=data,
+                              session=session, env=env)
+
+    def injected(self, proc) -> str:
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        payload = json.loads(proc.stdout)
+        self.assertEqual(set(payload), {"hookSpecificOutput"})
+        out = payload["hookSpecificOutput"]
+        self.assertEqual(set(out), {"hookEventName", "additionalContext"})
+        self.assertEqual(out["hookEventName"], "SessionStart")
+        return out["additionalContext"]
+
+    def test_resume_and_compact_inject_bound_task(self):
+        for source in ("resume", "compact"):
+            text = self.injected(self.run_session_start(source=source))
+            self.assertIn("<copilot-session-recovery>", text)
+            self.assertIn("</copilot-session-recovery>", text)
+            self.assertIn(self.state()["task_id"], text)
+            self.assertIn(self.state_path, text)
+            self.assertIn("C1", text)
+            self.assertIn("不是用户新指令", text)
+            self.assertIn("不重做", text)
+            self.assertLessEqual(len(text), 1600)
+
+    def test_startup_and_clear_do_not_inject(self):
+        for source in ("startup", "clear"):
+            proc = self.run_session_start(source=source)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(proc.stdout.strip(), "")
+            self.assertEqual(proc.stderr.strip(), "")
+
+    def test_other_session_task_is_not_injected(self):
+        # 任务绑定的是 SESSION；当前会话是 OTHER_SESSION，属于其它会话的任务。
+        proc = self.run_session_start(session=OTHER_SESSION)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "")
+
+    def test_unbound_task_is_not_injected(self):
+        os.unlink(os.path.join(self.task_dir, "session.json"))
+        proc = self.run_session_start()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "")
+        self.assertNotIn("task_id", proc.stdout)
+
+    def test_missing_session_id_does_not_inject(self):
+        proc = self.run_session_start(session=None)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "")
+
+    def test_workspace_or_task_disable_skips_injection(self):
+        marker = os.path.join(self.workspace, ".copilot-tasks", ".stop-guard-off")
+        with open(marker, "w", encoding="utf-8") as fh:
+            fh.write("{}")
+        self.assertEqual(self.run_session_start().stdout.strip(), "")
+        os.unlink(marker)
+        state = self.state()
+        state["stop_guard"] = False
+        self.save(state)
+        self.assertEqual(self.run_session_start().stdout.strip(), "")
+
+    def test_corrupt_state_fails_open_with_hint(self):
+        bad = os.path.join(self.workspace, ".copilot-tasks", "bad")
+        os.makedirs(bad, exist_ok=True)
+        with open(os.path.join(bad, "state.json"), "w", encoding="utf-8") as fh:
+            fh.write("{not json")
+        text = self.injected(self.run_session_start())
+        self.assertIn("任务状态读取异常", text)
+        # 只有损坏状态、没有绑定任务时不注入任何东西。
+        os.unlink(os.path.join(self.task_dir, "session.json"))
+        proc = self.run_session_start()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "")
+
+    def test_closed_task_is_not_injected(self):
+        state = self.state()
+        state["closure"] = {"closed": True}
+        self.save(state)
+        self.assertEqual(self.run_session_start().stdout.strip(), "")
+
+    def test_injection_is_read_only(self):
+        tracked = [self.state_path, os.path.join(self.task_dir, "session.json")]
+        before = {path: read_bytes(path) for path in tracked}
+        self.run_session_start()
+        self.assertEqual(before, {path: read_bytes(path) for path in tracked},
+                         "恢复注入不得写状态或绑定文件")
+
+    def test_other_workspace_task_is_not_injected(self):
+        other_ws = tempfile.TemporaryDirectory()
+        self.addCleanup(other_ws.cleanup)
+        other_task = os.path.join(other_ws.name, ".copilot-tasks", "t9")
+        os.makedirs(other_task, exist_ok=True)
+        other_state = os.path.join(other_task, "state.json")
+        G.start_state(other_state, goal="另一个工作区", contract=CONTRACT,
+                      test_policy={"required": False}, workspace=other_ws.name)
+        self.bind(SESSION, task_dir=other_task)
+        text = self.injected(self.run_session_start())
+        self.assertNotIn(other_ws.name, text)
+        self.assertIn(self.workspace, text)
 
 
 if __name__ == "__main__":

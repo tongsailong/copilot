@@ -43,7 +43,7 @@ import review_policy as RP  # noqa: E402
 import sol_review as SR  # noqa: E402
 import knowledge_handoff as KH  # noqa: E402
 
-__version__ = "9.1.0"
+__version__ = "9.2.0"
 
 
 class CLIError(Exception):

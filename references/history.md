@@ -137,6 +137,12 @@
   `authority=authoritative` 字段原样保留；历史 G4 BLOCKED 不改写为 PASS。
 - **未放宽**：G1–G3、fail-closed、证据完整性、PWW 接受、授权与安全边界不变。
 
+## v8.0.1（2026-11-17）SOL 安全与可靠性加固（历史）
+
+v8.0.1 只收紧 SOL 安全与可靠性（错误详情脱敏、base_url 绕过、advisory 提级、重复付费
+防护、台账幂等、ID 唯一、dry-run 校验），不改变任务合同、G1–G3 与授权边界。
+细节见 `legacy/` 与 Git 历史（f62f375 / c44c13a / 20db0ba）。
+
 ## v7.0.0（2026-11-17）SOL Review Edition（历史）
 
 - **原生多轮 Reviewer 退役**：普通复核不再派发只读子代理、不再创建 review attempt、
@@ -170,6 +176,205 @@
 - **G1–G4 保留**：G4 仍要求原生独立只读复核、宿主记录重核、目标摘要绑定与 fail-closed。
 - **证据/审计保留**：先登记后引用、SHA-256、文件重读校验、脱敏采集、只增不改的 history、
   收口不可改、reopen 保留旧 closure 快照。
+
+## v6.3–v6.12.0（2026-11-13～11-17）复核收敛与宿主能力沿革（历史）
+
+v6.12.0 是 G4 宿主能力校验与调度收敛专项：
+
+- **宿主现场复核（ZCode 3.18.2）**：工作区只读 Profile 真实加载并生效——`profileSnapshot`
+  记录 `tools=[Read,Grep,Glob]`、`disallowedTools` 含 `Write/Edit/Bash`，44 个真实
+  `independent-readonly` 子会话只出现 `Read/Grep/Glob`；普通模式请求 Bash 返回
+  `tool_not_found`。但该 Profile 是 **project 级自定义 Agent**（宿主 `rCi` 把
+  `<cwd>/.zcode/agents` 标为 `source:"project"`），不是内置子代理。
+- **G4 架构合规（BLOCKED）**：原定架构只允许 ZCode 内置子代理。宿主内置只有
+  `Explore`（含 Bash）与 `general-purpose`（全工具），没有精确只读载体；`Agent` 工具
+  没有派发期 `tools` 参数。项目自定义 Profile 即使工具集精确，也不作为正式 G4 方案；
+  `profileSnapshot.source` 必须是 `built-in`，否则 `profile_source_not_builtin`。
+  因此当前宿主的正式 G4 只能是 **BLOCKED**，不能用自定义 Agent 或放宽权限制造 PASS。
+- **plan 模式 Bash 注入（新发现）**：父会话 `planEnabled=true` 时子会话继承 plan 模式，
+  宿主会给子代理注入 Bash 并可真实执行（真实记录：`independent-readonly` 子会话执行了
+  `git status --short`）。因此“精确只读”不能只看 `profileSnapshot`：`g4_attest`、
+  `native_agent review` 与 `capability` 都读取子会话 `runtime/execution_state`，要求
+  `planEnabled=false`；缺失/未知一律 fail-closed（`host_session_state_missing` /
+  `host_session_state_unknown` / `host_session_plan_mode`）。
+- **控制平面工具**：宿主对所有子代理无条件注入 `RespondToCoordinator`
+  （`agent.message.respond`、`sideEffectScope=session`，只向父运行时队列发消息，不能读写
+  文件或执行命令）；它不在声明白名单内，`x3n` 即使 Profile 禁用也会重新加入。按“工具集
+  字面精确等于 Read/Grep/Glob”的口径，它使任何子代理都无法满足字面精确；按“无额外
+  文件/命令能力”的口径不影响只读性。代码不把它加入白名单，G4 仍按声明策略与内置来源判定。
+- **能力探测可复验**：`capability` 的 `host_version` 是本次真实探测值（读
+  `app.asar package.json`，每次重新探测、不缓存；探测失败才回退常量并标
+  `source=unavailable`），`host_baseline` 固定为代码基线版本；同时输出
+  `session_execution`（mode/planEnabled）、`classification.carrier` /
+  `architecture_compliant`，并保留 `host_evidence` 逐调用统计。
+  `agent-policy --g4-required --plan-mode` 在 plan 模式下直接给出“不可派发”。
+- **能力缺口不反复派发**：最近一次 G4 取证的拒绝码属于宿主/Profile 能力缺口时，
+  `drive` 派生 `AUTO-G4-CAPABILITY`（诊断/修正/如实 block），而不是再派一个相同的
+  只读会话；环境修复后新取证会正常回到 `AUTO-G4`。
+- **未放宽**：G1–G4、fail-closed、attempt/宿主记录/证据绑定、PWW 接受与工具白名单不变；
+  plan 模式与来源约束只会让更多场景 fail-closed，不会放行。
+
+v6.11.0 是效率与性能专项，只减少重复开销，不改判定规则：
+
+- **字节码预编译**：文档命令统一用 `python3 -B`，`-B` 只禁止写 `.pyc`、不禁止读取。
+  `sync_runtime.py --apply` 在同步后编译运行时字节码，单次命令不再重复编译约
+  17k 行源码。行为不变；解释器版本或源码变化时 Python 自行重编译。
+- **一次命令一次快照**：`capture_code_snapshot` 新增可选 `cache`，由命令入口
+  （`drive`/`status`/`closure-check`）在单次进程内复用同一工作区快照；`close_task`、
+  `_evaluate_core`、`_gate_quality`、`derive_work` 共用一份，不再对同一工作区反复
+  扫描 git。库调用与测试默认 `cache=None`，漂移检测仍逐次重算。
+- **更少的 git 子进程**：工作区根与 HEAD 合并为一次 `rev-parse`（失败才分开重试）；
+  `git_root()` 单进程按目录缓存（一个任务的多个证据路径不再各跑一次 git）。
+- **未放宽**：G1–G4、fail-closed、代码范围/证据绑定、漂移检测与 PWW 接受规则不变；
+  缓存只复用同一命令内的只读结果，不跨进程。畸形仓库（index 有 gitlink 但缺
+  `.gitmodules`）仍按 `submodule_status_failed` 让快照不可用。
+
+v6.10.0 收敛复核频率与工具执行判定：
+
+- **三级复核策略**：`risk=low`（文档/文案/样式/简单修复）与 `risk=medium`（普通开发/
+  多页面 UI/常规重构，历史 `normal` 等价）默认不派 Reviewer；只有声明实质触发因素且独立
+  视角确有收益时才派一次定向复核。`risk=high` 恒走 G4，门禁不变。正式 REVIEW 仍要求用户
+  明确授权。`start --risk` 接受 `low|medium|high`（`normal` 兼容映射到 `medium`），
+  `review-admission` 输出 `tier` 与风险准入/重入结论。
+- **工具请求不等于执行**：`host_records.tool_execution_state()` 把宿主记录分为
+  `completed`/`denied_not_executed`/`executed_failed`/`execution_unknown`；只有策略拒绝
+  错误码且零时长/零输出/无退出码才认定未执行。`g4_attest`、`native_agent review` 与
+  `capability` 统一使用该判定。
+- **Bash 拒绝不再使复核失效**：plan 模式拒绝 Bash 等“请求但未执行”的记录不计入 G4 工具
+  白名单违规、不触发只读检查、不消耗 attempt；原会话继续用 `Read/Grep/Glob`。实际执行
+  Bash/Write/Edit 仍不合格；状态未知 fail-closed；重复拒绝记录
+  `repeated_denied_calls`。
+- **未放宽**：G1–G4、fail-closed、attempt/宿主记录绑定、证据与 PWW 接受规则不变。
+
+v6.9.0 优化 Agent 调度与原生子代理集成：
+
+- **调度策略落地**：主代理直接执行为默认；`Explore` 只做独立只读调查；`general-purpose`
+  只承担边界清晰、可独立交付且并行收益明显的工作。新增五问决策清单与
+  `copilot_dispatch.py agent-policy`（只读建议，不是门禁）；不设调用比例、预算或强制协作。
+- **内置能力基线（ZCode 3.18.2）**：`Explore` 工具集含 `Bash`（`read_only=0`）、
+  `injectAgentsMd=false`；`general-purpose` 为 `tools=["*"]` 并继承 MCP。宿主没有按派发
+  覆盖工具的参数，也没有 OS 级只读沙箱。
+- **G4 不放宽**：仍要求宿主精确 `Read/Grep/Glob` + 禁用 `Write/Edit/Bash`；内置 Explore 与
+  general-purpose 都不合格。新增
+  `native_agent.py capability --metadata ...` 只读诊断实际权限与 G4 资格；无法满足时
+  fail-closed 并如实报告能力缺口，不伪造 PASS。
+- **Profile 根因收敛**：宿主在会话启动时从 user/project 目录加载 Profile 并在会话内缓存；
+  旧 user `reviewer`（含 Bash）或内置 Explore/general-purpose 会产生
+  `profile_tools_not_exact`；未知类型返回 `UNKNOWN_AGENT_TYPE`，不会静默回退。
+- **失败与持续推进**：子代理不可用/返回 PARTIAL 时主代理继续；不原样重复失败派发；普通任务
+  不因 Profile 加载失败而 BLOCKED；G4 能力缺口与业务源码缺陷分开报告。
+- **未放宽**：G1–G4、fail-closed、attempt/宿主记录绑定、证据与 PWW 接受规则不变。
+
+v6.8.0 收敛独立复核效率：
+
+- **风险准入**：新增 `review-admission`；高风险恒需 G4，普通风险默认不派 Reviewer，声明
+  `security`/`core-logic`/`data-integrity` 等触发因素才建议复核；纯文档/格式调整不复核。
+- **一次完整复核 + 定向复验**：PASS 写入 `review_stops`；同一目标/代码范围拒绝重复
+  attempt；文档级变化返回 `review_not_needed_docs_only`；代码/目标变化必须声明
+  `blocking-fix`/`major-fix`/`code-changed` 等重入触发并记录 `review_admissions`。
+- **Finding 台账**：稳定 `F1..Fn`、跨轮去重、`open→fixed→verified→closed` 生命周期与
+  证据要求；未闭合 blocking/major 阻断 G4/G2，minor/info 不阻断；已修复未验证派生
+  `AUTO-VERIFY-<F>` 做定向测试，不重跑完整复核。
+- **调度幂等与失败恢复**：同一快照的未消费 attempt 直接复用；`derive_work` 不复制
+  `pending`/`running` 的同一缺口；派发失败不无限重试；上下文恢复沿用现有 attempt。
+- **度量**：`review-metrics` 新增 `full_reviews`、`incremental_reviews`、
+  `review_admissions_total`、`review_stops_total`、`rereported_findings`、
+  `incremental_new_blocking/major`、`no_information_reviews`、首次完整复核与总耗时。
+- **未放宽**：G1–G4、fail-closed、attempt 绑定、宿主记录、证据与 PWW 接受规则不变。
+
+v6.7.1 修复报告替代与代码范围绑定：
+
+- **替代关系**：新增 `supersedes_report_id`、`resolved_warning_ids`、
+  `resolved_residual_risk_ids`；新报告必须明确替代当前报告，旧未解决 W/R 必须继承或
+  在 subject 一致时声明解决，否则拒绝；未解决项沿替代链保留，PASS 不能携带未解决警告。
+- **代码范围**：`code_scope_capture.py` 在 verify 时先于报告生成 `commit`/`dirty`/
+  `code_scope_sha256`；声明摘要进入 `report_sha256`，接入时重算并绑定，G2 收口前再次
+  重算，代码漂移拒绝收口。Copilot 保存的 `code_scope` 标注为 ingest 重算，不冒充生成
+  时刻；纯文档报告不要求快照。
+- **工作区身份**：`start --workspace` 绑定任务工作区，未绑定时从证据/合同/派发上下文
+  唯一派生；`report --workspace` 必须一致，未绑定或指向其他仓库失败关闭；工作区进入
+  接受绑定。提供 `--workspace` 时报告必须声明代码字段，纯文档报告省略工作区。
+- **历史兼容**：v6.7.0 报告按旧载荷重算摘要（缺少 `generated_at` 时不写空串），兼容旧/
+  过渡绑定口径与缺少 `acceptance_history` 的历史接受记录；真实 v6.7.0 状态已验证。
+- **G2**：替代链、覆盖完整性、代码快照与接受记录一致性全部纳入检查；PASS 绑定变化报
+  `quality_binding_stale`，G4 仅排除未跟踪证据产物，原有 PWW 接受与原始结论保留规则不变。
+
+v6.7.0 建立 PWW 自动治理：
+
+- **报告接入即识别**：verify 结构化质量报告（`copilot-verify-result/v1`）经
+  `report --verify-report` 接入；只认标记 + JSON 结构，缺字段、正文关键词、校验失败一律
+  fail-closed。
+- **自动接受条件**：PWW 自动创建用户接受完成条件并绑定报告摘要、W/R 集合、目标快照与合同；
+  重复接入幂等，新报告替代旧报告时原接受不继承。
+- **G2 强制与用户边界**：未接受/部分接受/绑定失效/最新结论非 PASS 时拒绝收口；只有
+  `accept --by user` 能登记接受，部分接受保持 pending；执行方不得代替用户。
+- **原始结论分离**：`closure.verdict` 保留 `pass_with_warnings`，`closure.quality` 与
+  `quality` 命令记录原始 verdict、接受范围与时间，不改写为 PASS。
+
+v6.6.1 把工作区里最后一个
+Reviewer 专用文件改为通用只读权限载体：
+
+- **Profile 通用化**：`.zcode/agents/reviewer.md` → `.zcode/agents/independent-readonly.md`，
+  只声明宿主只读权限（`tools=[Read,Grep,Glob]`、禁用 `Write/Edit/Bash`、无 skills/MCP），
+  不再包含 Reviewer 身份、复核流程、输出契约或生命周期；同一个子代理既可用于普通只读
+  调查，也可用于独立复核。
+- **输出契约随派发走**：`review-json/v2` 的格式要求写在主 Agent 的派发 prompt 里，不再由
+  Profile 承担；G4 判定、Session/attempt/证据绑定与 fail-closed 不变。
+- **调用策略归主 Agent**：是否派生子代理、派几个、是否需要复核由 ZCode 主 Agent 按风险
+  自主决定；Copilot 只做状态治理与取证，不维护 Reviewer 生命周期。
+
+v6.6 把复核方身份与权限证据解耦：
+
+- **有效权限取代 Profile 身份**：复核资格只看宿主 `profileSnapshot` 派生的有效工具策略
+  （`tools=[Read,Grep,Glob]`、禁用 `Write/Edit/Bash`、无 skills/MCP）；Profile 名称、来源
+  与路径只作记录事实，不再参与 G4 判定。缺少策略证据时失败关闭。
+- **范围**：`native_bridge`/`native_agent`/`governance`/`test_execution`/`g4_attest`/
+  `g4_shadow` 同步改为策略判定；执行方只读 Profile 一律拒绝（`executor_profile_readonly`）。
+- **保留**：宿主 `tools` 白名单仍是唯一可证明的只读约束；工作区通用只读 Profile
+  （v6.6.1 起为 `independent-readonly.md`）在原生接口支持按派发指定工具前仍保留。
+
+v6.5 完成正式 G4 切换与旧 Reviewer 体系退役：
+
+- **正式 G4 切换**：`copilot_auto._ingest_review` 只在 `risk=high`、`g4_shadow` 状态
+  `attested` 且新链 eligible 时写入正式 `g4_eligible=true`/`g4_source="candidate"`；
+  `governance` 拒绝没有 candidate 来源的旧记录。信封自报 `g4_eligible` 不再生效。
+- **旧机制退役**：删除旧全局 `agents/reviewer.md` 与运行时副本，复核只使用工作区级
+  只读 Profile（Read/Grep/Glob，无 Bash）；删除 Bash 白名单、rollout 强依赖、旧会话/
+  宿主记录重复校验入口与重复证据计算；`sync_runtime` 不再分发任何 Profile。
+- **合同测试策略**：高风险任务必须显式声明 `test_policy`；合同命令/报告/产物进入合同
+  指纹与 binding，调用方只能加严；测试证据按四层判定，只有当前合同显式不要求测试时
+  才接受 N/A。
+- **保留**：G1–G4 标准、fail-closed、attempt 绑定、原始输出持久化与一次性消费均不降低；
+  历史 attestation 与旧台账只读保留。
+
+v6.4 基于《测试体系与独立复核机制过度设计专项审计报告》的真实任务证据，只做三项 P1 收敛：
+
+- **BLOCKED 受控写入**：允许在阻塞期间登记证据、工作项结果、条件核销、报告、判断、额外
+  阻塞与已授权正式 REVIEW；不自动解除阻塞，不改变合同/授权，`close` 仍拒绝；`plan`、
+  `decide`、`evidence --drop` 继续拒绝。
+- **复核顺序与 PASS 收口**：最终 G4 复核前先稳定条件、证据与摘要，派发前读取
+  `review-context` warnings；PASS 后 minor/info 记录为 findings/residual_risks，不修改已
+  通过证据重开完整复核；后续实质变化必须重新判断原 PASS 是否仍覆盖新快照。
+- **正式 REVIEW amendment**：原始结论只登记一次；非实质修订用 `--amend` 追加，目标摘要
+  变化时拒绝并必须用 `--supersedes` 登记新结论；原始记录、授权快照与结论不被覆盖，
+  `review-metrics` 分别统计有效/已 superseded/amendment。
+- **G2 完整代码范围与真实宿主绑定**：`review-context --create-attempt` 同时冻结 git 工作区
+  的代码范围（tracked/untracked/新增/删除/重命名）；G2、`review --attempt`、ingest 与 G4
+  都重算代码快照，未登记源码变化按 fail-closed 拒绝。真实宿主 metadata 的
+  `createdAt`/`prompt`/`workspaceRoot` 与 attempt 绑定，旧会话/旧工作区不能复用。
+
+v6.3 基于 10 个真实任务的复核复盘（ad-strategy 7 轮复核、Honor 7 次 G4 尝试、review-perf
+4 次正式 REVIEW、gromore / 腾讯 / journey 等）收敛“无效评审多、重复取证”的机制问题：补齐
+真实只读命令白名单（`git rev-list` / `git cat-file` / `git ls-tree` / `paste` 等）与危险
+长选项缩写拒绝，`&&` 与 `;`/`|` 同等串联只读命令；放宽围栏 JSON 解析的真实变体；finding
+增加稳定 ID/根因/状态/去重；新增 `review-context`、`review-metrics` 与无效信封审计；
+执行证据漂移进入收口提醒。**v6.5 起 Reviewer 无 Bash，上述命令白名单与 `preflight-commands`
+已随旧机制一并退役；本节只作版本沿革。**
+G1–G4、证据完整性、宿主记录与 fail-closed 语义未放宽；新增能力不扩大任何授权。
+v5.x 及以前的 SOL 决策通道、轮次/预算状态机与远程 REVIEW 裁决已退役；历史文档保留但明确
+标注为历史，不再作为当前规则。协作语义基线是 ChatGPT 自定义指令（唯一权威）与用户级
+`AGENTS.md`；本 Skill 只维护轻量治理规则，不保存其副本、不维护版本映射，按规则变化做
+增量同步。
 
 ## 2026-11-11：SOL 指令拆分与 REVIEW 历史证据投影（已退役实现）
 

@@ -151,6 +151,13 @@ BLOCKED/PASS 规避上限、以及新回合先 `status --json` 核实再继续�
 排查时可设 `COPILOT_STOP_GUARD_LOG=<path>`，每次判定追加一行 JSON（退出码、工作区、
 会话、任务与阶段），默认不写任何文件。
 
+**恢复注入（`SessionStart`，`resume|compact`）**：`copilot_stop_guard.py session-start` 处理
+`SessionStart` 事件；只在 `source=resume|compact` 时工作（`startup`/`clear` 静默），只对本会话
+已绑定的任务输出一段只读快照：任务 id、阶段与原因、未闭合条件、下一条命令、可粘贴续接命令，
+并提示先核实现场、复用已完成工作与已登记证据。它不绑定任务、不写 state/session、不消费
+Stop 次数；无绑定任务、文件损坏或输入非法时一律静默退出 0（fail-open），不阻断会话启动。
+安装/卸载与 Stop 守卫共用同一命令，同时覆盖两个事件。
+
 `closure-check` 的退出码与结论一致：PASS=0、FAIL=1（`--json` 同样），避免“检查过”被误当
 “通过”。
 

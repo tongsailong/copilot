@@ -24,8 +24,14 @@ Copilot 的 `EXIT_CONTINUE=10` 只是命令退出码，模型可以忽略它并�
 
 只读任务状态、不调用模型。退出码：0 放行，2 要求续跑。
 
+恢复注入（SessionStart）只覆盖上下文真正丢失的事件：`source=resume|compact`。它只向
+绑定当前会话、且 `continuation.required=true` 的任务提供一段只读快照（阶段、未闭合条件、
+可粘贴的续接命令），不绑定新任务、不写状态、不消费 Stop 次数；任何异常一律退出 0 且不注入，
+不阻断会话启动。
+
 用法：
   copilot_stop_guard.py                     # Stop 钩子模式（stdin 读事件 JSON）
+  copilot_stop_guard.py session-start       # SessionStart 恢复注入（stdin 读事件 JSON）
   copilot_stop_guard.py status [--workspace DIR] [--session ID]
   copilot_stop_guard.py config [--workspace DIR]
   copilot_stop_guard.py install --workspace DIR [--apply]
@@ -64,6 +70,14 @@ SESSION_ENV_KEYS = ("ZCODE_SESSION_ID", "CLAUDE_SESSION_ID", "CLAUDE_CODE_SESSIO
 MAX_CONTINUATIONS = 3
 # 宿主把 stderr 截断到 4000 字符作为继续原因。
 REASON_LIMIT = 3900
+# SessionStart 只在这些事件注入恢复快照：resume/compact 是上下文真正丢失的时点。
+# startup 不推断旧任务的归属（避免把无关会话引向旧任务），clear 尊重用户的清空动作。
+SESSION_START_SOURCES = ("resume", "compact")
+SESSION_START_MATCHER = "resume|compact"
+SESSION_START_LIMIT = 1600
+SESSION_START_MAX_TASKS = 2
+SESSION_START_OPEN = "<copilot-session-recovery>"
+SESSION_START_CLOSE = "</copilot-session-recovery>"
 
 
 def _env_off() -> bool:
@@ -179,6 +193,15 @@ def _recorded_sessions(task_dir: str) -> tuple[set[str], str]:
     return ids, ""
 
 
+def _unmet_criteria(state: dict) -> list[str]:
+    """未闭合完成条件（只读，用于恢复快照；不改写条件状态）。"""
+    criteria = (state.get("contract") or {}).get("criteria") or []
+    return [str(item.get("criterion_id") or "") for item in criteria
+            if isinstance(item, dict)
+            and str(item.get("status") or "") != "met"
+            and str(item.get("criterion_id") or "")]
+
+
 def collect(root: str, *, session: str = "") -> tuple[list[dict], list[dict]]:
     """返回 (要求续跑的任务, 异常)。
 
@@ -248,6 +271,7 @@ def collect(root: str, *, session: str = "") -> tuple[list[dict], list[dict]]:
             "derivable": list(cont.get("derivable") or []),
             "blocked_items": list(cont.get("blocked_items") or []),
             "unattributed_criteria": list(cont.get("unattributed_criteria") or []),
+            "unmet_criteria": _unmet_criteria(state),
             "next_command": cont.get("next_command") or "",
             "updated": str(state.get("updated") or ""),
             "binding": binding,
@@ -436,6 +460,82 @@ def cmd_check() -> int:
                          continued=continued))
 
 
+def _session_start_text(rows: list[dict], anomalies: list[dict] | None = None) -> str:
+    """恢复快照：只给定位阶段与续接入口所需的信息，不复制任务正文。"""
+    lines = [
+        SESSION_START_OPEN,
+        "上下文恢复快照（Copilot 只读状态；不是用户新指令，也不是完成证明）。",
+    ]
+    for row in rows[:SESSION_START_MAX_TASKS]:
+        lines.append(f"- 任务 {row['task_id']} · 阶段 {row['phase']} · "
+                     f"{row['reason'] or '仍有未完成工作'}")
+        if row["unmet_criteria"]:
+            lines.append("  未闭合条件：" + "、".join(row["unmet_criteria"]))
+        if row["next_command"]:
+            lines.append("  下一步命令：" + row["next_command"].replace(
+                "<state>", row["state_path"]))
+        lines.append("  可粘贴续接命令：" + _resume_command(row))
+    if len(rows) > SESSION_START_MAX_TASKS:
+        lines.append(f"- 另有 {len(rows) - SESSION_START_MAX_TASKS} 个本会话任务要求续跑；"
+                     "用 status 查看。")
+    if anomalies:
+        lines.append(f"- 另有 {len(anomalies)} 处任务状态读取异常；先按 status 的 fix 提示"
+                     "处理，不得忽略，也不得伪造 PASS。")
+    lines.append("先核对现场（阶段、已完成工作项与证据）再继续；已完成工作与已登记证据"
+                 "直接复用，不重做、不重复读取。")
+    lines.append(SESSION_START_CLOSE)
+    text = "\n".join(lines)
+    if len(text) <= SESSION_START_LIMIT:
+        return text
+    tail = "\n...（已截断）\n" + SESSION_START_CLOSE
+    return text[:SESSION_START_LIMIT - len(tail)] + tail
+
+
+def cmd_session_start() -> int:
+    """SessionStart 钩子模式：只读恢复快照；任何异常都放行且不注入。"""
+    try:
+        if _env_off():
+            _log(0, "", note="session-start-env-off")
+            return 0
+        payload, payload_error = _read_payload()
+        if payload_error:
+            _log(0, "", note="session-start-payload-error")
+            return 0
+        source = str(payload.get("source") or payload.get("hook_source") or "").strip().lower()
+        if source not in SESSION_START_SOURCES:
+            _log(0, "", note=f"session-start-skip:{source or 'unknown'}")
+            return 0
+        session = _session_from(payload)
+        if not session:
+            # 无法判定归属时不注入：不把旧任务引向无关会话，也不自动绑定。
+            _log(0, "", note="session-start-no-session")
+            return 0
+        start = _cwd_from_payload(payload)
+        root = find_tasks_root(start)
+        if not root:
+            _log(0, start, note="session-start-no-tasks-dir", session=session)
+            return 0
+        if os.path.exists(os.path.join(root, TASKS_DIR, OFF_MARKER)):
+            _log(0, root, note="session-start-marker-off", session=session)
+            return 0
+        rows, anomalies = collect(root, session=session)
+        bound = [row for row in rows if row["binding"] == "bound"]
+        if not bound:
+            _log(0, root, note=f"session-start-out-of-scope:{len(rows)}", session=session)
+            return 0
+        text = _session_start_text(bound, anomalies)
+        _log(0, root, task_id=bound[0]["task_id"], session=session,
+             note=f"session-start-inject:{source}")
+        print(json.dumps({"hookSpecificOutput": {
+            "hookEventName": "SessionStart",
+            "additionalContext": text,
+        }}, ensure_ascii=False))
+        return 0
+    except Exception as exc:  # noqa: BLE001 - 恢复注入失败不得阻断会话启动
+        _log(0, "", note=f"session-start-error:{type(exc).__name__}")
+        return 0
+
+
 def cmd_status(args) -> int:
     start = args.workspace or os.getcwd()
     root = find_tasks_root(start)
@@ -470,14 +570,33 @@ def _print_runtime_hint() -> None:
               "      先执行 scripts-sync/sync_runtime.py --apply 下发运行时，否则钩子会失败。")
 
 
-def _hook_command() -> str:
-    return 'python3 -B "$HOME/.zcode/skills/copilot/scripts/copilot_stop_guard.py"'
+def _hook_command(*, subcommand: str = "") -> str:
+    suffix = f" {subcommand}" if subcommand else ""
+    return ('python3 -B "$HOME/.zcode/skills/copilot/scripts/copilot_stop_guard.py"'
+            + suffix)
+
+
+def _hook_group(*, subcommand: str = "", matcher: str = "") -> dict:
+    group = {"hooks": [{"type": "command",
+                        "command": _hook_command(subcommand=subcommand),
+                        "timeout": 10}]}
+    if matcher:
+        group = dict({"matcher": matcher}, **group)
+    return group
+
+
+def _install_targets() -> tuple[tuple[str, dict], ...]:
+    """两个事件各一条：Stop 管回合内续跑，SessionStart 只管恢复快照。"""
+    return (
+        ("Stop", _hook_group()),
+        ("SessionStart", _hook_group(subcommand="session-start",
+                                     matcher=SESSION_START_MATCHER)),
+    )
 
 
 def _config_payload() -> dict:
-    return {"hooks": {"enabled": True, "events": {"Stop": [
-        {"hooks": [{"type": "command", "command": _hook_command(), "timeout": 10}]}
-    ]}}}
+    return {"hooks": {"enabled": True, "events": {
+        event: [group] for event, group in _install_targets()}}}
 
 
 def _config_path(workspace: str) -> str:
@@ -559,23 +678,27 @@ def cmd_install(args) -> int:
     hooks = data.setdefault("hooks", {})
     hooks["enabled"] = True
     events = hooks.setdefault("events", {})
-    stop = events.setdefault("Stop", [])
-    command = _hook_command()
-    wanted = {"hooks": [{"type": "command", "command": command, "timeout": 10}]}
-    existing = [group for group in stop if _is_guard_group(group)]
-    if len(existing) == 1 and existing[0] == wanted:
+    changed: list[str] = []
+    removed = 0
+    for event, wanted in _install_targets():
+        groups = events.setdefault(event, [])
+        existing = [group for group in groups if _is_guard_group(group)]
+        if len(existing) == 1 and existing[0] == wanted:
+            continue
+        # 幂等：先移除本守卫在该事件下的旧条目（可能指向过期路径或重复多份），再写一条。
+        kept = [group for group in groups if not _is_guard_group(group)]
+        removed += len(groups) - len(kept)
+        kept.append(wanted)
+        events[event] = kept
+        changed.append(event)
+    if not changed:
         # 重复安装不产生重复 Hook，也不重复备份/改写配置。
-        print(f"已存在 Copilot 续跑守卫：{path}（{_scope_note(path)}）")
+        print(f"已存在 Copilot 续跑守卫与恢复注入：{path}（{_scope_note(path)}）")
         _print_runtime_hint()
         return 0
-    # 幂等：先移除本守卫的旧条目（可能指向过期路径或重复多份），再写一条。
-    kept = [group for group in stop if not _is_guard_group(group)]
-    removed = len(stop) - len(kept)
-    kept.append(wanted)
-    events["Stop"] = kept
     if not args.apply:
         if removed:
-            print(f"{path} 已有 {removed} 条 Copilot 续跑守卫记录，将被收敛为 1 条"
+            print(f"{path} 已有 {removed} 条 Copilot 守卫记录，将被收敛为每事件 1 条"
                   "（未加 --apply，不做修改）")
         else:
             print(f"将写入 {path}（{_scope_note(path)}；未加 --apply，不做修改）：")
@@ -587,9 +710,10 @@ def cmd_install(args) -> int:
         with open(path, "rb") as src, open(backup, "wb") as dst:
             dst.write(src.read())
     _write_config(path, data)
-    print(f"已安装 Copilot 续跑守卫：{path}（{_scope_note(path)}）")
+    print(f"已安装 Stop 续跑守卫与 SessionStart 恢复注入"
+          f"（{SESSION_START_MATCHER}）：{path}（{_scope_note(path)}）")
     if removed:
-        print(f"已收敛 {removed} 条重复/过期记录为 1 条")
+        print(f"已收敛 {removed} 条重复/过期记录为每事件 1 条")
     if backup:
         print(f"原配置备份：{backup}")
     _print_runtime_hint()
@@ -605,17 +729,21 @@ def cmd_uninstall(args) -> int:
     data = _load_config(path)
     hooks = data.get("hooks") or {}
     events = hooks.get("events") or {}
-    stop = events.get("Stop") or []
-    kept = [group for group in stop if not _is_guard_group(group)]
-    if len(kept) == len(stop):
+    removed = 0
+    for event in ("Stop", "SessionStart"):
+        groups = events.get(event) or []
+        kept = [group for group in groups if not _is_guard_group(group)]
+        removed += len(groups) - len(kept)
+        if event in events:
+            events[event] = kept
+    if not removed:
         print(f"未安装 Copilot 续跑守卫：{path}")
         return 0
-    events["Stop"] = kept
     if not args.apply:
-        print(f"将从 {path} 移除 Copilot 续跑守卫（未加 --apply，不做修改）")
+        print(f"将从 {path} 移除 Copilot 续跑守卫与恢复注入（未加 --apply，不做修改）")
         return 0
     _write_config(path, data)
-    print(f"已移除 Copilot 续跑守卫：{path}")
+    print(f"已移除 Copilot 续跑守卫与恢复注入：{path}")
     return 0
 
 
@@ -682,7 +810,9 @@ def main(argv: list[str] | None = None) -> int:
     p_status.add_argument("--workspace", default="")
     p_status.add_argument("--session", default="",
                           help="按指定会话判定归属（默认读 ZCODE_SESSION_ID）")
-    p_config = sub.add_parser("config", help="打印 Stop 钩子配置片段")
+    sub.add_parser("session-start",
+                   help="SessionStart 恢复注入（resume|compact；只读、失败放行）")
+    p_config = sub.add_parser("config", help="打印 Stop/SessionStart 钩子配置片段")
     p_config.add_argument("--workspace", default="")
     p_install = sub.add_parser("install", help="把守卫写入工作区/用户级配置")
     p_install.add_argument("--workspace", default="", help="工作区级：写入 <ws>/.zcode/config.json")
@@ -705,6 +835,8 @@ def main(argv: list[str] | None = None) -> int:
             p.add_argument("--reason", default="", help="为什么放行（必填，审计用）")
             p.add_argument("--by", default="agent", help="谁决定的（默认 agent）")
     args = parser.parse_args(argv)
+    if args.command == "session-start":
+        return cmd_session_start()
     if args.command == "status":
         return cmd_status(args)
     if args.command == "config":
