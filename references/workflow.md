@@ -2,9 +2,9 @@
 
 本文是 Copilot 的**操作层**权威说明：命令、参数、退出码与标准回合流程。
 语义（阶段判定、派生规则、门禁细节）见 `runtime.md`、`review.md`、`agent-bridge.md`。
-除 `sol-think` 与 `sol-review` 外，所有命令都只读写本地任务状态文件，不发起网络或模型
-调用。两个 SOL 命令都是一次调用只发一次请求，不自动重试、不自动二审；THINK 失败只记录
-并降级，不阻断工程推进。
+除 `sol-consult` / `sol-plan` / `sol-review` 外，所有命令都只读写本地任务状态文件，不
+发起网络或模型调用。三个 SOL 命令都是一次调用只发一次请求，不自动重试、不自动二审；
+CONSULT / PLAN 失败只记录并降级，不阻断工程推进。
 
 ## 1. 状态文件
 
@@ -31,9 +31,9 @@ python3 -B scripts/copilot_dispatch.py <子命令> --state <state.json> [参数]
 
 | 子命令 | 用途 | 关键参数 |
 |---|---|---|
-| `start` | 创建任务合同 | `--goal`、`--contract-file`、`--criteria-file`、`--test-policy`/`--test-policy-file`（JSON：`required`/`commands`/`report`/`artifacts`/`require_*`）、`--risk low\|medium\|high`（历史 `normal` 等价 `medium`）、`--backend legacy\|native`、`--task-id`、`--mode`、`--note`、`--workspace`（省略取状态文件所在目录的 git 根）；`--backend` 可选；`risk=high` 不再强制 native |
+| `start` | 创建任务合同 | `--goal`、`--contract-file`、`--criteria-file`、`--task-kind <kind>`（默认 `standard`，简单类型见 `trivial`/`mechanical`/`docs`/`format`）、`--trigger <name>`（可重复，声明 security/permissions/core-logic/...）、`--test-policy`/`--test-policy-file`（JSON：`required`/`commands`/`report`/`artifacts`/`require_*`）、`--risk low\|medium\|high`（历史 `normal` 等价 `medium`）、`--backend legacy\|native`、`--task-id`、`--mode`、`--note`、`--workspace`（省略取状态文件所在目录的 git 根）；`risk=high` 不再强制 native |
 | `plan` | 登记 ZCode 本地计划 | `--plan <plan.json>`（或 stdin）、`--source` |
-| `status` / `next` | 查看阶段、工作项、门禁、下一步 | `--json` |
+| `status` / `next` | 查看阶段、工作项、门禁、下一步与 SOL 建议 | `--json` |
 | `record` | 回填工作项结果 | `--id`、`--status`、`--result`、`--evidence E1`（可重复） |
 | `rerun` | 把已终结工作项重开为 pending（修复后重新验证） | `--id`、`--reason`；旧结果保留在 `rerun_history` |
 | `criterion` | 核销完成条件 | `--id C1`、`--status pending\|met\|not_met`、`--evidence`（`met` 必填） |
@@ -45,9 +45,11 @@ python3 -B scripts/copilot_dispatch.py <子命令> --state <state.json> [参数]
 | `decide` | 记录用户/任务决策 | `--text`、`--source`；**不能替代 PWW 接受** |
 | `block` / `unblock` | 记录/解除真实阻塞 | `block --reason ... --needs ... (--work-item A2 [--work-item A3] [--criterion C2] | --scope task)`；`unblock --reason ... [--block-id B...]`（多条未解除时必须指定）；解除后被冻结工作项自动恢复 `pending` |
 | `closure-check` | 只读检查 G1–G3 | `--json` |
-| `review-admission` | SOL 主动介入建议的单一确定性入口（只读、不写状态、不是门禁）：先算任务复杂度与已有 SOL 覆盖，再结合 G1–G3 给出 `advice.action`（`none`/`reuse`/`think`/`review`）、建议模式与命令 | `--trigger security`（可重复）、`--reason`、`--user-request`、`--review-request`、`--json`；返回 `decision`、`advice`、`complexity`、`recommended_action`/`recommended_mode`/`recommended_phase`、`sol_calls_total` |
-| `sol-think` | SOL 默认认知引擎：材料 + 问题 → 一次请求 → 判断/策略/取舍/风险/优先级/验证信号；建议写入统一 `sol_calls`（`mode=THINK`），不入门禁；失败只登记并降级 | `--materials <file>`、`--question`、`--knowledge-file`、`--dry-run`、`--list`、`--json`、`--timeout`、`--max-output-tokens`、`--audit-log`（默认 `sol-audit.jsonl`）、`--output-dir`；再次调用：`--force --trigger <user-request\|scope-changed\|new-risk\|materials-omitted\|strategy-failed\|major-uncertainty> --reason` |
-| `sol-review` | SOL 零工具单轮独立复核（仅用户明确要求）：材料 → 一次请求 → advisory findings；记录写入统一 `sol_calls` | `--materials <file>`、`--knowledge-file`、`--dry-run`、`--list`、`--json`、`--timeout`、`--max-output-tokens`、`--audit-log`（默认 `sol-audit.jsonl`）、`--output-dir`；再次复核：`--force --trigger ... --reason` |
+| `review-admission` | SOL-first 生命周期建议的单一确定性入口（只读、不写状态、不是门禁）：先算任务类型、复杂度与已有 SOL 覆盖，再给出 `advice.action`（`none`/`reuse`/`consult`/`plan`/`review`）、建议模式、阶段与命令 | `--trigger security`（可重复）、`--reason`、`--user-request`、`--review-request`、`--json`；返回 `decision`、`advice`、`task_kind`、`complexity`、`recommended_action`/`recommended_mode`/`recommended_stage`、`sol_calls_total` |
+| `sol-consult` | SOL 默认认知入口：材料 + 问题 → 一次请求 → 目标理解/问题本质/路线与取舍/风险/调查方向/再咨询条件；建议写入统一 `sol_calls`（`mode=CONSULT`），不入门禁；失败只登记并降级 | `--materials <file>`、`--question`（必填）、`--stage <understanding\|planning\|development\|stage\|closure>`、`--knowledge-file`、`--dry-run`、`--list`、`--json`、`--timeout`、`--max-output-tokens`、`--audit-log`（默认 `sol-audit.jsonl`）、`--output-dir`；再次调用：`--force --trigger <user-request\|scope-changed\|new-risk\|materials-omitted\|strategy-failed\|major-uncertainty\|stage-result> --reason` |
+| `sol-plan` | SOL 调查后规划判断：方案比较、取舍、优先级、阶段目标与验收关注点；记录写入统一 `sol_calls`（`mode=PLAN`） | 参数同 `sol-consult`；省略 `--stage` 时默认 `planning` |
+| `sol-think` | 历史别名：等同 `sol-consult`（`mode=CONSULT`），保留给既有调用方 | 参数同 `sol-consult` |
+| `sol-accept` | 回填主代理对 SOL 建议的采纳结论（事实记录，不改变阶段、G1–G3 或授权） | `--call-id SC...`、`--status accepted\|modified\|rejected`、`--note`、`--reason`、`--decided-by`（默认 `zcode`） |
 | `agent-policy` | Agent 调度建议：主代理默认，Explore/general-purpose 按需（只读、不派发）。判定顺序：子代理不可用 → 主代理；写入冲突 → 主代理；`--research-only` → Explore（绝不交给全工具代理）；独立交付物需并发且有收益才建议 general-purpose；其余 → 主代理 | `--needs-independent-context`、`--parallel`、`--independent-deliverable`、`--write-conflict`、`--saves-time`、`--research-only`、`--subagent-unavailable`、`--json` |
 | `finding` | 查看 / 更新 Finding 台账（不触发复核） | `--list`；`--id F1 --status open\|fixed\|verified\|closed\|regressed\|dropped --evidence E1 --note`；`fixed`/`verified` 必须有证据 |
 | `review-metrics` | 统计统一 SOL 调用流（`sol.calls_total` / `sol.by_mode`）、准入门槛、停止标记与 Finding 计数 | `--state`；历史 G4 数据标记 `g4.retired` |

@@ -130,14 +130,16 @@ class UnifiedRecordTests(FusionBase):
         self.assertNotIn("sol_reviews", state)
         self.assertNotIn("sol_advisories", state)
         self.assertEqual(len(G.list_sol_reviews(state)), 1)
-        self.assertEqual(len(G.list_sol_think_calls(state)), 3)
+        self.assertEqual(len(G.list_sol_consult_calls(state)), 2)
+        self.assertEqual(len(G.list_sol_plan_calls(state)), 1)
         metrics = G.review_metrics(state)
         self.assertEqual(metrics["sol"]["calls_total"], 4)
-        # 历史 PLAN 归入 THINK：同一份认知结论，不按旧模式重复计数。
+        # CONSULT / PLAN / REVIEW 各自独立计数；历史 THINK 归入 CONSULT。
         self.assertEqual(metrics["sol"]["by_mode"],
-                         {"REVIEW": 1, "THINK": 3})
-        self.assertEqual(metrics["sol_think"]["completed"], 2)
-        self.assertEqual(metrics["sol_think"]["failed"], 1)
+                         {"CONSULT": 2, "PLAN": 1, "REVIEW": 1})
+        self.assertEqual(metrics["sol_cognitive"]["consult_total"], 2)
+        self.assertEqual(metrics["sol_cognitive"]["plan_total"], 1)
+        self.assertEqual(metrics["sol_cognitive"]["failed"], 1)
 
     def test_record_ids_are_unified(self):
         record = G.record_sol_call(self.state_path, think_record("THINK"),
@@ -149,7 +151,7 @@ class UnifiedRecordTests(FusionBase):
                                    think_record("PLAN"),
                                    mode="PLAN")
         self.assertEqual(G.sol_call_mode(legacy), "PLAN")
-        self.assertEqual(G.sol_ref_mode(legacy), "THINK")
+        self.assertEqual(G.sol_ref_mode(legacy), "PLAN")
 
     def test_legacy_records_stay_readable(self):
         """v8.1 及更早的任务状态只读兼容：不迁移、不改写、不重复计数。"""
@@ -167,16 +169,17 @@ class UnifiedRecordTests(FusionBase):
                          ["SRlegacy", "SAlegacy"])
         self.assertEqual(G.sol_call_mode(merged[0]), "REVIEW")
         self.assertEqual(G.sol_call_mode(merged[1]), "PLAN")
-        self.assertEqual(G.sol_ref_mode(merged[1]), "THINK")
+        self.assertEqual(G.sol_ref_mode(merged[1]), "PLAN")
         self.assertEqual(len(G.list_sol_reviews(state)), 1)
-        self.assertEqual(len(G.list_sol_think_calls(state)), 1)
+        self.assertEqual(len(G.list_sol_consult_calls(state)), 0)
+        self.assertEqual(len(G.list_sol_plan_calls(state)), 1)
         metrics = G.review_metrics(state)
         self.assertEqual(metrics["sol"]["calls_total"], 2)
         self.assertEqual(metrics["sol"]["verdicts"]["partial"], 1)
         admission = G.review_admission(state)
         self.assertEqual(admission["sol_calls_total"], 2)
-        # 历史 PLAN 记录按 THINK 计入覆盖：升级后不重复付费。
-        self.assertEqual(admission["sol_calls_by_mode"]["THINK"], 1)
+        # 历史 PLAN 记录按 PLAN 计入覆盖：任何已有认知结论都不重复付费。
+        self.assertEqual(admission["sol_calls_by_mode"]["PLAN"], 1)
         # 单轮复用也能命中历史结论，避免升级后重复付费。
         legacy = merged[0]
         decision = SR.single_round_decision(
@@ -227,11 +230,11 @@ class SharedContextTests(FusionBase):
         self.assertIn(eid, prompt)
         self.assertIn(f"支持 {cid}", prompt)
         self.assertIn("本次 Diff 与测试结果", prompt)
-        think = SR.build_prompt(state, "材料", mode="THINK",
+        think = SR.build_prompt(state, "材料", mode="CONSULT",
                                 question="关键风险是什么？")
         self.assertIn("## 本次需要判断的事项", think)
         self.assertIn("关键风险是什么？", think)
-        self.assertIn("## THINK 输出要求", think)
+        self.assertIn("## 输出要求", think)
         self.assertIn("不要包含完整仓库、冗长日志", think)
 
     def test_evidence_injection_is_bounded(self):
@@ -295,27 +298,30 @@ class SharedContextTests(FusionBase):
 
 
 class DeterministicFirstTests(FusionBase):
-    def test_admission_reports_not_needed_until_gates_pass(self):
+    def test_admission_reports_consult_until_gates_pass(self):
         state = G.load_state(self.state_path)
         decision = G.review_admission(state)
         self.assertEqual(decision["decision"], "recommended")  # 风险策略
-        self.assertEqual(decision["recommended_action"], "not_needed")
+        self.assertEqual(decision["recommended_action"], "recommended")
+        self.assertEqual(decision["recommended_mode"], "CONSULT")
         self.assertFalse(decision["gates"]["passed"])
         self.assertTrue(decision["gates"]["codes"]["G2"])
 
-    def test_admission_returns_optional_think_after_gates_pass(self):
-        """收口阶段不再自动建议 REVIEW：高风险只在未认知时给可选 THINK。"""
+    def test_admission_returns_closure_consult_after_gates_pass(self):
+        """收口阶段不再自动建议 REVIEW：高风险在未认知时给一次收口 CONSULT。"""
         self.plan_and_close_actions()
         state = G.load_state(self.state_path)
         self.assertTrue(G.closure_check(state)["passed"])
         decision = G.review_admission(state)
-        self.assertEqual(decision["recommended_action"], "optional")
-        self.assertEqual(decision["recommended_mode"], "THINK")
+        self.assertEqual(decision["recommended_action"], "recommended")
+        self.assertEqual(decision["recommended_mode"], "CONSULT")
+        self.assertEqual(decision["recommended_stage"], "closure")
         self.assertTrue(decision["gates"]["passed"])
 
     def test_low_risk_task_needs_no_sol(self):
         state = G.load_state(self.state_path)
         state["risk"] = "low"
+        state["task_kind"] = "trivial"
         decision = G.review_admission(state)
         self.assertEqual(decision["recommended_action"], "not_needed")
 
@@ -364,10 +370,10 @@ class DeterministicFirstTests(FusionBase):
             knowledge_file="")
         out = io.StringIO()
         with mock.patch.object(
-                SR, "run_think",
+                SR, "run_consult",
                 side_effect=SR.SolQuotaError("sol_quota", "429")), \
                 contextlib.redirect_stdout(out):
-            code = CD.cmd_sol_think(args)
+            code = CD.cmd_sol_consult(args)
         self.assertEqual(code, 0)
         degraded = json.loads(out.getvalue())
         self.assertEqual(degraded["status"], "unavailable")
@@ -375,7 +381,7 @@ class DeterministicFirstTests(FusionBase):
         state = G.load_state(self.state_path)
         failed = [item for item in G.iter_sol_calls(state)
                   if item.get("status") == "failed"]
-        self.assertEqual(failed[0]["mode"], "THINK")
+        self.assertEqual(failed[0]["mode"], "CONSULT")
         self.assertEqual(failed[0]["error"], "sol_quota")
         self.assertEqual(G.evaluate(state)["phase"], "PARTIAL")
         self.assertEqual(state.get("blocks") or [], [])
@@ -420,7 +426,7 @@ class RecordPathTests(FusionBase):
     def test_modes_share_audit_file_and_lock(self):
         results = {
             "REVIEW": review_record(reply_text="{}"),
-            "THINK": think_record("THINK", reply_text="{}"),
+            "CONSULT": think_record("CONSULT", reply_text="{}"),
         }
 
         audit_paths: list[str] = []
@@ -437,19 +443,19 @@ class RecordPathTests(FusionBase):
             return call
 
         with mock.patch.object(SR, "run_review", side_effect=fake("REVIEW")), \
-                mock.patch.object(SR, "run_think", side_effect=fake("THINK")):
+                mock.patch.object(SR, "run_consult", side_effect=fake("CONSULT")):
             self.assertEqual(CD.main([
                 "sol-review", "--state", self.state_path, "--materials",
                 self._materials()]), 0)
             self.assertEqual(CD.main([
-                "sol-think", "--state", self.state_path, "--materials",
-                self._materials()]), 0)
+                "sol-consult", "--state", self.state_path, "--materials",
+                self._materials(), "--question", "下一步怎么走？"]), 0)
         self.assertEqual(len(audit_paths), 2)
         self.assertTrue(all(path.endswith("sol-audit.jsonl")
                             for path in audit_paths), audit_paths)
         state = G.load_state(self.state_path)
         self.assertEqual(sorted(item["mode"] for item in state["sol_calls"]),
-                         ["REVIEW", "THINK"])
+                         ["CONSULT", "REVIEW"])
         ids = [item["call_id"] for item in state["sol_calls"]]
         self.assertTrue(all(ident.startswith("SC") for ident in ids))
         # 原始输出文件名必须与统一记录 ID 一致（可按 call_id 直接定位取证）。

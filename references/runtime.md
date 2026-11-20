@@ -6,11 +6,11 @@
 ## 1. 设计原则
 
 - **本地判定**：阶段判定、工作项派生、门禁检查只读状态文件与证据文件，不调用网络、模型或
-  子进程（命令采集只在 CLI 显式请求时执行）。`sol-think` 与 `sol-review` 是仅有的例外：
-  它们由主代理显式调用（THINK 按复杂度建议、REVIEW 由用户明确要求），结果统一写入
-  `sol_calls`（历史 `sol_reviews` / `sol_advisories` 只读兼容），不自动改变阶段、不参与
-  PARTIAL 派生；THINK 也不进入 Finding 台账或 G1–G3。SOL 调用失败只登记真实原因，不产生
-  阻塞或派生工作项。
+  子进程（命令采集只在 CLI 显式请求时执行）。`sol-consult` / `sol-plan` / `sol-review`
+  是仅有的例外：它们由主代理显式调用（CONSULT / PLAN 按生命周期建议、REVIEW 由用户
+  明确要求），结果统一写入 `sol_calls`（历史 `sol_reviews` / `sol_advisories` 只读兼容），
+  不自动改变阶段、不参与 PARTIAL 派生；CONSULT / PLAN 也不进入 Finding 台账或 G1–G3。
+  SOL 调用失败只登记真实原因，不产生阻塞或派生工作项。
 - **PARTIAL 不是终点**：PARTIAL 表示还有工作可做，运行时必须派生下一步，而不是停止或
   等待外部判断。
 - **无人工上限**：没有轮次上限、Token 预算、费用阈值或评审次数限制。唯一的循环保护是
@@ -91,7 +91,7 @@
 - 已有 `pending`/`running` 的 `AUTO-REPLAN` 时，同一缺口不再派生第 4 次同路径尝试，等替代
   路线产出结果；替代路线已结束（`done`/`failed`/`dropped`）而缺口仍未闭合时，派生新的
   `AUTO-REPLAN` 并要求说明上一路线为何未闭合，不由通用 `AUTO-NEXT` 兜底静默续跑。
-- G4 退役后不再派生 `AUTO-G4*`；按复杂度主动建议的是 THINK，REVIEW 只在用户明确要求
+- G4 退役后不再派生 `AUTO-G4*`；按生命周期主动建议的是 CONSULT / PLAN，REVIEW 只在用户明确要求
   时执行；两者都不是阻塞性工作项。
 - 失败/停摆的 `AUTO-C*` 项不再额外派生恢复项，避免同一缺口两份工作单。
 - 派生项带通用约束：不得越过原始授权范围、不得改目标/条件/业务规则、只做缺口需要的最小

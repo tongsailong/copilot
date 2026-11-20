@@ -5,17 +5,25 @@ Copilot 是运行于 ZCode 内的**轻量协作治理 Skill**：用户侧 ChatGP
 调试、测试与验证；Copilot 负责任务合同、完成条件、状态、证据、审计与收口门禁，并用 PARTIAL
 派生持续推进任务；SOL 作为默认认知引擎按需提供判断，用户明确要求时可执行一次独立复核。
 
+**v9.0.0 SOL-first 默认认知引擎**：SOL 恢复为 `CONSULT` / `PLAN` / `REVIEW` 三模式，
+CONSULT 与 PLAN 成为非简单任务的默认认知活动（`THINK` 只作读取别名）。生命周期：
+`start` 声明任务类型 → 起点 CONSULT（理解目标/本质/风险/调查方向）→ 调查后 PLAN
+（方案比较/优先级/阶段目标）→ 新证据或方案失败时动态 CONSULT → 高复杂阶段复盘 →
+收口前一次综合判断；没有硬性次数或 Token 上限，每次必须有明确问题与决策价值。
+`sol-accept` 记录主代理的采纳/修改/否决；`review-metrics` 输出覆盖率、重复率、采纳与
+usage/latency（缺失标 `unavailable`）。简单/机械任务 0 调用；正式 REVIEW 仍只在用户
+明确要求时执行。SOL 零工具、单轮、advisory，不改变阶段、不影响 G1–G3，失败只登记并
+降级（退出码 0）不阻断工程推进。
+
 **v8.5.0 PARTIAL 强制续跑**：`continuation` 判定进入 `next`/`status`/`drive` 以及
 `record`/`rerun`/`criterion`/`report`/`block`/`unblock`；仍有原始授权内的可执行工作时返回
 `EXIT_CONTINUE=10`，阶段报告不再是任务终点。阻塞按工作项成立（`block --work-item`），
 单项缺授权不冻结其余工作；`--criterion` 声明被卡住的条件，`unblock` 自动恢复被冻结项；
 只有全部剩余工作真实受阻时才整体 BLOCKED。G1–G3、SOL 语义与授权边界不变。
 
-**v8.4.0 SOL 默认认知引擎**：CONSULT / PLAN 并入 `sol-think`（`THINK`），只保留一种认知
-调用与一份结构化输出（核心判断、问题本质、推荐策略、关键取舍、主要风险、实施优先级、
-验证信号、再咨询条件）。简单任务 0 调用；中高复杂任务在形成初步理解后建议一次，只有
-升级型新信号或合同修订才追加；REVIEW 只在用户明确要求时执行，不再由风险或收口阶段自动
-派生。THINK 材料上限 120,000 字符，失败只登记并降级（退出码 0），不阻断工程推进。
+**v8.4.0 SOL 默认认知引擎铺垫（历史）**：v8.4 曾把 CONSULT / PLAN 并入单一的 `THINK`
+模式与一份结构化输出；v9 按生命周期重新拆为 CONSULT / PLAN，THINK 保留为读取别名。
+简单任务 0 调用；REVIEW 只在用户明确要求时执行。认知材料上限 120,000 字符。
 
 **知识交接扩展（2026-11-18）**：新增 `scripts/knowledge_handoff.py`，把主 Agent 已实际
 Read 的 Memory/Vault 卡片渲染为带状态、核验时间与必要摘录的交接块；`sol-think` /
@@ -88,7 +96,7 @@ copilot/
 │   ├── governance.py        # 本地治理引擎：合同、状态、阶段、G1–G3、PARTIAL 派生
 │   ├── copilot_dispatch.py  # CLI：任务、计划、证据、收口、SOL 认知/复核、正式 REVIEW、历史只读
 │   ├── copilot_auto.py      # 驱动：drive（推进/工作单/派生）与 ingest（执行信封回填）
-│   ├── sol_review.py        # SOL 两模式（THINK/REVIEW）：请求/解析/审计（唯一远程调用）
+│   ├── sol_review.py        # SOL 三模式（CONSULT/PLAN/REVIEW）：请求/解析/审计（唯一远程调用）
 │   ├── knowledge_handoff.py # 知识交接块：校验 read 摘录来源并渲染 Memory/Vault → SOL/子 Agent
 │   ├── native_bridge.py     # Native Bridge v2 执行信封协议与校验
 │   ├── native_agent.py      # 从宿主运行记录生成正式执行信封

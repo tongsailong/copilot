@@ -84,15 +84,16 @@ class RemoteReviewBoundaryTests(unittest.TestCase):
                            "read_zcode_provider_key"):
                 self.assertNotIn(needle, text, f"{name} 不应包含 {needle}")
 
-    def test_sol_is_advisory_only_with_two_modes(self):
+    def test_sol_is_advisory_only_with_three_modes(self):
         text = source(NETWORK_MODULE)
         self.assertIn("tool_choice", text)
         self.assertIn("gpt-6.2-sol", text)
         # 模型升级必须真正切换，不得保留旧模型名或静默回退。
         self.assertNotIn("gpt-6.1-sol", text)
-        self.assertIn('SOL_MODES = ("THINK", "REVIEW")', text)
-        # CONSULT / PLAN 只作为历史别名读取，不再出现在活动模式集合里。
-        self.assertIn('LEGACY_SOL_MODES = ("CONSULT", "PLAN")', text)
+        self.assertIn('SOL_MODES = ("CONSULT", "PLAN", "REVIEW")', text)
+        # THINK 只作为历史别名读取，不再出现在活动模式集合里。
+        self.assertIn('LEGACY_SOL_MODES = ("THINK",)', text)
+        self.assertIn('COGNITIVE_MODES = ("CONSULT", "PLAN")', text)
         self.assertIn('REASONING_EFFORT = "high"', text)
         self.assertIn("sol_effort_not_pinned", text)
         # DECIDE 不恢复；SOL 不接管工程执行或决策（文案可提退役，但不得成为模式）。

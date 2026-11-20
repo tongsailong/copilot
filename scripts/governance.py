@@ -213,6 +213,9 @@ def _default_state() -> dict:
         "mode": "",
         "note": "",
         "risk": "medium",
+        "task_kind": RP.DEFAULT_TASK_KIND,
+        "task_kind_source": "default",
+        "admission_triggers": [],
         "execution_backend": "legacy",
         "workspace": "",
         "workspace_source": "",
@@ -232,8 +235,9 @@ def _default_state() -> dict:
         "contract": _default_contract(),
         "native_dispatch": None,
         "native_results": [],
-        # SOL 调用记录（THINK / REVIEW，历史 CONSULT / PLAN）统一存放在 `sol_calls`。历史状态里的
-        # `sol_reviews` / `sol_advisories` 继续只读兼容，不再新增默认键，也不回写。
+        # SOL 调用记录（CONSULT / PLAN / REVIEW，历史 THINK 只读兼容）统一存放在
+        # `sol_calls`。历史状态里的 `sol_reviews` / `sol_advisories` 继续只读兼容，
+        # 不再新增默认键，也不回写。
         "sol_calls": [],
         "review_admissions": [],
         "review_stops": [],
@@ -602,6 +606,66 @@ def _git_workspace(path: str) -> str:
     return os.path.realpath(root) if root else ""
 
 
+def _normalize_task_kind(value: object) -> tuple[str, str]:
+    """任务类型归一化；未知类型回落到 standard（非简单，默认进入 SOL 认知流程）。"""
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return RP.DEFAULT_TASK_KIND, "default"
+    if raw not in RP.TASK_KINDS:
+        raise GovernanceError(
+            f"task_kind={value!r} 非法；只能是 {' / '.join(sorted(RP.TASK_KINDS))}。")
+    return raw, "declared"
+
+
+def _normalize_triggers(value: object) -> list[dict]:
+    """声明触发因素；只接受字符串名称，去重保序。"""
+    items: object = value
+    if isinstance(items, str):
+        items = [part for part in items.replace(";", ",").split(",")]
+    if items is None:
+        return []
+    if not isinstance(items, (list, tuple, set)):
+        raise GovernanceError("triggers 必须是字符串数组。")
+    out: list[dict] = []
+    seen: set[str] = set()
+    for item in items:
+        name = str(item or "").strip().lower().replace("_", "-")
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        out.append({"name": name, "source": "declared", "at": now_iso()})
+    return out
+
+
+def _add_triggers(state: dict, triggers: object) -> list[dict]:
+    """把触发因素并入状态；同名只保留首次登记，返回本次新增条目。"""
+    added: list[dict] = []
+    existing = {str(t.get("name") or "") for t in state.get("admission_triggers") or []
+                if isinstance(t, dict)}
+    for item in _normalize_triggers(triggers):
+        if item["name"] in existing:
+            continue
+        existing.add(item["name"])
+        state.setdefault("admission_triggers", []).append(item)
+        added.append(item)
+    return added
+
+
+def add_admission_triggers(path: str, triggers: object, *, source: str = "zcode") -> dict:
+    """登记新的触发因素（新证据/新风险/范围变化等）；不改变任务状态与门禁。"""
+    state = load_state(path)
+    _assert_open(state, "登记 SOL 触发因素", allow_blocked=True)
+    added = _add_triggers(state, triggers)
+    for item in added:
+        item["source"] = str(source or "zcode")[:40]
+    if added:
+        _history(state, "admission_triggers_added",
+                 {"triggers": [t["name"] for t in added]})
+        save_state(path, state)
+    return {"added": [t["name"] for t in added],
+            "triggers": [t["name"] for t in state.get("admission_triggers") or []]}
+
+
 def _task_workspace_info(state: dict, state_path: str = "") -> tuple[str, list[str]]:
     """任务工作区与候选来源；显式绑定优先，否则要求候选唯一。"""
     explicit = _canonical_workspace(state.get("workspace") or "")
@@ -665,7 +729,8 @@ def start_state(path: str, goal: str, *, contract: str = "", criteria: object = 
                 risk: str = "medium", execution_backend: str = "legacy",
                 task_id: str = "", mode: str = "", note: str = "",
                 contract_source: str = "", workspace: str = "",
-                test_policy: dict | None = None) -> dict:
+                test_policy: dict | None = None,
+                task_kind: str = "", triggers: object = None) -> dict:
     if os.path.exists(path):
         raise GovernanceError(f"任务状态已存在：{path}；续跑请直接使用，勿重建。")
     goal = (goal or "").strip()
@@ -685,6 +750,8 @@ def start_state(path: str, goal: str, *, contract: str = "", criteria: object = 
     if backend not in BACKENDS:
         raise GovernanceError(
             f"execution_backend={execution_backend!r} 非法；只能是 {' / '.join(BACKENDS)}。")
+    kind, kind_source = _normalize_task_kind(task_kind)
+    admission_triggers = _normalize_triggers(triggers)
     raw_criteria = criteria if criteria else _criteria_from_text(contract)
     items = _normalize_criteria(raw_criteria)
     policy = _normalize_test_policy(test_policy)
@@ -710,6 +777,9 @@ def start_state(path: str, goal: str, *, contract: str = "", criteria: object = 
         "mode": (mode or "").strip().upper(),
         "note": (note or "").strip(),
         "risk": risk,
+        "task_kind": kind,
+        "task_kind_source": kind_source,
+        "admission_triggers": admission_triggers,
         "execution_backend": backend,
         "workspace": workspace_value,
         "workspace_source": "start" if workspace_value else "",
@@ -731,7 +801,9 @@ def start_state(path: str, goal: str, *, contract: str = "", criteria: object = 
     if source:
         state["contract"]["source"] = source
     _history(state, "task_started", {"task_id": task_id, "risk": risk,
-                                     "execution_backend": backend})
+                                     "execution_backend": backend,
+                                     "task_kind": kind,
+                                     "triggers": [t["name"] for t in admission_triggers]})
     save_state(path, state, expect={"absent": True})
     return state
 
@@ -746,7 +818,8 @@ def _history(state: dict, event: str, detail: dict | None = None) -> None:
 def amend_contract(path: str, *, contract: str = "",
                    criteria: object = None,
                    contract_source: str = "",
-                   test_policy: dict | None = None) -> dict:
+                   test_policy: dict | None = None,
+                   task_kind: str = "", triggers: object = None) -> dict:
     """用户/任务范围内修订合同与完成条件；保留同描述条件的既有核销记录。
 
     BLOCKED 时允许修订：阻塞常常正是因为合同条款不可执行，禁止修订只会逼出
@@ -834,6 +907,14 @@ def amend_contract(path: str, *, contract: str = "",
     source = _contract_source_record(contract_source)
     if source:
         state["contract"]["source"] = source
+    if str(task_kind or "").strip():
+        kind, kind_source = _normalize_task_kind(task_kind)
+        state["task_kind"] = kind
+        state["task_kind_source"] = kind_source
+        _history(state, "task_kind_changed", {"task_kind": kind,
+                                             "source": kind_source})
+    if triggers:
+        _add_triggers(state, triggers)
     _history(state, "contract_amended", {"criteria_sha256": sha})
     save_state(path, state)
     return {"contract_sha256": state["contract_sha256"], "criteria_sha256": sha,
@@ -3426,37 +3507,41 @@ def review_admission(state: dict, *, triggers: list[str] | None = None,
     """SOL 主动介入准入建议（只读，不写状态）。
 
     这是“要不要调用 SOL”的**单一确定性入口**：先用本地 G1–G3 与台账事实判断
-    确定性门禁是否已通过，再结合任务认知复杂度给出一次 `THINK`（默认认知引擎）
-    或用户要求的 `REVIEW` 建议。SOL 是 advisory，不构成收口门禁，也不证明宿主
-    只读权限。
+    确定性门禁是否已通过，再结合任务类型与认知复杂度给出 `CONSULT` / `PLAN`
+    的默认认知建议，或用户要求的 `REVIEW` 建议。SOL 是 advisory，不构成收口
+    门禁，也不证明宿主只读权限。
 
     - `decision`：风险等级策略建议（`not_needed` / `optional` / `recommended`），
       只反映风险与触发因素，保持历史输出兼容。
-    - `advice`：复杂度与覆盖判断（`none` / `reuse` / `think` / `review`）＋
-      建议模式、阶段、新信号与命令提示。
-    - `recommended_action`：`advice.action` 的兼容视图；中高复杂任务在开发阶段
-      会得到 `recommended`（一次主动认知判断），简单任务始终 `not_needed`。
+    - `advice`：生命周期判断（`none` / `reuse` / `consult` / `plan` / `review`）＋
+      建议阶段、新信号、第二轮触发与命令提示。
+    - `recommended_action`：`advice.action` 的兼容视图；非简单任务在启动/规划
+      阶段会得到 `recommended`（默认认知判断），简单任务始终 `not_needed`。
     """
     import sol_review as SR
 
     risk = str(state.get("risk") or "")
-    decision = SR.admission(risk=risk, triggers=triggers, reason=reason)
+    state_triggers = [str(t.get("name") or "")
+                      for t in state.get("admission_triggers") or []
+                      if isinstance(t, dict) and t.get("name")]
+    trigger_values = list(triggers or []) + state_triggers
+    decision = SR.admission(risk=risk, triggers=trigger_values, reason=reason)
     calls = [item for item in iter_sol_calls(state)
              if item.get("status") == "completed"]
     reviews = [item for item in calls if sol_call_mode(item) == "REVIEW"]
-    # 历史 CONSULT / PLAN 记录按 THINK 计入：同一合同只认一次认知调用。
     by_mode = {mode: len([item for item in calls
                           if sol_ref_mode(item) == mode])
                for mode in SOL_MODES}
     target = str(target_sha256 or final_evidence_digest(state))
     check = closure_check(state) if include_gates else None
     advice = RP.sol_advice(
-        state, calls=calls, triggers=triggers,
+        state, calls=calls, triggers=trigger_values,
         gates_passed=bool(check and check["passed"]),
         user_request=user_request, review_requested=review_requested,
         workspace=str(workspace or state.get("workspace") or ""))
     result = {
         **decision,
+        "task_kind": str(state.get("task_kind") or RP.DEFAULT_TASK_KIND),
         "target_sha256": target,
         "sol_calls_total": len(calls),
         "sol_calls_by_mode": by_mode,
@@ -3483,6 +3568,7 @@ def review_admission(state: dict, *, triggers: list[str] | None = None,
         "recommended_action": advice["recommended_action"],
         "recommended_mode": advice["mode"],
         "recommended_phase": advice["phase"],
+        "recommended_stage": advice.get("stage") or "",
     }
     if not include_gates:
         result["recommended_reason"] = advice["reason"]
@@ -3505,10 +3591,10 @@ def review_admission(state: dict, *, triggers: list[str] | None = None,
 # ── SOL 调用记录：单一权威流 `sol_calls` + 历史只读兼容 ──────────────────────
 SOL_CALLS_KEY = "sol_calls"
 LEGACY_SOL_KEYS = ("sol_reviews", "sol_advisories")
-# 新记录只允许 THINK / REVIEW；CONSULT / PLAN 是 v8.4 之前的历史模式，
-# 只用于读取旧状态与旧调用方（写入时仍兼容，但不再产生新流程）。
-SOL_MODES = ("THINK", "REVIEW")
-LEGACY_SOL_MODES = ("CONSULT", "PLAN")
+# v9：SOL 默认认知引擎——CONSULT / PLAN 是一等模式，REVIEW 仍只在用户明确
+# 要求时执行；THINK 是 v8.4–v8.5 的历史模式名，只读兼容并归入 CONSULT。
+SOL_MODES = ("CONSULT", "PLAN", "REVIEW")
+LEGACY_SOL_MODES = ("THINK",)
 RECORD_SOL_MODES = SOL_MODES + LEGACY_SOL_MODES
 
 
@@ -3522,7 +3608,7 @@ def sol_call_id(record: dict) -> str:
 
 
 def sol_call_mode(record: dict) -> str:
-    """记录中实际存储的模式（含历史 CONSULT / PLAN）；缺失时按存放位置判定。"""
+    """记录中实际存储的模式（含历史 THINK）；缺失时按存放位置判定。"""
     mode = str(record.get("mode") or "").upper()
     if mode in RECORD_SOL_MODES:
         return mode
@@ -3530,11 +3616,13 @@ def sol_call_mode(record: dict) -> str:
 
 
 def sol_ref_mode(record: dict) -> str:
-    """记录的认知模式：历史 CONSULT / PLAN 归入 THINK，用于覆盖与计数。"""
+    """规范模式：历史 THINK 归入 CONSULT，用于覆盖与计数。"""
     mode = sol_call_mode(record)
     if mode == "REVIEW":
         return "REVIEW"
-    return "THINK"
+    if mode == "PLAN":
+        return "PLAN"
+    return "CONSULT"
 
 
 def iter_sol_calls(state: dict) -> list[dict]:
@@ -3564,15 +3652,15 @@ def iter_sol_calls(state: dict) -> list[dict]:
 def list_sol_calls(state: dict, *, mode: str = "") -> list[dict]:
     """只读返回统一 SOL 调用记录；`mode` 为空时返回全部模式。
 
-    `mode=THINK` 同时命中历史 CONSULT / PLAN 记录；其他模式按存储值精确匹配。
+    `mode=CONSULT` 同时命中历史 THINK 记录；其他模式按存储值精确匹配。
     """
     rows = iter_sol_calls(state)
     if not mode:
         return rows
     wanted = str(mode).upper()
-    if wanted == "THINK":
-        return [item for item in rows if sol_ref_mode(item) == "THINK"]
-    return [item for item in rows if sol_call_mode(item) == wanted]
+    if wanted == "CONSULT":
+        return [item for item in rows if sol_ref_mode(item) == "CONSULT"]
+    return [item for item in rows if sol_ref_mode(item) == wanted]
 
 
 def list_sol_reviews(state: dict) -> list[dict]:
@@ -3580,25 +3668,35 @@ def list_sol_reviews(state: dict) -> list[dict]:
     return list_sol_calls(state, mode="REVIEW")
 
 
+def list_sol_consult_calls(state: dict) -> list[dict]:
+    """只读返回 CONSULT 记录（含历史 THINK 与失败记录）。"""
+    return list_sol_calls(state, mode="CONSULT")
+
+
+def list_sol_plan_calls(state: dict) -> list[dict]:
+    """只读返回 PLAN 记录（含失败记录）。"""
+    return list_sol_calls(state, mode="PLAN")
+
+
 def list_sol_think_calls(state: dict) -> list[dict]:
-    """只读返回认知判断记录（THINK 与历史 CONSULT / PLAN，含失败记录）。"""
-    return list_sol_calls(state, mode="THINK")
+    """历史名称：v9 起等同 `list_sol_consult_calls`，保留给既有调用方。"""
+    return list_sol_consult_calls(state)
 
 
 def record_sol_call(path: str, call: dict, *, mode: str = "",
                     materials_sha256: str = "", trigger: str = "",
                     reason: str = "") -> dict:
-    """登记一次已完成的 SOL 调用（THINK / REVIEW 共用）。
+    """登记一次已完成的 SOL 调用（CONSULT / PLAN / REVIEW 共用）。
 
     SOL 是建议层：REVIEW 的 findings 以 `advisory` 进入 Finding 台账，主代理
-    逐条核实后修复、定向验证或给出反证；THINK 只留审计记录，不进入台账、
-    不改变完成条件、不影响 G1–G3。历史 CONSULT / PLAN 记录仍可写入（兼容
-    旧调用方），但新流程只产生 THINK。
+    逐条核实后修复、定向验证或给出反证；CONSULT / PLAN 只留审计记录，不进入
+    台账、不改变完成条件、不影响 G1–G3。历史 THINK 记录仍可写入（兼容旧调用
+    方），读取时归入 CONSULT。
     """
     state = load_state(path)
     _assert_open(state, "登记 SOL 调用", allow_blocked=True)
     record = {**call}
-    resolved = str(mode or record.get("mode") or "THINK").upper()
+    resolved = str(mode or record.get("mode") or "CONSULT").upper()
     if resolved not in RECORD_SOL_MODES:
         raise GovernanceError(f"未知 SOL 模式：{resolved}")
     record["mode"] = resolved
@@ -3614,6 +3712,12 @@ def record_sol_call(path: str, call: dict, *, mode: str = "",
                                      or record.get("materials_sha256") or "")
     record["trigger"] = str(trigger or "")
     record["reason"] = str(reason or "")[:1000]
+    record["question"] = str(record.get("question") or "")[:4000]
+    record["stage"] = str(record.get("stage") or "")[:40]
+    record["progress_digest"] = str(record.get("progress_digest") or "")
+    # 采纳状态：未登记时为空，由 record_sol_acceptance 显式回填。
+    if not isinstance(record.get("acceptance"), dict):
+        record["acceptance"] = {"status": "pending"}
     record["created_at"] = str(record.get("completed_at") or now_iso())
     detail = {
         "call_id": record["call_id"],
@@ -3621,6 +3725,7 @@ def record_sol_call(path: str, call: dict, *, mode: str = "",
         "materials_sha256": record["materials_sha256"],
         "prompt_version": str(record.get("prompt_version") or ""),
         "trigger": record["trigger"],
+        "stage": record["stage"],
     }
     if resolved == "REVIEW":
         merge = RP.merge_review(state, record, authoritative=False)
@@ -3645,13 +3750,63 @@ def record_sol_call(path: str, call: dict, *, mode: str = "",
     return record
 
 
-def record_sol_call_failure(path: str, *, mode: str = "THINK",
+def _find_sol_call(state: dict, call_id: str) -> dict:
+    target = str(call_id or "").strip()
+    if not target:
+        raise GovernanceError("必须提供 SOL 记录的 call_id。")
+    for item in state.get(SOL_CALLS_KEY) or []:
+        if isinstance(item, dict) and sol_call_id(item) == target:
+            return item
+    raise GovernanceError(
+        f"当前任务的 sol_calls 中不存在记录：{target}；历史只读记录不接受采纳回填。")
+
+
+ACCEPTANCE_STATUSES = ("accepted", "modified", "rejected", "pending")
+
+
+def record_sol_acceptance(path: str, call_id: str, *, status: str,
+                          note: str = "", reason: str = "",
+                          decided_by: str = "zcode") -> dict:
+    """回填主代理对 SOL 建议的采纳结论（accepted / modified / rejected）。
+
+    采纳结论是事实记录：用于统计与恢复时复用已确认结论，不改变任务阶段、
+    不改变 G1–G3、也不是用户授权。`modified`/`rejected` 应写明理由；`note`
+    记录实际采用的范围（例如只采纳了哪些建议）。
+    """
+    state = load_state(path)
+    _assert_open(state, "登记 SOL 采纳结论", allow_blocked=True)
+    value = str(status or "").strip().lower()
+    if value not in ACCEPTANCE_STATUSES or value == "pending":
+        raise GovernanceError(
+            "采纳结论必须是 accepted / modified / rejected 之一。")
+    record = _find_sol_call(state, call_id)
+    if str(record.get("status") or "") != "completed":
+        raise GovernanceError("只能对已完成的 SOL 调用登记采纳结论。")
+    entry = {
+        "status": value,
+        "note": str(note or "")[:4000],
+        "reason": str(reason or "")[:1000],
+        "decided_by": str(decided_by or "zcode")[:40],
+        "at": now_iso(),
+        "basis": "zcode-judgment",
+    }
+    record["acceptance"] = entry
+    _history(state, "sol_call_acceptance", {
+        "call_id": sol_call_id(record),
+        "mode": sol_call_mode(record),
+        "status": value,
+    })
+    save_state(path, state)
+    return {"call_id": sol_call_id(record), "acceptance": entry}
+
+
+def record_sol_call_failure(path: str, *, mode: str = "CONSULT",
                             error_code: str = "", detail: str = "",
                             materials_sha256: str = "",
                             model: str = "") -> dict:
     """登记一次失败的 SOL 调用；失败不改变任务阶段，也不阻断主代理继续。"""
     state = load_state(path)
-    resolved = str(mode or "THINK").upper()
+    resolved = str(mode or "CONSULT").upper()
     if resolved not in RECORD_SOL_MODES:
         raise GovernanceError(f"未知 SOL 模式：{resolved}")
     record = {
@@ -3689,9 +3844,9 @@ def record_sol_review(path: str, review: dict, *,
 def record_sol_advisory(path: str, advisory: dict, *,
                         materials_sha256: str = "",
                         trigger: str = "", reason: str = "") -> dict:
-    """历史名称：等同 `record_sol_call(mode=THINK|历史模式)`，保留给既有调用方。"""
+    """历史名称：等同 `record_sol_call(mode=CONSULT|历史模式)`，保留给既有调用方。"""
     return record_sol_call(path, advisory,
-                           mode=str(advisory.get("mode") or "THINK"),
+                           mode=str(advisory.get("mode") or "CONSULT"),
                            materials_sha256=materials_sha256,
                            trigger=trigger, reason=reason)
 
@@ -3705,11 +3860,11 @@ def record_sol_review_failure(path: str, *, error_code: str, detail: str = "",
                                    materials_sha256=materials_sha256, model=model)
 
 
-def record_sol_advisory_failure(path: str, *, mode: str = "THINK",
+def record_sol_advisory_failure(path: str, *, mode: str = "CONSULT",
                                 error_code: str = "", detail: str = "",
                                 materials_sha256: str = "",
                                 model: str = "") -> dict:
-    """历史名称：等同 `record_sol_call_failure(mode=THINK|历史模式)`。"""
+    """历史名称：等同 `record_sol_call_failure(mode=CONSULT|历史模式)`。"""
     return record_sol_call_failure(path, mode=mode, error_code=error_code,
                                    detail=detail,
                                    materials_sha256=materials_sha256, model=model)
@@ -4009,7 +4164,9 @@ def review_metrics(state: dict, *, task_dir: str = "") -> dict:
     # 指标口径只有一套，不因历史存放位置不同而重复计数。
     sol_calls = iter_sol_calls(state)
     sol_reviews = [r for r in sol_calls if sol_call_mode(r) == "REVIEW"]
-    think_calls = [r for r in sol_calls if sol_ref_mode(r) == "THINK"]
+    consult_calls = [r for r in sol_calls if sol_ref_mode(r) == "CONSULT"]
+    plan_calls = [r for r in sol_calls if sol_ref_mode(r) == "PLAN"]
+    cognitive_calls = consult_calls + plan_calls
     admissions = [item for item in state.get("review_admissions") or []
                   if isinstance(item, dict)]
     admission_triggers: dict[str, int] = {}
@@ -4062,10 +4219,54 @@ def review_metrics(state: dict, *, task_dir: str = "") -> dict:
     ledger.pop("items", None)
     stops = [item for item in state.get("review_stops") or []
              if isinstance(item, dict)]
+
+    def _acceptance_counts(calls: list[dict]) -> dict:
+        counts = {status: 0 for status in ACCEPTANCE_STATUSES}
+        for item in calls:
+            if str(item.get("status") or "") != "completed":
+                continue
+            value = str((item.get("acceptance") or {}).get("status")
+                        or "pending").lower()
+            if value not in counts:
+                value = "pending"
+            counts[value] += 1
+        return counts
+
+    completed_cognitive = [r for r in cognitive_calls
+                           if str(r.get("status") or "") == "completed"]
+    adoption = _acceptance_counts(cognitive_calls)
+    # 重复调用：带 trigger/reason 的认知调用（同模式第二轮的决策价值声明）。
+    repeated = [r for r in completed_cognitive
+                if str(r.get("trigger") or "").strip()]
+    usage_fields: dict[str, int] = {}
+    latency_ms = 0.0
+    latency_samples = 0
+    for item in completed_cognitive:
+        usage = item.get("usage") if isinstance(item.get("usage"), dict) else {}
+        for key, value in usage.items():
+            if isinstance(value, (int, float)):
+                usage_fields[str(key)] = usage_fields.get(str(key), 0) + int(value)
+        # 调用记录用 `latency_ms`；`duration_ms` 是早期字段，读取时一并兼容。
+        duration = item.get("latency_ms")
+        if duration is None:
+            duration = item.get("duration_ms")
+        if isinstance(duration, (int, float)):
+            latency_ms += float(duration)
+            latency_samples += 1
+    complexity = RP.task_complexity(
+        state, triggers=[str(t.get("name") or "")
+                         for t in state.get("admission_triggers") or []
+                         if isinstance(t, dict)],
+        workspace=str(state.get("workspace") or ""))
+    non_simple = bool(complexity.get("non_simple"))
     return {
-        "schema": "copilot-review-metrics/v1",
+        "schema": "copilot-review-metrics/v2",
         "task_id": str(state.get("task_id") or ""),
         "risk": str(state.get("risk") or ""),
+        "task_kind": str(state.get("task_kind") or RP.DEFAULT_TASK_KIND),
+        "task_kind_source": str(state.get("task_kind_source") or "default"),
+        "complexity": {"level": complexity["level"],
+                       "signals": complexity["signal_codes"]},
         "execution_backend": str(state.get("execution_backend") or ""),
         "closed": bool(closure.get("closed")),
         "review_admissions_total": len(admissions),
@@ -4107,17 +4308,46 @@ def review_metrics(state: dict, *, task_dir: str = "") -> dict:
                 for severity in ("blocking", "major", "minor", "info")},
             "single_round": True,
         },
+        "sol_cognitive": {
+            "non_simple": bool(non_simple),
+            "default_covered": bool(non_simple
+                                    and any(str(r.get("status") or "") == "completed"
+                                            for r in cognitive_calls)),
+            "consult_total": len(consult_calls),
+            "consult_completed": len([r for r in consult_calls
+                                      if r.get("status") == "completed"]),
+            "plan_total": len(plan_calls),
+            "plan_completed": len([r for r in plan_calls
+                                   if r.get("status") == "completed"]),
+            "failed": len([r for r in cognitive_calls
+                           if r.get("status") == "failed"]),
+            "repeated": len(repeated),
+            "repeat_rate": (round(len(repeated) / len(completed_cognitive), 3)
+                            if completed_cognitive else 0.0),
+            "acceptance": adoption,
+            "adopted": adoption["accepted"] + adoption["modified"],
+            "usage": dict(sorted(usage_fields.items())),
+            "latency_ms_avg": (round(latency_ms / latency_samples, 1)
+                               if latency_samples else None),
+            "latency_unavailable": latency_samples == 0,
+            "modes": {
+                mode: len([r for r in cognitive_calls
+                           if r.get("status") == "completed"
+                           and sol_call_mode(r) == mode])
+                for mode in ("CONSULT", "PLAN", "THINK")},
+            "advisory_only": True,
+        },
         "sol_think": {
-            "total": len(think_calls),
-            "completed": len([r for r in think_calls
+            "total": len(consult_calls),
+            "completed": len([r for r in consult_calls
                               if r.get("status") == "completed"]),
-            "failed": len([r for r in think_calls
+            "failed": len([r for r in consult_calls
                            if r.get("status") == "failed"]),
             "modes": {
-                mode: len([r for r in think_calls
+                mode: len([r for r in consult_calls
                            if r.get("status") == "completed"
                            and str(r.get("mode") or "").upper() == mode])
-                for mode in ("THINK", "CONSULT", "PLAN")},
+                for mode in ("THINK", "CONSULT")},
             "advisory_only": True,
         },
         "g4": {
@@ -4804,17 +5034,21 @@ def continuation(state: dict, *, cache: dict | None = None,
 def sol_advice_summary(state: dict, *, gates_passed: bool = False,
                        user_request: bool = False, review_requested: bool = False,
                        triggers: list[str] | None = None) -> dict:
-    """SOL 主动介入建议（只读）：复杂度 + 覆盖 + 新信号，不改变阶段与门禁。
+    """SOL 默认认知建议（只读）：任务类型 + 复杂度 + 覆盖 + 新信号，不改变
+    阶段与门禁。
 
-    简单任务返回 `action=none`；中高复杂任务在形成初步理解后返回一次 `think`
-    建议；已有有效结论且无升级型新信号时返回 `reuse`；`review` 只在用户明确
-    要求时给出。
+    简单任务返回 `action=none`；非简单任务在启动阶段返回 `consult`、在形成现场
+    事实后返回 `plan`；已有有效结论且无升级型新信号时返回 `reuse`；`review` 只在
+    用户明确要求时给出。不设调用次数上限。
     """
+    state_triggers = [str(t.get("name") or "")
+                      for t in state.get("admission_triggers") or []
+                      if isinstance(t, dict) and t.get("name")]
     return RP.sol_advice(
         state,
         calls=[item for item in iter_sol_calls(state)
                if isinstance(item, dict) and item.get("status") == "completed"],
-        triggers=triggers,
+        triggers=list(triggers or []) + state_triggers,
         gates_passed=gates_passed,
         user_request=user_request,
         review_requested=review_requested,
@@ -4832,12 +5066,13 @@ def evaluate(state: dict, *, cache: dict | None = None) -> dict:
         # SOL 建议只是提示：不派生工作项、不改变阶段、不影响门禁。
         advice = sol_advice_summary(state, gates_passed=(phase == "PASS"))
         result["sol"] = advice
-        if advice.get("action") in ("think", "review"):
+        if advice.get("action") in ("consult", "plan", "review", "think"):
             prefix = "可选" if advice.get("recommended_action") == "optional" else "建议"
             command = advice.get("command") or ""
             if command:
+                mode = advice.get("mode") or advice.get("action", "").upper()
                 result.setdefault("next_commands", []).insert(
-                    0, f"{prefix}：{command}（SOL {advice['mode']}，advisory）")
+                    0, f"{prefix}：{command}（SOL {mode}，advisory）")
     # 续跑判定：忽略它不会改变状态，但阶段报告与工作项回填必须据此继续。
     result["continuation"] = continuation(state, cache=cache, evaluation=result)
     return result
@@ -4886,6 +5121,23 @@ def render_status(state: dict, evaluation: dict | None = None, *,
         + (f"；未闭合 {', '.join(criteria.get('unmet') or [])}"
            if criteria.get("unmet") else ""),
     ]
+    sol_calls = [item for item in iter_sol_calls(state)
+                 if isinstance(item, dict)]
+    completed_calls = [item for item in sol_calls
+                       if str(item.get("status") or "") == "completed"]
+    kind = str(state.get("task_kind") or RP.DEFAULT_TASK_KIND)
+    counts = {mode: len([item for item in completed_calls
+                         if sol_ref_mode(item) == mode])
+              for mode in SOL_MODES}
+    accepted = len([item for item in completed_calls
+                    if str((item.get("acceptance") or {}).get("status") or "")
+                    in ("accepted", "modified")])
+    lines.append(
+        f"SOL：{kind}（{state.get('task_kind_source') or 'default'}）· "
+        f"CONSULT {counts['CONSULT']} / PLAN {counts['PLAN']} / "
+        f"REVIEW {counts['REVIEW']} · 采纳 {accepted}"
+        + (f" · 失败 {len([i for i in sol_calls if i.get('status') == 'failed'])}"
+           if any(i.get("status") == "failed" for i in sol_calls) else ""))
     quality = quality_summary(state, cache=cache)
     if quality.get("verdict") == PWW:
         accepted = "、".join(quality.get("accepted_ids") or []) or "无"

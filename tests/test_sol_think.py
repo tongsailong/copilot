@@ -1,20 +1,14 @@
 #!/usr/bin/env python3
-"""v8.4 SOL 默认认知引擎（THINK）契约。
+"""v9 SOL 默认认知引擎（CONSULT / PLAN，历史 THINK 别名）契约。
 
-覆盖本轮的验收不变量：
+覆盖的核心不变量：
 
-1. 简单任务直接执行，不强制调用 SOL；
-2. 复杂任务获得一次 THINK 策略建议（命令可直接执行）；
-3. 不存在固定的 CONSULT / PLAN / REVIEW 链路；
-4. SOL 不承担任何工程工具操作（零工具、无状态写入权）；
-5. SOL 不拥有工程执行与最终技术决策权；
-6. ZCode 可以采纳、调整或否决建议，不产生强制工作项；
-7. 没有新增信息时不重复调用；
-8. 重大新证据可以触发必要的再咨询；
-9. THINK 超时、429 与异常不阻断工程推进；
-10. PARTIAL 继续派生并推进；
-11. G1–G3 保持原样；
-12. 不存在 G4、强制 Reviewer 或自定义子 Agent 回归。
+1. CONSULT / PLAN 是一等认知模式，THINK 只做历史别名；
+2. SOL 零工具、单轮、advisory；
+3. SOL 不拥有工程执行与最终技术决策权；
+4. 没有新增决策价值时不重复调用；
+5. 认知失败只记录并降级，不阻断工程推进；
+6. G1–G3 保持原样，不存在 G4、强制 Reviewer 或自定义子 Agent 回归。
 """
 from __future__ import annotations
 
@@ -43,15 +37,22 @@ CONTRACT = """## 完成条件
 """
 
 
-def think_reply(**overrides) -> str:
+def cognitive_reply(**overrides) -> str:
     payload = {
         "schema": SR.THINK_SCHEMA,
         "judgment": "先补定向测试再合并",
+        "goal_understanding": "交付可复核、可回归的结果",
         "essence": "风险集中在缺少验证",
         "strategy": "一次定向测试锁定行为",
+        "alternatives": ["直接合并", "先灰度再合并"],
         "tradeoffs": ["灰度更慢但回滚面更小"],
         "risks": ["缺少集成测试"],
         "priority": ["P1 验证", "P2 合并"],
+        "investigation": ["读取现有测试基线"],
+        "phase_goals": ["第一阶段锁定行为"],
+        "assumptions": ["单进程写入"],
+        "omissions": ["未覆盖并发场景"],
+        "decisions": ["是否接受灰度成本"],
         "verify": ["定向测试覆盖关键分支"],
         "reconsult": ["出现并发写入"],
         "unverified": [],
@@ -84,10 +85,11 @@ class ThinkBase(unittest.TestCase):
         with open(self.materials, "w", encoding="utf-8") as fh:
             fh.write("## 已确认事实\n- 单进程写入\n\n## 本次问题\n风险在哪？\n")
 
-    def start(self, *, risk: str = "medium") -> None:
+    def start(self, *, risk: str = "medium", kind: str = "feature") -> None:
         G.start_state(
             self.state_path, goal="交付可复核结果", contract=CONTRACT,
             risk=risk, task_id="sol-think", workspace=self.dir,
+            task_kind=kind,
             test_policy={"required": False} if risk == "high" else None)
 
     def plan(self, actions: int, *, deps: bool = False) -> None:
@@ -119,54 +121,58 @@ class ThinkBase(unittest.TestCase):
     def advice(self, **kwargs) -> dict:
         return G.sol_advice_summary(G.load_state(self.state_path), **kwargs)
 
-    def cli_think(self, *extra: str):
-        return F.run_cli("copilot_dispatch.py", "sol-think", "--state",
+    def cli_consult(self, *extra: str):
+        return F.run_cli("copilot_dispatch.py", "sol-consult", "--state",
                          self.state_path, "--materials", self.materials,
-                         *extra)
+                         "--question", "风险在哪？", *extra)
 
 
-class RoutingTests(ThinkBase):
-    def test_simple_task_stays_zero_call(self):
-        self.start(risk="low")
-        self.plan(1)
-        self.evidence()
-        advice = self.advice()
-        self.assertEqual(advice["action"], "none")
-        self.assertEqual(advice["mode"], "")
-        evaluation = G.evaluate(G.load_state(self.state_path))
-        self.assertFalse([cmd for cmd in evaluation.get("next_commands") or []
-                          if "sol-" in cmd])
+class ModeContractTests(ThinkBase):
+    def test_modes_are_consult_plan_review(self):
+        self.assertEqual(SR.SOL_MODES, ("CONSULT", "PLAN", "REVIEW"))
+        self.assertEqual(SR.COGNITIVE_MODES, ("CONSULT", "PLAN"))
+        self.assertEqual(SR.normalize_mode("THINK"), "CONSULT")
+        self.assertEqual(SR.normalize_mode("consult"), "CONSULT")
+        self.assertEqual(SR.normalize_mode("plan"), "PLAN")
+        self.assertEqual(G.SOL_MODES, ("CONSULT", "PLAN", "REVIEW"))
+        self.assertEqual(G.LEGACY_SOL_MODES, ("THINK",))
 
-    def test_complex_task_gets_one_think_with_command(self):
-        self.start(risk="high")
-        self.plan(5, deps=True)
-        self.evidence(modules=2, count=2)
-        advice = self.advice()
-        self.assertEqual(advice["action"], "think")
-        self.assertEqual(advice["mode"], "THINK")
-        self.assertEqual(advice["recommended_action"], "recommended")
-        self.assertIn("sol-think", advice["command"])
-        self.assertIn("--question", advice["command"])
+    def test_legacy_think_records_are_read_as_consult(self):
+        self.start()
+        state = G.load_state(self.state_path)
+        state["sol_calls"] = [{
+            "call_id": "SCold", "mode": "THINK", "status": "completed",
+            "contract_sha256": state.get("contract_sha256"),
+            "completed_at": G.now_iso()}]
+        G.save_state(self.state_path, state)
+        state = G.load_state(self.state_path)
+        self.assertEqual(G.sol_ref_mode(state["sol_calls"][0]), "CONSULT")
+        self.assertEqual(len(G.list_sol_consult_calls(state)), 1)
+        self.assertEqual(len(G.list_sol_calls(state, mode="PLAN")), 0)
 
-    def test_no_fixed_consult_or_plan_chain(self):
-        """CONSULT / PLAN 不再是可选命令面；旧名称只做历史别名归一。"""
-        self.start(risk="high")
-        self.assertEqual(SR.SOL_MODES, ("THINK", "REVIEW"))
-        self.assertEqual(SR.normalize_mode("CONSULT"), "THINK")
-        self.assertEqual(SR.normalize_mode("PLAN"), "THINK")
+    def test_sol_advisory_command_is_removed(self):
+        self.start()
         with self.assertRaises(SystemExit):
             with contextlib.redirect_stderr(io.StringIO()):
                 CD.main(["sol-advisory", "--state", self.state_path,
                          "--materials", self.materials])
-        # 建议动作只有 none / reuse / think / review。
-        state = G.load_state(self.state_path)
-        actions = {RP.sol_advice(state)["action"] for _ in range(1)}
-        self.assertTrue(actions <= {"none", "reuse", "think", "review"})
+
+    def test_mode_instructions_are_distinct_and_zero_tool(self):
+        self.assertIn("咨询", SR.CONSULT_INSTRUCTIONS)
+        self.assertIn("规划", SR.PLAN_INSTRUCTIONS)
+        self.assertNotEqual(SR.CONSULT_INSTRUCTIONS, SR.PLAN_INSTRUCTIONS)
+        for mode in ("CONSULT", "PLAN", "REVIEW"):
+            payload = SR.build_payload("材料", mode=mode)
+            self.assertNotIn("tools", payload)
+            self.assertNotIn("functions", payload)
+            self.assertEqual(payload["tool_choice"], "none")
+            self.assertEqual(payload["reasoning"]["effort"], "high")
+            self.assertIn("不能使用任何工具", payload["instructions"])
 
 
 class ZeroToolAndAuthorityTests(ThinkBase):
-    def test_think_payload_is_zero_tool(self):
-        payload = SR.build_payload("材料", mode="THINK")
+    def test_payload_is_zero_tool(self):
+        payload = SR.build_payload("材料", mode="CONSULT")
         self.assertNotIn("tools", payload)
         self.assertNotIn("functions", payload)
         self.assertEqual(payload["tool_choice"], "none")
@@ -174,38 +180,39 @@ class ZeroToolAndAuthorityTests(ThinkBase):
         self.assertIn("不能使用任何工具", payload["instructions"])
         self.assertIn("不承担工程工作", payload["instructions"])
 
-    def test_think_output_is_structured_and_strict(self):
-        parsed = SR.parse_think_output(think_reply())
-        for key in ("judgment", "essence", "strategy"):
+    def test_output_is_structured_and_strict(self):
+        parsed = SR.parse_think_output(cognitive_reply())
+        for key in ("judgment", "goal_understanding", "essence", "strategy"):
             self.assertTrue(parsed[key])
-        for key in ("tradeoffs", "risks", "priority", "verify", "reconsult"):
+        for key in ("alternatives", "tradeoffs", "risks", "priority",
+                    "investigation", "phase_goals", "assumptions",
+                    "omissions", "decisions", "verify", "reconsult"):
             self.assertIsInstance(parsed[key], list)
         with self.assertRaises(SR.SolResponseError):
-            SR.parse_think_output(think_reply(risks="风险"))
+            SR.parse_think_output(cognitive_reply(risks="风险"))
         with self.assertRaises(SR.SolResponseError):
-            SR.parse_think_output(think_reply(judgment="", strategy=""))
+            SR.parse_think_output(cognitive_reply(judgment="", strategy=""))
 
     def test_decision_channel_does_not_exist(self):
         with self.assertRaises(SR.SolUsageError):
             SR.normalize_mode("DECIDE")
         self.assertNotIn("DECIDE", SR.SOL_MODES)
 
-    def test_think_does_not_change_phase_or_gates(self):
+    def test_cognitive_call_does_not_change_phase_or_gates(self):
         self.start(risk="high")
         self.plan(1)
+        state = G.load_state(self.state_path)
         G.record_sol_call(self.state_path, {
-            "call_id": "SCthink", "mode": "THINK", "status": "completed",
-            "contract_sha256": G.load_state(self.state_path).get(
-                "contract_sha256") or "",
+            "call_id": "SCconsult", "mode": "CONSULT", "status": "completed",
+            "contract_sha256": state.get("contract_sha256") or "",
             "judgment": "继续", "unverified": [],
             "completed_at": G.now_iso(),
-        }, mode="THINK", materials_sha256="m" * 64)
+        }, mode="CONSULT", materials_sha256="m" * 64)
         state = G.load_state(self.state_path)
         self.assertIn(G.evaluate(state)["phase"], ("RUNNING", "PARTIAL"))
         check = G.closure_check(state)
         self.assertEqual(set(check["gates"]), {"G1", "G2", "G3"})
         self.assertEqual(G.list_findings(state)["items"], [])
-        # SOL 结论不是完成证据：条件仍待主代理登记真实证据。
         self.assertEqual(
             [c["status"] for c in state["contract"]["criteria"]], ["pending"])
 
@@ -220,35 +227,38 @@ class ZeroToolAndAuthorityTests(ThinkBase):
 
 
 class RepeatAndReconsultTests(ThinkBase):
-    def test_same_contract_is_reused(self):
-        self.start(risk="high")
-        self.plan(5, deps=True)
-        self.evidence(modules=2, count=2)
-        profile = self.advice()["complexity"]
-        G.record_sol_call(self.state_path, {
-            "call_id": "SC1", "mode": "THINK", "status": "completed",
-            "contract_sha256": G.load_state(self.state_path).get(
-                "contract_sha256") or "",
-            "complexity_signals": profile["signal_codes"],
-            "completed_at": G.now_iso(),
-        }, mode="THINK", materials_sha256="m" * 64)
-        advice = self.advice()
-        self.assertEqual(advice["action"], "reuse")
-        self.assertEqual(advice["recommended_action"], "not_needed")
-        self.assertEqual(advice["new_signals"], [])
-
-    def test_new_evidence_allows_exactly_one_more_call(self):
+    def test_same_progress_reuses_consult(self):
         self.start(risk="high")
         self.plan(3, deps=True)
         self.evidence(modules=2, count=2)
+        state = G.load_state(self.state_path)
         profile = self.advice()["complexity"]
-        G.record_sol_call(self.state_path, {
-            "call_id": "SC1", "mode": "THINK", "status": "completed",
-            "contract_sha256": G.load_state(self.state_path).get(
-                "contract_sha256") or "",
-            "complexity_signals": profile["signal_codes"],
-            "completed_at": G.now_iso(),
-        }, mode="THINK", materials_sha256="m" * 64)
+        for mode, stage in (("CONSULT", "understanding"), ("PLAN", "planning")):
+            G.record_sol_call(self.state_path, {
+                "call_id": "SC" + mode, "mode": mode, "status": "completed",
+                "stage": stage,
+                "contract_sha256": state.get("contract_sha256") or "",
+                "complexity_signals": profile["signal_codes"],
+                "completed_at": G.now_iso(),
+            }, mode=mode, materials_sha256="m" * 64)
+        advice = self.advice()
+        self.assertEqual(advice["action"], "reuse")
+        self.assertEqual(advice["new_signals"], [])
+
+    def test_new_evidence_allows_dynamic_consult(self):
+        self.start(risk="high")
+        self.plan(3, deps=True)
+        self.evidence(modules=2, count=2)
+        state = G.load_state(self.state_path)
+        profile = self.advice()["complexity"]
+        for mode, stage in (("CONSULT", "understanding"), ("PLAN", "planning")):
+            G.record_sol_call(self.state_path, {
+                "call_id": "SC" + mode, "mode": mode, "status": "completed",
+                "stage": stage,
+                "contract_sha256": state.get("contract_sha256") or "",
+                "complexity_signals": profile["signal_codes"],
+                "completed_at": G.now_iso(),
+            }, mode=mode, materials_sha256="m" * 64)
         state = G.load_state(self.state_path)
         state.setdefault("actions", []).append({
             "id": "AUTO-REPLAN", "title": "重新分析根因", "goal": "替代路线",
@@ -257,7 +267,7 @@ class RepeatAndReconsultTests(ThinkBase):
             "result": "", "evidence_ids": []})
         G.save_state(self.state_path, state)
         advice = self.advice()
-        self.assertEqual(advice["action"], "think")
+        self.assertEqual(advice["action"], "consult")
         self.assertIn("replan-history", advice["new_signals"])
         self.assertTrue(advice["second_round"])
         self.assertIn("--force --trigger new-risk", advice["command"])
@@ -268,16 +278,16 @@ class DegradationTests(ThinkBase):
         self.start(risk="high")
         args = argparse.Namespace(
             state=self.state_path, materials=self.materials,
-            question="风险在哪？", reason="", trigger="", force=False,
+            question="风险在哪？", stage="", reason="", trigger="", force=False,
             dry_run=False, list=False, json=True, timeout=1,
             max_output_tokens=100, audit_log="", output_dir="",
             knowledge_file="")
         out = io.StringIO()
         with mock.patch.object(
-                SR, "run_think",
+                SR, "run_consult",
                 side_effect=SR.SolTimeoutError("sol_timeout", "1s")), \
                 contextlib.redirect_stdout(out):
-            code = CD.cmd_sol_think(args)
+            code = CD.cmd_sol_consult(args)
         self.assertEqual(code, 0)
         degraded = json.loads(out.getvalue())
         self.assertEqual(degraded["status"], "unavailable")
@@ -285,7 +295,7 @@ class DegradationTests(ThinkBase):
         state = G.load_state(self.state_path)
         failed = [item for item in G.iter_sol_calls(state)
                   if item.get("status") == "failed"]
-        self.assertEqual(failed[-1]["mode"], "THINK")
+        self.assertEqual(failed[-1]["mode"], "CONSULT")
         self.assertEqual(state.get("blocks") or [], [])
         self.assertIn(G.evaluate(state)["phase"], ("RUNNING", "PARTIAL"))
 
@@ -305,7 +315,7 @@ class DegradationTests(ThinkBase):
         self.start(risk="medium")
         state = G.load_state(self.state_path)
         state["sol_calls"] = [{
-            "call_id": "SCfail", "mode": "THINK", "status": "failed",
+            "call_id": "SCfail", "mode": "CONSULT", "status": "failed",
             "error": "sol_quota", "completed_at": G.now_iso()}]
         G.save_state(self.state_path, state)
         out = io.StringIO()
@@ -317,24 +327,35 @@ class DegradationTests(ThinkBase):
 
 
 class InputBudgetTests(ThinkBase):
-    def test_think_materials_have_a_tighter_budget(self):
-        self.assertLess(SR.MATERIALS_LIMITS["THINK"],
+    def test_cognitive_materials_are_tighter_than_review(self):
+        self.assertLess(SR.MATERIALS_LIMITS["CONSULT"],
+                        SR.MATERIALS_LIMITS["REVIEW"])
+        self.assertLess(SR.MATERIALS_LIMITS["PLAN"],
                         SR.MATERIALS_LIMITS["REVIEW"])
         with self.assertRaises(SR.SolUsageError) as ctx:
-            SR.validate_materials("x" * (SR.MATERIALS_LIMITS["THINK"] + 1),
-                                  mode="THINK")
+            SR.validate_materials("x" * (SR.MATERIALS_LIMITS["CONSULT"] + 1),
+                                  mode="CONSULT")
         self.assertEqual(ctx.exception.code, "sol_materials_too_large")
-        # REVIEW 仍接受更大的材料，但同样不是静默截断。
         SR.validate_materials("x" * 200_000, mode="REVIEW")
 
-    def test_think_prompt_requires_curated_sections(self):
+    def test_prompt_requires_curated_sections_and_stage(self):
         self.start(risk="medium")
         prompt = SR.build_prompt(G.load_state(self.state_path), "材料",
-                                 mode="THINK", question="风险在哪？")
+                                 mode="PLAN", question="方案怎么选？",
+                                 stage="planning")
         self.assertIn("## 本次需要判断的事项", prompt)
-        self.assertIn("## THINK 输出要求", prompt)
+        self.assertIn("## 输出要求", prompt)
+        self.assertIn("阶段：planning", prompt)
         self.assertIn("不要包含完整仓库、冗长日志", prompt)
         self.assertIn("已尝试方案及结果", prompt)
+
+    def test_stage_normalization_is_mode_aware(self):
+        self.assertEqual(SR.normalize_stage("", mode="CONSULT"), "development")
+        self.assertEqual(SR.normalize_stage("", mode="PLAN"), "planning")
+        self.assertEqual(SR.normalize_stage("closure", mode="CONSULT"),
+                         "closure")
+        with self.assertRaises(SR.SolUsageError):
+            SR.normalize_stage("bogus", mode="CONSULT")
 
 
 class GovernanceBoundaryTests(ThinkBase):

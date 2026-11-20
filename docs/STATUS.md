@@ -1,7 +1,53 @@
 # STATUS
 
-更新：2026-11-19 CST。本文件只记录现场可核实的事实；规划与未完成事项单独标注。
-当前版本：v8.5.0（PARTIAL 强制续跑与按工作项阻塞）。
+更新：2026-11-20 CST。本文件只记录现场可核实的事实；规划与未完成事项单独标注。
+当前版本：v9.0.0（SOL-first 默认认知生命周期）。
+
+## SOL-first 默认认知生命周期（2026-11-20，v9.0.0）
+
+现场基线：`HEAD=d3990c5`；源码工作区含本轮修改的 `sol_review.py`、`review_policy.py`、
+`governance.py`、`copilot_dispatch.py`、`copilot_auto.py` 与对应测试/文档；两个未跟踪知识
+交接文件（`scripts/knowledge_handoff.py`、`tests/test_knowledge_handoff.py`）保持原样，
+未删除、未纳入。
+
+- **模式与生命周期**：`SOL_MODES=("CONSULT","PLAN","REVIEW")`，`THINK` 只作读取别名归一到
+  CONSULT；`start/contract --task-kind` 声明 16 类任务，简单/机械类型 0 调用，未声明按
+  `standard` 处理。`review_policy.sol_advice` 按 A–E 生命周期给出 `consult`/`plan`/`review`
+  建议（起点理解、调查后规划、升级型新信号动态咨询、高复杂阶段复盘、收口判断），
+  无硬性调用次数或 Token 上限；同一认知对象无新信息时复用，重复调用要求
+  `--force --trigger --reason`。
+- **记录与采纳**：`sol_calls` 记录 mode/stage/question/progress_digest/complexity/task_kind/
+  usage/latency/zero_tool，采纳结论由 `sol-accept` 单独登记；`review-metrics` 新增
+  `sol_cognitive`（覆盖、计数、失败、重复率、采纳、usage/latency，缺失标 `unavailable`）。
+  修复了延迟统计只读 `duration_ms` 的缺陷，现优先读 `latency_ms` 并兼容旧字段。
+- **失败语义**：CONSULT / PLAN 失败登记真实原因后以退出码 0 降级返回
+  `copilot-sol-cognitive-degraded/v1`，不阻断工程；REVIEW 失败仍返回真实非零。
+- **测试**：`python3 -B -m unittest discover -s tests -p 'test_*.py'` **604 项通过**（含新增
+  `tests/test_sol_first.py` 32 项：简单任务 0 调用、默认起点 CONSULT、调查后 PLAN、产品
+  设计/架构咨询、新证据动态咨询、普通步骤不触发、无新信息不重复、合同修订重新覆盖、
+  ACCEPT/MODIFY/REJECT、零工具、失败继续、provider 不可用不伪造、PARTIAL 恢复复用、
+  项级阻塞隔离、阶段复盘去重、收口 CONSULT 先于 REVIEW、正式 REVIEW 需用户要求、
+  G1–G3 不受影响）。`python3 -m compileall -q scripts` 通过。
+- **legacy 回归**：`legacy/tests` 853 项（skip 32）失败/错误集合与 `HEAD=d3990c5` 完全一致
+  （146 项）；`comm` 对比两侧排序后的失败列表，差异 0 行，无新增回归。
+- **真实 SOL 调用（隔离任务 `task-1db809b74a473082`，临时仓库 `/tmp/copilot-sol-first-e2e-20261120/ws`）**：
+  1. CONSULT `SCcc56ea6d0d1a8fce103b5f78`：`gpt-6.2-sol`、effort=high、mode=standard、
+     `zero_tool=true`、`tools_sent=false`、`tool_choice=none`，usage 2,943 tokens，
+     latency 35,418 ms；返回目标理解、策略、2 个备选、3 项取舍、3 项风险、4 项验证信号。
+  2. PLAN `SCe6cec088108623bf73380a8f`：同模型与零工具，2,528 tokens，22,641 ms；返回
+     路线比较与 A1/A2 优先级。
+  两条采纳结论均登记为 `accepted`（`sol-accept`），记录文件分别在 `sol-consult/` 与
+  `sol-plans/`。
+- **隔离端到端**：`start` → 起点 CONSULT 建议 → 真实 CONSULT → 登记计划 → 真实 PLAN →
+  实现 `sort_items.py` 与 4 项 unittest → 证据 E1/E2 → 工作项与条件闭合 → `drive`
+  `PASS`/`CLOSED`（`verdict=pass`，G1–G3 通过）。`review-metrics` 的 `sol_cognitive`：
+  non_simple=true、default_covered=true、CONSULT 1/PLAN 1/REVIEW 0、failed=0、
+  repeat_rate=0.0、acceptance accepted=2、latency_avg=29,029.5 ms、usage 5,471 tokens。
+- **运行时同步**：`--apply` 写入 11 个文件，`--check` 缺失 0/不同 0，`--baseline` 重建为
+  20 个 Git 跟踪文件，`--verify-baseline` 通过；`scripts/knowledge_handoff.py` 仍为未跟踪、
+  未写入基线。
+- **未验证 / 限制**：未在独立 GUI 宿主会话中复跑该 E2E（本轮通过宿主 CLI 与本会话执行）；
+  未 commit / push（不在授权范围）；未做真实 REVIEW（用户未要求）。
 
 ## PARTIAL 续跑修复（2026-11-19，v8.5.0）
 

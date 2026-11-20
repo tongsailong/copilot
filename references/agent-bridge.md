@@ -7,16 +7,17 @@ v1 信封（SOL 通道时代）已退役，出现即 `schema_retired`。
 > `native_agent.py review` / `review-context` / `capability`、review attempt 与
 > `g4_attest`/`g4_shadow`/`test_execution` 已删除。独立复核请使用
 > `copilot_dispatch.py sol-review`（零工具、单轮、advisory）；历史复核记录只读保留。
-> v8.4.0 起 SOL 收敛为默认认知引擎 **THINK**：`copilot_dispatch.py sol-think` 按确定性
-> 复杂度建议一次整体判断；**REVIEW** 只在用户明确要求时执行。CONSULT / PLAN 已并入
-> THINK，`sol-advisory` 命令移除，历史记录只读兼容。SOL 仍零工具、单轮、advisory。
+> v9.0.0 起 SOL 是默认认知引擎：`copilot_dispatch.py sol-consult` / `sol-plan` 按生命周期
+> 建议（起点理解、调查后规划、新证据动态咨询、阶段复盘、收口判断）；**REVIEW** 只在用户
+> 明确要求时执行。`THINK` 只作读取别名归一到 CONSULT，历史记录只读兼容。SOL 仍零工具、
+> 单轮、advisory。
 
 ## 1. 角色与边界
 
 | 角色 | 职责 | 约束 |
 |---|---|---|
 | Executor | 执行单个工作项，产出结果与原始证据 | 必须是原生子代理（`kind=subagent`），带 Agent/Child Session 身份与 profile 快照 |
-| SOL（THINK / REVIEW） | 默认认知判断与用户要求的独立复核（advisory） | 由 `sol_review.py` 零工具单轮调用；不读写文件、不证明宿主权限、不构成收口门禁 |
+| SOL（CONSULT / PLAN / REVIEW） | 默认认知判断与用户要求的独立复核（advisory） | 由 `sol_review.py` 零工具单轮调用；不读写文件、不证明宿主权限、不构成收口门禁 |
 
 Copilot 不派发 Agent、不调用模型、不写别人的会话。它只校验宿主已产生的记录并回填状态。
 `native_agent.py` 从真实 `metadata.json`、宿主 SQLite（`tool_usage`/`part`/`session_entry`）

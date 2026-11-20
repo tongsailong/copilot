@@ -1635,3 +1635,27 @@
     - **不变量**：G1–G3 与 fail-closed 不变；G4 不存在、不恢复；不新增自定义子 Agent、
       不强制 Reviewer、不设人为轮次/Token/复核数量停止条件；ZCode 仍是唯一执行与技术决策
       主体；`start`/`drive` 是任务进入状态机的唯一入口。
+
+61. **SOL 恢复为按生命周期的默认认知引擎：CONSULT / PLAN 独立，REVIEW 仅用户明确要求（2026-11-20，v9.0.0，用户专项）。**
+    依据：用户《Copilot SOL-first 默认认知引擎专项升级》；本仓库 HEAD `d3990c5`、
+    运行时 v8.5.0 的现场状态。
+    - **定位**：SOL 负责目标理解、问题本质、路线与取舍、风险与调查方向；ZCode 主代理仍是
+      唯一工程执行与技术决策主体，可采纳/修改/否决，不机械服从也不因 SOL 跳过现场调查。
+    - **模式与别名**：`SOL_MODES=("CONSULT","PLAN","REVIEW")`，`COGNITIVE_MODES` 为前两者；
+      `THINK` 只作读取别名归一为 CONSULT，不再作为独立模式暴露。CONSULT/PLAN 与 REVIEW
+      共享单轮零工具管线、`sol_calls` 记录与审计，不进入 Finding 台账、不影响 G1–G3。
+    - **生命周期 A–E**：起点 CONSULT（understanding）→ 调查后 PLAN（planning）→ 新证据/
+      方案失败/范围或风险变化的动态 CONSULT（development）→ 高复杂阶段复盘（stage）→
+      收口前综合判断（closure）。`start/contract --task-kind` 声明 16 类任务；简单/机械类型
+      （trivial/mechanical/docs/format）0 调用，未声明按 `standard`（非简单）处理，默认走
+      起点 CONSULT。没有硬性调用次数或 Token 上限；同一认知对象无新信息时复用，
+      重复调用需 `--force --trigger --reason` 说明决策价值。
+    - **采纳记录**：`sol-accept --call-id ... --status accepted|modified|rejected` 记录主代理
+      结论，是事实记录，不改变阶段、不改变 G1–G3、不构成授权。
+    - **统计**：`review-metrics` 的 `sol_cognitive` 输出覆盖率、CONSULT/PLAN/REVIEW 计数、
+      失败数、重复率、采纳分布、usage 与 latency；缺失标记 `unavailable`，不估算、不虚增。
+    - **失败语义**：CONSULT/PLAN 失败只登记真实原因并降级（退出码 0），不阻断工程推进；
+      REVIEW 失败返回真实非零退出码，只有用户明确要求完成独立复核时才按 BLOCKED 报告。
+    - **不变量**：零工具、单轮、`gpt-6.2-sol` + `effort=high` + `mode=standard`、CPA `127`
+      出口、模型/强度回显校验；不换 Provider/账户/付费方案；G1–G3 fail-closed；G4 不存在、
+      不恢复；不新增自定义子 Agent；不强制 Reviewer；敏感凭据不进入材料。

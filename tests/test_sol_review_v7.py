@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""SOL 零工具单轮调用（THINK / REVIEW）：请求不变量、解析、失败收敛、单轮与边界。
+"""SOL 零工具单轮调用（CONSULT / PLAN / REVIEW）：请求不变量、解析、失败收敛、单轮与边界。
 
-v8.4.0 起 SOL 收敛为默认认知引擎 THINK，CONSULT / PLAN 并入其中（历史记录
-只读兼容）；REVIEW 只在用户明确要求时使用。两者都不进入 Finding 台账、
-不影响 G1–G3（REVIEW 的 findings 仍以 advisory 进入台账）。
+v9.0.0 起 SOL 是默认认知引擎：CONSULT / PLAN 按生命周期按需发出，THINK 作为
+历史名称只读兼容并归一为 CONSULT；REVIEW 只在用户明确要求时使用。两者都不
+进入 Finding 台账、不影响 G1–G3（REVIEW 的 findings 仍以 advisory 进入台账）。
 """
 from __future__ import annotations
 
@@ -106,17 +106,22 @@ class ZeroToolTests(unittest.TestCase):
                     SR.build_payload("材料", effort=effort)
 
     def test_mode_instructions_are_distinct_and_zero_tool(self):
-        think = SR.build_payload("材料", mode="THINK")["instructions"]
+        consult = SR.build_payload("材料", mode="CONSULT")["instructions"]
+        plan = SR.build_payload("材料", mode="PLAN")["instructions"]
         review = SR.build_payload("材料", mode="REVIEW")["instructions"]
-        self.assertNotEqual(think, review)
-        self.assertIn("THINK", think)
+        self.assertNotEqual(consult, plan)
+        self.assertNotEqual(consult, review)
+        self.assertIn("CONSULT", consult)
+        self.assertIn("PLAN", plan)
         self.assertIn("REVIEW", review)
-        for text in (think, review):
+        for text in (consult, plan, review):
             self.assertIn("没有、也不能使用任何工具", text)
             self.assertIn("zcode", text.lower())
-        # 默认模式就是认知引擎：不传 mode 时构造 THINK 请求。
+        # THINK 是历史别名：只归一为 CONSULT，不产生第三套指令。
         self.assertEqual(
-            SR.build_payload("材料")["instructions"], think)
+            SR.build_payload("材料", mode="THINK")["instructions"], consult)
+        # 默认模式就是默认认知引擎：不传 mode 时构造 CONSULT 请求。
+        self.assertEqual(SR.build_payload("材料")["instructions"], consult)
 
     def test_unknown_mode_fails_closed(self):
         for mode in ("DECIDE", "decide", "", "REVIEWER"):
@@ -156,22 +161,26 @@ class ZeroToolTests(unittest.TestCase):
             calls.append(body)
             return response(think())
 
+        # THINK 是历史别名：请求仍是 CONSULT 语义，结果模式归一为 CONSULT。
         result = SR.run_think("材料", transport=fake, api_key="k")
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0]["model"], "gpt-6.2-sol")
         self.assertEqual(calls[0]["reasoning"], {"effort": "high"})
         self.assertNotIn("tools", calls[0])
         self.assertEqual(calls[0]["tool_choice"], "none")
-        self.assertEqual(result["mode"], "THINK")
+        self.assertEqual(result["mode"], "CONSULT")
         self.assertTrue(result["zero_tool"])
         self.assertEqual(result["judgment"], "先补定向测试再合并")
 
-    def test_legacy_modes_normalize_to_think(self):
-        """CONSULT / PLAN 是历史名称：只归一，不再产生两套流程。"""
-        self.assertEqual(SR.normalize_mode("CONSULT"), "THINK")
-        self.assertEqual(SR.normalize_mode("plan"), "THINK")
-        self.assertNotIn("CONSULT", SR.SOL_MODES)
-        self.assertNotIn("PLAN", SR.SOL_MODES)
+    def test_legacy_thinks_normalize_to_consult(self):
+        """THINK 是历史名称：只归一为 CONSULT，不再产生第三套流程。"""
+        self.assertEqual(SR.normalize_mode("THINK"), "CONSULT")
+        self.assertEqual(SR.normalize_mode("think"), "CONSULT")
+        self.assertEqual(SR.normalize_mode("CONSULT"), "CONSULT")
+        self.assertEqual(SR.normalize_mode("plan"), "PLAN")
+        self.assertEqual(SR.normalize_mode("REVIEW"), "REVIEW")
+        self.assertNotIn("THINK", SR.SOL_MODES)
+        self.assertEqual(SR.COGNITIVE_MODES, ("CONSULT", "PLAN"))
 
 
 class ParseTests(unittest.TestCase):
@@ -717,6 +726,7 @@ class CliTests(unittest.TestCase):
 
     def test_think_dry_run_is_zero_tool_and_does_not_write(self):
         before = open(self.state, "rb").read()
+        # sol-think 是历史别名，语义等同 sol-consult：dry-run 报 CONSULT。
         proc = F.run_cli("copilot_dispatch.py", "sol-think",
                          "--state", self.state,
                          "--materials", self.materials,
@@ -724,7 +734,7 @@ class CliTests(unittest.TestCase):
                          "--dry-run", "--json")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         payload = json.loads(proc.stdout)
-        self.assertEqual(payload["mode"], "THINK")
+        self.assertEqual(payload["mode"], "CONSULT")
         self.assertEqual(payload["model"], "gpt-6.2-sol")
         self.assertEqual(payload["reasoning_effort"], "high")
         self.assertTrue(payload["zero_tool"])
@@ -737,7 +747,7 @@ class CliTests(unittest.TestCase):
         import io
         import copilot_dispatch as CD
         result = {
-            "schema": SR.THINK_SCHEMA, "mode": "THINK",
+            "schema": SR.THINK_SCHEMA, "mode": "CONSULT",
             "model": SR.MODEL, "model_resolved": SR.MODEL,
             "reasoning_effort": "high", "reasoning_mode": "standard",
             "reasoning_resolved": {"effort": "high"}, "reasoning_verified": True,
@@ -754,21 +764,21 @@ class CliTests(unittest.TestCase):
         }
         args = argparse.Namespace(
             state=self.state, materials=self.materials,
-            question="该方案是否可行？", reason="", trigger="", force=False,
-            dry_run=False, list=False, json=True, timeout=5,
+            question="该方案是否可行？", stage="", reason="", trigger="",
+            force=False, dry_run=False, list=False, json=True, timeout=5,
             max_output_tokens=100, audit_log="", output_dir="",
             knowledge_file="")
         out = io.StringIO()
-        with mock.patch("sol_review.run_think", return_value=dict(result)), \
+        with mock.patch("sol_review.run_consult", return_value=dict(result)), \
                 contextlib.redirect_stdout(out):
             self.assertEqual(CD.cmd_sol_think(args), 0)
         state = G.load_state(self.state)
-        self.assertEqual(state["sol_calls"][-1]["mode"], "THINK")
+        self.assertEqual(state["sol_calls"][-1]["mode"], "CONSULT")
         self.assertEqual(state["sol_calls"][-1]["request_id"], "req-1")
         self.assertEqual([r for r in state["sol_calls"]
                           if r.get("mode") == "REVIEW"], [])
         self.assertEqual(G.list_findings(state)["items"], [])
-        self.assertTrue(os.path.isdir(os.path.join(self.dir, "sol-think")))
+        self.assertTrue(os.path.isdir(os.path.join(self.dir, "sol-consult")))
 
     def test_think_list_is_read_only(self):
         G.record_sol_call_failure(

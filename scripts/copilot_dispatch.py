@@ -43,7 +43,7 @@ import review_policy as RP  # noqa: E402
 import sol_review as SR  # noqa: E402
 import knowledge_handoff as KH  # noqa: E402
 
-__version__ = "8.5.0"
+__version__ = "9.0.0"
 
 
 class CLIError(Exception):
@@ -200,14 +200,26 @@ def cmd_start(args) -> int:
         task_id=args.task_id or "", mode=args.mode or "", note=args.note or "",
         contract_source=args.contract_file or "",
         workspace=workspace,
-        test_policy=_load_test_policy(args))
+        test_policy=_load_test_policy(args),
+        task_kind=args.task_kind or "",
+        triggers=args.trigger or [])
     print(f"任务已创建：{state['task_id']}")
     print(f"状态文件：{os.path.abspath(state_path)}")
     if state.get("workspace"):
         print(f"任务工作区：{state['workspace']}")
     print(f"完成条件：{len(state['contract']['criteria'])} 条 "
           f"（{', '.join(c['criterion_id'] for c in state['contract']['criteria'])}）")
-    print(f"风险：{state['risk']} · 执行后端：{state['execution_backend']}")
+    print(f"风险：{state['risk']} · 类型：{state['task_kind']} "
+          f"· 执行后端：{state['execution_backend']}")
+    advice = G.sol_advice_summary(state)
+    if advice.get("action") in ("consult", "plan", "review"):
+        command = advice.get("command") or ""
+        print(f"SOL 默认流程：{advice['action'].upper()}（{advice.get('stage') or '-'}）")
+        print(f"理由：{advice.get('reason')}")
+        if command:
+            print(f"下一步：{command}")
+    else:
+        print(f"SOL 默认流程：跳过（{advice.get('reason')}）")
     return 0
 
 
@@ -582,13 +594,17 @@ def cmd_review_admission(args) -> int:
         advice = decision.get("advice") or {}
         complexity = advice.get("complexity") or {}
         signals = [item.get("code") for item in complexity.get("signals") or []]
+        print(f"任务类型：{advice.get('task_kind') or decision.get('task_kind') or '-'}")
         print(f"任务复杂度：{complexity.get('level') or '-'}"
               f"（信号：{', '.join(signals) if signals else '无'}）")
         print(f"SOL 建议：{advice.get('action') or '-'}"
-              f"（mode={advice.get('mode') or '-'}，phase={advice.get('phase') or '-'}）")
+              f"（mode={advice.get('mode') or '-'}，"
+              f"stage={advice.get('stage') or advice.get('phase') or '-'}）")
         print(advice.get("reason") or "")
         if advice.get("new_signals"):
             print("新增信号：" + ", ".join(advice["new_signals"]))
+        if advice.get("second_round") and advice.get("trigger"):
+            print(f"第二轮触发：{advice['trigger']}")
         if advice.get("command"):
             print("调用：" + advice["command"])
         if decision.get("recommended_action"):
@@ -598,9 +614,13 @@ def cmd_review_admission(args) -> int:
               f" — {decision.get('detail') or ''}")
         if decision.get("triggers"):
             print("触发因素：" + ", ".join(decision["triggers"]))
+        by_mode = decision.get("sol_calls_by_mode") or {}
         print(f"已有 SOL 调用：{decision.get('sol_calls_total', 0)} 次"
-              f"（REVIEW {decision.get('sol_reviews_total', 0)}）")
-        print("说明：SOL 是建议性独立审查（advisory），不是收口门禁；单轮调用，不自动二审。")
+              f"（CONSULT {by_mode.get('CONSULT', 0)} / "
+              f"PLAN {by_mode.get('PLAN', 0)} / "
+              f"REVIEW {by_mode.get('REVIEW', 0)}）")
+        print("说明：CONSULT/PLAN 是默认认知输入（advisory），REVIEW 仅在用户明确"
+              "要求时执行；都不构成收口门禁，单轮调用、不自动二审。")
     return 0
 
 
@@ -679,16 +699,16 @@ def _invoke_sol_once(*, state_path: str, task_dir: str, prompt: str,
               "不重复发起请求。", file=sys.stderr)
     else:
         try:
-            if mode == "REVIEW":
-                result = SR.run_review(
-                    prompt, audit_log=audit_log,
-                    max_output_tokens=args.max_output_tokens,
-                    timeout=args.timeout)
-            else:
-                result = SR.run_think(
-                    prompt, audit_log=audit_log,
-                    max_output_tokens=args.max_output_tokens,
-                    timeout=args.timeout)
+            call = {
+                "REVIEW": SR.run_review,
+                "PLAN": SR.run_plan,
+                "CONSULT": SR.run_consult,
+                "THINK": SR.run_consult,
+            }.get(mode, SR.run_consult)
+            result = call(
+                prompt, audit_log=audit_log,
+                max_output_tokens=args.max_output_tokens,
+                timeout=args.timeout)
         except SR.SolError as exc:
             G.record_sol_call_failure(
                 state_path, mode=mode, error_code=exc.code, detail=exc.detail,
@@ -705,10 +725,10 @@ def _invoke_sol_once(*, state_path: str, task_dir: str, prompt: str,
                   "新增关键信息后可人工重新发起。", file=sys.stderr)
             if getattr(args, "json", False):
                 _print({
-                    "schema": "copilot-sol-think-degraded/v1",
+                    "schema": "copilot-sol-cognitive-degraded/v1",
                     "status": "unavailable",
                     "action": "continue",
-                    "mode": "THINK",
+                    "mode": mode,
                     "error": exc.code,
                     "detail": exc.detail,
                     "materials_sha256": digest,
@@ -731,7 +751,7 @@ def _invoke_sol_once(*, state_path: str, task_dir: str, prompt: str,
 
 
 def _sol_channel_config(mode: str) -> dict:
-    """SOL 两模式的少量差异（原始输出目录、文案与预检 schema）。
+    """SOL 各模式的少量差异（原始输出目录、文案与预检 schema）。
 
     记录、审计与互斥锁已统一：所有模式写入同一 `sol_calls` 流、同一
     `sol-audit.jsonl` 与同一 `.sol.lock`，不再按模式复制一套通道。
@@ -743,11 +763,18 @@ def _sol_channel_config(mode: str) -> dict:
             "dry_run_schema": "copilot-sol-review-dry-run/v1",
             "closed_note": "任务已收口；新复核需先由用户授权 reopen",
         }
+    if mode == "PLAN":
+        return {
+            "subdir": "sol-plans",
+            "label": "方案规划",
+            "dry_run_schema": "copilot-sol-plan-dry-run/v1",
+            "closed_note": "任务已收口；新的方案规划需先由用户授权 reopen",
+        }
     return {
-        "subdir": "sol-think",
-        "label": "认知判断",
-        "dry_run_schema": "copilot-sol-think-dry-run/v1",
-        "closed_note": "任务已收口；新的认知判断需先由用户授权 reopen",
+        "subdir": "sol-consult",
+        "label": "认知咨询",
+        "dry_run_schema": "copilot-sol-consult-dry-run/v1",
+        "closed_note": "任务已收口；新的认知咨询需先由用户授权 reopen",
     }
 
 
@@ -794,22 +821,29 @@ def _run_sol_channel(args, mode: str) -> int:
         return _sol_list(args, state, mode, cfg)
     if not args.materials:
         raise CLIError(
-            ("sol-review" if mode == "REVIEW" else "sol-think")
+            {"REVIEW": "sol-review", "PLAN": "sol-plan"}.get(mode, "sol-consult")
             + " 需要 --materials（或 --list）。")
     materials, knowledge_meta = _compose_materials(
         _read_text(args.materials),
         str(getattr(args, "knowledge_file", "") or ""))
     if not materials.strip():
         raise CLIError("材料为空。")
-    question = str(getattr(args, "question", "") or "")
+    question = str(getattr(args, "question", "") or "").strip()
+    stage = str(getattr(args, "stage", "") or "").strip().lower()
+    if mode in ("CONSULT", "PLAN"):
+        if not question:
+            raise CLIError(
+                f"SOL {mode} 需要 --question：必须写明本次真正需要判断的事项；"
+                "没有明确问题时不要调用 SOL。")
+        stage = SR.normalize_stage(stage, mode=mode)
 
     def prepare(current: dict) -> tuple[str, str, str, dict]:
-        # 两模式共用同一上下文构造：合同、完成条件、工作项与证据登记自动注入，
+        # 各模式共用同一上下文构造：合同、完成条件、工作项与证据登记自动注入，
         # 主代理只需提供本次增量的材料与具体问题。
         prompt_text = SR.build_prompt(current, materials, mode=mode,
-                                      question=question)
+                                      question=question, stage=stage)
         subject = SR.review_subject_sha256(
-            current, materials, mode=mode, question=question)
+            current, materials, mode=mode, question=question, stage=stage)
         # 上限口径与真实调用一致（THINK 更紧）：超限会拒绝而不是静默截断。
         limit = SR.MATERIALS_LIMITS[mode]
         if len(prompt_text) > SR.MATERIALS_WARN[mode]:
@@ -838,12 +872,14 @@ def _run_sol_channel(args, mode: str) -> int:
             "endpoint": SR.resolve_base_url() + SR.ENDPOINT,
             "materials_sha256": digest,
             "materials_chars": len(prompt),
+            "question": question,
+            "stage": stage,
             # 缓存/复用口径：这些成分变化即不再复用旧结论。
             "prompt_version": SR.PROMPT_VERSION,
             "cache_key_components": ["prompt_version", "model",
                                      "reasoning_effort", "goal", "contract",
                                      "criteria", "evidence_digest",
-                                     "materials", "mode", "question"],
+                                     "materials", "mode", "question", "stage"],
             "evidence_digest": SR.evidence_digest(state),
             "evidence_entries": len(state.get("evidence") or []),
             "action_entries": len(state.get("actions") or []),
@@ -903,12 +939,15 @@ def _run_sol_channel(args, mode: str) -> int:
             raw_error = str(exc)
             print(f"警告：原始输出写入失败（结构化结果仍登记）：{exc}",
                   file=sys.stderr)
-        # 统一的调用记录：两模式共享同一状态流与同一字段口径；模式差异只在
-        # 结果字段（REVIEW 的 findings / THINK 的认知结构）。
+        # 统一的调用记录：各模式共享同一状态流与同一字段口径；模式差异只在
+        # 结果字段（REVIEW 的 findings / 认知模式的判断与方案结构）。
         # `complexity_signals` 是调用时刻的复杂度快照：后续判断“是否出现新的
         # 认知信号”只需要比较快照，不需要重新推理。
         complexity = RP.task_complexity(
-            state, triggers=None,
+            state,
+            triggers=[str(t.get("name") or "")
+                      for t in state.get("admission_triggers") or []
+                      if isinstance(t, dict) and t.get("name")],
             workspace=str(state.get("workspace") or ""))
         record = {
             # 原始输出文件名与统一记录 ID 必须一致，审计才能按 call_id 直接定位。
@@ -916,10 +955,15 @@ def _run_sol_channel(args, mode: str) -> int:
             "task_id": state.get("task_id") or "",
             "contract_sha256": state.get("contract_sha256") or "",
             "risk": state.get("risk") or "",
+            "task_kind": str(state.get("task_kind") or RP.DEFAULT_TASK_KIND),
             "complexity": complexity["level"],
             "complexity_signals": complexity["signal_codes"],
             "status": "completed",
             "mode": mode,
+            "stage": stage if mode in ("CONSULT", "PLAN") else "",
+            "question": question,
+            "progress_digest": (RP.sol_progress_key(state)
+                                if mode in ("CONSULT", "PLAN") else ""),
             "prompt_version": SR.PROMPT_VERSION,
             "evidence_digest": SR.evidence_digest(state),
             "model": result["model"],
@@ -971,11 +1015,20 @@ def _run_sol_channel(args, mode: str) -> int:
             record.update({
                 "schema": SR.THINK_SCHEMA,
                 "judgment": result.get("judgment") or "",
+                "goal_understanding": result.get("goal_understanding") or "",
                 "essence": result.get("essence") or "",
                 "strategy": result.get("strategy") or "",
+                "contradictions": result.get("contradictions") or [],
+                "alternatives": result.get("alternatives") or [],
                 "tradeoffs": result.get("tradeoffs") or [],
                 "risks": result.get("risks") or [],
                 "priority": result.get("priority") or [],
+                "investigation": result.get("investigation") or [],
+                "phase_goals": result.get("phase_goals") or [],
+                "acceptance_focus": result.get("acceptance_focus") or [],
+                "assumptions": result.get("assumptions") or [],
+                "omissions": result.get("omissions") or [],
+                "decisions": result.get("decisions") or [],
                 "verify": result.get("verify") or [],
                 "reconsult": result.get("reconsult") or [],
             })
@@ -1005,14 +1058,20 @@ def _run_sol_channel(args, mode: str) -> int:
             print("说明：SOL 只提供建议；主代理核实、修复并用定向测试验证，"
                   "不自动发起第二轮复核。")
         else:
-            print(f"SOL THINK 完成：{record_id}")
+            label = cfg["label"]
+            print(f"SOL {mode}（{label}）完成：{record_id}"
+                  + (f" stage={record.get('stage')}" if record.get("stage") else ""))
             print(f"核心判断：{record.get('judgment') or '(无)'}")
+            if record.get("goal_understanding"):
+                print(f"目标理解：{record['goal_understanding']}")
             if record.get("strategy"):
                 print(f"推荐策略：{record['strategy']}")
             print("产出：" + "，".join([
+                f"alternatives={len(record.get('alternatives') or [])}",
                 f"tradeoffs={len(record.get('tradeoffs') or [])}",
                 f"risks={len(record.get('risks') or [])}",
                 f"priority={len(record.get('priority') or [])}",
+                f"omissions={len(record.get('omissions') or [])}",
                 f"verify={len(record.get('verify') or [])}"]))
             if record.get("unverified"):
                 print(f"未验证事项：{len(record['unverified'])} 条（见结果 JSON）")
@@ -1020,7 +1079,8 @@ def _run_sol_channel(args, mode: str) -> int:
             if not record.get("audit_written", True):
                 print("警告：审计日志写入失败；认知结果已登记，"
                       f"错误 {record.get('audit_error') or '-'}。", file=sys.stderr)
-            print("说明：SOL 只提供认知输入；是否采纳、如何实现与验证由主代理决定。")
+            print("说明：SOL 只提供认知输入；是否采纳、如何实现与验证由主代理决定。"
+                  f"采纳结论用 sol-accept --call-id {record_id} 登记。")
         return 0
 
 
@@ -1029,9 +1089,36 @@ def cmd_sol_review(args) -> int:
     return _run_sol_channel(args, "REVIEW")
 
 
+def cmd_sol_consult(args) -> int:
+    """SOL 默认认知咨询：目标理解、问题本质、方案取舍与风险；失败只降级。"""
+    return _run_sol_channel(args, "CONSULT")
+
+
+def cmd_sol_plan(args) -> int:
+    """SOL 方案规划：调查后比较方案、优先级与验收关注点；失败只降级。"""
+    return _run_sol_channel(args, "PLAN")
+
+
 def cmd_sol_think(args) -> int:
-    """SOL 默认认知引擎：一次零工具判断；失败只记录并降级，不阻断工程推进。"""
-    return _run_sol_channel(args, "THINK")
+    """历史命令：v9 起等价于 `sol-consult`。"""
+    return _run_sol_channel(args, "CONSULT")
+
+
+def cmd_sol_accept(args) -> int:
+    """回填主代理对 SOL 建议的采纳结论（事实记录，不改变任务状态与门禁）。"""
+    path = _state_path(args)
+    result = G.record_sol_acceptance(
+        path, args.call_id, status=args.status,
+        note=args.note or "", reason=args.reason or "",
+        decided_by=args.decided_by or "zcode")
+    if args.json:
+        _print(result)
+    else:
+        entry = result["acceptance"]
+        print(f"SOL 采纳结论已登记：{result['call_id']} → {entry['status']}"
+              + (f"（{entry['note']}）" if entry.get("note") else ""))
+        print("说明：这是主代理对建议的事实判断记录；不是用户授权，也不改变 G1–G3。")
+    return 0
 
 
 def cmd_agent_policy(args) -> int:
@@ -1353,7 +1440,9 @@ def cmd_contract(args) -> int:
     criteria = _load_criteria(args.criteria_file) if args.criteria_file else None
     result = G.amend_contract(path, contract=contract_text, criteria=criteria,
                               contract_source=args.contract_file or "",
-                              test_policy=_load_test_policy(args))
+                              test_policy=_load_test_policy(args),
+                              task_kind=args.task_kind or "",
+                              triggers=args.trigger or [])
     print(f"合同已修订：criteria_sha256={result['criteria_sha256'][:16]}…")
     for criterion in result["criteria"]:
         print(f"- {criterion['criterion_id']} [{criterion['status']}] "
@@ -1445,6 +1534,12 @@ def build_parser() -> argparse.ArgumentParser:
                         "（advisory，不阻塞收口）")
     p.add_argument("--backend", default="legacy", choices=G.BACKENDS)
     p.add_argument("--task-id", default="")
+    p.add_argument("--task-kind", default="",
+                   choices=sorted(RP.TASK_KINDS),
+                   help="任务类型；省略按 standard（非简单，默认进入 SOL 认知流程）；"
+                        "trivial/mechanical/docs/format 明确声明才跳过")
+    p.add_argument("--trigger", action="append", default=[],
+                   help="声明触发因素（可多次）：new-evidence/new-risk/scope-changed 等")
     p.add_argument("--mode", default="")
     p.add_argument("--note", default="")
     p.add_argument("--workspace", default="",
@@ -1613,35 +1708,70 @@ def build_parser() -> argparse.ArgumentParser:
                    help="原始输出目录；默认任务目录 sol-reviews/")
     p.set_defaults(func=cmd_sol_review)
 
+    def _add_sol_cognitive_args(parser, *, subdir: str) -> None:
+        parser.add_argument("--state", required=True)
+        parser.add_argument("--materials", default="",
+                            help="主代理整理的材料文件（- 表示 stdin）；--list 时可省略")
+        parser.add_argument("--knowledge-file", default="",
+                            help="知识交接 JSON（由 knowledge_handoff.py 校验）；"
+                                 "摘录追加到 materials")
+        parser.add_argument("--question", default="",
+                            help="本次真正需要 SOL 判断的事项（必填；越具体越好）")
+        parser.add_argument("--stage", default="",
+                            choices=("", *SR.SOL_STAGES),
+                            help="生命周期阶段：understanding/planning/development/"
+                                 "stage/closure；省略按模式默认")
+        parser.add_argument("--reason", default="", help="再次调用的具体原因")
+        parser.add_argument("--trigger", default="",
+                            choices=("", *sorted(SR.RETRY_TRIGGERS)),
+                            help="再次调用的实质原因类型")
+        parser.add_argument("--force", action="store_true",
+                            help="已有同模式结论且材料不同时，按 --trigger/--reason "
+                                 "再调用一次（声明决策价值，不是次数上限）")
+        parser.add_argument("--dry-run", action="store_true",
+                            help="只构建并校验请求（零工具/材料预算/推理强度），"
+                                 "不发请求、不写状态")
+        parser.add_argument("--list", action="store_true", help="只读列出记录")
+        parser.add_argument("--json", action="store_true")
+        parser.add_argument("--timeout", type=float, default=SR.DEFAULT_TIMEOUT,
+                            help="单次请求超时秒数（不重试）")
+        parser.add_argument("--max-output-tokens", type=int,
+                            default=SR.DEFAULT_MAX_OUTPUT_TOKENS)
+        parser.add_argument("--audit-log", default="",
+                            help="审计日志路径；默认任务目录 sol-audit.jsonl")
+        parser.add_argument("--output-dir", default="",
+                            help=f"原始输出目录；默认任务目录 {subdir}/")
+
+    p = sub.add_parser(
+        "sol-consult",
+        help="SOL 默认认知咨询：目标理解、问题本质、方案取舍与风险；失败只降级")
+    _add_sol_cognitive_args(p, subdir="sol-consult")
+    p.set_defaults(func=cmd_sol_consult)
+
+    p = sub.add_parser(
+        "sol-plan",
+        help="SOL 方案规划：调查后比较方案、优先级与验收关注点；失败只降级")
+    _add_sol_cognitive_args(p, subdir="sol-plans")
+    p.set_defaults(func=cmd_sol_plan)
+
     p = sub.add_parser(
         "sol-think",
-        help="SOL 默认认知引擎：一次零工具判断；不可用时只记录并降级")
-    p.add_argument("--state", required=True)
-    p.add_argument("--materials", default="",
-                   help="主代理整理的材料文件（- 表示 stdin）；--list 时可省略")
-    p.add_argument("--knowledge-file", default="",
-                   help="知识交接 JSON（由 knowledge_handoff.py 校验）；摘录追加到 materials")
-    p.add_argument("--question", default="",
-                   help="本次真正需要 SOL 判断的事项（越具体越好）")
-    p.add_argument("--reason", default="", help="再次调用的具体原因")
-    p.add_argument("--trigger", default="",
-                   choices=("", *sorted(SR.RETRY_TRIGGERS)),
-                   help="再次调用的实质原因类型")
-    p.add_argument("--force", action="store_true",
-                   help="已有认知结论且材料不同时，允许按 --trigger/--reason 再调用一次")
-    p.add_argument("--dry-run", action="store_true",
-                   help="只构建并校验请求（零工具/材料预算/推理强度），不发请求、不写状态")
-    p.add_argument("--list", action="store_true", help="只读列出认知判断记录")
-    p.add_argument("--json", action="store_true")
-    p.add_argument("--timeout", type=float, default=SR.DEFAULT_TIMEOUT,
-                   help="单次请求超时秒数（不重试）")
-    p.add_argument("--max-output-tokens", type=int,
-                   default=SR.DEFAULT_MAX_OUTPUT_TOKENS)
-    p.add_argument("--audit-log", default="",
-                   help="审计日志路径；默认任务目录 sol-audit.jsonl（两模式共用）")
-    p.add_argument("--output-dir", default="",
-                   help="原始输出目录；默认任务目录 sol-think/")
+        help="历史命令：v9 起等价于 sol-consult")
+    _add_sol_cognitive_args(p, subdir="sol-consult")
     p.set_defaults(func=cmd_sol_think)
+
+    p = sub.add_parser(
+        "sol-accept",
+        help="回填 SOL 建议的采纳结论（accepted/modified/rejected；事实记录）")
+    p.add_argument("--state", required=True)
+    p.add_argument("--call-id", required=True, help="SOL 记录的 call_id")
+    p.add_argument("--status", required=True,
+                   choices=("accepted", "modified", "rejected"))
+    p.add_argument("--note", default="", help="实际采用范围或修改说明")
+    p.add_argument("--reason", default="", help="拒绝或修改的理由")
+    p.add_argument("--decided-by", default="zcode")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_sol_accept)
 
     p = sub.add_parser("agent-policy",
                        help="只读调度建议：主代理默认，Explore/general-purpose 按需")
@@ -1704,6 +1834,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--test-policy", default="",
                    help="修订合同测试策略 JSON（省略则保留原策略）")
     p.add_argument("--test-policy-file", default="")
+    p.add_argument("--task-kind", default="", choices=("", *sorted(RP.TASK_KINDS)),
+                   help="修订任务类型（影响 SOL 默认认知路由）")
+    p.add_argument("--trigger", action="append", default=[],
+                   help="追加剧情的触发因素（可多次）")
     p.set_defaults(func=cmd_contract)
 
     p = sub.add_parser("authorize-review", help="记录用户对正式 REVIEW 的明确授权")

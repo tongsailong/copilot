@@ -80,9 +80,11 @@ class SkillEntryTests(unittest.TestCase):
         # 模型升级必须写进当前版本说明，并且不得残留旧模型为现行配置。
         self.assertIn("gpt-6.2-sol", self.doc)
         self.assertIn("reasoning.effort=\"high\"", self.doc)
-        # 当前命令面是 sol-think；sol-advisory 只允许作为历史版本说明出现。
-        self.assertIn("sol-think", self.doc)
-        self.assertIn("v8.4.0（SOL 默认认知引擎）", self.doc)
+        # 当前命令面是 sol-consult / sol-plan；THINK 只作读取别名，sol-advisory 只允许作为历史说明。
+        self.assertIn("sol-consult", self.doc)
+        self.assertIn("sol-plan", self.doc)
+        self.assertIn("THINK 保留为只读别名", self.doc)
+        self.assertIn("v9.0.0（SOL-first", self.doc)
 
     def test_think_and_review_are_advisory_not_gates(self):
         self.assertIn("sol_advisories", self.doc)
@@ -180,6 +182,7 @@ class ReferenceTests(unittest.TestCase):
         self.assertIn("v8.1.0", doc)
         self.assertIn("gpt-6.2-sol", doc)
         self.assertIn("SOL 零工具单轮复核", doc)
+        self.assertIn("v9.0.0", doc)
         self.assertIn("legacy/", doc)
 
 
@@ -208,7 +211,7 @@ class ReadonlyProfileTests(unittest.TestCase):
 class ProjectDocTests(unittest.TestCase):
     def test_agents_md_points_to_v8_architecture(self):
         doc = text(os.path.join(ROOT, "AGENTS.md"))
-        self.assertIn("唯一远程调用是 SOL（THINK / REVIEW）", doc)
+        self.assertIn("唯一远程调用是 SOL（CONSULT / PLAN / REVIEW）", doc)
         self.assertIn("gpt-6.2-sol", doc)
         self.assertIn("PARTIAL 不是终点", doc)
         self.assertIn("legacy/tests", doc)
@@ -221,11 +224,12 @@ class ProjectDocTests(unittest.TestCase):
     def test_charter_and_roadmap_mark_sol_advisory_only(self):
         charter = text(os.path.join(ROOT, "docs", "PROJECT-CHARTER.md"))
         roadmap = text(os.path.join(ROOT, "docs", "ROADMAP.md"))
-        self.assertIn("v8.4.0 把 CONSULT / PLAN 并入默认认知引擎 THINK", charter)
+        self.assertIn("v9.0.0 按生命周期恢复 CONSULT / PLAN", charter)
         self.assertIn("唯一工程执行与技术决策主体", charter)
         self.assertIn("v7.0", roadmap)
         self.assertIn("v8.0", roadmap)
         self.assertIn("v8.1", roadmap)
+        self.assertIn("Phase 13（v9.0）", roadmap)
 
     def test_status_and_decisions_record_versions(self):
         status = text(os.path.join(ROOT, "docs", "STATUS.md"))

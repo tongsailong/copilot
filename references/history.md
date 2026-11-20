@@ -7,8 +7,22 @@
 > （2026-11-18）升级 `gpt-6.2-sol` 并恢复建议性 CONSULT / PLAN；v8.2.0（2026-11-18）
 > 把三模式融合为 Copilot 内部统一按需认知能力；v8.3.0（2026-11-18）把“什么时候调用
 > SOL”升级为确定性复杂度判断与主动介入；v8.4.0（2026-11-18）把 CONSULT / PLAN 并入
-> 默认认知引擎 THINK，REVIEW 只在用户明确要求时执行；v8.5.0（2026-11-19）把 PARTIAL
-> 改为强制续跑的连续执行状态，并把阻塞收窄到工作项范围**。
+> 改为强制续跑的连续执行状态，并把阻塞收窄到工作项范围；v9.0.0（2026-11-20）把 SOL
+> 恢复为按生命周期的默认认知引擎 CONSULT / PLAN，THINK 只作读取别名**。
+
+## v9.0.0（2026-11-20）SOL-first 默认认知引擎
+
+- **模式**：`SOL_MODES=("CONSULT","PLAN","REVIEW")`；`THINK` 只作读取别名归一到 CONSULT；
+  CONSULT / PLAN 与 REVIEW 共享单轮零工具管线、`sol_calls` 记录与审计。
+- **生命周期**：起点 CONSULT（understanding）→ 调查后 PLAN（planning）→ 新证据/方案失败时
+  动态 CONSULT（development）→ 高复杂阶段复盘（stage）→ 收口综合判断（closure）。
+- **路由**：`--task-kind` 16 类；简单/机械类型（trivial/mechanical/docs/format）0 调用，
+  未声明按 `standard` 非简单处理；没有硬性次数或 Token 上限，重复调用需说明决策价值。
+- **采纳与统计**：`sol-accept` 记录 accepted/modified/rejected；`review-metrics` 的
+  `sol_cognitive` 输出覆盖率、重复率、采纳、usage/latency（缺失标 `unavailable`）。
+- **降级**：CONSULT / PLAN 失败登记后退出码 0，不阻断工程推进；REVIEW 失败仍非零。
+- **不变量**：零工具、单轮、`gpt-6.2-sol` + `high` + `standard`、CPA `127` 出口；
+  G1–G3、授权边界与 G4 退役状态不变。
 
 ## v8.5.0（2026-11-19）PARTIAL 强制续跑与按工作项阻塞
 

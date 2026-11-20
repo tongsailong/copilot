@@ -165,8 +165,9 @@ def drive(args) -> int:
         sol = evaluation.get("sol") or {}
         # PASS 阶段 drive 会立即收口，此时再提示 SOL 已无法执行；收口前的建议
         # 由 `status` / `review-admission` 在收口前给出（见 SKILL.md 顺序）。
-        if phase != "PASS" and sol.get("action") in ("think", "review"):
+        if phase != "PASS" and sol.get("action") in ("consult", "plan", "review"):
             print(f"SOL {sol.get('mode')} 建议（{sol.get('recommended_action')}，"
+                  f"阶段 {sol.get('stage') or '-'}，"
                   f"复杂度 {(sol.get('complexity') or {}).get('level') or '-'}）："
                   f"{sol.get('reason')}")
             if sol.get("command"):
