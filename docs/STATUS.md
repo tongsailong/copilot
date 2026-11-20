@@ -3,6 +3,32 @@
 更新：2026-11-20 CST。本文件只记录现场可核实的事实；规划与未完成事项单独标注。
 当前版本：v9.0.0（SOL-first 默认认知生命周期）。
 
+## v9.0.0 发布与运行时验证（2026-11-20）
+
+- **提交**：`a5b2df9`（`feat(copilot): make SOL-first the default cognitive lifecycle`），
+  26 个文件（25 修改 + `tests/test_sol_first.py` 新增），+2239/−787。显式路径暂存，未使用
+  `git add .`/`-A`；未跟踪的 `scripts/knowledge_handoff.py` 与 `tests/test_knowledge_handoff.py`
+  保持原样，未纳入、未删除。
+- **推送**：`origin/main` `d3990c5..a5b2df9` 普通快进；本地 `HEAD`、`@{u}`、
+  `git ls-remote origin refs/heads/main` 三方同为 `a5b2df9ba164c2b8ba65248e5e36802ab5309b29`，
+  ahead/behind `0/0`；未 force push、未 rebase。
+- **测试证据**：提交前 `python3 -B -m unittest discover -s tests -p 'test_*.py'` 604 项 OK；
+  其后仅改动本记录，提交前用工作区指纹（`git diff | sha256sum`
+  `58fcf006…`）确认树未变化，并定向复跑 `test_sol_first`（32）、`test_docs_v6`、
+  `test_sync_runtime` 均 OK。`legacy/tests` 853 项失败/错误集合与 `HEAD=d3990c5` 完全一致
+  （146 项，排序后 `comm` 差异 0）；`compileall` 通过。
+- **运行时同步**：`--apply` 写入 0 个文件（此前已同步），`--check` 缺失 0/不同 0，
+  `--verify-baseline` 通过。运行时 `copilot_dispatch.py __version__=9.0.0`，其
+  `copilot_dispatch.py`、`sol_review.py`、`SKILL.md` 的 sha256 与源码逐一相同。
+- **运行时能力核对（实际加载目录 `~/.zcode/skills/copilot`）**：
+  `SOL_MODES=('CONSULT','PLAN','REVIEW')`、`COGNITIVE_MODES=('CONSULT','PLAN')`、
+  `THINK→CONSULT` 归一、5 个生命周期 stage、16 类任务与 4 类简单任务；
+  `start --task-kind feature` 输出 CONSULT（understanding）默认建议；
+  `sol-consult`/`sol-plan --dry-run` 均输出 `gpt-6.2-sol`、`effort=high`、零工具；
+  已有 CONSULT+PLAN 覆盖且出现 `risk-high` 新信号时，运行时的 `sol_advice` 返回
+  `consult/development/new-risk`（动态咨询）；简单机械任务返回 `none`。
+- **未验证 / 限制**：未在独立 GUI 宿主会话中复跑该链路；未做正式 REVIEW（用户未要求）。
+
 ## SOL-first 默认认知生命周期（2026-11-20，v9.0.0）
 
 现场基线：`HEAD=d3990c5`；源码工作区含本轮修改的 `sol_review.py`、`review_policy.py`、
