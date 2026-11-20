@@ -8,10 +8,12 @@
 - **提交**：`a5b2df9`（`feat(copilot): make SOL-first the default cognitive lifecycle`），
   26 个文件（25 修改 + `tests/test_sol_first.py` 新增），+2239/−787。显式路径暂存，未使用
   `git add .`/`-A`；未跟踪的 `scripts/knowledge_handoff.py` 与 `tests/test_knowledge_handoff.py`
-  保持原样，未纳入、未删除。
-- **推送**：`origin/main` `d3990c5..a5b2df9` 普通快进；本地 `HEAD`、`@{u}`、
-  `git ls-remote origin refs/heads/main` 三方同为 `a5b2df9ba164c2b8ba65248e5e36802ab5309b29`，
-  ahead/behind `0/0`；未 force push、未 rebase。
+  保持原样，未纳入、未删除。发布记录由 `bb3689d`（`docs(copilot): record v9.0.0 release
+  verification`，1 文件 +26）补齐。
+- **推送**：`origin/main` 两次普通快进（`d3990c5..a5b2df9`、`a5b2df9..bb3689d`）；
+  记录写入时本地 `HEAD`、`@{u}`、`git ls-remote origin refs/heads/main` 三方同为
+  `bb3689dd6163729021b7881152dfb9692dfa4ac1`，ahead/behind `0/0`；未 force push、未 rebase。
+  本记录自身的后续修订只改文档，不改变代码、测试或运行时状态。
 - **测试证据**：提交前 `python3 -B -m unittest discover -s tests -p 'test_*.py'` 604 项 OK；
   其后仅改动本记录，提交前用工作区指纹（`git diff | sha256sum`
   `58fcf006…`）确认树未变化，并定向复跑 `test_sol_first`（32）、`test_docs_v6`、
