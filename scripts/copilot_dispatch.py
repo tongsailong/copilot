@@ -160,6 +160,12 @@ def _brief(state: dict) -> str:
 
 EXIT_CONTINUE = 10
 
+# 只读命令不写任何文件（含 session.json 会话绑定）：它们的契约是“只看不改”。
+READ_ONLY_COMMANDS = frozenset({
+    "closure-check", "review-metrics", "review-admission", "agent-policy",
+    "handoff", "legacy-status", "next", "brief", "render", "status",
+})
+
 
 def _print_continuation(path: str) -> int:
     """回填类命令的统一续跑判定：仍有可执行工作时返回 10。
@@ -176,6 +182,10 @@ def _print_continuation(path: str) -> int:
             print("可执行工作项：" + "、".join(cont["executable"]))
         if cont.get("derivable"):
             print("可派生工作项：" + "、".join(cont["derivable"]))
+        if cont.get("unattributed_criteria"):
+            print("未归属完成条件：" + "、".join(cont["unattributed_criteria"])
+                  + "（若由已阻塞工作项承载，先 block --criterion 归属，"
+                    "不要反复派生执行不了的 AUTO-C）")
         if cont.get("next_command"):
             print(f"下一步：{cont.get('next_command')}")
         print("提示：该动作未完成前不要结束回合；报告与阶段结论都不是任务终点。")
@@ -422,6 +432,20 @@ def cmd_block(args) -> int:
         print(f"已进入任务级 BLOCKED：{block['block_id']}")
     if block.get("criteria"):
         print(f"同时卡住的完成条件：{', '.join(block['criteria'])}")
+    elif block.get("work_items"):
+        # 条件归属缺口：本项被阻塞却没有声明它承载哪些条件，未闭合条件会继续被
+        # 派生为 AUTO-C<n>，任务永远到不了 BLOCKED。这里把缺口直接说清楚。
+        state = G.load_state(_state_path(args))
+        pending = [str(c.get("criterion_id") or "")
+                   for c in (state.get("contract") or {}).get("criteria") or []
+                   if str(c.get("status") or "pending") != "met"]
+        if pending:
+            print(f"警告：本次阻塞未归属完成条件；仍未闭合：{', '.join(pending)}")
+            print("若这些条件正由本工作项承载，请补登记归属："
+                  f"copilot_dispatch.py block --state <state> --work-item "
+                  f"{block['work_items'][0]} --criterion {pending[0]} "
+                  "--reason \"<为何由该项承载>\" --needs \"<解除条件>\"；"
+                  "否则每一轮都会派生执行不了的 AUTO-C。")
     print(f"原因：{block['reason']}")
     print(f"所需条件：{block['needs']}")
     print("提示：未阻塞的工作项继续执行；不要因单项阻塞结束回合。")
@@ -517,9 +541,12 @@ def cmd_closure_check(args) -> int:
     state = G.load_state(path)
     check = G.closure_check(
         state, task_dir=os.path.dirname(os.path.abspath(path)))
+    # 门禁结果必须体现在退出码上：FAIL 仍返回 0 会让调用方（和管道后的 shell）
+    # 把“检查过”误当“通过了”。PASS=0，FAIL=1。
+    exit_code = 0 if check.get("passed") else 1
     if args.json:
         _print({"task_id": state.get("task_id"), **check})
-        return 0
+        return exit_code
     print(f"任务 {state.get('task_id')} 三道门检查："
           f"{'PASS' if check['passed'] else 'FAIL'}")
     for name in ("G1", "G2", "G3"):
@@ -534,7 +561,10 @@ def cmd_closure_check(args) -> int:
               f"已接受 {'、'.join(quality.get('accepted_ids') or []) or '无'}）")
     for warning in check.get("warnings") or []:
         print(f"- 提醒（不阻断）：{warning}")
-    return 0
+    if exit_code:
+        print("门禁未通过：这不是任务终点；按 drive 的下一步继续处理缺口，"
+              "不要以本次检查结果收束回合。")
+    return exit_code
 
 
 def cmd_review_metrics(args) -> int:
@@ -1907,6 +1937,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    # 会话绑定：推进任务的命令表示“本会话正在负责这个任务”，Stop 守卫据此
+    # 判定归属（只写任务目录的 session.json，不改任务状态）；只读命令不写。
+    if args.command not in READ_ONLY_COMMANDS:
+        G.touch_session(str(getattr(args, "state", "") or ""))
     try:
         return args.func(args) or 0
     except (G.GovernanceError, CLIError) as exc:

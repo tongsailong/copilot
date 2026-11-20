@@ -431,6 +431,73 @@ def save_state(path: str, state: dict, expect: dict | None = None) -> None:
             _unlock_file(lock_fh)
 
 
+SESSION_ENV_KEYS = ("ZCODE_SESSION_ID", "CLAUDE_SESSION_ID", "CLAUDE_CODE_SESSION_ID")
+SESSION_BINDING_FILE = "session.json"
+MAX_BOUND_SESSIONS = 20
+
+
+def current_session_id() -> str:
+    """当前 ZCode 会话标识（宿主在 Bash/钩子环境里注入）；不可用时返回空串。"""
+    for key in SESSION_ENV_KEYS:
+        value = str(os.environ.get(key) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def touch_session(state_path: str, *, session: str = "") -> str:
+    """把当前会话绑定到任务目录，供 Stop 守卫判定“本会话是否负责该任务”。
+
+    只写任务目录下的 `session.json` 旁路文件，不改 governance 状态、证据或历史；
+    没有会话标识（手工运行、非 ZCode 环境）时不做任何事。失败不影响命令本身：
+    守卫在缺失绑定时会退化为“不拦截”，不会因此误判任务完成。
+    """
+    sid = str(session or "").strip() or current_session_id()
+    if not sid or not state_path:
+        return ""
+    target = os.path.abspath(state_path)
+    directory = os.path.dirname(target)
+    if not os.path.isdir(directory):
+        return ""
+    path = os.path.join(directory, SESSION_BINDING_FILE)
+    rows: list[dict] = []
+    try:
+        if os.path.isfile(path):
+            with open(path, encoding="utf-8") as fh:
+                existing = json.load(fh)
+            if isinstance(existing, dict) and isinstance(existing.get("sessions"), list):
+                rows = [row for row in existing["sessions"]
+                        if isinstance(row, dict) and str(row.get("session_id") or "")]
+    except (OSError, ValueError):
+        rows = []
+    now = now_iso()
+    rows = [row for row in rows if str(row.get("session_id") or "") != sid]
+    rows.append({"session_id": sid, "at": now})
+    rows = rows[-MAX_BOUND_SESSIONS:]
+    payload = {"sessions": rows, "updated": now}
+    workspace = str(os.environ.get("ZCODE_PROJECT_DIR") or "").strip()
+    if workspace:
+        payload["workspace"] = workspace
+    try:
+        fd, tmp = tempfile.mkstemp(prefix=".copilot-session-", dir=directory, text=True)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh, ensure_ascii=False, indent=2)
+                fh.write("\n")
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+    except OSError:
+        return ""
+    return path
+
+
 def log_attempt(state_path: str, kind: str, code: str, message: str,
                 envelope: dict | None = None) -> str:
     """把被拒/无法生成的信封尝试追加到任务目录 `review-attempts.jsonl`。
@@ -1525,21 +1592,41 @@ def add_block(path: str, reason: str, needs: str,
     if not reason or not needs:
         raise GovernanceError("BLOCKED 必须同时说明原因（--reason）与所需条件（--needs）。")
     items: list[str] = []
+    auto_criteria: list[str] = []
     for raw in work_items or []:
         aid = str(raw or "").strip()
         if not aid or aid in items:
             continue
-        _by_id(state, aid)
+        action = _by_id(state, aid)
         items.append(aid)
+        # 工作项可以在计划期声明自己承载的完成条件（target_criteria），派生工作项
+        # AUTO-C<n> 天然承载 C<n>。阻塞时自动归属这些条件：否则条件悬空会被反复
+        # 派生为新的“可执行”工作项，任务永远到不了真实 BLOCKED。
+        declared = action.get("target_criteria") or action.get("criteria") or []
+        if isinstance(declared, str):
+            declared = [declared]
+        if not declared:
+            match = re.fullmatch(r"AUTO-C([0-9]{1,3})", aid)
+            if match:
+                declared = [f"C{match.group(1)}"]
+        for raw_cid in declared:
+            cid = str(raw_cid or "").strip()
+            if cid and cid not in auto_criteria:
+                auto_criteria.append(cid)
     criterion_ids: list[str] = []
     known = {str(c.get("criterion_id") or "")
              for c in (state.get("contract") or {}).get("criteria") or []}
-    for raw in criteria or []:
+    explicit = [str(raw or "").strip() for raw in criteria or []]
+    # 显式 --criterion 优先（并校验存在性）；未显式声明时用工作项自身的归属。
+    # 自动归属只接受合同内真实存在的条件，拼写错误不会被悄悄冻结。
+    for raw in (explicit if explicit else auto_criteria):
         cid = str(raw or "").strip()
         if not cid or cid in criterion_ids:
             continue
         if cid not in known:
-            raise GovernanceError(f"不存在完成条件：{cid}。")
+            if explicit:
+                raise GovernanceError(f"不存在完成条件：{cid}。")
+            continue
         criterion_ids.append(cid)
     block = {
         "block_id": "B" + _sha256_text(
@@ -4965,7 +5052,8 @@ def derive_work(state: dict, *, reason: str = "partial",
             f"使完成条件 {cid}「{criterion.get('description') or ''}」闭合："
             "执行所需工作，登记覆盖该条件的原始证据，并用 criterion 记录 met。",
             f"覆盖 {cid} 的原始产物（命令输出 / 文件内容 / 日志 / diff / 测试结果），"
-            "登记为证据后引用")
+            "登记为证据后引用",
+            extra={"target_criteria": [cid]})
 
     stalled = stalled_actions(state)
     for action, why in stalled[:MAX_DERIVED_PER_CALL]:
@@ -5174,13 +5262,32 @@ def _evaluate_core(state: dict, *, cache: dict | None = None) -> dict:
             ],
         }
     if open_unmet:
+        open_cids = [str(c.get("criterion_id") or "") for c in open_unmet]
+        all_blocked = _all_remaining_blocked(state)
+        if all_blocked:
+            # 剩余工作已全部阻塞，但仍有条件没有归属到任何阻塞项。这不是“可执行
+            # 工作”，而是归属缺口：必须用 block --criterion 把条件挂到承载它的
+            # 工作项上，否则每一轮都会派生一条执行不了的 AUTO-C。
+            reason = ("剩余工作全部受阻，但完成条件 " + "、".join(open_cids)
+                      + " 尚未归属任何阻塞项")
+            next_commands = [
+                "copilot_dispatch.py block --state <state> --work-item "
+                + (blocked_items[0]["id"] if blocked_items else "<承载该条件的已阻塞工作项>")
+                + " --criterion " + open_cids[0]
+                + " --reason <为何该条件由该项承载> --needs <解除条件>",
+                "若该条件其实另有可执行路线，先解除对应对的阻塞再执行，不要直接标 met",
+            ]
+        else:
+            reason = "仍有未闭合完成条件"
+            next_commands = ["copilot_auto.py drive --state <state>（本地派生下一步并退出 EXECUTE）"]
         return {
-            "phase": "PARTIAL", "reason": "仍有未闭合完成条件",
+            "phase": "PARTIAL", "reason": reason,
             "actions": [], "stalled": [{"id": a.get("id"), "reason": why}
                                        for a, why in stalled],
             "blocked_items": blocked_items,
+            "unattributed_criteria": open_cids,
             "gate": None, "criteria": criteria,
-            "next_commands": ["copilot_auto.py drive --state <state>（本地派生下一步并退出 EXECUTE）"],
+            "next_commands": next_commands,
         }
     if stalled:
         return {
@@ -5244,6 +5351,7 @@ def continuation(state: dict, *, cache: dict | None = None,
         "derivable": [],
         "blocked_items": ev.get("blocked_items") or [],
         "dependency_blocked": ev.get("dependency_blocked") or [],
+        "unattributed_criteria": ev.get("unattributed_criteria") or [],
         "next_command": "",
         "reason": "",
     }
@@ -5279,16 +5387,26 @@ def continuation(state: dict, *, cache: dict | None = None,
         return base
     derivable = _dry_derive_ids(state, cache=cache)
     if derivable:
+        hint = ""
+        if base["unattributed_criteria"]:
+            hint = ("；条件 " + "、".join(base["unattributed_criteria"]) +
+                    " 未归属任何阻塞项：若确由已阻塞工作承载，先用 block --criterion "
+                    "归属，再 drive 判断是否整体受阻")
         base.update({
             "required": True,
             "action": "derive",
             "derivable": derivable,
             "next_command": "copilot_auto.py drive --state <state>（派生下一步并执行）",
-            "reason": "任务仍处于 PARTIAL 且可派生下一步工作项：继续推进",
+            "reason": "任务仍处于 PARTIAL 且可派生下一步工作项：继续推进" + hint,
         })
         return base
-    base["reason"] = "没有可执行工作；检查合同、证据与阻塞口径"
-    base["next_command"] = "copilot_dispatch.py next --state <state>"
+    base.update({
+        "required": True,
+        "action": "replan",
+        "next_command": "copilot_dispatch.py next --state <state>",
+        "reason": ("PARTIAL 但没有可直接派生的下一步：必须重新分析路线、补证据或"
+                   "登记真实阻塞，不能把无进展当成任务终点"),
+    })
     return base
 
 

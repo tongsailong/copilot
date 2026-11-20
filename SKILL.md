@@ -186,7 +186,8 @@ PASS 才表示目标达成、证据充分、可以结束；BLOCKED 只在剩余�
 ### 续跑判定
 
 每次求值都会给出 `continuation`（`phase` / `required` / `action` / `executable` /
-`derivable` / `blocked_items` / `dependency_blocked` / `next_command` / `reason`）：
+`derivable` / `unattributed_criteria` / `blocked_items` / `dependency_blocked` /
+`next_command` / `reason`）：
 
 | phase / 局面 | action | required | 含义 |
 |---|---|---|---|
@@ -217,6 +218,92 @@ PASS 才表示目标达成、证据充分、可以结束；BLOCKED 只在剩余�
   可自行补齐的证据不足。
 - 只有确实缺少授权、用户决策、必要资源或存在真实外部限制（服务商限流/配额、网络、安全
   边界）时才用 `block`，并写明原因、所需条件与责任方；一项阻塞不影响其它可执行工作。
+
+### Stop 续跑守卫（机械衔接层）
+
+`EXIT_CONTINUE=10` 只是命令退出码，模型仍可能写完报告就结束回合。`scripts/copilot_stop_guard.py`
+把本地续跑判定接到 ZCode 的 `Stop` 钩子上：Stop 时读取工作区 `.copilot-tasks/*/state.json`，
+只要还有 `continuation.required=true` 的任务，就以退出码 2 让宿主继续当前回合（宿主单回合最多
+连续续跑 3 次，且原因文本必须非空）。它只读状态、不调用模型、不改任务状态，CLOSED / 真实
+BLOCKED / 所有剩余工作均被项级阻塞时一律放行。
+
+**归属绑定（取代时间过期）**：守卫不按“多久没更新”放行。Copilot CLI 在处理任务的命令里把当前
+`ZCODE_SESSION_ID` 记到任务目录 `session.json`；守卫只拦截“本会话真正推进过”的任务，
+其它会话、其它工作区、以及从未绑定过当前会话的旧任务都不参与判定。这样既不会因为旧任务
+永久误拦工作区，也不会因为时间上限放弃仍有可执行工作的任务。要继续一个旧任务，先在本会话
+运行一次会改写状态的命令（如 `drive`），绑定即建立。
+
+安装（默认工作区级；若本机 `Stop` 钩子未获 `workspaceHookAdmission` 则不触发，此时装用户级）：
+
+```bash
+python3 -B ~/.zcode/skills/copilot/scripts/copilot_stop_guard.py \
+  install --workspace <repo> --apply      # 写入 <repo>/.zcode/config.json，原文件有备份
+python3 -B ~/.zcode/skills/copilot/scripts/copilot_stop_guard.py \
+  install --user --apply                  # 写入 ~/.zcode/cli/config.json（全部工作区生效）
+python3 -B ~/.zcode/skills/copilot/scripts/copilot_stop_guard.py status --workspace <repo>
+python3 -B ~/.zcode/skills/copilot/scripts/copilot_stop_guard.py \
+  uninstall (--workspace <repo> | --user) --apply
+```
+
+`--user` 会改写用户级 `config.json`（同文件还含 mcp/plugins），安装前自动备份，且只追加/移除
+`Stop` 里的这一条守卫命令，不动其它配置；重复安装会把多条/过期记录收敛为一条，不产生重复
+Hook。`ZCODE_USER_CONFIG` 可覆盖目标路径（测试用）。新会话生效（配置在会话启动时加载）。
+
+**放行路径**：`COPILOT_STOP_GUARD=0`、工作区 `.copilot-tasks/.stop-guard-off`、任务目录
+`.stop-guard-off`、任务 state 的 `stop_guard=false`，或 `disable --state <state> --reason "<原因>"`
+（用户明确要求停止/紧急退出时由主代理执行，`enable` 恢复）。用户的 ESC 中断本身会中止钩子
+进程，宿主不会续跑。
+
+**异常一律 fail-closed**：state 损坏、绑定文件损坏、任务目录不可读、钩子输入非法时不静默放行，
+也不伪造 PASS，而是以退出码 2 给出可执行的修复命令（修复该文件，或对已废弃任务执行
+`disable --state ...`）。守卫是兜底，不替代主代理执行工作单。
+
+### 单回合续跑上限与跨回合交接
+
+ZCode 每回合最多接受 **3 次** Stop 自动续跑（发行版硬编码 `xmc=3`，无配置项，钩子也拿不到
+已用/剩余次数）；第 4 次及以后的退出码 2 会被宿主忽略。守卫把这一事实写进每次注入的续跑
+理由，并且**不推测剩余次数**、不断言"这是最后一次"。据此执行：
+
+- **一次拦截 = 一个最小可验证工作单元**：优先完成一个工作项或一条完成条件（实施 + 定向
+  验证 + 证据登记）。不用只读核对、重复计划或长篇说明代替实际进展。
+- **结束续跑前必须落盘**：`record`/`report` 写结论，`evidence --add` 登记证据，未完成项
+  保留 `pending`/`blocked` 并写明原因；守卫给出的续接命令原样可粘贴。
+- **不得改状态规避上限**：禁止为结束回合把 PARTIAL 改写成 BLOCKED 或 PASS。BLOCKED 只在
+  真实外部阻塞（每条有 `reason`/`needs`）时登记，PASS 只由 G1–G3 全部通过的收口产生；
+  改状态规避等同于伪造结论。
+- **续接不新建任务**：用满 3 次仍未完成时，同一 `--state` 就是续接点；用户在新回合粘贴
+  守卫给出的 `python3 -B <runtime>/scripts/copilot_auto.py drive --state <绝对路径>` 继续。
+- 守卫**不增加持久化计数器**，仍只读状态与绑定文件；3 次是宿主行为，不是 Copilot 的预算、
+  轮次上限或停止理由。
+
+### Goal 模式（可选，仅用户发起）
+
+原生 `/goal`（headless `--target`）让宿主跨回合持续同一目标，可超出单回合 3 次续跑上限。
+它**不是默认机制**：普通任务继续用 `drive` + Stop 守卫；只有用户明确要求时才使用。
+
+**适用**：多阶段、预计远超 3 次续跑的复杂工作；目标清晰可验证（有客观完成标志）；
+权限客户端已确认可用。**不适用**：单回合能完成的任务、目标本身待澄清、环境权限未就绪。
+
+- **只能由用户发起**：Copilot 与主代理不得自行 `/goal` / `--target`，也不得把既有任务
+  偷偷改造成 goal 目标。
+- **Goal 与 Plan 互斥**：宿主不允许两者同时启用；不要为了启用 goal 强制切换会话模式。
+- **objective 对齐合同目标**：objective 必须与 Copilot 合同目标一致，不得扩大、缩小或改写
+  完成条件；目标变化走 `contract --amend` 并重新确认，而不是只改 objective。
+- **验收仍以 Copilot 为准**：goal 完成校验通过后，主代理必须核对 Copilot 最终状态与 G1–G3；
+  goal 自报完成、校验器结论或 `target` 状态都不能当作工程 PASS，也不能据此 `closure --close`。
+- **不用 yolo 绕过权限**：缺少权限客户端时如实报告并停下，不得用 `--mode yolo` 或等价配置
+  绕过审批；不调用未公开的内部预算/目标接口。
+- **异常先暂停**：连续多轮无进展、token 消耗异常增长、权限错误反复出现时先 `/goal pause`
+  并调查根因，不继续放大消耗。
+- 不引入常驻后台服务，不递归启动 ZCode 进程，不修改宿主安装包与运行时。
+
+### 条件归属（block 的第二个作用）
+
+阻塞一个工作项时，`--criterion` 声明它承载哪些完成条件；派生工作项 `AUTO-C<n>` 天然承载
+`C<n>`，计划期也可以在工作项上写 `target_criteria: ["C1"]`，`block` 会自动归属。若被阻塞项
+既无显式 `--criterion` 也无自动归属，未闭合条件会一直悬空并每轮派生一条执行不了的
+`AUTO-C<n>`，任务永远到不了真实 BLOCKED：此时求值会把条件列进 `unattributed_criteria`，
+`continuation.reason` 与 `block` 输出都会给出补齐归属的具体命令。
 
 ## 状态机
 
@@ -574,6 +661,21 @@ CONSULT / PLAN 输出契约（`copilot-sol-think/v2`）：`judgment`、`goal_und
 - 上下文中断时保留：原始目标与完成条件、当前阶段、已完成工作、未解决问题、证据与验证结果、
   明确的下一步；恢复后从真实现场继续，不把历史计划当作当前事实。
 - 不重复已证无效的做法；同一问题不重复检索；没有新证据时不重复评审。
+
+### 跨回合续接（同一任务）
+
+跨回合（用满自动续跑、用户新开会话、进程重启）继续同一任务时：
+
+1. **复用同一 `--state`**：不新建任务、不改 `task_id`，续接点就是原 `state.json`。
+2. **先核实再动手**：`status --json` 看阶段、`continuation`、ready/stalled、门禁缺口；
+   核对 Git 工作区实际改动、证据文件与摘要、未闭合条件、未完成工作项及其阻塞原因。
+3. **不重做已完成工作**：`done` 的项、已登记且摘要未变的证据直接复用；只继续真正未完成的
+   部分。证据不覆盖、不改写，需要新证据就新增。
+4. **保持原授权范围**：续接不继承新的授权，也不扩大范围；原任务内已给的授权继续有效。
+5. **仍在 PARTIAL 就继续**：按派生规则执行并回填，不因"换了回合"另建重复任务，也不把
+   上一回合的进展当成已完成而未登记。
+6. **真实 BLOCKED 才停**：列出每条阻塞的 `reason`/`needs` 与解除条件；条件满足后
+   `unblock` 并立即恢复。
 
 ## 模块路由（按需读取）
 

@@ -601,7 +601,7 @@ class PwwCliTests(PwwFixture):
 
         check = F.run_cli("copilot_dispatch.py", "closure-check", "--state",
                           self.state_path)
-        self.assertEqual(check.returncode, 0)
+        self.assertEqual(check.returncode, 1)
         self.assertIn("pww_acceptance_pending", check.stdout)
 
         close = F.run_cli("copilot_dispatch.py", "closure", "--state",

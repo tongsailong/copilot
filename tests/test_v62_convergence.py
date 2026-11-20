@@ -171,7 +171,8 @@ class EvidenceWarningsTests(unittest.TestCase):
         G.save_state(self.state_path, state)
         proc = F.run_cli("copilot_dispatch.py", "closure-check",
                          "--state", self.state_path)
-        self.assertEqual(proc.returncode, 0, proc.stderr)
+        # 该夹具没有通过 G1–G3，退出码必须如实反映 FAIL（历史实现恒返回 0）。
+        self.assertEqual(proc.returncode, 1, proc.stderr)
         self.assertIn("提醒（不阻断）", proc.stdout)
         self.assertIn("重复登记", proc.stdout)
 

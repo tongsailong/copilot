@@ -449,5 +449,91 @@ class DriveExitCodeTests(ContinuationBase):
         self.assertEqual(proc.returncode, 10, proc.stdout + proc.stderr)
 
 
+class CriterionAttributionTests(ContinuationBase):
+    """阻塞必须能归属到完成条件，否则条件悬空会被反复派生。"""
+
+    def test_blocking_derived_autoc_auto_links_its_criterion(self):
+        G.record_action(self.state_path, "A1", "done", result="完成")
+        G.record_action(self.state_path, "A2", "done", result="完成")
+        state = self.state()
+        created = G.derive_work(state)
+        G.save_state(self.state_path, state)
+        target = next(a for a in created if a["id"] == "AUTO-C1")
+        self.assertEqual(target.get("target_criteria"), ["C1"])
+
+        block = G.add_block(self.state_path, "缺少外部通道", "设备可用",
+                            work_items=["AUTO-C1"])
+        self.assertEqual(block["criteria"], ["C1"])
+        self.assertIn("C1", G._blocked_criteria(self.state()))
+
+    def test_blocking_plan_item_with_target_criteria_auto_links(self):
+        state = self.state()
+        for action in state["actions"]:
+            if action["id"] == "A2":
+                action["target_criteria"] = ["C2"]
+        G.save_state(self.state_path, state)
+        block = G.add_block(self.state_path, "缺少推送授权", "用户授权 push",
+                            work_items=["A2"])
+        self.assertEqual(block["criteria"], ["C2"])
+
+    def test_explicit_criteria_wins_over_auto_link(self):
+        state = self.state()
+        for action in state["actions"]:
+            if action["id"] == "A2":
+                action["target_criteria"] = ["C2"]
+        G.save_state(self.state_path, state)
+        block = G.add_block(self.state_path, "缺少推送授权", "用户授权 push",
+                            work_items=["A2"], criteria=["C1"])
+        self.assertEqual(block["criteria"], ["C1"])
+
+    def test_unattributed_criteria_get_attribution_command(self):
+        G.record_action(self.state_path, "A1", "done", result="完成")
+        self.block("A2")  # 未声明条件归属
+        evaluation = self.ev()
+        self.assertEqual(evaluation["phase"], "PARTIAL")
+        self.assertEqual(evaluation.get("unattributed_criteria"), ["C1", "C2"])
+        joined = " ".join(evaluation["next_commands"])
+        self.assertIn("block --state", joined)
+        self.assertIn("--criterion", joined)
+        self.assertTrue(self.cont()["required"])
+        self.assertIn("未归属任何阻塞项", self.cont()["reason"])
+
+        # 补齐归属后进入真实 BLOCKED，不再派生执行不了的 AUTO-C。
+        G.add_block(self.state_path, "缺少推送授权", "用户授权 push",
+                    work_items=["A2"], criteria=["C1", "C2"])
+        evaluation = self.ev()
+        self.assertEqual(evaluation["phase"], "BLOCKED")
+        self.assertFalse(evaluation["continuation"]["required"])
+
+    def test_attribution_survives_next_evaluation(self):
+        self.block("A2", criteria=["C2"])
+        state = self.state()
+        created = [a["id"] for a in G.derive_work(state)]
+        G.save_state(self.state_path, state)
+        self.assertIn("AUTO-C1", created)
+        self.assertNotIn("AUTO-C2", created)
+
+
+class ClosureCheckExitCodeTests(ContinuationBase):
+    def test_closure_check_returns_nonzero_when_gates_fail(self):
+        proc = F.run_cli("copilot_dispatch.py", "closure-check",
+                         "--state", self.state_path)
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("FAIL", proc.stdout)
+        self.assertIn("不是任务终点", proc.stdout)
+
+    def test_closure_check_returns_zero_when_gates_pass(self):
+        eid = self.evidence()
+        for aid in ("A1", "A2"):
+            G.record_action(self.state_path, aid, "done", result="完成",
+                            evidence_ids=[eid])
+        G.record_criterion(self.state_path, "C1", "met", evidence_ids=[eid])
+        G.record_criterion(self.state_path, "C2", "met", evidence_ids=[eid])
+        proc = F.run_cli("copilot_dispatch.py", "closure-check",
+                         "--state", self.state_path)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("PASS", proc.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()

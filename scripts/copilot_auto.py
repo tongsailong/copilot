@@ -373,6 +373,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    # 会话绑定：drive/ingest 表示本会话正在负责该任务，供 Stop 守卫判定归属。
+    G.touch_session(str(getattr(args, "state", "") or ""))
     try:
         return args.func(args) or 0
     except (AutoError, G.GovernanceError) as exc:
