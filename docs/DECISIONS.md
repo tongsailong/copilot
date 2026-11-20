@@ -1659,3 +1659,28 @@
     - **不变量**：零工具、单轮、`gpt-6.2-sol` + `effort=high` + `mode=standard`、CPA `127`
       出口、模型/强度回显校验；不换 Provider/账户/付费方案；G1–G3 fail-closed；G4 不存在、
       不恢复；不新增自定义子 Agent；不强制 Reviewer；敏感凭据不进入材料。
+
+62. **SOL 采纳记录升级为可追溯的 v2 结构，证据关联只做提示不做门禁（2026-11-20，v9.1.0，用户维护任务）。**
+    依据：用户《Copilot 增量维护：完善 SOL 采纳记录与证据关联》；现场 HEAD `971e330`，
+    v9.0.0 的 `sol-accept` 只写 status/note/reason。
+    - **问题**：实际任务中 SOL 建议、实际决策与采纳状态都齐全，但采纳记录没有直接关联
+      E1/E2 证据，事后无法从采纳记录追溯到工程证据。
+    - **结构**：新增 `copilot-sol-acceptance/v2`，字段 `decision`（ZCode 实际做法）、
+      `rationale`（缺省回落 `reason`）、`delta`（modified 与原建议差异）、`evidence_refs`、
+      `source_refs`、`evidence_note`、`advice_ref`（call_id/mode/stage/判断摘要/回复路径与
+      摘要）。原建议不复制正文；旧字段与旧 CLI 参数保持兼容。
+    - **证据口径**：登记时逐条解析 `linked` / `unresolved` / `archived`，汇总状态由逐条
+      结果派生；未登记与已归档引用只作待核引用，不自动补登记、不进入正式证据链，也不改变
+      `record`/`criterion`/`finding` 对已登记证据的要求。`source_refs` 仅定位，不称已核验。
+    - **非阻断**：缺实际决策/理由/modified 差异、暂无证据、引用未登记或归档只产生 warnings
+      与中文提示；登记成功、退出码 0，不改变任务阶段、完成条件或 G1–G3。E 编号格式错误
+      属于输入错误，直接拒绝。
+    - **重复登记与历史**：以最近一次为准，旧字段不隐式继承；每次登记的完整快照写入
+      `history.sol_call_acceptance`（只增不改），`first_registered_at` 保留最初时间，
+      `registration_count` 只计 v2 次数。旧记录只读可读、不计入质量分母、不迁移、不重写。
+    - **统计**：`sol_cognitive.acceptance_quality` 分开报告 `complete_rate`（决策+理由+
+      modified 差异）与 `evidence_link_rate`（至少一条 linked E），另列 source-only、无
+      证据、待核、归档与排除的旧版记录数；零分母为 null。原 `acceptance` 四态与 `adopted`
+      口径不变。指标只用于观察机制质量，不是验证率、KPI 或门禁。
+    - **不变量**：SOL-first 生命周期、零工具、单轮、advisory、G1–G3、PARTIAL 续跑与授权
+      边界不变；不新增模型调用、不新增审批门。

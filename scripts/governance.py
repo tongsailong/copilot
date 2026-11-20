@@ -3762,16 +3762,186 @@ def _find_sol_call(state: dict, call_id: str) -> dict:
 
 
 ACCEPTANCE_STATUSES = ("accepted", "modified", "rejected", "pending")
+# 采纳记录结构版本：显式标记区分新旧记录，不按日期或字段是否填满推断。
+# v1（无 schema 字段）与 v2 都可读取；质量指标只以 v2 已决记录为分母，
+# 并把排除的旧记录单独披露。
+ACCEPTANCE_SCHEMA = "copilot-sol-acceptance/v2"
+ACCEPTANCE_EVIDENCE_STATES = ("linked", "partial", "unresolved",
+                              "archived_only", "source_only", "none",
+                              "unrecorded")
+ACCEPTANCE_HINTS = {
+    "actual_decision_missing":
+        "缺少实际决策说明：建议用 --decision 记录 ZCode 最终采取的做法"
+        "（不是 SOL 原建议）。",
+    "rationale_missing":
+        "缺少采纳理由：建议用 --rationale（省略时回落 --reason）说明采纳、"
+        "修改或拒绝的依据。",
+    "modified_delta_missing":
+        "modified 缺少与原建议的差异：建议用 --delta 说明调整了什么。",
+    "evidence_missing":
+        "暂无证据关联：可如实保留；如需追溯，可引用已登记 E 编号、报告章节"
+        "或文件路径。",
+    "evidence_unregistered":
+        "引用的 E 编号尚未在本任务登记：请核实编号或先登记证据；未登记引用"
+        "只作为待核引用，不进入正式证据链。",
+    "evidence_archived":
+        "引用的 E 编号已归档：请核实是否应改用新的证据编号。",
+}
+
+
+def _normalize_acceptance_evidence_refs(refs) -> list[str]:
+    """规范化 E 编号引用：支持重复传参与逗号分隔，去空去重。
+
+    格式错误是调用方输入错误（不是证据门禁）；合法但未登记的编号由
+    `resolve_acceptance_evidence` 标为待核引用，不阻断登记。
+    """
+    out: list[str] = []
+    for raw in refs or []:
+        if raw is None:
+            continue
+        for piece in str(raw).split(","):
+            eid = piece.strip().upper()
+            if not eid:
+                continue
+            if not EVIDENCE_ID_RE.match(eid):
+                raise GovernanceError(f"证据引用 {eid!r} 非法（应形如 E1）。")
+            if eid not in out:
+                out.append(eid)
+    if len(out) > 50:
+        raise GovernanceError("证据引用过多（最多 50 条）。")
+    return out
+
+
+def _normalize_acceptance_source_refs(refs) -> list[str]:
+    """来源定位（报告章节、文件路径等）：只记录，不做证据核验。"""
+    out: list[str] = []
+    for raw in refs or []:
+        if raw is None:
+            continue
+        text = str(raw).strip()
+        if not text:
+            continue
+        if len(text) > 300:
+            raise GovernanceError("来源引用过长（最多 300 字符）。")
+        if text not in out:
+            out.append(text)
+    if len(out) > 20:
+        raise GovernanceError("来源引用过多（最多 20 条）。")
+    return out
+
+
+def resolve_acceptance_evidence(state: dict, evidence_refs: list[str]) -> dict:
+    """登记时解析证据引用：已登记 / 未登记 / 已归档。
+
+    只核对本任务证据登记表，不做内容核验、不自动补登记；未登记与已归档的
+    编号保留为待核引用，不进入正式证据链。
+    """
+    linked: list[str] = []
+    unresolved: list[str] = []
+    archived: list[str] = []
+    for eid in evidence_refs:
+        entry = _evidence_entry(state, eid)
+        if entry is None:
+            unresolved.append(eid)
+        elif entry.get("dropped"):
+            archived.append(eid)
+        else:
+            linked.append(eid)
+    return {"linked": linked, "unresolved": unresolved, "archived": archived}
+
+
+def acceptance_evidence_status(entry: dict) -> str:
+    """由登记时的逐条解析结果派生汇总状态（不持久化为第二事实来源）。"""
+    if not isinstance(entry, dict) or not entry.get("evidence_resolution"):
+        refs = (entry or {}).get("evidence_refs")
+        if refs is None:
+            return "unrecorded"
+        if not refs:
+            return "source_only" if (entry or {}).get("source_refs") else "none"
+    res = entry.get("evidence_resolution") or {}
+    linked = list(res.get("linked") or [])
+    unresolved = list(res.get("unresolved") or [])
+    archived = list(res.get("archived") or [])
+    if linked and (unresolved or archived):
+        return "partial"
+    if linked:
+        return "linked"
+    if unresolved:
+        return "unresolved"
+    if archived:
+        return "archived_only"
+    return "source_only" if entry.get("source_refs") else "none"
+
+
+def acceptance_rationale(entry: dict) -> str:
+    """有效理由：新字段优先，历史记录回落到 reason。"""
+    return str(entry.get("rationale") or entry.get("reason") or "").strip()
+
+
+def acceptance_is_complete(entry: dict) -> bool:
+    """完整率口径：只看决策记录（决策 + 理由 + modified 差异），不看证据。"""
+    if not isinstance(entry, dict):
+        return False
+    if not str(entry.get("decision") or "").strip():
+        return False
+    if not acceptance_rationale(entry):
+        return False
+    if str(entry.get("status") or "") == "modified" \
+            and not str(entry.get("delta") or "").strip():
+        return False
+    return True
+
+
+def _acceptance_advice_ref(record: dict) -> dict:
+    """原建议的可追溯引用：沿 call_id 定位已有回复，不复制正文。"""
+    return {
+        "call_id": sol_call_id(record),
+        "mode": sol_call_mode(record),
+        "stage": str(record.get("stage") or ""),
+        "schema": str(record.get("schema") or ""),
+        "judgment": str(record.get("judgment")
+                        or record.get("summary") or "")[:400],
+        "reply_path": str(record.get("reply_path") or ""),
+        "reply_sha256": str(record.get("reply_sha256") or ""),
+        "materials_sha256": str(record.get("materials_sha256") or ""),
+    }
+
+
+def _acceptance_warnings(entry: dict, resolution: dict,
+                         source_refs: list[str]) -> list[str]:
+    codes: list[str] = []
+    if not str(entry.get("decision") or "").strip():
+        codes.append("actual_decision_missing")
+    if not acceptance_rationale(entry):
+        codes.append("rationale_missing")
+    if entry.get("status") == "modified" \
+            and not str(entry.get("delta") or "").strip():
+        codes.append("modified_delta_missing")
+    if not entry.get("evidence_refs") and not source_refs:
+        codes.append("evidence_missing")
+    if resolution.get("unresolved"):
+        codes.append("evidence_unregistered")
+    if resolution.get("archived"):
+        codes.append("evidence_archived")
+    return codes
 
 
 def record_sol_acceptance(path: str, call_id: str, *, status: str,
                           note: str = "", reason: str = "",
+                          decision: str = "", rationale: str = "",
+                          delta: str = "", evidence_refs: list | None = None,
+                          source_refs: list | None = None,
+                          evidence_note: str = "",
                           decided_by: str = "zcode") -> dict:
     """回填主代理对 SOL 建议的采纳结论（accepted / modified / rejected）。
 
     采纳结论是事实记录：用于统计与恢复时复用已确认结论，不改变任务阶段、
-    不改变 G1–G3、也不是用户授权。`modified`/`rejected` 应写明理由；`note`
-    记录实际采用的范围（例如只采纳了哪些建议）。
+    不改变 G1–G3、也不是用户授权。
+
+    v2 增补 `decision`（ZCode 实际做法）、`rationale`（缺省回落 `reason`）、
+    `delta`（modified 与原建议的差异）、`evidence_refs`（E 编号）、
+    `source_refs`（报告章节/文件路径）与 `evidence_note`；原建议只存
+    `advice_ref` 引用。缺项只产生非阻断提示，登记始终成功。
     """
     state = load_state(path)
     _assert_open(state, "登记 SOL 采纳结论", allow_blocked=True)
@@ -3782,22 +3952,113 @@ def record_sol_acceptance(path: str, call_id: str, *, status: str,
     record = _find_sol_call(state, call_id)
     if str(record.get("status") or "") != "completed":
         raise GovernanceError("只能对已完成的 SOL 调用登记采纳结论。")
+    refs = _normalize_acceptance_evidence_refs(evidence_refs)
+    sources = _normalize_acceptance_source_refs(source_refs)
+    resolution = resolve_acceptance_evidence(state, refs)
+    previous = record.get("acceptance")
+    if not isinstance(previous, dict):
+        previous = {}
+    stamp = now_iso()
     entry = {
+        "schema": ACCEPTANCE_SCHEMA,
         "status": value,
+        "decision": str(decision or "").strip()[:4000],
+        "rationale": str(rationale or reason or "").strip()[:1000],
+        "delta": str(delta or "").strip()[:1000],
         "note": str(note or "")[:4000],
         "reason": str(reason or "")[:1000],
+        "evidence_refs": refs,
+        "evidence_resolution": resolution,
+        "source_refs": sources,
+        "evidence_note": str(evidence_note or "").strip()[:2000],
+        "advice_ref": _acceptance_advice_ref(record),
         "decided_by": str(decided_by or "zcode")[:40],
-        "at": now_iso(),
+        "at": stamp,
+        "first_registered_at": str(previous.get("first_registered_at")
+                                   or previous.get("at") or stamp),
+        # 只计 v2 登记次数：升级前的次数不可可靠重建，不冒充全量。
+        "registration_count": int(previous.get("registration_count") or 0) + 1,
         "basis": "zcode-judgment",
     }
+    entry["warnings"] = _acceptance_warnings(entry, resolution, sources)
+    # 当前记录以最近一次登记为准；每次登记在追加历史中保留完整快照，
+    # 旧记录不被改写，也不隐式继承上一次的字段。
     record["acceptance"] = entry
     _history(state, "sol_call_acceptance", {
         "call_id": sol_call_id(record),
         "mode": sol_call_mode(record),
         "status": value,
+        "decision_recorded": bool(entry["decision"]),
+        "rationale_recorded": bool(entry["rationale"]),
+        "evidence_refs": list(refs),
+        "evidence_status": acceptance_evidence_status(entry),
+        "warnings": list(entry["warnings"]),
+        "acceptance": dict(entry),
     })
     save_state(path, state)
-    return {"call_id": sol_call_id(record), "acceptance": entry}
+    return {
+        "call_id": sol_call_id(record),
+        "acceptance": entry,
+        "evidence_status": acceptance_evidence_status(entry),
+        "warnings": list(entry["warnings"]),
+        "hints": [ACCEPTANCE_HINTS[code] for code in entry["warnings"]
+                  if code in ACCEPTANCE_HINTS],
+    }
+
+
+def acceptance_quality(calls: list[dict]) -> dict:
+    """SOL 采纳记录质量（只读）：完整性、证据关联与排除量分别披露。
+
+    分母是 v2 已决采纳记录（accepted / modified / rejected）；pending 与无
+    schema 的历史记录不计入分母，另以 `legacy_records` 披露。这是观察口径，
+    不是调用次数、采纳率或证据数量的 KPI，也不影响任何门禁。
+    """
+    registered: list[dict] = []
+    for item in calls:
+        if str(item.get("status") or "") != "completed":
+            continue
+        acc = item.get("acceptance")
+        if not isinstance(acc, dict):
+            continue
+        if str(acc.get("status") or "pending") not in (
+                "accepted", "modified", "rejected"):
+            continue
+        registered.append(acc)
+    current = [a for a in registered
+               if str(a.get("schema") or "") == ACCEPTANCE_SCHEMA]
+    complete = [a for a in current if acceptance_is_complete(a)]
+    linked = [a for a in current
+              if (a.get("evidence_resolution") or {}).get("linked")]
+    unresolved = [a for a in current
+                  if (a.get("evidence_resolution") or {}).get("unresolved")]
+    archived = [a for a in current
+                if (a.get("evidence_resolution") or {}).get("archived")]
+    modified = [a for a in current if a.get("status") == "modified"]
+
+    def _rate(count: int) -> float | None:
+        return round(count / len(current), 3) if current else None
+
+    return {
+        "schema": "copilot-sol-acceptance-quality/v1",
+        "records": len(current),
+        "legacy_records": len(registered) - len(current),
+        "complete": len(complete),
+        "complete_rate": _rate(len(complete)),
+        "evidence_linked": len(linked),
+        "evidence_link_rate": _rate(len(linked)),
+        "source_only": len([a for a in current
+                            if acceptance_evidence_status(a) == "source_only"]),
+        "no_evidence": len([a for a in current
+                            if acceptance_evidence_status(a) == "none"]),
+        "unresolved_records": len(unresolved),
+        "archived_records": len(archived),
+        "modified": len(modified),
+        "modified_with_delta": len([a for a in modified
+                                    if str(a.get("delta") or "").strip()]),
+        "note": "登记时口径：完整率只看决策/理由/差异，证据关联率只看已登记 "
+                "E（不代表内容已核验）；未登记或归档引用不进入正式证据链，"
+                "旧版记录不计入分母。",
+    }
 
 
 def record_sol_call_failure(path: str, *, mode: str = "CONSULT",
@@ -4326,6 +4587,7 @@ def review_metrics(state: dict, *, task_dir: str = "") -> dict:
                             if completed_cognitive else 0.0),
             "acceptance": adoption,
             "adopted": adoption["accepted"] + adoption["modified"],
+            "acceptance_quality": acceptance_quality(cognitive_calls),
             "usage": dict(sorted(usage_fields.items())),
             "latency_ms_avg": (round(latency_ms / latency_samples, 1)
                                if latency_samples else None),

@@ -362,6 +362,220 @@ class HandoffTests(SolFirstBase):
         self.assertEqual(parsed["alternatives"], ["直接合并"])
 
 
+class AcceptanceEvidenceTests(SolFirstBase):
+    """采纳记录 v2：实际决策/理由/多证据关联、非阻断提示与历史兼容。"""
+
+    def accept(self, call, **kwargs) -> dict:
+        return G.record_sol_acceptance(
+            self.state_path, G.sol_call_id(call), **kwargs)
+
+    def quality(self) -> dict:
+        return G.review_metrics(
+            G.load_state(self.state_path))["sol_cognitive"]["acceptance_quality"]
+
+    def test_v2_record_links_registered_evidence_and_tracks_advice(self):
+        self.start(kind="feature")
+        call = self.record("CONSULT")
+        first, second = self.evidence(count=2)
+        result = self.accept(
+            call, status="accepted", decision="按建议先调查再实施",
+            rationale="现场证据支持该路线", evidence_refs=[f"{first},{second}"],
+            evidence_note="测试与现场一致")
+        entry = result["acceptance"]
+        self.assertEqual(entry["schema"], G.ACCEPTANCE_SCHEMA)
+        self.assertEqual(entry["evidence_refs"], [first, second])
+        self.assertEqual(entry["evidence_resolution"],
+                         {"linked": [first, second], "unresolved": [],
+                          "archived": []})
+        self.assertEqual(result["evidence_status"], "linked")
+        self.assertEqual(result["warnings"], [])
+        self.assertEqual(result["hints"], [])
+        self.assertTrue(G.acceptance_is_complete(entry))
+        # 原建议沿 call_id 引用，不复制正文。
+        self.assertEqual(entry["advice_ref"]["call_id"], G.sol_call_id(call))
+        self.assertEqual(entry["advice_ref"]["judgment"], "建议")
+        self.assertNotIn("summary", entry)
+        event = [h for h in G.load_state(self.state_path)["history"]
+                 if h["event"] == "sol_call_acceptance"][-1]
+        self.assertEqual(event["detail"]["evidence_refs"], [first, second])
+        self.assertEqual(event["detail"]["evidence_status"], "linked")
+        self.assertTrue(event["detail"]["decision_recorded"])
+
+    def test_unregistered_evidence_stays_pending_and_is_not_blocking(self):
+        self.start(kind="feature")
+        call = self.record("PLAN")
+        first = self.evidence()[0]
+        result = self.accept(
+            call, status="modified", decision="只采纳排序建议",
+            rationale="原方案范围过大", delta="去掉新增模块",
+            evidence_refs=[first, "E9"])
+        self.assertEqual(result["evidence_status"], "partial")
+        self.assertIn("evidence_unregistered", result["warnings"])
+        self.assertTrue(result["hints"])
+        entry = result["acceptance"]
+        self.assertEqual(entry["evidence_resolution"]["unresolved"], ["E9"])
+        self.assertEqual(entry["registration_count"], 1)
+        # 未登记引用不自动补登记，也不进入状态证据表。
+        ids = [item["id"] for item in G.load_state(self.state_path)["evidence"]]
+        self.assertNotIn("E9", ids)
+        quality = self.quality()
+        self.assertEqual(quality["records"], 1)
+        self.assertEqual(quality["unresolved_records"], 1)
+        self.assertEqual(quality["complete_rate"], 1.0)
+        self.assertEqual(quality["evidence_link_rate"], 1.0)
+
+    def test_missing_evidence_is_recorded_as_is(self):
+        self.start(kind="feature")
+        call = self.record("CONSULT")
+        result = self.accept(
+            call, status="rejected", decision="不采纳原路线",
+            rationale="与现场证据冲突")
+        self.assertEqual(result["evidence_status"], "none")
+        self.assertIn("evidence_missing", result["warnings"])
+        self.assertTrue(result["hints"])
+        self.assertTrue(G.acceptance_is_complete(result["acceptance"]))
+        state = G.load_state(self.state_path)
+        self.assertEqual(state["sol_calls"][0]["acceptance"]["status"],
+                         "rejected")
+        quality = self.quality()
+        self.assertEqual(quality["no_evidence"], 1)
+        self.assertEqual(quality["evidence_link_rate"], 0.0)
+
+    def test_source_reference_without_evidence_is_allowed(self):
+        self.start(kind="feature")
+        call = self.record("CONSULT")
+        result = self.accept(
+            call, status="modified", decision="分两阶段实施",
+            rationale="降低回归风险", delta="延后批量迁移",
+            source_refs=["报告 §3 差异分析", "src/app/flow.py:120"])
+        self.assertEqual(result["evidence_status"], "source_only")
+        self.assertNotIn("evidence_missing", result["warnings"])
+        self.assertEqual(result["acceptance"]["source_refs"],
+                         ["报告 §3 差异分析", "src/app/flow.py:120"])
+        self.assertEqual(self.quality()["source_only"], 1)
+        self.assertEqual(self.quality()["no_evidence"], 0)
+
+    def test_modified_without_delta_is_incomplete(self):
+        self.start(kind="feature")
+        call = self.record("PLAN")
+        result = self.accept(call, status="modified",
+                             decision="调整执行顺序",
+                             rationale="先做低风险项")
+        self.assertIn("modified_delta_missing", result["warnings"])
+        self.assertFalse(G.acceptance_is_complete(result["acceptance"]))
+        quality = self.quality()
+        self.assertEqual(quality["complete_rate"], 0.0)
+        self.assertEqual(quality["modified"], 1)
+        self.assertEqual(quality["modified_with_delta"], 0)
+
+    def test_archived_evidence_is_reported_but_not_linked(self):
+        self.start(kind="feature")
+        call = self.record("CONSULT")
+        first = self.evidence()[0]
+        state = G.load_state(self.state_path)
+        G.drop_evidence(state, first, "已被新证据替代")
+        G.save_state(self.state_path, state)
+        result = self.accept(call, status="accepted", decision="采纳",
+                             rationale="证据充分", evidence_refs=[first])
+        self.assertEqual(result["evidence_status"], "archived_only")
+        self.assertIn("evidence_archived", result["warnings"])
+        self.assertEqual(result["acceptance"]["evidence_resolution"],
+                         {"linked": [], "unresolved": [], "archived": [first]})
+        quality = self.quality()
+        self.assertEqual(quality["archived_records"], 1)
+        self.assertEqual(quality["evidence_linked"], 0)
+
+    def test_invalid_evidence_id_is_rejected(self):
+        self.start(kind="feature")
+        call = self.record("CONSULT")
+        for bad in ("E0", "X1", "E1.5"):
+            with self.subTest(ref=bad):
+                with self.assertRaises(G.GovernanceError):
+                    self.accept(call, status="accepted", decision="采纳",
+                                evidence_refs=[bad])
+
+    def test_reregistration_keeps_history_snapshot_and_counts_once(self):
+        self.start(kind="feature")
+        call = self.record("CONSULT")
+        first = self.accept(call, status="accepted", decision="按建议执行",
+                            rationale="现场一致")
+        stamp = first["acceptance"]["at"]
+        second = self.accept(call, status="rejected", decision="暂不执行",
+                             rationale="范围变化")
+        entry = second["acceptance"]
+        self.assertEqual(entry["registration_count"], 2)
+        self.assertEqual(entry["first_registered_at"], stamp)
+        self.assertEqual(entry["decision"], "暂不执行")
+        state = G.load_state(self.state_path)
+        events = [h for h in state["history"]
+                  if h["event"] == "sol_call_acceptance"]
+        self.assertEqual([e["detail"]["status"] for e in events],
+                         ["accepted", "rejected"])
+        # 第一次登记快照未被改写：历史里仍可还原上一版决定。
+        self.assertEqual(events[0]["detail"]["acceptance"]["decision"],
+                         "按建议执行")
+        self.assertEqual(state["sol_calls"][0]["acceptance"]["status"],
+                         "rejected")
+        metrics = G.review_metrics(state)["sol_cognitive"]
+        self.assertEqual(metrics["acceptance"],
+                         {"accepted": 0, "modified": 0, "rejected": 1,
+                          "pending": 0})
+        self.assertEqual(metrics["acceptance_quality"]["records"], 1)
+
+    def test_legacy_acceptance_is_readable_and_excluded_from_quality(self):
+        self.start(kind="feature")
+        call = self.record("CONSULT")
+        state = G.load_state(self.state_path)
+        legacy_at = G.now_iso()
+        state["sol_calls"][0]["acceptance"] = {
+            "status": "accepted", "note": "旧记录", "reason": "",
+            "decided_by": "zcode", "at": legacy_at,
+            "basis": "zcode-judgment"}
+        G.save_state(self.state_path, state)
+        quality = self.quality()
+        self.assertEqual(quality["records"], 0)
+        self.assertEqual(quality["legacy_records"], 1)
+        self.assertIsNone(quality["complete_rate"])
+        self.assertIsNone(quality["evidence_link_rate"])
+        metrics = G.review_metrics(state)["sol_cognitive"]
+        self.assertEqual(metrics["acceptance"]["accepted"], 1)
+        self.assertEqual(metrics["adopted"], 1)
+        self.assertEqual(
+            G.acceptance_evidence_status(
+                state["sol_calls"][0]["acceptance"]), "unrecorded")
+        self.assertFalse(G.acceptance_is_complete(
+            state["sol_calls"][0]["acceptance"]))
+        # 历史记录仍可重新登记为 v2（当前为准，旧值不被隐式继承）。
+        result = self.accept(call, status="accepted", decision="采纳",
+                             rationale="复核后确认")
+        self.assertEqual(result["acceptance"]["schema"],
+                         G.ACCEPTANCE_SCHEMA)
+        # first_registered_at 沿用历史登记时间；registration_count 只计 v2
+        # 登记次数（升级前次数不可知，不冒充全量）。
+        self.assertEqual(result["acceptance"]["first_registered_at"], legacy_at)
+        self.assertEqual(result["acceptance"]["registration_count"], 1)
+
+    def test_cli_accept_prints_hints_and_exits_zero(self):
+        self.start(kind="feature")
+        call = self.record("CONSULT")
+        proc = F.run_cli("copilot_dispatch.py", "sol-accept",
+                         "--state", self.state_path,
+                         "--call-id", G.sol_call_id(call),
+                         "--status", "accepted",
+                         "--decision", "按建议先调查",
+                         "--rationale", "现场一致",
+                         "--evidence-ref", "E7",
+                         "--source-ref", "报告 §2")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("待核 E7", proc.stdout)
+        self.assertIn("提示（非阻断", proc.stdout)
+        self.assertIn("E7", proc.stdout)
+        entry = G.load_state(self.state_path)["sol_calls"][0]["acceptance"]
+        self.assertEqual(entry["evidence_resolution"]["unresolved"], ["E7"])
+        self.assertEqual(entry["source_refs"], ["报告 §2"])
+        self.assertEqual(entry["decision"], "按建议先调查")
+
+
 class FailureTests(SolFirstBase):
     def test_failed_consult_is_recorded_and_task_continues(self):
         self.start(kind="feature")

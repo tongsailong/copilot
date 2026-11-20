@@ -9,7 +9,7 @@ when_to_use: >
   直接由 ZCode 原生完成，不进入本 Skill。
 ---
 
-# copilot：轻量协作治理（v9.0.0）
+# copilot：轻量协作治理（v9.1.0）
 
 Copilot 是运行在 ZCode 内的**协作治理层**，不是决策模型，也不是执行体。它负责把任务变成可
 追踪的合同、状态、证据与收口条件，并在任务没有真正完成时继续推进。
@@ -103,8 +103,9 @@ CONSULT / PLAN / REVIEW 都是 **SOL 调用**；工作项计划由 ZCode 本地�
   只负责记录与校验（例如拒绝依赖环），不批准也不否决，也不交给 SOL 生成工程步骤。
 - **SOL 只提供认知输入**：CONSULT / PLAN / REVIEW 都不接管工程执行、技术选型、收口判断或
   写操作；材料由主代理一次性整理，结论由主代理核实后决定采纳、调整或否决，并用
-  `sol-accept --call-id ... --status accepted|modified|rejected` 登记事实。不恢复 DECIDE，
-  不设硬性调用次数上限，也不因等待 SOL 停止已有工作。
+  `sol-accept --call-id ... --status accepted|modified|rejected` 登记事实（v9.1 起可附
+  `--decision` / `--rationale` / `--delta` / `--evidence-ref E1,E3` / `--source-ref`）。
+  不恢复 DECIDE，不设硬性调用次数上限，也不因等待 SOL 停止已有工作。
 - **正式 REVIEW 不是门禁**：普通开发不需要正式 REVIEW，也不需要等待任何模型裁决。用户明确
   要求后，授权在同一任务合同内持续有效；范围或风险实质变化时重新确认。没有用户授权时不得
   伪造正式 REVIEW，也不得用自检冒充。
@@ -285,7 +286,9 @@ BLOCKED 表示**不能正常收口或继续受阻动作**，不表示无法记�
   `sol-reviews/<call_id>.raw.txt`；审计统一写 `sol-audit.jsonl`（三模式共用，只记脱敏元数据：
   材料/请求/回复摘要、模型、推理强度回显、请求/追踪 ID、usage、耗时、错误码），不记正文与
   凭据。三模式共用同一把 `.sol.lock`。采纳结论由 `sol-accept` 回填，属于主代理的事实判断，
-  不是用户授权，也不改变门禁。历史任务状态里的 `sol_reviews` / `sol_advisories` 继续
+  不是用户授权，也不改变门禁；v9.1 起记录含 `decision`/`rationale`/`delta`/
+  `evidence_resolution`（linked/unresolved/archived）与 `advice_ref`，缺项只给非阻断提示。
+  历史任务状态里的 `sol_reviews` / `sol_advisories` 继续
   **只读兼容**：`--list`、`review-metrics`、`review-admission` 与单轮复用都会合并读取，
   历史 CONSULT / PLAN / THINK 记录按 CONSULT 计入覆盖，不迁移、不改写、不重复计数。
 - **SOL 与门禁共用上下文**：提示词自动注入任务目标、完整合同正文、完成条件、工作项状态与
@@ -588,8 +591,27 @@ CONSULT / PLAN 输出契约（`copilot-sol-think/v2`）：`judgment`、`goal_und
 
 ## 版本
 
-当前版本 **v9.0.0（SOL-first 默认认知生命周期）**。本版把 SOL 从“按复杂度建议一次整体
-判断”升级为默认认知引擎，不改变 G1–G3、授权边界与 ZCode 唯一工程执行主体：
+当前版本 **v9.1.0（SOL 采纳记录与证据关联）**。本版只完善采纳记录质量，不改变 SOL-first
+生命周期、G1–G3、授权边界与 ZCode 唯一工程执行主体：
+
+- **采纳记录 v2**：`sol-accept` 新增 `--decision`（实际做法）、`--rationale`（省略回落到
+  `--reason`）、`--delta`（modified 与原建议的差异）、`--evidence-ref`（可重复/逗号分隔）、
+  `--source-ref`（报告章节/文件路径等定位）、`--evidence-note`；原有
+  `--note`/`--reason`/`--decided-by` 不变。记录带 `schema=copilot-sol-acceptance/v2`，
+  原建议只存 `advice_ref`（call_id/阶段/判断摘要/回复路径与摘要），不复制正文。
+- **证据关联只做登记时核对**：E 编号解析为 `linked`（本任务已登记）/`unresolved`（未登记）/
+  `archived`（已归档），未登记与归档引用只作待核引用，不自动补登记、不进入正式证据链；
+  `source_refs` 只作定位，不称为已核验证据。
+- **非阻断提示**：缺实际决策、缺理由、modified 缺差异、暂无证据、引用未登记/已归档时给出
+  `warnings` 与中文提示，退出码仍为 0，不改变登记成功、任务阶段或门禁。
+- **统计**：`review-metrics.sol_cognitive` 新增 `acceptance_quality`：完整率（决策+理由+
+  modified 差异）、证据关联率（至少 1 条 linked E），另列 source-only、无证据、待核、归档
+  记录数与排除的旧版记录数；分母只取 v2 已决记录，零分母返回 null。原 `acceptance` 四态与
+  `adopted` 口径不变，历史记录只读兼容、不计入质量分母、不重写。
+- **不变量**：SOL 仍是 advisory、零工具、单轮，采纳记录不是用户授权也不改变 G1–G3。
+
+v9.0.0（SOL-first 默认认知生命周期）把 SOL 从“按复杂度建议一次整体判断”升级为默认认知引擎，
+不改变 G1–G3、授权边界与 ZCode 唯一工程执行主体：
 
 - **任务类型与路由**：`start/contract --task-kind` 声明 16 类任务；简单/机械类型默认 0 调用，
   未声明按 `standard`（非简单）处理。类型只用于路由，不是门禁。

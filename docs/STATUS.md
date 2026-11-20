@@ -1,7 +1,34 @@
 # STATUS
 
 更新：2026-11-20 CST。本文件只记录现场可核实的事实；规划与未完成事项单独标注。
-当前版本：v9.0.0（SOL-first 默认认知生命周期）。
+当前版本：v9.1.0（SOL 采纳记录与证据关联）。
+
+## SOL 采纳记录与证据关联（2026-11-20，v9.1.0）
+
+现场基线：`HEAD=971e330`；本轮修改 10 个跟踪文件（+657/−22），未提交、未推送（无授权）。
+未跟踪的 `scripts/knowledge_handoff.py`、`tests/test_knowledge_handoff.py` 保持原样。
+
+- **代码**：`governance.py` 新增 `copilot-sol-acceptance/v2` 记录（`decision`/`rationale`/
+  `delta`/`evidence_refs`/`source_refs`/`evidence_note`/`advice_ref`）、登记时证据解析
+  （`linked`/`unresolved`/`archived`）、非阻断 warnings 与 `acceptance_quality` 指标；
+  `copilot_dispatch.py::sol-accept` 新增对应 CLI 参数并打印提示；版本号 `9.1.0`。
+- **重复登记与历史**：当前记录以最近一次为准，旧字段不隐式继承；每次登记完整快照写入
+  `history.sol_call_acceptance`，`first_registered_at` 保留最初时间，`registration_count`
+  只计 v2 次数；旧记录只读可读、不计入质量分母。
+- **测试**：`python3 -B -m unittest discover -s tests -p 'test_*.py'` **614 项 OK**
+  （v9.0.0 基线 604 + 新增 10 项：v2 多证据关联、未登记引用待核、无证据如实登记、
+  仅来源定位、modified 缺差异、已归档引用、非法 E 编号、重复登记快照、旧记录兼容、
+  CLI 非阻断提示）。`compileall` 通过。
+- **legacy 回归**：`legacy/tests` 853 项（skip 32）当前树 99 failures + 47 errors = 146；
+  在 `971e330` 临时 worktree 复跑同为 146，失败/错误用例名排序后 `comm` 差异 0 行。
+- **运行时同步**：`--apply` 写入 6 个文件；`--check` 缺失 0/不同 0（`hm.txt` 为既有未受
+  管理文件，保留）；`--baseline` 重建 20 个 Git 跟踪项，`--verify-baseline` 通过；
+  运行时 `__version__=9.1.0`。
+- **真实调用**：本任务 CONSULT `SC4782e907ccfdc83245835eb3`（48.5s）与 PLAN
+  `SC31764715d2849a39b7533023` 均 `gpt-6.2-sol`、`effort=high`、零工具；两条采纳记录按
+  新结构登记（decision/rationale/evidence_refs/advice_ref），证据编号指向本任务已登记证据。
+- **未验证 / 限制**：未在独立 GUI 宿主会话复跑；未做正式 REVIEW（用户未要求）；
+  提交与推送按用户要求留待确认。
 
 ## v9.0.0 发布与运行时验证（2026-11-20）
 

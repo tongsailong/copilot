@@ -43,7 +43,7 @@ import review_policy as RP  # noqa: E402
 import sol_review as SR  # noqa: E402
 import knowledge_handoff as KH  # noqa: E402
 
-__version__ = "9.0.0"
+__version__ = "9.1.0"
 
 
 class CLIError(Exception):
@@ -1110,6 +1110,11 @@ def cmd_sol_accept(args) -> int:
     result = G.record_sol_acceptance(
         path, args.call_id, status=args.status,
         note=args.note or "", reason=args.reason or "",
+        decision=args.decision or "", rationale=args.rationale or "",
+        delta=args.delta or "",
+        evidence_refs=args.evidence_ref or [],
+        source_refs=args.source_ref or [],
+        evidence_note=args.evidence_note or "",
         decided_by=args.decided_by or "zcode")
     if args.json:
         _print(result)
@@ -1117,6 +1122,20 @@ def cmd_sol_accept(args) -> int:
         entry = result["acceptance"]
         print(f"SOL 采纳结论已登记：{result['call_id']} → {entry['status']}"
               + (f"（{entry['note']}）" if entry.get("note") else ""))
+        print("记录：" + "，".join([
+            f"实际决策={'有' if entry.get('decision') else '缺'}",
+            f"理由={'有' if G.acceptance_rationale(entry) else '缺'}",
+            f"差异={'有' if entry.get('delta') else '缺'}"]))
+        resolution = entry.get("evidence_resolution") or {}
+        print("证据关联：" + "，".join([
+            "已登记 " + ("、".join(resolution.get("linked") or []) or "无"),
+            "待核 " + ("、".join(resolution.get("unresolved") or []) or "无"),
+            "已归档 " + ("、".join(resolution.get("archived") or []) or "无"),
+            "来源定位 " + str(len(entry.get("source_refs") or [])) + " 条"]))
+        if result["hints"]:
+            print("提示（非阻断，不影响登记与任务推进）：")
+            for hint in result["hints"]:
+                print(f"- {hint}")
         print("说明：这是主代理对建议的事实判断记录；不是用户授权，也不改变 G1–G3。")
     return 0
 
@@ -1767,8 +1786,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--call-id", required=True, help="SOL 记录的 call_id")
     p.add_argument("--status", required=True,
                    choices=("accepted", "modified", "rejected"))
-    p.add_argument("--note", default="", help="实际采用范围或修改说明")
-    p.add_argument("--reason", default="", help="拒绝或修改的理由")
+    p.add_argument("--note", default="", help="实际采用范围或补充说明")
+    p.add_argument("--reason", default="",
+                   help="拒绝或修改的理由（--rationale 省略时作为理由）")
+    p.add_argument("--decision", default="",
+                   help="ZCode 实际采取的做法（最终决策，不是 SOL 原建议）")
+    p.add_argument("--rationale", default="",
+                   help="采纳/修改/拒绝的依据（省略时回落 --reason）")
+    p.add_argument("--delta", default="",
+                   help="modified 时相对原建议的差异")
+    p.add_argument("--evidence-ref", action="append", default=[],
+                   help="关联本任务已登记证据编号；可重复或逗号分隔（E1,E3）")
+    p.add_argument("--source-ref", action="append", default=[],
+                   help="报告章节/文件路径等来源定位（只记录，不做证据核验）")
+    p.add_argument("--evidence-note", default="", help="证据补充说明")
     p.add_argument("--decided-by", default="zcode")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_sol_accept)

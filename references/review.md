@@ -104,6 +104,43 @@ python3 -B scripts/copilot_dispatch.py sol-plan --state <state.json> \
   如何实施由 ZCode 主代理决定。采纳结论用
   `sol-accept --state <state> --call-id <SC...> --status accepted|modified|rejected` 登记
   （事实记录，不是用户授权，不改变门禁）。
+
+### 采纳记录（v9.1，`copilot-sol-acceptance/v2`）
+
+```bash
+python3 -B scripts/copilot_dispatch.py sol-accept --state <state> \
+  --call-id SC... --status modified \
+  --decision "先补定向测试再改实现" \
+  --rationale "现场缺少回归覆盖，直接改风险更高" \
+  --delta "不采纳原建议的一次性重写，改为分两步" \
+  --evidence-ref E1,E3 --source-ref "报告 §3 差异分析"
+```
+
+- **字段**：`decision`（ZCode 实际做法，不是 SOL 原建议）、`rationale`（省略时回落
+  `--reason`）、`delta`（modified 与原建议的差异）、`evidence_refs`、`source_refs`、
+  `evidence_note`；保留 `status`/`note`/`reason`/`decided_by`/`at`/`basis`。
+  `advice_ref` 只存 `call_id`/`mode`/`stage`/判断摘要/`reply_path`/`reply_sha256`，
+  不复制原建议正文。
+- **证据解析（登记时）**：`evidence_refs` 逐条判定为 `linked`（本任务已登记且未归档）、
+  `unresolved`（未登记）或 `archived`（已 `dropped`），保存在 `evidence_resolution`；
+  汇总状态由逐条结果派生（`linked` / `partial` / `unresolved` / `archived_only` /
+  `source_only` / `none`）。未登记与归档引用只作待核引用，不自动补登记，也不进入正式
+  证据链（`record`/`criterion`/`finding` 仍只接受已登记证据）。
+- **非阻断提示**：`actual_decision_missing`、`rationale_missing`、
+  `modified_delta_missing`、`evidence_missing`、`evidence_unregistered`、
+  `evidence_archived` 写入记录并在 CLI 打印中文提示；登记始终成功、退出码 0，不改变任务
+  阶段、证据表或 G1–G3。E 编号格式错误是输入错误，直接拒绝。
+- **重复登记**：以最近一次为准，旧字段不隐式继承；每次登记的完整快照追加到
+  `history` 的 `sol_call_acceptance` 事件（只增不改）。`first_registered_at` 保留最初
+  时间；`registration_count` 只计 v2 登记次数，不冒充历史全量。
+- **历史兼容**：无 `schema` 的旧采纳记录保持只读可读，`reason` 作为历史理由展示，
+  `note` 不被当成实际决策；不迁移、不重写、不重放已 CLOSED 任务。
+- **指标**：`review-metrics` 的 `sol_cognitive.acceptance_quality` 以 v2 已决记录
+  （accepted/modified/rejected）为分母，输出 `complete_rate`（决策+理由+modified 差异）、
+  `evidence_link_rate`（至少一条 linked E）、`source_only`、`no_evidence`、
+  `unresolved_records`、`archived_records`、`modified_with_delta` 与 `legacy_records`；
+  零分母返回 `null`。原 `acceptance` 四态与 `adopted` 口径不变。这些是观察指标，
+  不是验证率、KPI 或门禁。
 - **失败**：只登记真实原因并返回 `status=unavailable`（退出码 0），主代理按已有判断继续。
 
 ### 触发与调用（REVIEW）
