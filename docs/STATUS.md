@@ -3,10 +3,14 @@
 更新：2026-11-20 CST。本文件只记录现场可核实的事实；规划与未完成事项单独标注。
 当前版本：v9.2.0（ZCode 原生恢复衔接与上下文瘦身）。
 
-## ZCode 原生恢复衔接与上下文瘦身（2026-11-20，v9.2.0，未提交）
+## ZCode 原生恢复衔接与上下文瘦身（2026-11-20，v9.2.0）
 
-现场基线：`HEAD=0b64f62`。本轮改动**未提交、未推送**（任务边界：commit/push 另行确认），
-未跟踪的 `scripts/knowledge_handoff.py`、`tests/test_knowledge_handoff.py` 保持原样。
+现场基线：交付前 `HEAD=0b64f62`；交付提交 `37f5cd8a5ebb7eb67429deae50bac42c022f9090`
+（`feat(copilot): optimize skill context and session recovery`，8 个跟踪文件 +583/−385），
+已普通快进推送 `origin/main`（`0b64f62..37f5cd8`）。推送后本地 HEAD、`@{u}` 与
+`git ls-remote origin refs/heads/main` 三方同为 `37f5cd8a…`，ahead/behind `0/0`；
+未 force push、未 rebase。未跟踪的 `scripts/knowledge_handoff.py`、
+`tests/test_knowledge_handoff.py` 与 `.copilot-tasks/` 保持原样。
 
 - **SessionStart 恢复注入**：`copilot_stop_guard.py` 新增 `session-start` 子命令，只处理
   `source=resume|compact`；只对本会话已绑定且 `continuation.required=true` 的任务输出一段
@@ -20,9 +24,10 @@
 - **测试**：`python3 -B -m unittest discover -s tests -p 'test_*.py'` **684 项 OK**（新增 12 项
   SessionStart/安装测试）；`legacy/tests` 853 项（skip 32）99 failures + 47 errors = 146，
   与 `git archive HEAD` 归档运行的失败/错误用例名逐条 diff 为空。
-- **同步**：`--apply` 写入 5 个受管理文件，`--check` 缺失 0/不同 0；`--baseline` 重建 21 个
-  Git 跟踪项（未跟踪的 `knowledge_handoff.py` 未写入），`--verify-baseline` 通过；
-  运行时 `copilot_dispatch.py __version__=9.2.0`。
+- **同步**：开发期 `--apply` 写入 5 个受管理文件，提交后写入 0 个；`--check` 缺失 0/不同 0；
+  `--baseline` 重建 21 个 Git 跟踪项（未跟踪的 `knowledge_handoff.py` 未写入），
+  `--verify-baseline` 通过；运行时 `copilot_dispatch.py __version__=9.2.0`，与源码逐文件
+  SHA-256 一致。
 - **隔离 E2E**（`/tmp/copilot-e2e2`，运行时脚本）：未完成时 Stop 守卫 exit 2、
   resume/compact 注入含任务 id 与 C1/C2；`startup`/`clear`/其它会话/收口后均输出 0 字节；
   收口 `closure-check` G1–G3 PASS，state 损坏时 `session-start` 静默 exit 0。
@@ -33,8 +38,13 @@
 - **本机安装**：用户级 `~/.zcode/cli/config.json` 已含 `Stop` 与新增
   `SessionStart(resume|compact)` 条目，安装前备份 `config.json.bak-20261120223622`，
   `mcp`/`plugins` 等其它配置未变；新会话启动时加载。
-- **未验证 / 限制**：宿主真实 `resume`/`compact` 事件尚未在本会话内复现（钩子命令按宿主
-  输入形状直接在隔离工作区验证）；未在 GUI 新会话复跑；未提交、未推送。
+- **真实宿主 resume**：headless `--resume sess_a5b42fc8…`（ZCode CLI 0.18.0）的会话 rollout 中
+  确认宿主拼接 `SessionStart hook additional context: #1 <copilot-session-recovery> …`
+  （任务 id、RUNNING、未闭合 C1、续接命令），同一 rollout 出现 37 处 Stop 守卫续跑理由。
+  该次 resume 共 44 次模型请求、3,334,400 input tokens（cache read 3,290,880）、约 3 分钟；
+  带未完成绑定任务的 resume 会真实驱动执行，不宜无预算预期地复跑。
+- **未验证 / 限制**：宿主真实 `compact` 事件尚未单独复现（与 resume 共用同一注入路径，
+  单测覆盖 `source=compact`）；未在 GUI 新会话复跑。
 
 ## SOL 采纳记录与证据关联（2026-11-20，v9.1.0）
 
