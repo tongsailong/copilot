@@ -42,8 +42,9 @@ import governance as G  # noqa: E402
 import agent_policy as AP  # noqa: E402
 import review_policy as RP  # noqa: E402
 import sol_review as SR  # noqa: E402
+import sol_schedule as SS  # noqa: E402
 
-__version__ = "9.5.1"
+__version__ = "9.6.1"
 
 
 class CLIError(Exception):
@@ -178,6 +179,7 @@ EXIT_CONTINUE = 10
 READ_ONLY_COMMANDS = frozenset({
     "closure-check", "review-metrics", "review-admission", "agent-policy",
     "handoff", "legacy-status", "next", "brief", "render", "status", "quality",
+    "sol-stats",
 })
 
 
@@ -194,15 +196,177 @@ def _is_read_only(args) -> bool:
         return not (getattr(args, "add", None) or getattr(args, "drop", None))
     if command == "contract":
         return not getattr(args, "amend", None)
+    if command == "sol-schedule":
+        # 只读查看调度；--execute 会发起一次真实调用，属于写动作。
+        return not getattr(args, "execute", False)
     return False
 
 
-def _print_continuation(path: str) -> int:
+# ── SOL 生命周期调度（v9.6）───────────────────────────────────────────────
+# 调度不是新的调用通道：义务只是「应调用」的持久化事实，执行仍然走
+# `_run_sol_channel`（同一 sol_review 通道、同一 sol_calls 台账、同一把锁）。
+# 三条硬边界：
+#   1. 每条命令最多执行 1 个义务、最多 1 次请求（有界）；
+#   2. 只自动执行 recommended 级；optional 级只提示；
+#   3. 读命令永不执行；SOL 失败只记录，不改变命令退出码。
+SOL_POLICIES = ("off", "advise", "auto")
+DEFAULT_SOL_POLICY = "auto"
+
+
+def _sol_policy(args) -> str:
+    raw = str(getattr(args, "sol", "") or os.environ.get("COPILOT_SOL")
+              or DEFAULT_SOL_POLICY)
+    value = raw.strip().lower()
+    if value not in SOL_POLICIES:
+        print(f"提示：未知 SOL 调度策略 {raw!r}；按 {DEFAULT_SOL_POLICY} 处理。",
+              file=sys.stderr)
+        return DEFAULT_SOL_POLICY
+    return value
+
+
+def _auto_execution_allowed() -> bool:
+    """是否允许自动执行（会真实计费）。
+
+    `COPILOT_SOL_AUTO=off` 是显式离线开关；测试进程（`unittest` 已加载）默认
+    只记录义务、不发起付费请求——单元测试不得因为调度而访问模型。需要验证自动
+    执行的测试显式设 `COPILOT_SOL_AUTO=on` 并替换 SOL 通道。
+    """
+    value = str(os.environ.get("COPILOT_SOL_AUTO") or "").strip().lower()
+    if value in ("off", "0", "false", "no"):
+        return False
+    if value in ("on", "1", "true", "yes"):
+        return True
+    return "unittest" not in sys.modules
+
+
+def _obligation_round_two(state: dict, obligation: dict) -> bool:
+    """同一模式已有已完成记录时，再调用必须声明 --force/--trigger/--reason。"""
+    mode = str(obligation.get("mode") or "CONSULT").upper()
+    return any(isinstance(item, dict) and G.sol_ref_mode(item) == mode
+               and str(item.get("status") or "") == "completed"
+               for item in G.iter_sol_calls(state))
+
+
+def _obligation_argv(path: str, obligation: dict, *,
+                     round_two: bool) -> list[str]:
+    mode = str(obligation.get("mode") or "CONSULT").upper()
+    sub = {"PLAN": "sol-plan", "REVIEW": "sol-review"}.get(mode, "sol-consult")
+    argv = [sub, "--state", path,
+            "--obligation", str(obligation.get("obligation_id") or "")]
+    if round_two:
+        trigger = RP.SOL_EVENT_TRIGGERS.get(
+            str(obligation.get("event")), "new-evidence")
+        argv += ["--force", "--trigger", trigger, "--reason",
+                 str(obligation.get("reason")
+                     or "同一认知对象出现新的现场事实，需要重新判断")]
+    return argv
+
+
+def _execute_obligation(path: str, obligation: dict) -> int:
+    """执行一个调度义务：复用既有通道，一次请求，失败只记录不阻断。"""
+    state = G.load_state(path)
+    obligation_id = str(obligation.get("obligation_id") or "")
+    mode = str(obligation.get("mode") or "CONSULT").upper()
+    argv = _obligation_argv(path, obligation,
+                            round_two=_obligation_round_two(state, obligation))
+    try:
+        ns = build_parser().parse_args(argv)
+    except SystemExit:
+        print(f"SOL 调度：义务 {obligation_id} 的参数不合法；保持待执行。",
+              file=sys.stderr)
+        return 0
+    print(f"SOL 调度：执行义务 {obligation_id}"
+          f"（{obligation.get('family')}/{obligation.get('event')} → "
+          f"{mode} stage={obligation.get('stage')}）", file=sys.stderr)
+    try:
+        return _run_sol_channel(ns, mode)
+    except G.LockBusyError as exc:
+        print(f"SOL 调度：{exc}；本次不执行，义务保持待执行。", file=sys.stderr)
+        return 0
+    except CLIError as exc:
+        # 前置条件不成立（材料超限、任务已收口等）：记一次尝试；连续失败后
+        # 终止该义务，避免每条命令都重复打印同一条错误。
+        current = G.load_state(path)
+        row = G.record_sol_obligation_error(current, obligation_id, str(exc))
+        if row is not None:
+            G.save_state(path, current)
+        print(f"SOL 调度：义务 {obligation_id} 未能执行（{exc}）；"
+              "工程进展不受影响。", file=sys.stderr)
+        return 0
+
+
+def _sol_schedule_step(path: str, args, *, gates_passed: bool = False,
+                       execute: bool = True, prefer_family: str = "",
+                       closure_ready: dict | None = None,
+                       cache: dict | None = None) -> dict:
+    """生命周期命令的统一调度步：物化义务 → 显示 →（auto 时）有界执行 1 个。
+
+    `closure_ready` 是 E 阶段（收口 CONSULT）的唯一准入事实，这里只算一次并原样
+    交给建议层：最后一个工作项关闭不等于最终工程验证完成，因此不能由工作项耗尽
+    触发收口判断。未给出时按当前状态现算（只读、可缓存）。
+
+    `prefer_family` 用于收口：收口前的认知窗口是 E（收口综合判断），不能被更早
+    的未执行窗口挤掉；更早的窗口仍按窗口事实记为漏调。
+    """
+    policy = _sol_policy(args)
+    state = G.load_state(path)
+    if bool((state.get("closure") or {}).get("closed")):
+        return {"policy": policy, "closed": True, "executed": ""}
+    readiness = closure_ready if isinstance(closure_ready, dict) \
+        else G.closure_readiness(state, cache=cache)
+    advice = G.sol_advice_summary(state, gates_passed=gates_passed,
+                                  closure_ready=readiness, cache=cache)
+    synced = G.sync_sol_schedule(state, advice=advice)
+    if synced["changes"]:
+        G.save_state(path, state)
+    due = SS.due_obligations(state)
+    if prefer_family:
+        preferred = [item for item in due
+                     if str(item.get("family") or "") == prefer_family]
+        if preferred:
+            due = preferred
+    optional = [item for item in SS.obligations(state)
+                if isinstance(item, dict) and item.get("window") == "open"
+                and str(item.get("status") or "") == "due"
+                and str(item.get("level") or "") != "recommended"]
+    result = {"policy": policy, "advice": advice.get("action"),
+              "schedule": synced["schedule"], "executed": "", "command": "",
+              "closure_ready": readiness.get("ready"),
+              "closure_blockers": list(readiness.get("blockers") or []),
+              "optional": [str(item.get("obligation_id")) for item in optional]}
+    if not due:
+        if optional and policy != "off":
+            print("SOL 调度：可选义务 " + "、".join(result["optional"])
+                  + "（`sol-schedule` 查看命令）")
+        return result
+    target = due[0]
+    if policy == "auto" and execute and _auto_execution_allowed():
+        result["executed"] = str(target.get("obligation_id"))
+        result["exit"] = _execute_obligation(path, target)
+        return result
+    if policy == "off":
+        return result
+    command = "python3 -B " + shlex.join(
+        [os.path.abspath(__file__)]
+        + _obligation_argv(path, target,
+                           round_two=_obligation_round_two(state, target)))
+    result["command"] = command
+    print(f"SOL 调度：义务 {target.get('obligation_id')}"
+          f"（{target.get('family')}/{target.get('event')}）待执行")
+    print("可直接执行：" + command)
+    print("提示：不执行也可以继续工程推进；该义务会按窗口事实计入覆盖率。")
+    return result
+
+
+def _print_continuation(path: str, args=None) -> int:
     """回填类命令的统一续跑判定：仍有可执行工作时返回 10。
 
     阶段报告与工作项回填都是进度记录，不是任务终点。退出码 10 沿用 `drive`
     的口径（有待执行工作），调用方必须继续而不是收束回合。
     """
+    if args is not None:
+        # 调度步放在续跑判定之前：先给出（或执行完）当前的 SOL 认知窗口。
+        _sol_schedule_step(path, args)
     state = G.load_state(path)
     ev = G.evaluate(state)
     cont = ev.get("continuation") or {}
@@ -260,13 +424,23 @@ def cmd_start(args) -> int:
           f"（{', '.join(c['criterion_id'] for c in state['contract']['criteria'])}）")
     print(f"风险：{state['risk']} · 类型：{state['task_kind']} "
           f"· 执行后端：{state['execution_backend']}")
+    # 生命周期调度（v9.6）：启动认知窗口在 start 自身事务内兑现——`--sol auto` 时真的
+    # 执行一次 CONSULT，而不是只打印命令等主代理记得跑；`advise` 给无占位符的可执行
+    # 命令；`off` 明确静默。
+    step = _sol_schedule_step(state_path, args)
     advice = G.sol_advice_summary(state)
-    if advice.get("action") in ("consult", "plan", "review"):
-        command = advice.get("command") or ""
+    if step.get("executed"):
+        print(f"SOL 调度：已执行义务 {step['executed']}（启动认知判断，记录见 sol_calls）")
+    elif step.get("command"):
         print(f"SOL 默认流程：{advice['action'].upper()}（{advice.get('stage') or '-'}）")
         print(f"理由：{advice.get('reason')}")
-        if command:
-            print(f"下一步：{command}")
+    elif step.get("policy") == "off":
+        print("SOL 默认流程：跳过（--sol off）")
+    elif advice.get("action") in ("consult", "plan", "review"):
+        print(f"SOL 默认流程：{advice['action'].upper()}（{advice.get('stage') or '-'}）")
+        print(f"理由：{advice.get('reason')}")
+        if advice.get("command"):
+            print(f"下一步：{advice['command']}")
     else:
         print(f"SOL 默认流程：跳过（{advice.get('reason')}）")
     return 0
@@ -326,11 +500,11 @@ def cmd_plan(args) -> int:
     result = G.plan_state(_state_path(args), plan, source=args.source or "zcode")
     if result["idempotent"]:
         print(f"计划已存在（{result['plan']['plan_id']}），未重复登记。")
-        return _print_continuation(_state_path(args))
+        return _print_continuation(_state_path(args), args)
     print(f"计划已登记：{result['plan']['plan_id']}")
     for action in result["actions"]:
         print(f"- {action['id']} [{action['assignee']}] {action['title']}")
-    return _print_continuation(_state_path(args))
+    return _print_continuation(_state_path(args), args)
 
 
 def cmd_record(args) -> int:
@@ -340,14 +514,14 @@ def cmd_record(args) -> int:
     print(f"{action['id']} → {action['status']}"
           + (f"；证据 {', '.join(action['evidence_ids'])}"
              if action["evidence_ids"] else ""))
-    return _print_continuation(_state_path(args))
+    return _print_continuation(_state_path(args), args)
 
 
 def cmd_rerun(args) -> int:
     action = G.rerun_action(_state_path(args), args.id, reason=args.reason or "")
     print(f"{action['id']} → pending（第 {action['rerun_count']} 次重开）；"
           "旧结果已保存在 rerun_history。")
-    return _print_continuation(_state_path(args))
+    return _print_continuation(_state_path(args), args)
 
 
 def cmd_criterion(args) -> int:
@@ -357,7 +531,7 @@ def cmd_criterion(args) -> int:
     print(f"{criterion['criterion_id']} → {criterion['status']}"
           + (f"；证据 {', '.join(r['id'] for r in criterion['evidence_refs'])}"
              if criterion["evidence_refs"] else ""))
-    return _print_continuation(_state_path(args))
+    return _print_continuation(_state_path(args), args)
 
 
 def cmd_judgment(args) -> int:
@@ -365,6 +539,7 @@ def cmd_judgment(args) -> int:
         _state_path(args), args.status, args.summary,
         evidence_ids=_evidence_ids(args.evidence))
     print(f"判断已记录：{entry['judgment_id']}（{entry['status']}）")
+    _sol_schedule_step(_state_path(args), args)
     return 0
 
 
@@ -415,12 +590,12 @@ def cmd_report(args) -> int:
             print("警告：PWW 报告没有可接受的 W/R；按 fail-closed 处理。")
         if summary:
             print("报告已登记：已随质量报告一并写入（同一保存轮次）。")
-        return _print_continuation(path)
+        return _print_continuation(path, args)
     entry = G.add_report(path, summary,
                          blocked=bool(args.blocked), reason=args.reason or "")
     print(f"报告已登记：sha256={entry['report_sha256'][:16]}…")
     print("注意：报告是进度记录，不是任务终点；以续跑判定为准。")
-    return _print_continuation(path)
+    return _print_continuation(path, args)
 
 
 def cmd_accept(args) -> int:
@@ -436,7 +611,7 @@ def cmd_accept(args) -> int:
     else:
         print("全部警告/残余风险已接受；原始 verdict 保持 "
               f"{report.get('raw_verdict')}，不改写为 PASS。")
-    return _print_continuation(_state_path(args))
+    return _print_continuation(_state_path(args), args)
 
 
 def cmd_quality(args) -> int:
@@ -485,6 +660,8 @@ def cmd_quality(args) -> int:
 def cmd_decide(args) -> int:
     entry = G.add_decision(_state_path(args), args.text, source=args.source)
     print(f"决策已记录（{entry['source']}）：{entry['text'][:120]}")
+    # 用户决策是 decision-point 的可归因事实：这里同步一次调度窗口。
+    _sol_schedule_step(_state_path(args), args)
     return 0
 
 
@@ -537,7 +714,7 @@ def cmd_block(args) -> int:
     print(f"原因：{block['reason']}")
     print(f"所需条件：{block['needs']}")
     print("提示：未阻塞的工作项继续执行；不要因单项阻塞结束回合。")
-    return _print_continuation(_state_path(args))
+    return _print_continuation(_state_path(args), args)
 
 
 def cmd_unblock(args) -> int:
@@ -553,7 +730,7 @@ def cmd_unblock(args) -> int:
         print("block_id：" + ", ".join(result["block_ids"]))
     if result.get("resumed"):
         print("已恢复工作项：" + ", ".join(result["resumed"]) + "（重新进入可执行）")
-    return _print_continuation(_state_path(args))
+    return _print_continuation(_state_path(args), args)
 
 
 def cmd_evidence(args) -> int:
@@ -579,6 +756,7 @@ def cmd_evidence(args) -> int:
         G.drop_evidence(state, args.id, args.reason or "")
         G.save_state(path, state)
         print(f"{args.id} 已归档。")
+        _sol_schedule_step(path, args)
         return 0
     if not args.add:
         raise CLIError("请指定 --add / --drop / --list / --next-id。")
@@ -605,7 +783,8 @@ def cmd_evidence(args) -> int:
             raise CLIError(f"证据采集失败（exit {proc.returncode}）："
                            f"{(proc.stderr or proc.stdout).strip()[:1000]}")
         entry = G.register_evidence(state, eid, kind="capture",
-                                    file_path=out_path, note=args.note or "")
+                                    file_path=out_path, note=args.note or "",
+                                    capture_cmd=args.capture_cmd)
     elif args.file:
         entry = G.register_evidence(state, eid, kind=args.kind or "file",
                                     file_path=args.file, note=args.note or "")
@@ -626,6 +805,9 @@ def cmd_evidence(args) -> int:
     else:
         print(f"{entry['id']} 已登记：{entry['kind']} size={entry['size']} "
               f"sha256={entry['sha256'][:16]}…")
+    # 证据登记是最密集的生命周期动作：在这里给出（或执行）当前认知窗口，
+    # 但普通证据追加本身不会产生新义务（是否触发由事件判据决定）。
+    _sol_schedule_step(path, args)
     return 0
 
 
@@ -697,7 +879,7 @@ def cmd_finding(args) -> int:
     if item["status"] == "fixed":
         print("下一步：运行定向测试/检查并登记证据，再标记 verified；"
               "不需要重新派发完整复核。")
-    return _print_continuation(path)
+    return _print_continuation(path, args)
 
 
 def cmd_review_admission(args) -> int:
@@ -805,7 +987,8 @@ def _load_pending_result(task_dir: str, digest: str,
 
 def _invoke_sol_once(*, state_path: str, task_dir: str, prompt: str,
                      digest: str, mode: str, args, audit_log: str,
-                     audit_subdir: str) -> tuple[dict | None, int]:
+                     audit_subdir: str,
+                     stage: str = "") -> tuple[dict | None, int]:
     """共享的一次调用路径：pending 恢复 → 一次请求 → 落可恢复结果。
 
     返回 `(result, exit_code)`；result 为 None 表示失败且已打印真实原因。
@@ -835,7 +1018,9 @@ def _invoke_sol_once(*, state_path: str, task_dir: str, prompt: str,
         except SR.SolError as exc:
             G.record_sol_call_failure(
                 state_path, mode=mode, error_code=exc.code, detail=exc.detail,
-                materials_sha256=digest, model=SR.MODEL)
+                materials_sha256=digest, model=SR.MODEL,
+                obligation_id=str(getattr(args, "obligation_id", "") or ""),
+                stage=stage)
             print(f"SOL {mode} 失败 [{exc.code}]：{exc.detail or ''}",
                   file=sys.stderr)
             if mode == "REVIEW":
@@ -937,28 +1122,65 @@ def _run_sol_channel(args, mode: str) -> int:
     """SOL 两模式共用的一次调用路径；模式差异只在提示词、记录结构与失败语义。"""
     path = _state_path(args)
     state = G.load_state(path)
+    # 单次调用内复用证据摘要：收口准入在锁外预检、锁内复核都读同一份缓存。
+    readiness_cache: dict = {}
     if G.is_legacy_state(state):
         raise CLIError("v1/v2 SOL 历史状态只读；请为新任务创建 v6+ 状态。")
     cfg = _sol_channel_config(mode)
     if args.list:
         return _sol_list(args, state, mode, cfg)
+    obligation = None
+    obligation_id = str(getattr(args, "obligation_id", "") or "").strip()
+    if obligation_id:
+        obligation = SS.find_obligation(state, obligation_id=obligation_id)
+        if obligation is None:
+            raise CLIError(
+                f"当前任务的调度义务中不存在 {obligation_id}；"
+                "用 `sol-schedule` 查看可执行义务。")
     if not args.materials:
-        raise CLIError(
-            {"REVIEW": "sol-review", "PLAN": "sol-plan"}.get(mode, "sol-consult")
-            + " 需要 --materials（或 --list）。")
+        if obligation is None:
+            raise CLIError(
+                {"REVIEW": "sol-review", "PLAN": "sol-plan"}.get(mode, "sol-consult")
+                + " 需要 --materials（或 --list）。")
+        # 调度执行时材料由状态确定性生成：主代理不必先写材料文件，也不会因为
+        # 懒于写材料而放弃一次真实调用。手动调用仍以 --materials 为准。
+        # 材料里的验证事实与收口准入同源：非收口窗口只给必要测试的验证状态
+        # （便宜、不重算证据摘要），收口窗口给完整的最终验证准入。
+        tests_ok, tests_source = G.test_verification_evidence(state)
+        facts: dict = {"required_tests_completed": tests_ok,
+                       "tests_source": tests_source}
+        if str(obligation.get("family") or "") == "E" \
+                or str(obligation.get("stage") or "") == "closure":
+            facts = G.closure_readiness(state)
+        materials = SS.build_materials(state, obligation, readiness=facts)
+        print(f"材料：按调度义务 {obligation_id} 自动生成 "
+              f"（{len(materials)} 字符）", file=sys.stderr)
+    else:
+        materials = _read_text(args.materials)
     materials, knowledge_meta = _compose_materials(
-        _read_text(args.materials),
-        str(getattr(args, "knowledge_file", "") or ""))
+        materials, str(getattr(args, "knowledge_file", "") or ""))
     if not materials.strip():
         raise CLIError("材料为空。")
     question = str(getattr(args, "question", "") or "").strip()
     stage = str(getattr(args, "stage", "") or "").strip().lower()
+    if obligation is not None:
+        question = question or str(obligation.get("question") or "")
+        stage = stage or str(obligation.get("stage") or "")
     if mode in ("CONSULT", "PLAN"):
+        stage = SR.normalize_stage(stage, mode=mode)
+        # 收口阶段的准入先于其它参数校验：材料与问题都齐也不能拿未完成的最终
+        # 验证去问收口问题。锁内会用同一份缓存复核一次，避免重复重读证据文件。
+        if mode == "CONSULT" and stage == "closure":
+            early = G.closure_readiness(state, cache=readiness_cache)
+            if not early.get("ready"):
+                raise CLIError(
+                    "最终工程验证尚未完成，不能执行收口 CONSULT："
+                    + "；".join(G.closure_blockers_text(early))
+                    + "。先完成必要测试、证据登记与条件核销。")
         if not question:
             raise CLIError(
                 f"SOL {mode} 需要 --question：必须写明本次真正需要判断的事项；"
                 "没有明确问题时不要调用 SOL。")
-        stage = SR.normalize_stage(stage, mode=mode)
 
     def prepare(current: dict) -> tuple[str, str, str, dict]:
         # 各模式共用同一上下文构造：合同、完成条件、工作项与证据登记自动注入，
@@ -1033,11 +1255,41 @@ def _run_sol_channel(args, mode: str) -> int:
     task_dir = os.path.dirname(os.path.abspath(path))
     # 跨进程互斥：同一任务只允许一个 SOL 调用走“检查—调用—登记”临界区，
     # 避免并发进程在完成记录写入前各自发起一次付费请求（三模式共用一把锁）。
-    with G.task_lock(task_dir, ".sol.lock"):
+    # 生命周期命令使用 `--lock-timeout` 有界等待：拿不到锁说明另一个调用正在
+    # 进行，本次放弃执行（义务保持待执行），而不是阻塞工程命令。
+    with G.task_lock(task_dir, ".sol.lock",
+                     timeout=getattr(args, "lock_timeout", None)):
         state = G.load_state(path)
+        # 收口阶段（E 窗口）的唯一执行前提：最终工程验证真的完成，且待执行义务
+        # 对应的就是当前这份验证摘要。两条都不满足时不得付费调用，也不把旧摘要
+        # 的结论当成新结果的结论。
+        final_digest = ""
+        if mode == "CONSULT" and stage == "closure":
+            readiness = G.closure_readiness(state, cache=readiness_cache)
+            if not readiness.get("ready"):
+                raise CLIError(
+                    "最终工程验证尚未完成，不能执行收口 CONSULT："
+                    + "；".join(G.closure_blockers_text(readiness))
+                    + "。先完成必要测试、证据登记与条件核销。")
+            final_digest = str(readiness.get("digest") or "")
+            expected = str((obligation or {}).get("instance") or "")
+            if expected and expected != final_digest:
+                raise CLIError(
+                    f"调度义务 {obligation_id} 对应的最终验证摘要已变化"
+                    f"（义务 {expected} / 当前 {final_digest}）：旧摘要的判断不能"
+                    "覆盖新结果；重新执行生命周期命令以刷新义务后再调用。")
         prompt, digest, context_sha, decision = prepare(state)
         outcome = _sol_reuse_or_refuse(decision, args, mode, cfg)
         if outcome is not None:
+            if outcome == 0 and obligation is not None:
+                # 同一认知对象已有有效结论：义务由复用满足，不再付费。
+                current = G.load_state(path)
+                existing = decision.get("review") or {}
+                G.resolve_sol_obligation(
+                    current, obligation_id, status="satisfied", source="reuse",
+                    call_id=(G.sol_call_id(existing)
+                             if isinstance(existing, dict) else ""))
+                G.save_state(path, current)
             return outcome
         if (state.get("closure") or {}).get("closed"):
             raise CLIError(cfg["closed_note"] + "（--list 仍可只读查看）。")
@@ -1045,7 +1297,7 @@ def _run_sol_channel(args, mode: str) -> int:
         result, code = _invoke_sol_once(
             state_path=path, task_dir=task_dir, prompt=prompt,
             digest=digest, mode=mode, args=args, audit_log=audit_log,
-            audit_subdir=cfg["subdir"])
+            audit_subdir=cfg["subdir"], stage=stage)
         if result is None:
             return code
         reply_text = result.pop("reply_text", "")
@@ -1084,6 +1336,8 @@ def _run_sol_channel(args, mode: str) -> int:
             "status": "completed",
             "mode": mode,
             "stage": stage if mode in ("CONSULT", "PLAN") else "",
+            # 收口判断的身份：E 的去重与失效都以这份最终验证摘要为准。
+            "final_verification_digest": final_digest,
             "question": question,
             "progress_digest": (RP.sol_progress_key(state)
                                 if mode in ("CONSULT", "PLAN") else ""),
@@ -1158,7 +1412,8 @@ def _run_sol_channel(args, mode: str) -> int:
         record = G.record_sol_call(
             path, record, mode=mode, materials_sha256=digest,
             trigger=decision.get("trigger") or "",
-            reason=decision.get("reason") or "")
+            reason=decision.get("reason") or "",
+            obligation_id=obligation_id)
         try:
             os.unlink(_pending_result_path(task_dir, digest, cfg["subdir"]))
         except OSError:
@@ -1263,6 +1518,119 @@ def cmd_sol_accept(args) -> int:
     return 0
 
 
+def _sol_schedule_view(state: dict, path: str) -> dict:
+    """调度视图（只读）：义务清单、下一条可执行项与可直接执行的命令。"""
+    due = SS.due_obligations(state)
+    rows = []
+    for item in SS.obligations(state):
+        if not isinstance(item, dict):
+            continue
+        rows.append({
+            "obligation_id": item.get("obligation_id"),
+            "family": item.get("family"),
+            "event": item.get("event"),
+            "mode": item.get("mode"),
+            "stage": item.get("stage"),
+            "level": item.get("level"),
+            "status": item.get("status"),
+            "window": item.get("window"),
+            "missed": SS.is_missed(item),
+            "source": item.get("source"),
+            "call_id": item.get("call_id"),
+            "opened_at": item.get("opened_at"),
+            "closed_reason": item.get("closed_reason"),
+            "skip_reason": item.get("skip_reason"),
+            "failure": item.get("failure"),
+        })
+    command = ""
+    if due:
+        command = "python3 -B " + shlex.join(
+            [os.path.abspath(__file__)]
+            + _obligation_argv(path, due[0],
+                               round_two=_obligation_round_two(state, due[0])))
+    return {"schema": SS.SCHEDULE_SCHEMA, "summary": SS.summary(state),
+            "obligations": rows,
+            "next": (due[0].get("obligation_id") if due else ""),
+            "command": command}
+
+
+def cmd_sol_schedule(args) -> int:
+    """SOL 生命周期调度：显示（或执行）当前应做的认知窗口。"""
+    path = _state_path(args)
+    state = G.load_state(path)
+    advice = G.sol_advice_summary(state)
+    synced = G.sync_sol_schedule(state, advice=advice)
+    if args.execute:
+        # 显式执行：先落盘义务事实，再执行一个（有界），便于脚本按需推进。
+        if synced["changes"]:
+            G.save_state(path, state)
+        due = SS.due_obligations(state)
+        if not due:
+            print("SOL 调度：当前没有 recommended 级待执行义务。")
+        else:
+            _execute_obligation(path, due[0])
+        state = G.load_state(path)
+    view = _sol_schedule_view(state, path)
+    if args.json:
+        _print({**view, "advice": advice})
+        return 0
+    summary = view["summary"]
+    print(f"SOL 调度：义务 {summary['total']} 个"
+          f"（未闭合 {summary['pending']}，漏调 {summary['missed']}）")
+    for row in view["obligations"]:
+        mark = "漏调" if row["missed"] else row["status"]
+        extra = ""
+        if row.get("call_id"):
+            extra = f" call={row['call_id']}"
+        elif row.get("skip_reason"):
+            extra = f"（{row['skip_reason']}）"
+        elif row.get("failure"):
+            extra = f"（失败：{row['failure']}）"
+        print(f"- {row['obligation_id']} [{mark}] {row['family']}/{row['event']} "
+              f"{row['mode']} {row['level']} stage={row['stage'] or '-'}{extra}")
+    if view["command"]:
+        print("下一条可执行：" + str(view["next"]))
+        print("可直接执行：" + view["command"])
+    else:
+        print("当前没有待执行的 recommended 级义务。")
+    print("说明：调度义务是「应调用」的事实记录；SOL 仍是 advisory，不构成门禁。")
+    return 0
+
+
+def _iter_task_states(root: str) -> list[tuple[str, dict]]:
+    tasks_dir = os.path.join(root, ".copilot-tasks")
+    found: list[tuple[str, dict]] = []
+    if not os.path.isdir(tasks_dir):
+        return found
+    for name in sorted(os.listdir(tasks_dir)):
+        candidate = os.path.join(tasks_dir, name, "state.json")
+        if not os.path.isfile(candidate):
+            continue
+        try:
+            found.append((candidate, G.load_state(candidate)))
+        except G.GovernanceError:
+            continue
+    return found
+
+
+def cmd_sol_stats(args) -> int:
+    """SOL 调度覆盖率（显式分母）：建议/执行/复用/跳过/失败/漏调分开统计。"""
+    if args.workspace:
+        root = os.path.abspath(args.workspace)
+        pairs = _iter_task_states(root)
+        if not pairs:
+            raise CLIError(f"{root} 下没有找到可读的任务状态（.copilot-tasks/*/state.json）。")
+        scoped = [state for _path, state in pairs]
+        scope = f"workspace:{root}"
+    else:
+        path = _state_path(args)
+        scoped = [G.load_state(path)]
+        scope = f"state:{os.path.abspath(path)}"
+    result = SS.stats(scoped, scope=scope)
+    _print(result)
+    return 0
+
+
 def cmd_agent_policy(args) -> int:
     """只读调度建议：主代理默认执行，Explore/general-purpose 按需。
 
@@ -1297,7 +1665,47 @@ def cmd_closure(args) -> int:
     path = _state_path(args)
     if not args.close:
         return cmd_closure_check(args)
-    closure = G.close_task(path, by=args.by)
+    # 收口顺序固定为：最终工程验证（G1–G3）→ SOL 收口综合判断 → 收口。
+    # SOL 没有 PASS 批准权，也不阻断收口：advise/off 都会照常收口，未执行的
+    # 收口窗口按窗口事实记为漏调并写入 closure.sol_schedule。
+    state = G.load_state(path)
+    cache: dict = {}
+    gates = G.closure_check(state,
+                            task_dir=os.path.dirname(os.path.abspath(path)),
+                            cache=cache)
+    if gates.get("passed"):
+        # 收口前的统一准入：只有最终工程验证真的完成（工作项终态、条件核销、
+        # 证据与必要测试齐备）才允许执行 E，也才允许直接收口。`--close` 因此
+        # 不能绕过验证与 E 阶段调度。
+        readiness = G.closure_readiness(state, cache=cache)
+        if not readiness.get("ready"):
+            print("最终工程验证尚未完成，不能收口：")
+            for blocker in G.closure_blockers_text(readiness):
+                print(f"- {blocker}")
+            print("先补齐上述验证（测试执行结果、证据登记或条件核销），"
+                  "再执行 closure --close；收口 CONSULT 会在验证完成后自动调度。")
+            return 1
+        _sol_schedule_step(path, args, gates_passed=True,
+                           execute=(_sol_policy(args) == "auto"),
+                           prefer_family="E", closure_ready=readiness,
+                           cache=cache)
+        # 顺序：最终验证 → 收口 CONSULT → ZCode 独立验收 → G1–G3。刚执行完 E
+        # 就直接收口，等于让 `--close` 绕过 ZCode 对 SOL 结论的判断（收口后
+        # 状态已 CLOSED，再登记会被拒绝）。这里停在等待验收，退出码与回填类
+        # 命令一致（10 = 仍有必须继续的下一步）。
+        pending_acceptance = G.closure_acceptance_pending(G.load_state(path))
+        if pending_acceptance:
+            print("SOL 收口判断已完成，等待 ZCode 独立验收后再收口：")
+            print(f"- 调用：{pending_acceptance['call_id']}"
+                  f"（stage=closure，最终验证摘要 "
+                  f"{pending_acceptance['digest']}）")
+            print("下一步：copilot_dispatch.py sol-accept --state <state> "
+                  f"--call-id {pending_acceptance['call_id']} "
+                  "--status accepted|modified|rejected --rationale <依据>")
+            print("登记判断后再执行 closure --close：此时才执行 G1–G3 收口。")
+            return EXIT_CONTINUE
+    closure = G.close_task(path, by=args.by, cache=cache,
+                           sol_entry="closure-command")
     quality = closure.get("quality") or {}
     print(f"任务已收口：verdict={closure['verdict']} "
           f"iteration={closure['iteration_id']} by={closure['closed_by']}")
@@ -1312,7 +1720,7 @@ def cmd_reopen(args) -> int:
     G.reopen_task(_state_path(args), args.reason,
                   authorized_by=args.authorized_by)
     print("任务已重开；历史收口记录保留在 closure.reopen_history。")
-    return _print_continuation(_state_path(args))
+    return _print_continuation(_state_path(args), args)
 
 
 # ── 交付清单（只读） ──────────────────────────────────────────────────────
@@ -1591,7 +1999,7 @@ def cmd_contract(args) -> int:
     for criterion in result["criteria"]:
         print(f"- {criterion['criterion_id']} [{criterion['status']}] "
               f"{criterion['description']}")
-    return _print_continuation(path)
+    return _print_continuation(path, args)
 
 
 def cmd_authorize_review(args) -> int:
@@ -1664,6 +2072,12 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     sub = ap.add_subparsers(dest="command", required=True)
 
+    def _add_sol_policy(parser) -> None:
+        parser.add_argument(
+            "--sol", default="", choices=("", *SOL_POLICIES),
+            help="SOL 生命周期调度策略：auto（默认，有界执行 1 个 recommended 义务）/ "
+                 "advise（只给出可执行命令）/ off（只记录义务，不调用）")
+
     p = sub.add_parser("start", help="创建任务合同与状态")
     p.add_argument("--state", required=True)
     p.add_argument("--goal", required=True)
@@ -1689,12 +2103,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--workspace", default="",
                    help="任务实际 git 工作区；省略时取状态文件所在目录的 git 根")
     p.set_defaults(func=cmd_start)
+    _add_sol_policy(p)
 
     p = sub.add_parser("plan", help="登记 ZCode 本地计划（JSON）")
     p.add_argument("--state", required=True)
     p.add_argument("--plan", default="", help="计划 JSON 路径；默认读 stdin")
     p.add_argument("--source", default="zcode")
     p.set_defaults(func=cmd_plan)
+    _add_sol_policy(p)
 
     for name in ("next", "brief", "render", "status"):
         p = sub.add_parser(name, help="查看阶段、工作项、G1–G3 与下一步")
@@ -1709,12 +2125,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--result", default="")
     p.add_argument("--evidence", action="append", default=[])
     p.set_defaults(func=cmd_record)
+    _add_sol_policy(p)
 
     p = sub.add_parser("rerun", help="把已终结工作项重开为 pending（修复后重新验证）")
     p.add_argument("--state", required=True)
     p.add_argument("--id", required=True)
     p.add_argument("--reason", default="")
     p.set_defaults(func=cmd_rerun)
+    _add_sol_policy(p)
 
     p = sub.add_parser("criterion", help="核销完成条件")
     p.add_argument("--state", required=True)
@@ -1722,6 +2140,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--status", required=True, choices=G.CRITERION_STATUSES)
     p.add_argument("--evidence", action="append", default=[])
     p.set_defaults(func=cmd_criterion)
+    _add_sol_policy(p)
 
     p = sub.add_parser("judgment", help="记录 ZCode 自我判断（仅审计）")
     p.add_argument("--state", required=True)
@@ -1729,6 +2148,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--summary", required=True)
     p.add_argument("--evidence", action="append", default=[])
     p.set_defaults(func=cmd_judgment)
+    _add_sol_policy(p)
 
     p = sub.add_parser("evidence", help="登记 / 归档 / 列出证据")
     p.add_argument("--state", required=True)
@@ -1745,6 +2165,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--note", default="")
     p.add_argument("--reason", default="")
     p.set_defaults(func=cmd_evidence)
+    _add_sol_policy(p)
 
     p = sub.add_parser("report", help="登记执行报告或接入 verify 质量报告")
     p.add_argument("--state", required=True)
@@ -1757,6 +2178,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--blocked", action="store_true")
     p.add_argument("--reason", default="")
     p.set_defaults(func=cmd_report)
+    _add_sol_policy(p)
 
     p = sub.add_parser("accept", help="登记用户对 PWW 的明确接受")
     p.add_argument("--state", required=True)
@@ -1769,6 +2191,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="用户接受的原话（原样记录，不能只写调用方结论）")
     p.add_argument("--note", default="")
     p.set_defaults(func=cmd_accept)
+    _add_sol_policy(p)
 
     p = sub.add_parser("quality", help="查看质量结论与 PWW 接受状态")
     p.add_argument("--state", required=True)
@@ -1780,6 +2203,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--text", required=True)
     p.add_argument("--source", default="user")
     p.set_defaults(func=cmd_decide)
+    _add_sol_policy(p)
 
     p = sub.add_parser("block", help="记录真实阻塞（缺少授权/决策/资源/外部限制）")
     p.add_argument("--state", required=True)
@@ -1794,6 +2218,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--force", action="store_true",
                    help="仍存在可执行工作项时强制登记任务级阻塞（需先确认整体不可推进）")
     p.set_defaults(func=cmd_block)
+    _add_sol_policy(p)
 
     p = sub.add_parser("unblock", help="解除阻塞")
     p.add_argument("--state", required=True)
@@ -1805,6 +2230,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--quote", default="",
                    help="用户授权解除的原话（--by user 时必填）")
     p.set_defaults(func=cmd_unblock)
+    _add_sol_policy(p)
 
     p = sub.add_parser("closure-check", help="检查 G1–G3")
     p.add_argument("--state", required=True)
@@ -1861,7 +2287,14 @@ def build_parser() -> argparse.ArgumentParser:
     def _add_sol_cognitive_args(parser, *, subdir: str) -> None:
         parser.add_argument("--state", required=True)
         parser.add_argument("--materials", default="",
-                            help="主代理整理的材料文件（- 表示 stdin）；--list 时可省略")
+                            help="主代理整理的材料文件（- 表示 stdin）；--list 时可省略；"
+                                 "按 --obligation 调度执行时省略则从状态自动生成")
+        parser.add_argument("--obligation", dest="obligation_id", default="",
+                            help="按调度义务执行（sol-schedule 给出编号）：材料/问题/"
+                                 "阶段缺省时从义务补齐，并把结果结算到该义务")
+        parser.add_argument("--lock-timeout", type=float, default=None,
+                            help="等待任务 SOL 锁的秒数；省略则一直等待（手动调用），"
+                                 "生命周期调度使用有界等待")
         parser.add_argument("--knowledge-file", default="",
                             help="知识交接 JSON（由 knowledge_handoff.py 校验）；"
                                  "摘录追加到 materials")
@@ -1965,6 +2398,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--note", default="", help="状态变更说明（regressed/dropped/open 必填）")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_finding)
+    _add_sol_policy(p)
 
     p = sub.add_parser("closure", help="收口任务（必须 G1–G3 通过）")
     p.add_argument("--state", required=True)
@@ -1972,6 +2406,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--json", action="store_true")
     p.add_argument("--by", default="zcode-native")
     p.set_defaults(func=cmd_closure)
+    _add_sol_policy(p)
 
     p = sub.add_parser("reopen", help="用户授权后重开已收口任务")
     p.add_argument("--state", required=True)
@@ -1979,6 +2414,24 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--authorized-by", required=True,
                    help="必须显式写 user：重开需要用户授权")
     p.set_defaults(func=cmd_reopen)
+    _add_sol_policy(p)
+
+    p = sub.add_parser("sol-schedule",
+                       help="SOL 生命周期调度：当前义务、漏调与可直接执行的命令")
+    p.add_argument("--state", default="",
+                   help="任务状态文件（与 --workspace 二选一）")
+    p.add_argument("--execute", action="store_true",
+                   help="执行一个 recommended 义务（一次请求；默认只显示）")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_sol_schedule)
+
+    p = sub.add_parser("sol-stats",
+                       help="SOL 调度覆盖率：应调用/执行/复用/跳过/失败/漏调（显式分母）")
+    p.add_argument("--state", default="", help="单个任务状态文件")
+    p.add_argument("--workspace", default="",
+                   help="工作区根目录：聚合 .copilot-tasks/*/state.json")
+    p.add_argument("--json", action="store_true", help="输出 JSON（默认即为 JSON）")
+    p.set_defaults(func=cmd_sol_stats)
 
     p = sub.add_parser("handoff", help="只读列出生效交付清单与未提交/未跟踪文件")
     p.add_argument("--state", default="", help="任务状态文件（可选）")
@@ -2006,6 +2459,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--authorization-note", default="",
                    help="破坏性修订必填：用户原话或明确要求，写入合同历史供审计核对")
     p.set_defaults(func=cmd_contract)
+    _add_sol_policy(p)
 
     p = sub.add_parser("authorize-review", help="记录用户对正式 REVIEW 的明确授权")
     p.add_argument("--state", required=True)

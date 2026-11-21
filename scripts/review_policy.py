@@ -26,7 +26,7 @@ import re
 
 LEDGER_SCHEMA = "copilot-finding-ledger/v1"
 COMPLEXITY_SCHEMA = "copilot-task-complexity/v2"
-SOL_ADVICE_SCHEMA = "copilot-sol-advice/v3"
+SOL_ADVICE_SCHEMA = "copilot-sol-advice/v4"
 
 # 任务认知复杂度只使用状态里已有的确定性事实：不引入第二个模型，也不引入
 # 评分模型。每个信号都对应一条可复核的现场证据；0 个信号即低复杂度。
@@ -50,6 +50,49 @@ COMPLEXITY_SIGNALS = {
 # 目录或计划条目增加不代表需要重新判断；范围变化走合同修订（合同指纹变化即
 # 旧结论不再覆盖）。
 SOL_ESCALATION_SIGNALS = ("risk-high", "replan-history", "reopened")
+
+# ── 生命周期事件（v9.6 主动调度）──────────────────────────────────────────
+# 事件是“认知窗口”的稳定身份，不是复杂度信号。每个事件必须有一条可归因的现场
+# 判据：要么来自状态里已存在的确定性事实（工作项/条件/台账/合同/重开/风险），
+# 要么来自主代理显式登记的影响判断。普通证据追加、备注措辞变化、常规验收进展
+# 都不构成事件，避免把“有变化”误当成“需要重新判断”。
+SOL_EVENTS = {
+    "startup": "任务启动：理解目标、隐含需求、问题本质与主要风险",
+    "plan-needed": "调查已形成现场事实且存在实质方案决策",
+    "material-evidence-change": "实质证据变化：已验证结论被推翻或修复复现",
+    "decision-point": "出现需要取舍的决策点",
+    "risk-escalation": "风险等级实质上升",
+    "replan-history": "方案失效并重新规划",
+    "scope-changed": "目标、范围或合同实质变化",
+    "reopened": "任务重新打开",
+    "milestone": "medium/high 任务的重要阶段里程碑",
+    "closure": "最终收口综合判断",
+}
+SOL_EVENT_ORDER = ("startup", "plan-needed", "material-evidence-change",
+                   "decision-point", "risk-escalation", "replan-history",
+                   "scope-changed", "reopened", "milestone", "closure")
+# 六类动态事件：只在执行期按新增事实追加，不与启动/规划/里程碑/收口重复计数。
+SOL_DYNAMIC_EVENTS = ("material-evidence-change", "decision-point",
+                      "risk-escalation", "replan-history", "scope-changed",
+                      "reopened")
+SOL_EVENT_FAMILY = {
+    "startup": "A", "plan-needed": "B", "milestone": "D", "closure": "E",
+}
+SOL_DYNAMIC_FAMILY = "C"
+SOL_FAMILIES = ("A", "B", "C", "D", "E")
+# 事件 → 追加调用时使用的 --trigger（与 single_round 的触发口径一致）。
+SOL_EVENT_TRIGGERS = {
+    "material-evidence-change": "new-evidence",
+    "decision-point": "new-evidence",
+    "risk-escalation": "new-risk",
+    "replan-history": "new-risk",
+    "scope-changed": "scope-changed",
+    "reopened": "scope-changed",
+    "startup": "new-evidence",
+    "plan-needed": "new-evidence",
+    "milestone": "stage-result",
+    "closure": "stage-result",
+}
 
 # 台账状态：fixed 只是“已改”，verified 才表示修复被定向验证；只有
 # verified/closed/dropped 不再阻断。regressed 表示已修复问题又复现。
@@ -875,6 +918,209 @@ def _retry_trigger(new_codes: list[str]) -> str:
     return "new-evidence"
 
 
+def event_family(code: str) -> str:
+    """事件所属生命周期窗口：A 启动 / B 规划 / C 执行期动态 / D 里程碑 / E 收口。"""
+    return SOL_EVENT_FAMILY.get(_text(code), SOL_DYNAMIC_FAMILY)
+
+
+def has_substantive_progress(state: dict) -> bool:
+    """是否存在实质工程进展：终态工作项、已核销条件或已登记证据。
+
+    收口综合判断与覆盖率分母都用它，避免“刚建任务就谈收口”的空转咨询，也让
+    “有实质进展的非简单任务”有一个可复核的口径。
+    """
+    if any(_text(item.get("status")) in TERMINAL_STATUSES
+           for item in state.get("actions") or [] if isinstance(item, dict)):
+        return True
+    if any(_text(item.get("status")) == "met"
+           for item in (state.get("contract") or {}).get("criteria") or []
+           if isinstance(item, dict)):
+        return True
+    return bool([item for item in state.get("evidence") or []
+                 if isinstance(item, dict) and not item.get("dropped")])
+
+
+def declared_triggers(state: dict) -> list[str]:
+    """任务声明的准入触发因素（唯一读取口径，避免建议与统计各取一次）。"""
+    return [_text(item.get("name"))
+            for item in state.get("admission_triggers") or []
+            if isinstance(item, dict) and _text(item.get("name"))]
+
+
+def plan_admission(state: dict, *, triggers: list[str] | None = None,
+                   workspace: str = "") -> dict:
+    """PLAN 准入的唯一判定口径（建议与覆盖率统计共用）。
+
+    不再由工作项数量单独决定：方案类任务类型、中/高复杂、多工作项都构成
+    “存在实质方案决策”。单工作项任务只要命中任一条件也要规划；只有既无信号、
+    又无第二项工作、也不是方案类任务时才跳过。
+    """
+    if triggers is None:
+        # 调用方未显式传入时读取任务自己声明的触发因素：准入只有一个口径，
+        # 不能因为调用方忘了传就漏掉“声明触发”这条信号。
+        triggers = declared_triggers(state)
+    profile = task_complexity(state, triggers=triggers, workspace=workspace)
+    actions = _action_list(state, plan_only=True)
+    planned = len(actions)
+    done = len([item for item in actions
+                if _text(item.get("status")) in TERMINAL_STATUSES])
+    understood = bool(profile["readiness"]["understood"])
+    kind = profile["task_kind"]
+    required = (profile["level"] in ("medium", "high") or planned >= 2
+                or kind in PLAN_KINDS)
+    return {
+        "required": bool(required and understood),
+        "understood": understood,
+        "level": profile["level"],
+        "task_kind": kind,
+        "planned": planned,
+        "done": done,
+        "non_simple": bool(profile.get("non_simple")),
+        "reason": ("方案类任务、中/高复杂或多工作项" if required
+                   else "既无方案类信号也没有第二项工作"),
+    }
+
+
+def sol_event_snapshot(state: dict) -> dict:
+    """事件判据的确定性快照，用于与上次认知调用比较是否出现新的认知对象。
+
+    只使用状态里已有的可归因事实：台账中复现的 finding、曾经 met 又被回退的
+    条件、重规划工作项、显式登记的决策（新增即为新的决策窗口）、合同指纹、风险
+    等级、重开次数。它不读 history、不解析自由文本，也不把证据数量当作认知价值。
+    """
+    ledger = state.get("finding_ledger") or {}
+    regressed = sorted(
+        str(item.get("finding_id") or "")
+        for item in (ledger.get("items") or [])
+        if isinstance(item, dict) and _text(item.get("status")) == "regressed")
+    met = sorted(
+        str(item.get("criterion_id") or "")
+        for item in (state.get("contract") or {}).get("criteria") or []
+        if isinstance(item, dict) and _text(item.get("status")) == "met")
+    replans = sorted(
+        str(item.get("id") or "")
+        for item in state.get("actions") or []
+        if isinstance(item, dict)
+        and (_text(item.get("origin")) == "replan"
+             or str(item.get("id") or "").startswith("AUTO-REPLAN")))
+    decisions = sorted(
+        str(item.get("decision_id") or f"D{index + 1}")
+        for index, item in enumerate(state.get("decisions") or [])
+        if isinstance(item, dict))
+    reopen_seq = len((state.get("closure") or {}).get("reopen_history") or [])
+    risk = _text(state.get("risk")).lower()
+    return {
+        "regressed": regressed,
+        "met": met,
+        "replans": replans,
+        "decisions": decisions,
+        "contract_sha256": _text(state.get("contract_sha256")),
+        "risk": "medium" if risk == "normal" else risk,
+        "reopen_seq": reopen_seq,
+    }
+
+
+def closure_key(state: dict) -> str:
+    """收口判断的去重键：合同指纹 + 重开次数（一次收口周期一个键）。
+
+    合同修订或重开会开启新的收口周期，旧收口结论不再覆盖新周期；除此之外不
+    因证据增删或时间推移重复付费。调用记录与建议使用同一个函数，避免两处口径
+    漂移导致“刚收口完又建议收口”。
+    """
+    snapshot = sol_event_snapshot(state)
+    return sha256_text(canonical_json(
+        [snapshot["contract_sha256"], snapshot["reopen_seq"]]))[:16]
+
+
+def _new_items(current: list[str], previous: list[str]) -> list[str]:
+    known = set(previous or [])
+    return [item for item in current if item not in known]
+
+
+def sol_events(state: dict, snapshot: dict, last: dict | None) -> list[dict]:
+    """当前成立的生命周期事件及其“是否新增”。
+
+    `last` 是上一次认知调用保存的事件快照。没有快照的旧记录退回复杂度信号口径，
+    避免升级后对同一认知对象重复付费。
+    """
+    rows: list[dict] = []
+    previous = last if isinstance(last, dict) else None
+    if previous is None:
+        return rows
+    new_regressed = _new_items(snapshot["regressed"],
+                               list(previous.get("regressed") or []))
+    # 曾经 met 的条件回退：既有结论被推翻，这是实质证据变化，不是普通进展。
+    invalidated = [cid for cid in (previous.get("met") or [])
+                   if cid not in set(snapshot["met"])]
+    if new_regressed or invalidated:
+        parts = []
+        if new_regressed:
+            parts.append("修复后复现的 finding：" + "、".join(new_regressed))
+        if invalidated:
+            parts.append("回退为未核销的完成条件：" + "、".join(sorted(invalidated)))
+        rows.append({
+            "code": "material-evidence-change",
+            "instance": sha256_text(canonical_json(
+                [new_regressed, sorted(invalidated)]))[:16],
+            "detail": "；".join(parts),
+            "facts": {"regressed": new_regressed,
+                      "invalidated": sorted(invalidated)},
+        })
+    new_decisions = _new_items(snapshot["decisions"],
+                               list(previous.get("decisions") or []))
+    if new_decisions:
+        rows.append({
+            "code": "decision-point",
+            "instance": sha256_text(canonical_json(new_decisions))[:16],
+            "detail": "新出现的未决决策窗口：" + "、".join(new_decisions),
+            "facts": {"decision_ids": new_decisions},
+        })
+    if snapshot["risk"] == "high" and previous.get("risk") != "high":
+        rows.append({
+            "code": "risk-escalation", "instance": "high",
+            "detail": "任务风险等级上升到 high",
+            "facts": {"previous_risk": previous.get("risk") or ""},
+        })
+    new_replans = _new_items(snapshot["replans"],
+                             list(previous.get("replans") or []))
+    if new_replans:
+        rows.append({
+            "code": "replan-history",
+            "instance": sha256_text(canonical_json(new_replans))[:16],
+            "detail": "出现重规划工作项：" + "、".join(new_replans),
+            "facts": {"replans": new_replans},
+        })
+    if snapshot["contract_sha256"] and previous.get("contract_sha256") \
+            and snapshot["contract_sha256"] != previous["contract_sha256"]:
+        rows.append({
+            "code": "scope-changed",
+            "instance": snapshot["contract_sha256"][:16],
+            "detail": "合同指纹变化：旧结论不再覆盖当前合同",
+            "facts": {"contract_sha256": snapshot["contract_sha256"]},
+        })
+    if int(snapshot["reopen_seq"]) > int(previous.get("reopen_seq") or 0):
+        rows.append({
+            "code": "reopened",
+            "instance": f"reopen-{int(snapshot['reopen_seq'])}",
+            "detail": f"任务第 {int(snapshot['reopen_seq'])} 次重开",
+            "facts": {"reopen_seq": int(snapshot["reopen_seq"])},
+        })
+    return rows
+
+
+def _signals_to_events(codes: list[str]) -> list[dict]:
+    """旧记录没有事件快照时的兼容口径：把升级型信号映射成同义事件。"""
+    rows = []
+    for code in codes:
+        event = {"risk-high": "risk-escalation",
+                 "replan-history": "replan-history",
+                 "reopened": "reopened"}.get(code)
+        if event:
+            rows.append({"code": event, "instance": code,
+                         "detail": SOL_EVENTS[event], "facts": {}})
+    return rows
+
+
 def _advice_command(mode: str, *, second_round: bool, trigger: str,
                     stage: str = "") -> str:
     if mode == "REVIEW":
@@ -896,23 +1142,28 @@ def _advice_command(mode: str, *, second_round: bool, trigger: str,
 
 def sol_advice(state: dict, *, calls: list[dict] | None = None,
                triggers: list[str] | None = None, gates_passed: bool = False,
+               closure_ready: dict | None = None,
                user_request: bool = False, review_requested: bool = False,
                workspace: str = "") -> dict:
     """SOL 默认认知生命周期建议（只读建议，不是门禁，也不派生工作项）。
 
-    生命周期与调用策略：
+    生命周期与调用策略（v9.6 事件驱动）：
 
-    1. 简单/机械任务（0 信号）→ 0 调用；复杂度不确定时按非简单处理。
-    2. 非简单任务启动阶段 → 默认建议一次 CONSULT（理解目标、问题与风险）。
-    3. 调查形成现场事实、且任务需要规划 → 建议一次 PLAN（方案比较与优先级）。
-    4. 执行期出现升级型新信号（风险升级、方案失败重规划、任务重开）→ 允许
-       追加 CONSULT；没有新信息时复用，不重复付费。
-    5. 高复杂任务在重要阶段完成后可做一次阶段复盘 CONSULT；收口前对高风险或
-       高复杂任务默认建议一次收口 CONSULT（中等复杂为可选）。
-    6. REVIEW 只由用户明确要求，不由阶段或风险自动派生。
+    1. 简单/机械任务（无信号且类型明确简单）→ 0 调用；复杂度不确定时按非简单处理。
+    2. A 启动：非简单任务 → 一次 CONSULT（目标理解、问题本质、约束与主要风险）。
+    3. B 规划：已形成现场事实且存在实质方案决策 → 一次 PLAN；准入不再由工作项
+       数量单独决定（方案类任务、声明触发、中/高复杂、多工作项任一即可）。
+    4. C 执行期：出现可归因的新事件（实质证据变化、决策点、风险上升、重规划、
+       合同修订、重开）→ 追加 CONSULT；普通证据追加与常规进展不触发。
+    5. D 里程碑：medium/high 任务完成实质工作后 → 可选阶段复盘（按 progress_key
+       去重，不按时间或证据条数）。
+    6. E 收口：有实质进展的非简单任务在最终验证后 → 收口综合判断（按收口周期
+       去重）；SOL 不拥有 PASS 批准权，也不是门禁。
+    7. REVIEW 只由用户明确要求，不由阶段或风险自动派生。
 
-    这里不设调用次数上限：`force/trigger` 只要求说明“为什么这次判断可能改变
-    目标理解、方案、优先级或风险”，不限制追加次数。
+    输出中的 `family` / `event` / `instance` / `level` 是调度层持久化“义务”的稳定
+    身份：同一 (合同, family, event, instance) 只应存在一个义务，重复评估只会
+    刷新同一个义务，不会产生新的付费对象。这里不设调用次数上限。
     """
     profile = task_complexity(state, triggers=triggers, workspace=workspace)
     if user_request:
@@ -948,16 +1199,34 @@ def sol_advice(state: dict, *, calls: list[dict] | None = None,
     if consult_calls:
         last_consult = max(consult_calls,
                            key=lambda item: _text(item.get("created_at")))
+    # 事件基线必须取“最近一次真实判断”，即使它是在旧合同下做的：合同修订正是
+    # 靠与旧基线比较才能判为 scope-changed。只按覆盖过滤会让修订后的第一次判断
+    # 退回“启动 CONSULT”，事件永远无法识别。
+    baseline = last_consult
+    if baseline is None:
+        everything = [item for item in completed
+                      if _record_mode(item) == "CONSULT"]
+        if everything:
+            baseline = max(everything,
+                           key=lambda item: _text(item.get("created_at")))
     same_signals: set[str] = set()
-    if last_consult is not None and "complexity_signals" in last_consult:
+    if baseline is not None and "complexity_signals" in baseline:
         same_signals = {_text(code)
-                        for code in last_consult.get("complexity_signals") or []}
+                        for code in baseline.get("complexity_signals") or []}
     # 旧记录没有信号快照时不做差异判断：按“已覆盖”处理，避免升级后重复付费。
     new_codes: list[str] = []
     if same_signals:
         new_codes = [code for code in profile["signal_codes"]
                      if code in SOL_ESCALATION_SIGNALS
                      and code not in same_signals]
+    # 事件是调度层与复用层的共同依据：快照只取可归因事实；旧记录缺快照时按
+    # 升级型信号映射同义事件，保持升级后不重复付费。
+    snapshot = sol_event_snapshot(state)
+    events = sol_events(state, snapshot,
+                        (baseline or {}).get("sol_event_snapshot"))
+    if not events and new_codes:
+        events = _signals_to_events(new_codes)
+    new_events = [str(item.get("code") or "") for item in events]
     risk = _text(state.get("risk")).lower()
     level = profile["level"]
     kind = profile["task_kind"]
@@ -967,10 +1236,29 @@ def sol_advice(state: dict, *, calls: list[dict] | None = None,
                 if _text(item.get("status")) in TERMINAL_STATUSES])
     all_done = planned > 0 and done == planned
     understood = bool(profile["readiness"]["understood"])
-    plan_required = (level == "high" or planned >= 2 or kind in PLAN_KINDS)
+    # PLAN 准入走唯一口径（plan_admission），覆盖率统计复用同一函数。
+    plan_required = plan_admission(
+        state, triggers=triggers, workspace=workspace)["required"]
+    # 收口综合判断只对“有实质工程进展”的非简单任务有认知价值。
+    progressed = has_substantive_progress(state)
     progress_key = sol_progress_key(state)
-    closure_consulted = any(_call_stage(item) == "closure"
-                            for item in consult_calls)
+    closure_cycle = closure_key(state)
+    # E 阶段准入＝最终工程验证完成（统一由 governance.closure_readiness 判定）。
+    # 缺省时沿用旧的 `gates_passed` 口径，只为历史调用点兼容；调度链路一律传入。
+    readiness = closure_ready if isinstance(closure_ready, dict) else {}
+    final_verified = (bool(readiness.get("ready")) if readiness
+                      else bool(gates_passed))
+    verification_digest = _text(readiness.get("digest"))
+    # 收口判断按“最终验证摘要”去重：同一份最终验证不重复付费；验证事实变化
+    # （新增条件证据、重跑测试报告、工作项结果变化）打开新的收口判断窗口。
+    closure_consulted = any(
+        _call_stage(item) == "closure"
+        and (
+            (_text(item.get("final_verification_digest")) and verification_digest
+             and _text(item.get("final_verification_digest")) == verification_digest)
+            or (not _text(item.get("final_verification_digest"))
+                and _text(item.get("closure_key") or closure_cycle) == closure_cycle))
+        for item in consult_calls)
     stage_consulted_now = any(
         _call_stage(item) == "stage"
         and _text(item.get("progress_digest")) == progress_key
@@ -981,6 +1269,8 @@ def sol_advice(state: dict, *, calls: list[dict] | None = None,
         "complexity": profile,
         "covered": covered,
         "new_signals": new_codes,
+        "new_events": new_events,
+        "events": events,
         "second_round": bool(last_consult is not None),
         "trigger": _retry_trigger(new_codes) if last_consult is not None else "",
         "action": "none",
@@ -988,6 +1278,12 @@ def sol_advice(state: dict, *, calls: list[dict] | None = None,
         "mode": "",
         "phase": "none",
         "stage": "",
+        "family": "",
+        "event": "",
+        "instance": "",
+        "level": "",
+        "final_verification_digest": "",
+        "question": "",
         "reason": "",
         "command": "",
     }
@@ -1035,35 +1331,48 @@ def sol_advice(state: dict, *, calls: list[dict] | None = None,
         return base
 
     # ── 阶段 E：收口前综合判断 ──────────────────────────────────────────
-    if gates_passed or all_done:
-        if not closure_consulted and (risk == "high" or level in ("high", "medium")):
-            recommended = "recommended" if (risk == "high" or level == "high") \
-                else "optional"
+    # 准入只有一条：最终工程验证真的完成（`closure_readiness`）。工作项刚好全部
+    # 终态、条件尚未核销或必要测试没有验证痕迹时，E 保持待执行而不是拿不完整的
+    # 材料去问收口问题。仍未处理的动态事件优先于收口判断。
+    if final_verified:
+        if not closure_consulted and progressed \
+                and (risk == "high" or level in ("high", "medium")):
+            # 收口综合判断对非简单有进展任务是必需窗口：medium 也必须是 recommended，
+            # 否则调度层按 recommended 取义务时永远取不到，收口 CONSULT 结构性不可达。
+            recommended = "recommended"
+            event = "closure"
             trigger = _retry_trigger(new_codes) if new_codes else "stage-result"
             base["second_round"] = True
             base["trigger"] = trigger
             base.update({
                 "action": "consult", "recommended_action": recommended,
                 "mode": "CONSULT", "phase": "closure", "stage": "closure",
-                "reason": ("最终验证稳定：建议在收口前做一次 SOL 收口综合判断"
-                           "（目标达成情况、重要遗漏与剩余风险）；工程验收仍由 "
-                           "ZCode 依据真实证据完成。"),
+                "family": "E", "event": event, "level": recommended,
+                "instance": verification_digest or closure_cycle,
+                "final_verification_digest": verification_digest,
+                "question": question_for(event, base),
+                "reason": ("最终工程验证已完成（工作项终态、条件核销、证据与必要"
+                           "测试齐备）：在收口前做一次 SOL 收口综合判断（目标达成"
+                           "情况、重要遗漏与剩余风险）；工程验收仍由 ZCode 依据真实"
+                           "证据完成。"),
                 "command": command_for("CONSULT", "closure", trigger),
             })
             return base
         if closure_consulted:
             base.update({
                 "action": "reuse", "mode": "CONSULT",
-                "reason": ("当前合同已有收口判断且没有新的升级型信号：直接复用，"
-                           "不重复调用。"),
+                "reason": ("当前最终验证摘要已有收口判断且没有新的升级型事件：直接"
+                           "复用，不重复调用。"),
             })
             return base
-        base["reason"] = ("简单/中等任务且没有新的认知不确定性：不因阶段自动调用 "
+        base["reason"] = ("任务没有实质工程进展或复杂度不足：不因阶段自动调用 "
                           "SOL，继续按本地证据收口。")
         return base
 
     # ── 阶段 A：非简单任务启动默认 CONSULT ──────────────────────────────
-    if not covered["CONSULT"]:
+    # 已有可归因的新事件时走 C（合同修订会让旧结论不再“覆盖”，但语境已经从
+    # 启动变成范围变化，问题也应问“哪些旧结论仍成立”而不是“重新理解任务”）。
+    if not covered["CONSULT"] and not events:
         stage = "understanding" if not understood else "development"
         if attempted["CONSULT"]:
             trigger = "user-request" if user_request else "scope-changed"
@@ -1074,6 +1383,10 @@ def sol_advice(state: dict, *, calls: list[dict] | None = None,
         base.update({
             "action": "consult", "recommended_action": "recommended",
             "mode": "CONSULT", "phase": stage, "stage": stage,
+            "family": "A", "event": "startup", "level": "recommended",
+            "instance": sha256_text(canonical_json(
+                [snapshot["contract_sha256"], "startup"]))[:16],
+            "question": question_for("startup", base),
             "reason": ("非简单任务从启动阶段默认获得一次 SOL CONSULT："
                        "确认目标理解、问题判断、关键矛盾、初步策略与主要风险；"
                        "随后由 ZCode 自主调查并核实。"),
@@ -1089,13 +1402,39 @@ def sol_advice(state: dict, *, calls: list[dict] | None = None,
         base.update({
             "action": "consult", "recommended_action": "recommended",
             "mode": "CONSULT", "phase": "development", "stage": "development",
+            "family": "C", "event": "decision-point", "level": "recommended",
+            "instance": "user-request",
+            "question": question_for("decision-point", base),
             "reason": ("用户明确要求再次 SOL 判断：按用户要求调用一次（advisory）；"
                        "结论不构成门禁。"),
             "command": command_for("CONSULT", "development", "user-request"),
         })
         return base
 
-    # ── 阶段 B：调查后默认 PLAN（多步骤 / 多方案 / 重要决策）────────────
+    # ── 阶段 C：执行期按新增事件动态追加 CONSULT ────────────────────────
+    # 事件来自可归因事实（结论被推翻、复现、决策窗口、风险上升、重规划、
+    # 合同修订、重开）。普通证据追加、备注变化、常规验收进展不在这里出现。
+    # 事件非空本身就要求“已有一次真实判断作为基线”，因此不再额外要求当前合同
+    # 已被覆盖：合同修订后的第一次判断正属于这一类。
+    if events:
+        row = events[0]
+        trigger = SOL_EVENT_TRIGGERS.get(row["code"], "new-evidence")
+        base["second_round"] = True
+        base["trigger"] = trigger
+        base.update({
+            "action": "consult", "recommended_action": "recommended",
+            "mode": "CONSULT", "phase": "development", "stage": "development",
+            "family": "C", "event": row["code"], "level": "recommended",
+            "instance": str(row.get("instance") or ""),
+            "question": question_for(str(row["code"]), base),
+            "reason": ("出现新的认知事件（" + str(row.get("detail") or row["code"])
+                       + "）：建议追加一次动态 CONSULT，判断是否调整方案、优先级"
+                       "或风险策略。"),
+            "command": command_for("CONSULT", "development", trigger),
+        })
+        return base
+
+    # ── 阶段 B：调查后默认 PLAN（方案比较 / 重要取舍 / 实施优先级）──────
     # 已到收口或全部工作项完成时不再补规划：此时收口综合判断价值更高。
     if not covered["PLAN"] and plan_required and understood \
             and not (gates_passed or all_done):
@@ -1105,6 +1444,10 @@ def sol_advice(state: dict, *, calls: list[dict] | None = None,
         base.update({
             "action": "plan", "recommended_action": "recommended",
             "mode": "PLAN", "phase": "planning", "stage": "planning",
+            "family": "B", "event": "plan-needed", "level": "recommended",
+            "instance": sha256_text(canonical_json(
+                [snapshot["contract_sha256"], "plan-needed"]))[:16],
+            "question": question_for("plan-needed", base),
             "reason": ("已形成现场事实且任务包含多步骤、多方案或重要决策："
                        "建议调用一次 SOL PLAN 比较方案、确定优先级与验收关注点；"
                        "最终技术方案仍由 ZCode 决定。"),
@@ -1112,37 +1455,70 @@ def sol_advice(state: dict, *, calls: list[dict] | None = None,
         })
         return base
 
-    # ── 阶段 C：执行期按新证据/新风险动态追加 CONSULT ───────────────────
-    if covered["PLAN"] and new_codes:
-        trigger = _retry_trigger(new_codes)
-        base["second_round"] = True
-        base["trigger"] = trigger
-        base.update({
-            "action": "consult", "recommended_action": "recommended",
-            "mode": "CONSULT", "phase": "development", "stage": "development",
-            "reason": ("出现升级型新信号（" + "、".join(new_codes)
-                       + "）：建议追加一次动态 CONSULT，判断是否调整方案、优先级"
-                       "或风险策略。"),
-            "command": command_for("CONSULT", "development", trigger),
-        })
-        return base
-
-    # ── 阶段 D：高复杂任务在重要阶段完成后可做一次复盘 ──────────────────
-    if level == "high" and done >= 2 and not all_done and not stage_consulted_now:
+    # ── 阶段 D：medium/high 任务在重要里程碑后可做一次复盘 ───────────────
+    # 里程碑以“已完成的实质工作”计量，不用证据条数或时间：medium/high 任务在
+    # 完成 ≥2 个工作项（或 ≥1 个工作项且已核销条件）后构成可归因的里程碑。
+    # 同一 progress_key 只复盘一次，普通进度推进不会反复触发。
+    milestone_done = done >= 2 or (done >= 1 and any(
+        _text(item.get("status")) == "met"
+        for item in (state.get("contract") or {}).get("criteria") or []
+        if isinstance(item, dict)))
+    if level in ("medium", "high") and milestone_done and not all_done \
+            and not stage_consulted_now:
         base["second_round"] = True
         base["trigger"] = "stage-result"
         base.update({
-            "action": "consult", "recommended_action": "optional",
+            "action": "consult", "recommended_action": "recommended",
             "mode": "CONSULT", "phase": "stage", "stage": "stage",
-            "reason": ("高复杂任务已推进多个工作项：可在阶段边界做一次成果复盘"
-                       "（是否偏离目标、未解决问题与下一阶段方向）；可选。"),
+            "family": "D", "event": "milestone", "level": "recommended",
+            "instance": progress_key[:16],
+            "question": question_for("milestone", base),
+            "reason": (f"{level} 复杂任务已完成 {done} 个工作项：在阶段边界做一次"
+                       "成果复盘（是否偏离目标、未解决问题与下一阶段方向）；"
+                       "同一进度只复盘一次，进度前进后旧窗口被新窗口取代。"),
             "command": command_for("CONSULT", "stage", "stage-result"),
         })
         return base
 
     base.update({
         "action": "reuse", "mode": "CONSULT",
-        "reason": ("同一合同已有有效 SOL 认知结论且没有新的升级型信号：直接复用，"
+        "reason": ("同一合同已有有效 SOL 认知结论且没有新的升级型事件：直接复用，"
                    "不重复调用。"),
     })
     return base
+
+
+def question_for(event: str, advice: dict | None = None) -> str:
+    """按生命周期窗口给出本次真正需要判断的事项（确定性模板，不含自由文本）。
+
+    它只是调用时的默认问题：主代理可以覆盖。问题必须落在“需要判断什么”上，
+    而不是要求 SOL 复述已知事实。
+    """
+    code = _text(event) or "startup"
+    return {
+        "startup": ("在开始实施前，请判断：任务目标与隐含需求是否理解完整？问题本质与"
+                    "关键矛盾是什么？有哪些重要业务约束、初步策略与主要风险？调查应"
+                    "从哪些重点与优先级入手？"),
+        "plan-needed": ("调查已形成现场事实。请比较可行方案与关键取舍，给出实施顺序、"
+                        "阶段优先级与验收关注点，并指出最容易被忽略的失败模式。"),
+        "material-evidence-change": ("出现可能改变原有判断的新事实（见材料中的实质变化"
+                                     "与触发事实）。请判断它是否推翻原方案或既有结论，"
+                                     "需要怎样调整方案、优先级或风险策略。"),
+        "decision-point": ("出现了需要取舍的决策点。请比较可选方案的收益、代价与风险，"
+                           "说明取舍依据、不可逆性，以及需要用户决定的事项。"),
+        "risk-escalation": ("任务风险等级实质上升。请判断新的风险来源与影响范围，"
+                            "以及是否应调整方案、验证强度或暂停某些动作。"),
+        "replan-history": ("原方案已失效并进入重新规划。请判断失败的根因、必须放弃的"
+                           "假设，以及实质不同的替代路线与验收方式。"),
+        "scope-changed": ("目标、范围或合同发生实质变化。请判断旧结论哪些仍成立、哪些"
+                          "已被推翻，以及新范围下的优先顺序与主要风险。"),
+        "reopened": ("任务已重新打开。请判断重开的真实原因、旧结论的适用范围，"
+                     "以及为避免再次返工应补充的验证。"),
+        "milestone": ("重要阶段成果已完成。请复盘：是否偏离原目标？原方案是否仍成立？"
+                      "是否有遗漏或新风险？下一阶段的重点与优先级是什么？"),
+        "closure": ("最终工程验证已完成，进入收口综合判断。请回答六点："
+                    "1) 目标是否真正达成？2) 是否有重要遗漏？"
+                    "3) 是否仍存在未解决的关键风险或限制？"
+                    "4) 证据与结论是否一致？5) 是否有必要补充验证？"
+                    "6) 与之前 SOL 的判断相比是否有实质变化或被推翻的部分？"),
+    }.get(code, SOL_EVENTS.get(code) or "请判断本次最需要澄清的事项。")

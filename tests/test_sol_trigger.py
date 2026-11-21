@@ -397,9 +397,10 @@ class GatesNoAutoCallTests(TriggerBase):
         state = G.load_state(self.state_path)
         self.assertTrue(G.closure_check(state)["passed"])
         advice = self.advice(gates_passed=True)
-        # 中等复杂任务收口前的综合判断是可选建议，不是强制调用。
+        # 中等复杂任务的收口综合判断是 recommended 窗口：自动调度可执行 1 次，
+        # 但 SOL 仍是 advisory，不构成收口门禁。
         self.assertEqual(advice["action"], "consult")
-        self.assertEqual(advice["recommended_action"], "optional")
+        self.assertEqual(advice["recommended_action"], "recommended")
 
     def test_high_risk_closure_never_derives_review(self):
         """正式 REVIEW 只由用户明确要求触发，不由阶段或风险自动派生。"""

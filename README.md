@@ -3,7 +3,25 @@
 Copilot 是运行于 ZCode 内的**轻量协作治理 Skill**：用户侧 ChatGPT 负责需求与产品层目标、
 交接与验收；ZCode 原生 Agent（主代理）是工程执行与技术决策主体，负责现场调查、规划、实现、
 调试、测试与验证；Copilot 负责任务合同、完成条件、状态、证据、审计与收口门禁，并用 PARTIAL
-派生持续推进任务；SOL 作为默认认知引擎按需提供判断，用户明确要求时可执行一次独立复核。
+派生持续推进任务；SOL 作为默认认知引擎按生命周期提供判断（启动理解、方案取舍、重大新证据、
+里程碑复盘、收口综合），用户明确要求时可执行一次独立复核。
+
+**v9.6.1 收口时序**：收口 CONSULT（E 窗口）此前可能在最后一个工作项关闭时立刻执行——
+此时合同要求的测试、最终证据与条件核销可能都没完成。现在 `closure_readiness` 是 E 与收口的
+唯一准入（工作项终态、条件核销、证据、合同必要测试的执行痕迹、finding 台账），并以
+`final_verification_digest` 作为义务身份：验证缺口存在时 `drive`/`closure --close`/手动
+`--stage closure` 都拒绝执行，验证完成后自动执行一次真实收口 CONSULT，再由 ZCode 完成最终
+验收与 G1–G3 收口；重跑测试会改变摘要，旧结论不再覆盖新结果，同一摘要不重复付费。详见
+`docs/DECISIONS.md` 第 75 条与 `references/runtime.md` §5。
+
+**v9.6.0 SOL 生命周期主动调度**：SOL 不再只是“建议 + 打印命令”——A–E 五个认知窗口
+（启动 CONSULT、调查后 PLAN、重大新证据的动态 CONSULT、里程碑复盘、收口综合判断）由
+`review_policy` 判定后物化为**调度义务**持久化在 `state.sol_schedule`，由 `start`/`drive`/
+`record`/`criterion`/`report`/`closure` 等生命周期命令在自身事务内**有界执行**（每条命令
+最多 1 个义务 / 1 次请求），`--sol auto|advise|off` 控制开关；同一合同同一问题直接复用不
+重复付费，合同修订把旧义务显式跳过，失败按真实原因降级且不阻断工程。`sol-stats` 给出
+显式分母的覆盖率（应调/执行/失败/复用/合理跳过/应调未执行），只统计真实请求成功。详见
+`docs/STATUS.md`、`docs/DECISIONS.md` 第 74 条与 `references/runtime.md` §5。
 
 **v9.5.1 宿主集成修正**：真实 ZCode 宿主验收暴露并修复四处偏差——SessionStart matcher
 补 `startup`（否则新会话发现不到未闭合任务）；状态文件不在 `.copilot-tasks/` 时 `start`
@@ -127,6 +145,7 @@ copilot/
 │   ├── copilot_dispatch.py  # CLI：任务、计划、证据、收口、SOL 认知/复核、正式 REVIEW、历史只读
 │   ├── copilot_auto.py      # 驱动：drive（推进/工作单/派生）与 ingest（执行信封回填）
 │   ├── sol_review.py        # SOL 三模式（CONSULT/PLAN/REVIEW）：请求/解析/审计（唯一远程调用）
+│   ├── sol_schedule.py      # SOL 生命周期调度：义务/窗口/覆盖率统计（纯策略，零网络零 I/O）
 │   ├── knowledge_handoff.py # 知识交接块：校验 read 摘录来源并渲染 Memory/Vault → SOL/子 Agent
 │   ├── context_engine.py    # 项目上下文：resolve/recall/pack/capture（只读、零模型调用）
 │   ├── native_bridge.py     # Native Bridge v2 执行信封协议与校验

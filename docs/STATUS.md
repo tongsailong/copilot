@@ -1,7 +1,186 @@
 # STATUS
 
 更新：2026-11-21 CST。本文件只记录现场可核实的事实；规划与未完成事项单独标注。
-当前版本：v9.5.1（宿主集成修正：startup 恢复、钩子可发现性、工作单条件归属）。
+当前版本：v9.6.1（收口时序：最终工程验证完成才执行收口 CONSULT）。
+
+## 收口时序精准修复（2026-11-21，v9.6.1）
+
+- **根因（现场证据）**：`review_policy.sol_advice` 的 E 分支只看 `all_done`（工作项是否
+  耗尽），`copilot_dispatch._sol_schedule_step` 固定传 `gates_passed=False`，没有任何入口
+  读“合同要求测试是否跑过、最终证据是否登记、条件是否核销”；`close_task` 只校验 G1–G3，
+  不含合同 `test_policy`。因此最后一个工作项一 `record done`，E 就可能在下一条生命周期
+  命令里立刻执行：SOL 拿到的是缺测试、缺证据、甚至条件未核销的收口材料。`register_evidence`
+  还从不写 `capture_cmd`（死字段），所以“测试跑过”本身也无法核对。
+- **实现（统一准入 + 验证摘要）**：`governance.closure_readiness(state)` 是 E 与收口的唯一
+  准入（便宜的缺口事实优先，其后才是 `verification_gates`：G1 工作项、G2 条件/证据/台账、
+  G3 无停摆；**不含**质量报告的用户接受）；`closure_verification_digest()` 只取验证事实的
+  `sha256[:16]`（合同指纹、条件状态与引用证据摘要、终态工作项、带 `capture_cmd` 的采集证据、
+  报告摘要），作为 E 义务 instance 与调用记录的 `final_verification_digest`。`test_verification_evidence`
+  要求采集命令按词元顺序匹配合同声明（允许 `-B` 等运行器参数），自述报告不算执行痕迹。
+- **入口一致**：`drive` 在缺口时打印缺口、返回 `EXIT_EXECUTE`（10）、零调用；`closure --close`
+  在缺口时退出码 1；手动 `sol-consult --stage closure` 锁外预检 + 锁内复核两处拒绝，义务
+  instance 与当前摘要不符时拒绝付费；`close_task` 对无测试证据的任务拒绝收口；`evaluate`
+  的 `continuation` 给 `verify` 动作，`status` 显示“最终验证：未完成（摘要 …）”与缺口。
+- **真实宿主端到端（真实 SOL 调用，不是替身）**：夹具任务 `task-72bcc554e6f6c3a7`
+  （`/tmp/e2e-v961/state.json`，`test_policy.required=true`，
+  commands=`["python3 -m unittest"]`）按 `start → plan → record ×2 → criterion ×2`
+  （`--sol advise`）推进：① 工作项与条件齐备但无测试证据时，`closure --close --sol auto`
+  **退出码 1**、`drive` **退出码 10**、`sol_calls=0`（E 未提前执行）；② 真实执行
+  `python3 -B -m unittest discover -s tests` 并用 `evidence --capture-cmd` 采集登记后，
+  同一条 `closure --close --sol auto` 自动执行 E：`SCf8876646268d06f1fba60bfd`，
+  mode=CONSULT、stage=closure、model=gpt-6.2-sol、effort=high、zero_tool=true、
+  `final_verification_digest=40424cfef8a47317`（与义务 SO2 instance 一致）、
+  `materials_sha256=4e4e57f980a487304fca320ef7d1a926f58fabdadc65bc138701bac4c5392657`、
+  status=completed、27,043 ms、3,045 tokens；③ 历史顺序 `sol_call_completed` →
+  `sol_schedule_sync` → `task_closed`，义务 SO2 `satisfied/executed/window=closed`，
+  `closure.sol_entry=closure-command`，`sol-stats` 的 `coverage.closure` 1/1。
+- **测试（对应最终代码）**：完整活动套件 `python3 -B -m unittest discover -s tests` **843 项
+  OK**（v9.6.0 的 824 + 本轮新增 19；证据 E6。更早的 E5 是同一条命令在 manifest 过期时的
+  红跑，修基线后由 E6 取代）；`tests/test_sol_scheduling.py` 61 项 OK（含
+  `ClosureAdmissionTests` 19 项：末项关闭无测试不收口、仅自述/无 `capture_cmd` 不解锁、条件未核销等待、完成后执行、
+  同摘要复用不二次付费、重跑后旧结论失效、重新验证后允许新 E、`drive` 缺口不执行、
+  `criterion` 重估准入、`closure --close` 拒绝绕过、`close_task` 拒绝、E 在收口之前的顺序、
+  手动收口 CONSULT 拒绝、摘要变化拒绝、失败降级、风险只作 advisory、`-B` 词元匹配、异运行器
+  不匹配）；受影响套件定向回归 448 + 181 项 OK（`test_sol_first`/`test_sol_trigger`/
+  `test_continuation`/`test_governance`/`test_v93_hardening`/`test_v671_quality`/
+  `test_pww_acceptance`/`test_v64_convergence`/`test_v62_convergence`/`test_stop_guard`/
+  `test_xmc_adaptation`/`test_sol_fusion`/`test_review_efficiency`/`test_efficiency_v611`/
+  `test_sol_think`/`test_v95_scheduling`/`test_sol_review_v7`）。未机械重跑全部 824 项。
+- **同步与基线（最终代码）**：`--apply` 写入 9 个文件（`SKILL.md`、`references/review.md`、
+  `references/runtime.md`、`references/workflow.md`、`scripts/copilot_auto.py`、
+  `copilot_dispatch.py`、`governance.py`、`review_policy.py`、`sol_schedule.py`），
+  `--check` 缺失 0 / 不同 0（`hm.txt` 未受管，默认保留）；`--baseline` 23 个 Git 跟踪文件、
+  `--verify-baseline` 通过；运行时 `__version__=9.6.1`、运行时 `SKILL.md` 标题
+  “copilot：轻量协作治理（v9.6.1）”，`zcode skills list` 读到的是同一份运行时文件。
+- **观察（未改动的既有口径）**：收口命令内 E 完成后，`close_task` 的收口结算会用“同合同
+  已有 CONSULT 覆盖”的既有复用规则把未执行的 A 窗口记为 `satisfied/source=reuse`，因此
+  `sol-stats` 的 `coverage.startup` 在该夹具里是 1/1。这是 v9.6.0 的复用口径，本轮未修改，
+  也不影响 E 的时机与收口顺序。
+- **未验证 / 边界**：未做并发压测（锁语义由既有 `LockBusyError` 用例覆盖）；未重演
+  “用户接受 PWW 之后再收口”的完整真机链路（该阶段刻意不进入 E 准入，由既有 PWW 用例覆盖）；
+  未提交、未推送、未发布。
+- **收口后的补充修复（材料合同正文，2026-11-21）**：本任务自己的收口 CONSULT 在 risks 里
+  指出“合同正文显示未登记”。现场核查为真实缺陷：`sol_schedule.build_materials` 读
+  `contract["body"]`，而合同正文实际存放在 `contract["done_criteria_text"]`（与
+  `sol_review.build_prompt` 同源），所以**每份义务材料**都印出 `合同正文摘要：None`。
+  已改为读 `done_criteria_text`（保留 `body` 作为旧状态回退），正文缺失时显式写
+  “（未登记）”，并新增 2 项定向测试（`test_materials_carry_contract_body_instead_of_none`、
+  `test_materials_mark_absent_contract_body_as_unregistered`）。修复后在同一代码上重跑：
+  完整活动套件 **845 项 OK**（74.3 s）、`test_sol_scheduling` **63 项 OK** + 受影响套件
+  **150 项 OK**（`test_sol_first`/`test_sol_trigger`/`test_stop_guard`/`test_xmc_adaptation`）、
+  legacy **853 项 99F/47E/32S（146，与非修复基线相同）**；`--apply` 写入 1 个文件、
+  `--check` 0/0、`--baseline` 23 个 Git 跟踪文件、`--verify-baseline` 通过。该修复发生在任务
+  `task-5cc94126d942b517` 收口之后：工程改动、定向测试、完整套件与运行时同步已重做，
+  但**该任务的 CLOSED 记录与 `final_verification_digest=df4d97f58ca0b794` 仍指向修复前的
+  代码状态**；要把记录也对齐到修复后代码，需用户授权 `reopen` 后重新验证并重跑收口
+  CONSULT（`reopen` 要求 `--authorized-by user`，不自报）。
+- **收口记录对齐与验收（2026-11-21，同一 v9.6.1，用户授权 reopen 两次）**：把“材料修复、
+  验证证据、SOL 收口判断、ZCode 验收、G1–G3 收口”对齐到同一份最终代码，并按真实事件核对
+  顺序，而不是按报告文字。
+  - **材料口径进入验证摘要**：`MATERIALS_SCHEMA` 升到 `copilot-sol-schedule-materials/v2`
+    并纳入 `closure_verification_digest()`（材料内也自报口径）。修复只改材料生成代码时验证
+    事实不变、旧摘要不变，旧 E 会被 `reuse` 覆盖到新材料上——这是本轮实测确认的口径缺口；
+    现在材料口径变化会自动打开新的收口判断窗口。
+  - **ZCode 验收的顺序缺口（真实路径，已修）**：第一次重开（I1）里 E 执行后 `drive` 直接
+    `close_task`，收口后再 `sol-accept` 被 `_assert_open` 拒绝（“任务已收口，不能登记”），
+    即自动路径把“ZCode 独立验收”这一步结构性跳过了。新增
+    `governance.closure_acceptance_pending()`：当前最终验证摘要的收口 CONSULT 没有
+    `accepted/modified/rejected` 记录时，`close_task` 拒绝收口、`continuation` 给
+    `action="accept"`、`drive` 与 `closure --close` 停在 `EXIT_EXECUTE`/`EXIT_CONTINUE` 并打印
+    `sol-accept` 命令。验收不是批准权：三种结论都能继续，SOL 仍不是门禁。
+  - **E 与 G1–G3 的真实顺序（审计事实）**：I0 为 `evidence E7 21:02:30` → `A3 done 21:02:32`
+    → `sol_call_completed SC23ca16ca… 21:03:15` → `task_closed 21:03:15`；I1 为 E
+    `SCa76afbf…` 先于 `task_closed 21:23:24`。两个迭代都是“验证 → E → 收口”，E 从未等待
+    G1–G3 全绿；缺的是 E 与收口之间的验收记录，本轮由上面的准入补齐。
+  - **重开**：两次 `reopen --authorized-by user`（`authorization_source=caller-declared`）保留
+    历史调用/证据/条件/收口记录，分别开启 I1、I2；`iteration` 参与摘要，重开后旧摘要失效，
+    `reopened_without_progress` 要求重开后有新进展。
+  - **测试（对应最终代码）**：完整活动套件 **849 项 OK**；`test_sol_scheduling` **67 项 OK**
+    （新增“验收前不得收口/三种结论都可继续/收口后不能再补登记/材料口径变更使旧结论失效”
+    等用例）；受影响套件 **292 + 263 项 OK**；`test_v64_convergence` 等其余模块随完整套件
+    通过；legacy `legacy/tests` 146 项与非修复基线相同（99F/47E/32S）。
+  - **最终真实链路（I2，全部由调度器产生，无手工记录）**：`reopen --authorized-by user`
+    （21:29:00，I2，摘要从 `3ec6a26e2d1fc61a` 变为新值）→ 登记最终代码验证证据
+    E10（`discover -s tests`，**849 项 OK**，21:32:47）与 E11（`discover -s legacy/tests`，
+    853 项 99F/47E/32S，21:33:53）→ `drive --sol auto` 执行真实收口 CONSULT
+    **`SC2fd44c691e57a5804eb4532e`**（21:34:31，mode=CONSULT、stage=closure、completed、
+    model=`gpt-6.2-sol`、reasoning_effort=high/standard、**zero_tool=true**、
+    `materials_sha256=0fead3a9f3c8d7d3…`（5891 字符，材料口径 v2）、
+    `final_verification_digest=9a2989de52710787` 与义务 SO9 instance 一致、33,780 ms、
+    5,218 tokens）→ `drive` 停在等待验收（`EXIT_EXECUTE`，未收口）→ ZCode 独立验收
+    `sol-accept … --status accepted`（决策/依据/证据 E2、E9、E10、E11 全部登记，
+    含对“摘要绑定”“legacy 非全绿”“合同正文未登记”三条的逐条核实）→ `drive` 执行
+    G1–G3 收口（21:35:08，iteration=I2，verdict=pass，`closed_at` 同摘要）。
+    顺序即「最终验证 → E → ZCode 验收 → G1–G3」，可直接从 `state.json` 的 `history`
+    （`sol_call_completed` → `sol_call_acceptance` → `task_closed`）复算。
+  - **同步与基线**：`--apply` 下发本轮改动（代码 3 个文件、文档 2 个文件；再执行写入 0 个），
+    `--check` 缺失 0/不同 0（`hm.txt` 未受管，默认保留）、`--baseline` 23 个 Git 跟踪文件、
+    `--verify-baseline` 通过；运行时 `__version__=9.6.1`。E10/E11 采集后仅追加本文档段落
+    （不改代码与测试），随后重建基线并复验 manifest 用例；未提交、未推送、未发布。
+  - **观察（记录，未改动，非门禁）**：① 本任务 `SO2`（family B / PLAN，`recommended`）自
+    I0 打开后一直未执行，收口时按窗口事实记 `missed=1`，`closure-check` 给出“1 个窗口未执行”
+    提醒——这是真实漏调（本任务确实没跑 PLAN），advisory 非门禁；② `sol-stats` 的
+    `coverage.closure.rate=3.0`（分子 3 = 跨迭代已满足的 E 义务，分母 1 = 当前任务收口窗口
+    是否适用），是 v9.6.0 起的统计口径（分子跨迭代计数、分母按适用性），非本轮引入，也未
+    影响任何判定；如需改成封顶展示应单独任务处理。
+
+## SOL 生命周期主动调度（2026-11-21，v9.6.0）
+
+- **根因（现场证据）**：旧实现 `sol_advice` 只打印命令，建议里带 `<state>`/`<materials>`
+  占位符，而 `sol-consult` 实际要求 `--materials` / `--question`；“应调未调”没有持久事实；
+  `plan_required` 只看工作项数量；动态 CONSULT 只比较三个粗粒度信号；里程碑复盘只在
+  `risk=high`；`drive` 的 PASS 分支直接 `close_task`，收口 CONSULT 结构上不可达。真实任务
+  统计中 6 个有 4 个 `sol_calls=0`。
+- **实现**：`scripts/sol_schedule.py`（纯策略层，零网络/零 I/O）把 A–E 窗口物化为义务并落在
+  `state.sol_schedule`；`review_policy` 的 `plan_admission()` 是 PLAN 准入唯一口径；六类事件
+  与 `sol_event_snapshot` 比较；`copilot_dispatch._sol_schedule_step` 在 15 个生命周期写命令
+  （`start`/`plan`/`record`/`rerun`/`criterion`/`judgment`/`evidence`/`report`/`accept`/
+  `decide`/`block`/`unblock`/`contract`/`reopen`/`finding`）与 `drive`、`closure`、
+  `sol-schedule --execute` 内有界执行（每条命令 1 个义务 / 1 次请求），
+  `--sol auto|advise|off`；`sol-stats` 给显式分母覆盖率。设计依据见
+  `docs/DECISIONS.md` 第 74 条与 `references/runtime.md` §5。
+- **按真实运行纠正的五类缺陷（文档/测试都不算证据）**：① `start` 是唯一带 `--sol` 却从不
+  进入调度步的生命周期命令（`--sol auto` 只打印、不执行也不落义务），已补调度步并用 CLI
+  级用例锁定；② 已执行义务只改 `status` 不关窗口，收口时会被算成“关闭前仍未执行”，新增
+  `sol_schedule.settle()` 在成功/失败/跳过时关闭窗口；③ 连续进展会为同一 family+event 反复
+  打开里程碑窗口（实测一次连续进展堆出 8 条 open D 义务、收口会误算 8 条漏调），改为新建
+  时即取代更早的未执行窗口（`skip_by=superseded-by-newer`），历史堆积在下一次同步收敛；
+  ④ D/E 曾被标成 `optional`，而 `due_obligations()` 只取 `recommended`，导致 medium 任务的
+  里程碑复盘与收口 CONSULT 结构性不可自动执行（`sol-schedule --execute` 明确回报“没有
+  recommended 义务”）；改为 D/E 一律 `recommended`，历史 `optional` 义务收口时记
+  `skipped` + `skip_by=not-required`（合理跳过，不算漏调），收口前先结算更晚窗口已满足；
+  ⑤ 真实收口时发现：最后一批进展刚打开 D 窗口、E 随即执行，D 被记成漏调（系统性假漏调）；
+  改为 E 已满足时的 D 窗口记 `skipped` + `skip_by=closure-covered`。
+- **真实 SOL 调用（运行时副本，非模拟）**：临时夹具任务 `task-d0f86a14e4af8675`
+  （`/tmp/sol-sched-final/state.json`）走默认调度路径：`start` 自动执行
+  `SCd240da149f519a3dcc4ffd8d`（CONSULT，understanding，gpt-6.2-sol，effort=high，
+  zero_tool=true，31,137 ms，2,977 tokens），`plan` 自动执行
+  `SCb2af8c3448f028d173629816`（PLAN，planning，同模型/强度，35,492 ms，3,101 tokens）；
+  义务 SO1/SO2 均 `satisfied` + `window=closed` + `source=executed`，`sol-stats` 的
+  `coverage.startup` 与 `coverage.plan` 都是 1/1（rate 1.0）。
+- **真实宿主验证**：`zcode skills list` 直接读运行时 SKILL.md，显示
+  “Copilot v9.6 … 生命周期主动调度（义务化、有界自动执行、覆盖率统计）”。
+  另用 ZCode 0.18.0 headless `--prompt`（`COPILOT_STOP_GUARD=0`，避免守卫把探针任务改成
+  续跑回合）让宿主 Agent 按技能文档自建任务（`task-7f28358b5a52202d`）：它没有手动调用
+  `sol-consult`/`sol-plan`，而由调度步执行 `SC1750a2abbad7961a7caa4648`（CONSULT，
+  startup，2,525 tokens），报告的 `coverage.startup` = 1/1。
+- **测试（最终代码）**：活动套件 **824 项 OK**（`discover -s tests`，含新增 42 项
+  `test_sol_scheduling`）；`legacy/tests` 853 项（skip 32）= 99 failures + 47 errors =
+  **146**，失败/错误用例名集合与 `HEAD=75a6fa1` 基线 `diff` 为空（历史环境失败，非本轮引入）。
+- **同步与基线（最终代码）**：末次 `--apply` 写入 5 个文件（`SKILL.md`、
+  `references/review.md`、`references/runtime.md`、`scripts/review_policy.py`、
+  `scripts/sol_schedule.py`），`--check` 缺失 0 / 不同 0（`hm.txt` 未受管，默认保留）；
+  `--baseline` 23 个 Git 跟踪文件（`scripts/sol_schedule.py` 未跟踪，按规则不进入 manifest），
+  `--verify-baseline` 通过；运行时 `__version__=9.6.0`，运行时副本 `start --sol advise` 冒烟
+  真实创建 A 窗口义务并给出无占位符的可执行命令（`evidence/runtime-smoke.log`）。
+- **未验证 / 边界**：15 类场景由定向测试覆盖（替身通道），未在真实宿主逐条重演；`drive`
+  收口路径与 `closure` 入口在测试中用替身验证；未做多会话并发真实调度压测（锁语义由
+  `LockBusyError` 用例覆盖）；`evaluate`/`review-admission` 的 `sol.command` 仍是含占位符的
+  模板，可直接执行的命令以 `sol-schedule` 与调度步输出为准；**手动** `sol-consult` /
+  `sol-plan`（不经调度义务）不记入覆盖率分子——本任务自身 2 次早期真实调用（`SC794602…`
+  understanding、`SC5b3884…` planning）因此在 `sol-stats` 里显示 `startup`/`plan` 0/1，
+  但调用本身完整记录在 `sol_calls`；本任务收口时按收口前代码把 1 条刚打开的 D 窗口记为漏调
+  （随后按 ⑤ 修正，任务记录保留该历史事实）；本次未提交、未推送、未发布。
 
 ## 宿主集成与真实宿主验收（2026-11-21，v9.5.1）
 

@@ -197,19 +197,48 @@ def _write_dispatch(state: dict, ready: list[dict], path: str,
 
 
 # ── drive ──────────────────────────────────────────────────────────────────
+def _dispatch_module():
+    """惰性导入调度执行器：模块级不引入网络客户端（sol_review）。
+
+    `copilot_dispatch` 会导入 `sol_review`（唯一允许访问网络与凭据的模块）；
+    `copilot_auto` 的模块级依赖必须保持零网络，所以只在真正调度时才导入。
+    """
+    import copilot_dispatch as D
+    return D
+
+
+def _drive_sol_step(path: str, args, *, gates_passed: bool = False,
+                    prefer_family: str = "",
+                    closure_ready: dict | None = None,
+                    cache: dict | None = None) -> dict:
+    """drive 内的有界调度步：失败只打印，不改变 drive 的退出码与阶段。"""
+    try:
+        D = _dispatch_module()
+        return D._sol_schedule_step(
+            path, args, gates_passed=gates_passed,
+            execute=(D._sol_policy(args) == "auto"),
+            prefer_family=prefer_family,
+            closure_ready=closure_ready, cache=cache)
+    except Exception as exc:  # noqa: BLE001 — SOL 不可用不阻断工程推进
+        print(f"SOL 调度未完成（{exc}）；按本地证据继续，不阻断。", file=sys.stderr)
+        return {"executed": "", "error": str(exc)}
+
+
 def drive(args) -> int:
     path = _state_path(args)
     # 单次驱动内工作区不会被本进程改写：代码快照与证据摘要只算一次，
     # 后续求值/派生/收口复用同一份，避免同一命令里重复扫描 git 工作区。
     cache: dict = {}
+    # 生命周期调度（v9.6）：drive 是有界消费点，每条命令最多执行 1 个义务。
+    # 收口前的窗口（family E）在 PASS 分支单独处理，不占用这个额度。
+    sol_used = False
     for step in range(MAX_DRIVE_STEPS):
         state = G.load_state(path)
         evaluation = G.evaluate(state, cache=cache)
         phase = evaluation.get("phase")
         print(f"[{step}] {state.get('task_id')} → {phase}：{evaluation.get('reason')}")
         sol = evaluation.get("sol") or {}
-        # PASS 阶段 drive 会立即收口，此时再提示 SOL 已无法执行；收口前的建议
-        # 由 `status` / `review-admission` 在收口前给出（见 SKILL.md 顺序）。
+        # 非 PASS 阶段：把建议显示为调度义务（auto 时由调度步真正执行）。
         if phase != "PASS" and sol.get("action") in ("consult", "plan", "review"):
             print(f"SOL {sol.get('mode')} 建议（{sol.get('recommended_action')}，"
                   f"阶段 {sol.get('stage') or '-'}，"
@@ -231,7 +260,37 @@ def drive(args) -> int:
                     "请检查阻塞范围（--work-item）与完成条件归属。")
             return EXIT_WAIT
         if phase == "PASS":
-            closure = G.close_task(path, cache=cache)
+            # 收口顺序固定：最终工程验证（PASS + 验证完成）→ SOL 收口综合判断 →
+            # 收口。验证缺口（合同要求的测试没有执行痕迹）时两步都不做：交给
+            # continuation 的 verify 动作，由主代理先补齐验证。
+            readiness = evaluation.get("closure_readiness")
+            if not isinstance(readiness, dict):
+                readiness = G.closure_readiness(state, cache=cache)
+            if not readiness.get("ready"):
+                print("G1–G3 已通过，但最终工程验证尚未完成："
+                      "暂不执行 SOL 收口判断、暂不收口。")
+                for blocker in G.closure_blockers_text(readiness):
+                    print(f"- {blocker}")
+                print("先执行合同要求的必要测试并登记验证结果，再重新 drive。")
+                return EXIT_EXECUTE
+            # 这里必须消费调度，否则收口 CONSULT 在 drive 路径上永远不可达。
+            _drive_sol_step(path, args, gates_passed=True, prefer_family="E",
+                            closure_ready=readiness, cache=cache)
+            # 顺序：最终验证 → SOL 收口判断 → ZCode 独立验收 → G1–G3 收口。刚执行完
+            # E 就收口会跳过 ZCode 的判断（收口后又不能再登记，已被 CLOSED 拒绝），
+            # 所以这里停下来把判断交回主代理；采纳/修改/否决任一条都能继续。
+            pending_acceptance = G.closure_acceptance_pending(G.load_state(path))
+            if pending_acceptance:
+                print("SOL 收口判断已完成，等待 ZCode 独立验收后再收口：")
+                print(f"- 调用：{pending_acceptance['call_id']}"
+                      f"（stage=closure，最终验证摘要 "
+                      f"{pending_acceptance['digest']}）")
+                print("下一步：copilot_dispatch.py sol-accept --state <state> "
+                      f"--call-id {pending_acceptance['call_id']} "
+                      "--status accepted|modified|rejected --rationale <依据>")
+                print("登记判断后再 drive：此时才执行 G1–G3 收口。")
+                return EXIT_EXECUTE
+            closure = G.close_task(path, cache=cache, sol_entry="drive")
             print(f"G1–G3 通过，任务已收口：verdict={closure.get('verdict')} "
                   f"iteration={closure['iteration_id']} by={closure['closed_by']}")
             quality = closure.get("quality") or {}
@@ -244,6 +303,15 @@ def drive(args) -> int:
             cont = evaluation.get("continuation") or {}
             if cont.get("required"):
                 print(f"续跑：{cont.get('action')} —— {cont.get('reason')}")
+            if not sol_used:
+                # 有界消费：先兑现当前的认知窗口（最多 1 次），再交付工作单，
+                # 这样 SOL 的判断能影响本次执行而不是事后补记。
+                sol_used = True
+                before_seq = state.get("save_seq")
+                _drive_sol_step(path, args)
+                if G.load_state(path).get("save_seq") != before_seq:
+                    # 调度步可能已写入调用记录：重新读取，避免领取被 CAS 拒绝。
+                    state = G.load_state(path)
             ready = G.ready_actions(state)
             if not ready:
                 print("阶段为 RUNNING 但没有可领取工作项；重新求值。")
@@ -432,6 +500,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--state", required=True)
     p.add_argument("--dispatch-out", default="",
                    help="native 后端的 dispatch 输出路径")
+    p.add_argument("--sol", default="",
+                   choices=("", "off", "advise", "auto"),
+                   help="SOL 生命周期调度：auto（默认，有界执行 1 个义务）/ "
+                        "advise（只给命令）/ off（只记录义务）")
     p.add_argument("--max-actions", type=int, default=1,
                    help="一次输出的工作单数量（默认 1，避免并行改写冲突）")
     p.set_defaults(func=drive)

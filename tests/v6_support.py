@@ -23,11 +23,18 @@ CONTRACT = """## 完成条件
 """
 
 
-def run_cli(script: str, *args: str, cwd: str | None = None) -> subprocess.CompletedProcess:
+#: 测试子进程默认不自动发起付费 SOL 调用：调度仍会登记义务，但执行改为
+#: 只给命令。需要验证「自动执行」的用例显式设 COPILOT_SOL_AUTO=on 并替换通道。
+TEST_ENV = {**os.environ, "COPILOT_SOL_AUTO": "off"}
+
+
+def run_cli(script: str, *args: str, cwd: str | None = None,
+            env: dict | None = None) -> subprocess.CompletedProcess:
     """以子进程运行 scripts/ 下的 CLI；返回完整 stdout/stderr 供断言。"""
     return subprocess.run(
         [sys.executable, "-B", os.path.join(SCRIPTS, script), *args],
         capture_output=True, text=True, cwd=cwd or ROOT,
+        env={**TEST_ENV, **(env or {})},
     )
 
 

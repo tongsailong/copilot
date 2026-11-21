@@ -1,6 +1,6 @@
 ---
 name: copilot
-description: "Copilot v9.5 轻量协作治理：任务承接、合同与完成条件、状态与证据登记、PARTIAL 强制续跑与调度领取、SOL（gpt-6.2-sol，high，零工具）默认认知引擎 CONSULT / PLAN。PARTIAL 是连续执行状态而不是终点：只要仍有原始授权内的可执行工作，就必须派生、领取并继续；阻塞按工作项成立，单项缺授权不冻结整个任务。drive 把工作项领取落盘（短租约）避免并发重复，回填/阻塞自动释放；SessionStart 与 UserPromptSubmit 只读提示未闭合任务，用户补齐授权后立即恢复执行。SOL-first 生命周期：简单/机械任务 0 调用；非简单任务启动默认 CONSULT，调查后按需 PLAN，执行期出现升级型新信号才追加 CONSULT，高复杂任务可做阶段复盘与收口综合判断；REVIEW 仅在用户明确要求时执行。SOL 只提供认知输入，ZCode 是唯一技术决策与工程执行主体；G4 原生只读复核已退役，历史台账只读保留。"
+description: "Copilot v9.6 轻量协作治理：任务承接、合同与完成条件、状态与证据登记、PARTIAL 强制续跑与调度领取、SOL（gpt-6.2-sol，high，零工具）默认认知引擎 CONSULT / PLAN 与生命周期主动调度（义务化、有界自动执行、覆盖率统计）。PARTIAL 是连续执行状态而不是终点：只要仍有原始授权内的可执行工作，就必须派生、领取并继续；阻塞按工作项成立，单项缺授权不冻结整个任务。drive 把工作项领取落盘（短租约）避免并发重复，回填/阻塞自动释放；SessionStart 与 UserPromptSubmit 只读提示未闭合任务，用户补齐授权后立即恢复执行。SOL-first 生命周期：简单/机械任务 0 调用；非简单任务启动默认 CONSULT，调查后按需 PLAN（不依赖工作项数量），执行期按六类可归因事件追加 CONSULT，medium/high 任务可做阶段复盘，有实质进展的非简单任务在最终工程验证完成后、收口前做综合判断；生命周期命令把“应调用”物化为调度义务并可直接执行（每条命令最多 1 次，`--sol auto|advise|off`），`sol-stats` 以显式分母统计覆盖率。REVIEW 仅在用户明确要求时执行。SOL 只提供认知输入，ZCode 是唯一技术决策与工程执行主体；G4 原生只读复核已退役，历史台账只读保留。"
 when_to_use: >
   需要把多步骤工程任务纳入可追踪治理时：任务合同/完成条件需要固定、证据与审计需要绑定、
   长任务需要 PARTIAL 持续推进与上下文恢复、非简单任务需要 SOL 默认认知（启动 CONSULT、
@@ -9,7 +9,7 @@ when_to_use: >
   直接由 ZCode 原生完成，不进入本 Skill。
 ---
 
-# copilot：轻量协作治理（v9.5.1）
+# copilot：轻量协作治理（v9.6.1）
 
 Copilot 是运行在 ZCode 内的**协作治理层**，不是决策模型，也不是执行体。它负责把任务变成可
 追踪的合同、状态、证据与收口条件，并在任务没有真正完成时继续推进。
@@ -74,8 +74,8 @@ start（合同 + 完成条件 + 风险 + 任务类型 + 后端）
   → ZCode 执行（主代理或原生子代理）
   → ingest / record / criterion / evidence（回填真实结果与原始证据）
   → [新证据/新风险/方案失败] sol-consult 动态追加；主代理自主采纳/调整/否决
-  → [高复杂，阶段边界] sol-consult --stage stage（成果复盘，可选）
-  → [收口前] sol-consult --stage closure（综合判断）→ drive 收口
+  → [中高复杂，阶段边界] sol-consult --stage stage（成果复盘，recommended 自动执行）
+  → [最终工程验证完成后、收口前] sol-consult --stage closure（综合判断）→ ZCode 最终验收 → 收口
   → [仅用户明确要求] sol-review 一次（REVIEW 独立复核）
 ```
 
@@ -501,10 +501,10 @@ verify 的结构化质量报告（`copilot-verify-result/v1`）走报告接入�
 | 阶段 | 默认行为 | 入口 |
 |---|---|---|
 | A 任务启动 | 非简单任务默认一次 CONSULT：目标与隐含需求、问题本质、关键矛盾、初步策略、主要风险、调查方向 | `sol-consult --stage understanding` |
-| B 调查之后 | 多步骤 / 多方案 / 重要决策的非简单任务建议一次 PLAN：方案比较、取舍、优先级、阶段目标 | `sol-plan --stage planning` |
-| C 执行期动态 | 出现升级型新信号（风险升级、方案失败重规划、任务重开）或合同实质修订时追加 CONSULT；普通测试失败、普通步骤推进不触发 | `sol-consult --stage development --force --trigger ...` |
-| D 阶段复盘 | 高复杂任务在重要阶段完成后可做一次成果复盘：是否偏离目标、未解决问题、下一阶段方向（可选） | `sol-consult --stage stage` |
-| E 收口判断 | G1–G3 前对高风险/高复杂任务建议一次综合判断：目标达成、重要遗漏与剩余风险；工程验收仍由 ZCode 完成 | `sol-consult --stage closure` |
+| B 调查之后 | 已形成现场事实且存在实质方案决策（方案类任务类型 / 声明触发 / 中高复杂 / ≥2 工作项任一）建议一次 PLAN：方案比较、取舍、优先级、阶段目标。单工作项任务只要命中任一条件同样适用 | `sol-plan --stage planning` |
+| C 执行期动态 | 出现六类可归因事件之一时追加 CONSULT：实质证据变化（finding 复现、条件回退）、决策点（新登记决策）、风险升级、重规划、合同实质修订（scope-changed）、任务重开；普通证据追加、备注变化、常规步骤推进不触发 | `sol-consult --stage development --force --trigger ...` |
+| D 阶段复盘 | medium/high 任务完成 ≥2 个工作项（或 ≥1 项且已核销条件）后做一次成果复盘：是否偏离目标、未解决问题、下一阶段方向（`recommended`，同一进度只一次） | `sol-consult --stage stage` |
+| E 收口判断 | 有实质进展的非简单任务在最终工程验证完成后（工作项终态、条件核销、证据与合同必要测试齐备）、G1–G3 收口之前做一次综合判断：目标达成、重要遗漏与剩余风险；工程验收仍由 ZCode 完成 | `sol-consult --stage closure` |
 
 - **没有硬性调用次数或 Token 上限**：重大新证据、实质策略变化、方案失败、新风险都可以
   追加；但每次必须有明确问题与预期决策价值（`--force --trigger --reason` 是决策价值声明，
@@ -543,6 +543,40 @@ verify 的结构化质量报告（`copilot-verify-result/v1`）走报告接入�
   （合同指纹变化＝新范围），才允许追加；证据目录增加、工作项增减等结构变化不算新的认知对象。
 - 收口前建议通过 `status` / `review-admission` / `evaluate` 获得；`drive` 命中 PASS 会立即
   收口，顺序是：最终验证 → 收口 CONSULT（如建议）→ `drive` 收口。
+
+### 生命周期主动调度（v9.6）
+
+**建议只有落成“义务”并真的被执行，才算 SOL 参与了任务。** 调度层把每次生命周期判断
+物化为一条调度义务（`copilot-sol-obligation/v1`），并在真实命令路径上有界执行：
+
+| 概念 | 含义 |
+|---|---|
+| 义务（obligation） | 一次“欠下的认知判断”：`family`（A 启动 / B 规划 / C 事件 / D 里程碑 / E 收口）+ `event` + `instance` + 合同指纹 + 级别（`recommended` / `optional`）；写入 `state.sol_schedule`，只增不改 |
+| 义务键 vs 复用键 | 义务键标识“哪个窗口欠一次判断”（任务 + 合同 + family + 事件 + 实例）；复用键仍由 `sol_review` 的 subject 摘要决定“同一材料与问题能否不重复付费”。两把键分开，避免用复用去掩盖漏调 |
+| 窗口 | `open` / `closed`；只有已持久化的事实能关闭窗口（任务收口、更晚窗口已满足、合同修订）。关闭时仍为 `due`/`claimed` 即为**漏调**（派生，不写死）；`in_flight` 单列为未决 |
+| 有界执行 | 每条生命周期命令最多执行 **1 条义务、1 次请求**（`drive` 只在 RUNNING 阶段消费一次，PASS 分支的 E 窗口单独一次）；不循环、不自动重试 |
+| 自动材料 | `--obligation SO<n>` 执行时由状态确定性生成材料（目标、合同、条件、工作项、证据身份与相对上次的实质变化），主代理不必先写材料文件；手动调用仍以 `--materials` 为准 |
+
+**策略开关**：`--sol auto|advise|off`（或 `COPILOT_SOL_AUTO`），默认 `auto`：
+
+- `auto`：`recommended` 级义务直接执行（D 里程碑与 E 收口都是 recommended）；历史 `optional` 义务只提示，收口时按 `not-required` 计合理跳过。
+- `advise`：只打印可直接粘贴的命令（无占位符），不发起调用。
+- `off`：只记录义务，不打印、不执行。
+- 读命令（`status` / `sol-schedule` 不带 `--execute` / `sol-stats` / `handoff`）**永不执行**；
+  测试进程（`unittest` 已加载）默认不自动调用；`COPILOT_SOL_AUTO=off` 可强制离线。
+
+**执行与结算**：执行仍走既有通道（`_run_sol_channel` → `sol_review`，同一 `sol_calls` 台账、
+同一 `.sol.lock`），不新建平行调用体系。成功写 `source=executed` 与 `call_id`；同一认知对象
+已有有效结论时由复用满足（`source=reuse`，不重复付费）；失败记录真实原因（`status=failed`
++ `failure`），工程继续，不阻断；前置条件连续失败 3 次后终止该义务，避免每条命令重复报错。
+合同修订后旧合同下未执行的义务显式记为 `skipped/contract-amended`（不进入新分母，但仍披露）。
+
+**覆盖率（观测，不是门禁）**：`sol-stats --state S` 或 `sol-stats --workspace W` 输出
+`copilot-sol-stats/v1`，分母显式且只含适用窗口：启动（非简单任务）、PLAN（按
+`plan_admission` 判定适用）、收口（有实质进展且中/高复杂或高风险的非简单任务）、事件（每出现一次
+构成一个窗口）。统计区分建议 / 执行 / 复用 / 跳过 / 失败 / 漏调 / 未登记
+（`not_registered`），以及采纳 `accepted|modified|rejected`、tokens 与延迟（缺失标
+`recorded_calls`，不推断）。覆盖率低只说明参与不足，**不改变阶段、G1–G3 或收口结论**。
 
 ### CONSULT / PLAN 输入与输出
 
@@ -732,7 +766,63 @@ CONSULT / PLAN 输出契约（`copilot-sol-think/v2`）：`judgment`、`goal_und
 
 ## 版本
 
-当前 **v9.5.1（宿主集成修正：startup 恢复、钩子可发现性、工作单条件归属）**：
+当前 **v9.6.1（收口时序：最终验证完成才执行收口 CONSULT）**：
+
+- **为什么改**：v9.6.0 的 E 准入只看“工作项是否耗尽”（`all_done`），`_sol_schedule_step`
+  又固定传 `gates_passed=False`，于是最后一个工作项一关闭就可能立刻执行收口 CONSULT——
+  而合同要求的测试、最终证据、条件核销甚至 G1–G3 还没完成，SOL 拿到的是不完整的收口材料。
+- **统一准入**：`governance.closure_readiness()` 是 E 与收口的唯一准入，先查便宜事实
+  （工作项终态、条件核销、证据、合同必要测试的执行痕迹、重开后无进展、开放 finding），
+  再算确定性门禁（不含质量报告的用户接受，它属于 ZCode 验收之后的用户一步）。
+- **验证摘要**：`closure_verification_digest()` 只取验证事实的 `sha256[:16]`，作为 E 义务的
+  instance。义务与当前摘要不符时拒绝付费；同一摘要再到达判 `reuse`；重跑测试或新增/修订
+  证据后摘要变化，旧 E 结论不再覆盖新结果。
+- **入口一致**：`drive` 在缺口时返回 `EXIT_EXECUTE` 且不执行 E；`closure --close`、手动
+  `sol-consult --stage closure`、`close_task` 都拒绝绕过；回填命令只更新义务。`evaluate`
+  的 `continuation` 在缺口时给出 `verify` 动作与阻塞原因。
+- **验收顺序强制**：E 执行后必须先有 ZCode 的 `sol-accept`（accepted/modified/rejected 任一）
+  才能收口——`closure_acceptance_pending()` 让 `close_task` 失败关闭、`drive` / `closure
+  --close` 停在 `EXIT_EXECUTE` / `EXIT_CONTINUE` 并打印命令。裁决不是 SOL 批准权，也不替代
+  用户对质量报告的接受。
+- **材料口径进摘要**：`MATERIALS_SCHEMA` 参与 `closure_verification_digest()`，材料生成口径
+  变化（例如合同正文来源修正）即可让旧 E 结论停止覆盖新结果；材料内自报口径版本。
+- **测试证据可核对**：`evidence --capture-cmd` 现在真的把命令写进证据记录（此前该字段是死的），
+  合同声明命令按词元顺序匹配（允许 `-B` 等运行器参数），自述“测试已通过”不算执行痕迹。
+- **不变量**：五阶段架构、G1–G3、PARTIAL 续跑、SOL advisory（E 不是门禁、不需 SOL PASS）、
+  REVIEW 仅用户明确要求、G4 退役、模型/Provider 配置全部不变。
+
+**v9.6.0（SOL 生命周期主动调度：义务化、有界执行、覆盖率统计）**：
+
+- **为什么改**：v9.0–v9.5 的 SOL 建议是纯函数输出，只在 `start`/`status`/`drive`/
+  `review-admission` 打印；建议命令带 3 处占位符，`_run_sol_channel` 又要求
+  `--materials`/`--question`，于是“应当调用”从未进入任何状态，事后也无法区分“没建议”
+  与“建议了没执行”。`drive` 在 PASS 分支直接收口，收口 CONSULT 结构上不可达。
+- **调度义务**：新增 `scripts/sol_schedule.py`（纯函数、零网络、零状态写入）。每次生命周期
+  判断物化为义务（family A–E / event / instance / 合同指纹 / level），写入
+  `state.sol_schedule`；窗口只按已持久化事实关闭，漏调由关闭时的事实派生。
+- **有界自动执行**：`start`/`plan`/`record`/`rerun`/`criterion`/`judgment`/`evidence`/
+  `report`/`accept`/`decide`/`block`/`unblock`/`finding`/`contract`/`reopen`/`closure` 与
+  `drive` 在回填后做一次有界调度步：最多 1 条义务、1 次请求、硬预算；`--sol
+  auto|advise|off` 控制策略，`optional` 只提示，读命令永不执行。
+- **PLAN 准入唯一口径**：`plan_admission()` 不再由工作项数量单独决定（方案类类型、声明
+  触发、中/高复杂、≥2 工作项任一），并默认读取任务自己声明的触发因素。
+- **六类动态事件可归因**：`material-evidence-change`（finding 复现 / 条件回退）、
+  `decision-point`（新登记的显式决策，`add_decision` 写入 `decision_id`）、
+  `risk-escalation`、`replan-history`、`scope-changed`（合同指纹变化）、`reopened`。
+  调用记录持久化 `sol_event_snapshot` 与 `closure_key`，事件比较与收口周期去重以真实
+  记录为基线（合同修订后仍与旧基线比较，才能判为 scope-changed）。
+- **里程碑与收口接线**：D 从“仅 high”扩到 medium/high（完成后 ≥2 项或 ≥1 项且条件已核销），
+  级别 `optional`；`drive` 的 PASS 分支与 `closure --close` 先消费 E 窗口再收口
+  （`closure.sol_entry` 区分 `drive` / `closure-command` / `zcode-native`）。
+- **去重、并发与降级**：同一 (合同, family, event, instance) 只有一个义务；同一 subject
+  复用不重复付费；`task_lock(timeout)` 拿不到锁即放弃本次执行（义务保持待执行）；失败记录
+  真实原因并继续，前置条件连续失败 3 次后终止该义务。
+- **统计**：`sol-stats` 输出显式分母的覆盖率、事件分布、采纳分布、tokens 与延迟；建议、
+  执行、复用、跳过、失败、漏调、未登记分开统计。覆盖率不是门禁。
+- **不变量**：SOL 零工具单轮、advisory、G1–G3、ZCode 唯一工程执行与技术决策主体、REVIEW
+  仅用户明确要求、授权边界、模型与 Provider 配置、G4 退役状态全部不变。
+
+**v9.5.1（宿主集成修正：startup 恢复、钩子可发现性、工作单条件归属）**：
 
 - **SessionStart matcher 含 startup**：宿主只在全新会话发 `source=startup`；匹配器为
   `startup|resume|compact`。startup 只给只读指针（不注入任务正文、不自动绑定、不强制

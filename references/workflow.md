@@ -32,6 +32,12 @@ CONSULT / PLAN 失败只记录并降级，不阻断工程推进。
 python3 -B scripts/copilot_dispatch.py <子命令> --state <state.json> [参数]
 ```
 
+生命周期命令（`start` / `plan` / `record` / `rerun` / `criterion` / `judgment` / `evidence` /
+`report` / `accept` / `decide` / `block` / `unblock` / `finding` / `contract` / `reopen` /
+`closure`）与 `copilot_auto.py drive` 都接受 `--sol auto|advise|off`（默认 `auto`）：回填后做
+一次有界调度步，最多执行 1 条义务、1 次请求；`optional` 级只提示；读命令永不执行。
+`COPILOT_SOL_AUTO=off` 可整体关闭自动执行。
+
 | 子命令 | 用途 | 关键参数 |
 |---|---|---|
 | `start` | 创建任务合同 | `--goal`、`--contract-file`、`--criteria-file`、`--task-kind <kind>`（默认 `standard`，简单类型见 `trivial`/`mechanical`/`docs`/`format`）、`--trigger <name>`（可重复，声明 security/permissions/core-logic/...）、`--test-policy`/`--test-policy-file`（JSON：`required`/`commands`/`report`/`artifacts`/`require_*`）、`--risk low\|medium\|high`（历史 `normal` 等价 `medium`）、`--backend legacy\|native`、`--task-id`、`--mode`、`--note`、`--workspace`（省略取状态文件所在目录的 git 根）；`risk=high` 不再强制 native |
@@ -49,14 +55,16 @@ python3 -B scripts/copilot_dispatch.py <子命令> --state <state.json> [参数]
 | `block` / `unblock` | 记录/解除真实阻塞 | `block --reason ... --needs ... (--work-item A2 [--work-item A3] [--criterion C2] | --scope task [--force])`；`unblock --reason ... [--block-id B...] [--by user --quote "<原话>"]`（多条未解除时必须指定）；解除后被冻结工作项自动恢复 `pending`。仍有可执行项时任务级 `--scope task` 被拒绝，必须显式 `--force`，状态记录 `ready_at_creation`/`forced_scope`；`--by user` 必须带原话，记录 `resolved_by` 与 `authorization_source=caller-declared` |
 | `closure-check` | 只读检查 G1–G3 | `--json` |
 | `review-admission` | SOL-first 生命周期建议的单一确定性入口（只读、不写状态、不是门禁）：先算任务类型、复杂度与已有 SOL 覆盖，再给出 `advice.action`（`none`/`reuse`/`consult`/`plan`/`review`）、建议模式、阶段与命令 | `--trigger security`（可重复）、`--reason`、`--user-request`、`--review-request`、`--json`；返回 `decision`、`advice`、`task_kind`、`complexity`、`recommended_action`/`recommended_mode`/`recommended_stage`、`sol_calls_total` |
-| `sol-consult` | SOL 默认认知入口：材料 + 问题 → 一次请求 → 目标理解/问题本质/路线与取舍/风险/调查方向/再咨询条件；建议写入统一 `sol_calls`（`mode=CONSULT`），不入门禁；失败只登记并降级 | `--materials <file>`、`--question`（必填）、`--stage <understanding\|planning\|development\|stage\|closure>`、`--knowledge-file`、`--dry-run`、`--list`、`--json`、`--timeout`、`--max-output-tokens`、`--audit-log`（默认 `sol-audit.jsonl`）、`--output-dir`；再次调用：`--force --trigger <user-request\|scope-changed\|new-risk\|materials-omitted\|strategy-failed\|major-uncertainty\|stage-result> --reason` |
+| `sol-consult` | SOL 默认认知入口：材料 + 问题 → 一次请求 → 目标理解/问题本质/路线与取舍/风险/调查方向/再咨询条件；建议写入统一 `sol_calls`（`mode=CONSULT`），不入门禁；失败只登记并降级 | `--materials <file>`（调度执行时可省略）、`--question`（必填，`--obligation` 时回落到义务问题）、`--stage <understanding\|planning\|development\|stage\|closure>`、`--obligation SO<n>`（按调度义务执行，材料由状态确定性生成）、`--lock-timeout <秒>`、`--knowledge-file`、`--dry-run`、`--list`、`--json`、`--timeout`、`--max-output-tokens`、`--audit-log`（默认 `sol-audit.jsonl`）、`--output-dir`；再次调用：`--force --trigger <user-request\|scope-changed\|new-risk\|materials-omitted\|strategy-failed\|major-uncertainty\|stage-result> --reason` |
 | `sol-plan` | SOL 调查后规划判断：方案比较、取舍、优先级、阶段目标与验收关注点；记录写入统一 `sol_calls`（`mode=PLAN`） | 参数同 `sol-consult`；省略 `--stage` 时默认 `planning` |
 | `sol-think` | 历史别名：等同 `sol-consult`（`mode=CONSULT`），保留给既有调用方 | 参数同 `sol-consult` |
 | `sol-accept` | 回填主代理对 SOL 建议的采纳结论（事实记录，不改变阶段、G1–G3 或授权）。v2 记录含实际决策、理由、modified 差异、证据引用与 `advice_ref`；缺项只给非阻断提示 | `--call-id SC...`、`--status accepted\|modified\|rejected`、`--decision`、`--rationale`（省略回落 `--reason`）、`--delta`、`--evidence-ref E1,E3`（可重复/逗号分隔，指向本任务已登记证据）、`--source-ref`（报告章节/文件路径，只定位不核验）、`--evidence-note`、`--note`、`--reason`、`--decided-by`（默认 `zcode`）、`--json` |
+| `sol-schedule` | SOL 生命周期调度视图（只读）：义务清单、漏调、下一条可执行项与可直接粘贴的命令；`--execute` 时有界执行 1 条 `recommended` 义务（1 次请求，失败只记录） | `--state`、`--execute`、`--json`；不带 `--execute` 不写状态 |
+| `sol-stats` | SOL 调度覆盖率（显式分母）：建议/执行/复用/跳过/失败/漏调/未登记分开统计，含事件分布、采纳分布、tokens 与延迟 | `--state` 或 `--workspace <根>`（聚合 `.copilot-tasks/*/state.json`）、`--json` |
 | `agent-policy` | Agent 调度建议：主代理默认，Explore/general-purpose 按需（只读、不派发）。判定顺序：子代理不可用 → 主代理；写入冲突 → 主代理；`--research-only` → Explore（绝不交给全工具代理）；独立交付物需并发且有收益才建议 general-purpose；其余 → 主代理 | `--needs-independent-context`、`--parallel`、`--independent-deliverable`、`--write-conflict`、`--saves-time`、`--research-only`、`--subagent-unavailable`、`--json` |
 | `finding` | 查看 / 更新 Finding 台账（不触发复核） | `--list`；`--id F1 --status open\|fixed\|verified\|closed\|regressed\|dropped --evidence E1[,E2] --note`；`fixed`/`verified` 必须有证据，多个证据可用逗号分隔；回填成功后按续跑判定返回 10 |
 | `review-metrics` | 统计统一 SOL 调用流（`sol.calls_total` / `sol.by_mode`）、准入门槛、停止标记与 Finding 计数 | `--state`；历史 G4 数据标记 `g4.retired` |
-| `closure` | 收口（必须 G1–G3 通过） | `--close`、`--by` |
+| `closure` | 收口：G1–G3 通过与**最终工程验证完成**（`closure_readiness`：工作项终态、条件核销、证据、合同必要测试的执行痕迹、finding 台账）都必须满足；验证有缺口时失败关闭（退出码 1），补完后同一条命令先做收口 CONSULT 再收口 | `--close`、`--by`、`--sol auto\|advise\|off` |
 | `reopen` | 用户授权后重开 | `--reason`（必填，写用户原话/要求）、`--authorized-by user`（必填；调用方自报声明，不是凭证）；`reopen_history` 标注 `authorization_source=caller-declared` |
 | `handoff` | 只读列出生效交付清单：分支/HEAD/上游、已暂存、未暂存、未跟踪分类 | `--state`（可选）、`--cwd`、`--limit`、`--json`；不提交、不删除、不改 `.gitignore` |
 | `contract` | 查看/修订合同与条件 | `--show`、`--amend --contract-file/--criteria-file`、`--test-policy`/`--test-policy-file`（省略则保留原策略）、`--authorized-by user` + `--authorization-note "用户要求"`（破坏性修订必需）；BLOCKED 时也可修订；登记源文件摘要，文件被改动时 `status` 给出非阻断提醒。**破坏性修订**指待核销条件净减少（删掉未满足条件）或放松 `test_policy`，没有用户授权或未写明用户要求时 fail-closed；改写措辞/拆分/合并但只要不减少待核销条数不需要授权。合同历史记录 `authorized_by`、`authorization_source=caller-declared`、授权说明、新增/删除的未核销条数与被删除条件及旧指纹。`--authorized-by` 是调用方自报声明，不是可验证凭证：审计时须以用户原话/授权说明为准 |
@@ -244,6 +252,11 @@ python3 -B scripts/copilot_auto.py drive --state T/state.json    # PASS → 0
 ```
 
 PARTIAL 时不需要额外命令：直接再次 `drive`，由本地派生工作项。
+
+收口顺序是**最终工程验证 → 收口 CONSULT → 收口**：`drive` 在 PASS 但验证有缺口（例如合同
+`test_policy.required=true` 却没有 `--capture-cmd` 证据）时打印缺口并返回 10，不执行 SOL、
+不收口；补齐测试与证据后再 `drive`（或 `closure --close`）即自动执行一次收口 CONSULT。手动
+`sol-consult --stage closure` 同样被缺口与“摘要不符”拒绝。
 
 ## 5. 正式 REVIEW 与已退役的 G4
 

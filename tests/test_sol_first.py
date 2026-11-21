@@ -672,7 +672,7 @@ class BoundaryTests(SolFirstBase):
         self.record("PLAN", signals=["risk-high", "multi-action"])
         first = self.advice()
         self.assertEqual(first["stage"], "stage")
-        self.assertEqual(first["recommended_action"], "optional")
+        self.assertEqual(first["recommended_action"], "recommended")
         digest = RP.sol_progress_key(G.load_state(self.state_path))
         self.record("CONSULT", signals=["risk-high", "multi-action"],
                     stage="stage", progress_digest=digest)

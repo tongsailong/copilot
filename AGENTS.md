@@ -12,6 +12,26 @@ Copilot 是运行于 ZCode 内的**轻量协作治理 Skill**：负责任务承�
 （CONSULT / PLAN）按生命周期提供整体判断，用户明确要求时执行一次独立复核（REVIEW），均由
 `gpt-6.2-sol` 零工具单轮调用完成。
 
+- **v9.6.1 起收口 CONSULT 的准入是“最终工程验证完成”**：`governance.closure_readiness()`
+  是 E 窗口与收口的唯一准入（工作项终态、条件核销、证据登记、合同 `test_policy` 的执行
+  痕迹、重开后无进展、finding 台账），并以 `closure_verification_digest()` 作为 E 义务的
+  instance。工作项全部关闭或 G1–G3 通过都**不等于**验证完成：缺口存在时 `drive` 返回
+  `EXIT_EXECUTE` 且不执行 E，`closure --close` 失败关闭，手动 `sol-consult --stage closure`
+  与 `close_task` 同样拒绝绕过；验证完成后自动执行一次真实收口 CONSULT，再由 ZCode 独立
+  验收并收口；同一摘要判 `reuse` 不重复付费，摘要变化即旧结论不再覆盖新结果。E 仍是
+  advisory，不是门禁。
+- **v9.6.0 起 SOL 由生命周期义务化调度**：`scripts/sol_schedule.py`（纯策略层，零网络、
+  零 I/O）把 A–E 五个认知窗口物化为义务并持久化在 `state.sol_schedule`；`review_policy`
+  的 `plan_admission()` 是 PLAN 准入唯一口径（方案类类型/声明触发/中高复杂/≥2 工作项，
+  单工作项+实质取舍可触发），六类事件（`material-evidence-change`/`decision-point`/
+  `risk-escalation`/`replan-history`/`scope-changed`/`reopened`）只与“上次判断时的事实”
+  比较，D 窗口扩到 medium/high，收口顺序为 PASS → E 窗口 CONSULT → `close_task`。
+  执行落在生命周期命令自身事务内（`_sol_schedule_step`），**每条命令最多 1 个义务 / 1 次
+  请求**，`--sol auto|advise|off`（默认 auto）、`COPILOT_SOL_AUTO` 可覆盖、测试进程默认
+  离线；只读命令只物化展示。同合同同问题 `reuse` 不重复付费，合同修订把旧义务记
+  `skipped/contract-amended`，失败按真实原因登记后降级（不改阶段、不阻断、退出码 0）。
+  `sol-stats` 给显式分母的覆盖率，只有真实请求成功才计“执行”，打印命令/预检/模拟不算；
+  覆盖率与义务状态都不构成门禁，不改变 G1–G3、`continuation` 或阶段。
 - **v9.5.0 起派生项以“领取”进入调度事实**：`drive` 为选中的工作项写
   `state["claims"]`（owner 会话、TTL `COPILOT_CLAIM_TTL` 默认 1800 s、`handoff_count`），
   `ready_actions`/`derive_work` 尊重其它 owner 的领取，`record`/`rerun`/条件核销/`block`/

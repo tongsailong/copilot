@@ -25,11 +25,13 @@ import re
 import secrets
 import sys
 import tempfile
+import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
 import code_scope as CS
 import review_policy as RP
+import sol_schedule as SS
 
 SCHEMA = "copilot-governance/v1"
 VERSION = 1
@@ -82,6 +84,10 @@ MAX_REPORT_CHARS = 8000
 
 class GovernanceError(Exception):
     """可预期的治理错误；调用方必须显式报告，不得静默丢弃。"""
+
+
+class LockBusyError(GovernanceError):
+    """任务锁在预算内未取到：表示并发调用正在进行，不是调用失败。"""
 
 
 # ── 基础工具 ───────────────────────────────────────────────────────────────
@@ -199,6 +205,10 @@ def _default_closure() -> dict:
         "gate": {"passed": None, "iteration_id": None, "reasons": []},
         "quality": None,
         "reopen_history": [],
+        # 收口入口与调度快照：两条真实编排路径（drive / closure 命令）都会写
+        # closure，必须能区分是谁收的口，以及收口时 SOL 调度义务是否闭合。
+        "sol_entry": "",
+        "sol_schedule": None,
     }
 
 
@@ -242,6 +252,9 @@ def _default_state() -> dict:
         # `sol_calls`。历史状态里的 `sol_reviews` / `sol_advisories` 继续只读兼容，
         # 不再新增默认键，也不回写。
         "sol_calls": [],
+        # SOL 生命周期调度义务（v9.6）：把「应调用但未执行」物化为可审计事实。
+        # 只增不改的窗口事实，`missed` 由窗口关闭 + 未满足派生，不写状态。
+        "sol_schedule": SS.empty_schedule(),
         "review_admissions": [],
         "review_stops": [],
         "finding_ledger": {
@@ -317,6 +330,19 @@ def _lock_file(fh) -> None:
     fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
 
 
+def _try_lock_file(fh) -> bool:
+    """非阻塞取锁：已被占用时返回 False（不抛异常、不等待）。"""
+    try:
+        import fcntl
+    except ImportError:  # pragma: no cover — 本机 Linux
+        return True
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except OSError:
+        return False
+
+
 def _unlock_file(fh) -> None:
     try:
         import fcntl
@@ -326,16 +352,28 @@ def _unlock_file(fh) -> None:
 
 
 @contextmanager
-def task_lock(task_dir: str, name: str = ".sol-review.lock"):
+def task_lock(task_dir: str, name: str = ".sol-review.lock", *,
+              timeout: float | None = None):
     """同一任务的跨进程互斥锁；用于远程付费调用前的“检查—调用—登记”临界区。
 
     锁文件与状态文件分离：持有时间覆盖一次 SOL 请求，但不会阻塞普通状态命令
     的保存（保存只锁自己的状态文件）。平台无 fcntl 时退化为无锁。
+
+    `timeout` 为等待预算（秒）：给定时不无限阻塞，超时抛 `LockBusyError`——那是
+    “别的进程正在调用”，不是调用失败，调用方应把它当作稍后重试而不是登记失败。
     """
     os.makedirs(task_dir, exist_ok=True)
     path = os.path.join(task_dir, name)
     with open(path, "a+", encoding="utf-8") as fh:
-        _lock_file(fh)
+        if timeout is None:
+            _lock_file(fh)
+        else:
+            deadline = time.monotonic() + max(0.0, float(timeout))
+            while not _try_lock_file(fh):
+                if time.monotonic() >= deadline:
+                    raise LockBusyError(
+                        f"等待任务锁超时（{timeout}s）：{path}；另一个 SOL 调用正在进行。")
+                time.sleep(0.05)
         try:
             yield
         finally:
@@ -2034,7 +2072,8 @@ def add_decision(path: str, text: str, *, source: str = "user") -> dict:
     text = (text or "").strip()
     if not text:
         raise GovernanceError("决策文本不能为空。")
-    entry = {"text": text[:MAX_REPORT_CHARS], "source": source,
+    entry = {"decision_id": f"D{len(state.get('decisions') or []) + 1}",
+             "text": text[:MAX_REPORT_CHARS], "source": source,
              "at": now_iso()}
     state.setdefault("decisions", []).append(entry)
     _history(state, "decision_recorded", {"source": source, "text": text[:200]})
@@ -3654,7 +3693,7 @@ def _evidence_entry(state: dict, eid: str) -> dict | None:
 
 def register_evidence(state: dict, eid: str, *, kind: str = "",
                       text: str | None = None, file_path: str | None = None,
-                      note: str = "") -> dict:
+                      note: str = "", capture_cmd: str = "") -> dict:
     # 证据是既成事实；登记不解除阻塞，也不跳过 G2 的文件重读校验。
     _assert_open(state, "登记证据", allow_blocked=True)
     eid = (eid or "").strip()
@@ -3692,6 +3731,9 @@ def register_evidence(state: dict, eid: str, *, kind: str = "",
         "task_id": str(state.get("task_id") or ""),
         "path_hint": hint,
         "note": (note or "").strip()[:500],
+        # 采集命令决定“这份证据能证明哪条测试真的跑过”：合同 test_policy 的
+        # 执行验证按命令核对，而不是只看是否登记了某个文件。
+        "capture_cmd": (capture_cmd or "").strip()[:500],
         "dropped": False,
         "dropped_reason": "",
     }
@@ -3889,6 +3931,271 @@ def final_evidence_digest(state: dict) -> str:
     }))
 
 
+def _command_covers(declared: str, capture: str) -> bool:
+    """采集命令是否在执行合同声明的测试命令。
+
+    合同声明的是“跑什么测试”，采集命令可以额外带运行器参数（例如仓库规范
+    强制 `python3 -B -m unittest …` 而合同写 `python3 -m unittest`）。因此按
+    词元顺序匹配：声明的词元必须按序出现在采集命令里，额外参数不构成不匹配，
+    但替换或缺少词元不算（`pytest` 不能冒充 `python3 -m unittest`）。
+    """
+    want = declared.split()
+    if not want:
+        return True
+    have = capture.split()
+    index = 0
+    for token in have:
+        if index < len(want) and token == want[index]:
+            index += 1
+    return index == len(want)
+
+
+def test_verification_evidence(state: dict) -> tuple[bool, str]:
+    """合同要求的必要测试是否有对应的验证证据。
+
+    只判定“合同自己要求的测试有没有留下验证痕迹”，不重新解释 G1–G3：
+    `test_policy.required=false`（默认）直接视为不适用；要求测试时只接受两种
+    可核对痕迹：带 `capture_cmd` 的证据（命令需与合同声明的 commands 对应），或
+    结构化质量报告明确给出 `required_tests_executed=true`。普通执行报告的摘要
+    文字不算“测试跑过”的证明。文件型证据的摘要核对仍由 G2 负责。
+    """
+    policy = (state.get("contract") or {}).get("test_policy") or {}
+    if not policy.get("required"):
+        return True, "not-required"
+    declared = [str(item).strip() for item in policy.get("commands") or []
+                if str(item).strip()]
+    for entry in state.get("evidence") or []:
+        if not isinstance(entry, dict) or entry.get("dropped"):
+            continue
+        command = str(entry.get("capture_cmd") or "").strip()
+        if not command:
+            continue
+        if not declared or any(_command_covers(item, command)
+                               for item in declared):
+            return True, "captured-command"
+    report = latest_quality_report(state)
+    checks = (report or {}).get("checks") or {}
+    if isinstance(checks, dict) and checks.get("required_tests_executed") is True:
+        return True, "quality-report"
+    return False, "missing"
+
+
+def verification_gates(state: dict, *, cache: dict | None = None) -> dict:
+    """最终工程验证的确定性部分（不含用户对质量报告的接受）。
+
+    G1 工作项终态、G2 的合同/条件/证据与 Finding 台账、G3 停摆一起构成“最终
+    工程验证是否完成”。质量报告的**用户接受**刻意不在这里：那是 ZCode 最终
+    验收之后由用户完成的一步，不能把 SOL 收口判断挡在它后面。
+    """
+    criteria = _gate_criteria(state, cache=cache)
+    findings = _gate_findings(state)
+    actions = _gate_actions(state)
+    stalled = _gate_stalled(state)
+    reasons = (criteria["reasons"] + findings["reasons"]
+               + actions["reasons"] + stalled["reasons"])
+    return {"passed": not reasons, "reasons": reasons,
+            "components": {"criteria": criteria["passed"],
+                           "findings": findings["passed"],
+                           "actions": actions["passed"],
+                           "stalled": stalled["passed"]}}
+
+
+def closure_verification_digest(state: dict) -> str:
+    """最终验证摘要：一次“最终工程验证”的稳定身份。
+
+    只包含验证事实（合同、条件及其证据摘要、终态工作项结果、执行报告），不含
+    未与条件/工作项关联的旁证，避免补一条备注就让收口判断失效；而新增条件证据、
+    重跑测试报告或工作项结果变化都会产生新摘要 —— 旧收口判断不再覆盖新成果。
+    """
+    contract = state.get("contract") or {}
+    criteria = contract.get("criteria") or []
+    evidence = {str(item.get("id") or ""): item
+                for item in state.get("evidence") or [] if isinstance(item, dict)}
+    referenced = set()
+    for criterion in criteria:
+        for ref in criterion.get("evidence_refs") or []:
+            referenced.add(str(ref.get("id") or ""))
+    # 合同要求的测试验证也是一次“最终验证”的组成部分：重跑测试（新的采集证据）
+    # 会产生新摘要，从而让旧收口判断停止覆盖新的验证结果。
+    test_rows = sorted([
+        [str(item.get("id") or ""), str(item.get("sha256") or "")]
+        for item in state.get("evidence") or []
+        if isinstance(item, dict) and not item.get("dropped")
+        and str(item.get("capture_cmd") or "").strip()])
+    return _sha256_text(canonical_json({
+        "task_id": state.get("task_id"),
+        "iteration": _current_iteration_id(state),
+        "contract_sha256": state.get("contract_sha256"),
+        "test_policy_required": bool(
+            (contract.get("test_policy") or {}).get("required")),
+        "test_verification": test_rows,
+        "criteria": sorted([
+            [criterion.get("criterion_id"), criterion.get("status"),
+             sorted([str(ref.get("id") or ""), str(ref.get("sha256") or "")]
+                    for ref in criterion.get("evidence_refs") or [])]
+            for criterion in criteria]),
+        "actions": sorted([
+            [action.get("id"), action.get("status"),
+             _sha256_text(str(action.get("result") or "")),
+             sorted(str(item) for item in action.get("evidence_ids") or [])]
+            for action in state.get("actions") or []
+            if isinstance(action, dict)
+            and str(action.get("origin") or "") != "g4-review"]),
+        "criteria_evidence": sorted([
+            [eid, str((evidence.get(eid) or {}).get("sha256") or ""),
+             int((evidence.get(eid) or {}).get("size") or 0)]
+            for eid in referenced]),
+        "reports": sorted([str(item.get("report_sha256") or "")
+                           for item in state.get("reports") or []
+                           if isinstance(item, dict)]),
+        # 材料生成口径也参与摘要：材料内容变了（合同正文来源、字段口径等），旧收口
+        # 判断就不能再覆盖新材料下的结论——即使验证事实本身一字未改。
+        "materials_schema": _materials_schema_version(),
+    }))[:16]
+
+
+def _materials_schema_version() -> str:
+    """`sol_schedule.MATERIALS_SCHEMA` 的只读取值（惰性导入，避免层间循环）。
+
+    导入失败返回空串：摘要仍可计算，只是不含口径版本，不阻断工程推进。
+    """
+    try:
+        import sol_schedule as _SS
+        return str(getattr(_SS, "MATERIALS_SCHEMA", "") or "")
+    except Exception:  # noqa: BLE001 - 策略层缺失不应让收口准入崩掉
+        return ""
+
+
+def closure_acceptance_pending(state: dict) -> dict | None:
+    """当前最终验证摘要的收口 CONSULT 是否还缺 ZCode 的采纳判断。
+
+    顺序要求：最终工程验证 → SOL 收口判断 → **ZCode 独立验收（采纳/修改/否决）** →
+    G1–G3 收口。自动路径（`drive`）一旦执行完 E 就立刻收口，等于跳过 ZCode 的判断
+    这一步；收口后再登记又会被 CLOSED 拒绝。这里只查事实，不要求 SOL PASS：`rejected`
+    同样是有效判断，E 仍然不是门禁。
+
+    返回 `{"call_id": ...}` 表示存在“当前摘要已完成、但还没有判断记录”的收口调用。
+    """
+    digest = closure_verification_digest(state)
+    for call in reversed(state.get("sol_calls") or []):
+        if not isinstance(call, dict):
+            continue
+        if str(call.get("stage") or "") != "closure":
+            continue
+        if str(call.get("status") or "") != "completed":
+            continue
+        if str(call.get("final_verification_digest") or "") != digest:
+            continue
+        acceptance = call.get("acceptance")
+        status = (str(acceptance.get("status") or "")
+                  if isinstance(acceptance, dict) else "")
+        if status in ("accepted", "modified", "rejected"):
+            return None
+        return {"call_id": str(call.get("call_id") or ""),
+                "stage": "closure", "digest": digest}
+    return None
+
+
+def closure_readiness(state: dict, *, gates: dict | None = None,
+                      cache: dict | None = None) -> dict:
+    """E 阶段（收口 CONSULT）的统一准入：最终工程验证是否真的完成。
+
+    `record` 关闭最后一个工作项、`criterion` 核销条件、`closure --close`、`drive`
+    的 PASS 分支都用同一判定，避免“工作项做完 ＝ 可以收口咨询”。
+
+    判定顺序是先廉价事实（工作项终态、条件全 met 且有证据、必要测试有验证痕迹、
+    台账无未闭合 blocking/major），再跑会重读证据文件的 `verification_gates`：
+    未完成的任务不会为每条命令多付一次文件重读。
+    """
+    contract = state.get("contract") or {}
+    criteria = [item for item in contract.get("criteria") or []
+                if isinstance(item, dict)]
+    actions = [item for item in state.get("actions") or []
+               if isinstance(item, dict)
+               and str(item.get("origin") or "") != "g4-review"]
+    evidence = {str(item.get("id") or ""): item
+                for item in state.get("evidence") or [] if isinstance(item, dict)}
+    blockers: list[dict] = []
+
+    pending = [str(item.get("id") or "") for item in actions
+               if str(item.get("status") or "") not in TERMINAL]
+    if pending:
+        blockers.append({"code": "actions_not_terminal",
+                         "detail": "未终态工作项：" + "、".join(sorted(pending))})
+    unmet = [str(item.get("criterion_id") or "") for item in criteria
+             if str(item.get("status") or "") != "met"]
+    if unmet or not criteria:
+        blockers.append({"code": "criteria_not_satisfied",
+                         "detail": "未核销完成条件：" + ("、".join(sorted(unmet))
+                                                        or "合同没有完成条件")})
+    missing_refs = []
+    for criterion in criteria:
+        cid = str(criterion.get("criterion_id") or "")
+        refs = [str(ref.get("id") or "")
+                for ref in criterion.get("evidence_refs") or []]
+        if str(criterion.get("status") or "") != "met" or not refs:
+            if not refs:
+                missing_refs.append(cid)
+            continue
+        for eid in refs:
+            entry = evidence.get(eid)
+            if entry is None or entry.get("dropped"):
+                missing_refs.append(f"{cid}:{eid}")
+    if missing_refs:
+        blockers.append({"code": "final_evidence_missing",
+                         "detail": "条件没有可用证据：" + "、".join(sorted(set(missing_refs)))})
+    tests_ok, tests_source = test_verification_evidence(state)
+    if not tests_ok:
+        blockers.append({"code": "required_tests_missing",
+                         "detail": "合同要求运行测试，但还没有执行报告或命令采集证据"})
+    if _reopened_without_progress(state):
+        # 重开表示用户认为旧结论不成立；旧条件的证据不能代表重开后的结果。
+        blockers.append({"code": "reopened_without_progress",
+                         "detail": "任务重开后尚未产生新的实质进展："
+                                   "旧验证不能替新结果背书"})
+    open_findings = [str(item.get("finding_id") or "")
+                     for item in RP.blocking_findings(state)]
+    if open_findings:
+        blockers.append({"code": "findings_open",
+                         "detail": "未闭合 blocking/major finding："
+                                   + "、".join(open_findings)})
+    verification = gates
+    if not blockers and verification is None:
+        verification = verification_gates(state, cache=cache)
+    if verification is not None and not verification.get("passed"):
+        for reason in verification.get("reasons") or []:
+            blockers.append({"code": str(reason.get("code") or "gate"),
+                             "detail": str(reason.get("detail") or "")})
+    return {
+        "schema": "copilot-closure-readiness/v1",
+        "ready": not blockers,
+        "digest": closure_verification_digest(state),
+        "all_actions_terminal": not pending,
+        "criteria_satisfied": not unmet and bool(criteria),
+        "final_evidence_recorded": not missing_refs,
+        "required_tests_completed": bool(tests_ok),
+        "tests_source": tests_source,
+        "no_pending_required_work": not pending and not open_findings,
+        "verification_passed": None if verification is None
+        else bool(verification.get("passed")),
+        "blockers": blockers,
+    }
+
+
+def closure_blockers_text(readiness: dict) -> list[str]:
+    """把收口准入缺口渲染成简短可读文本；JSON 仍保留结构化的 code/detail。"""
+    rows = []
+    for item in (readiness or {}).get("blockers") or []:
+        if isinstance(item, dict):
+            code = str(item.get("code") or "").strip()
+            detail = str(item.get("detail") or "").strip()
+            rows.append(f"{code}: {detail}" if code and detail
+                        else code or detail)
+        else:
+            rows.append(str(item))
+    return rows
+
+
 capture_code_snapshot = CS.capture_code_snapshot
 governance_paths = CS.governance_paths
 _evidence_paths = CS.evidence_paths
@@ -4082,7 +4389,7 @@ def list_sol_think_calls(state: dict) -> list[dict]:
 
 def record_sol_call(path: str, call: dict, *, mode: str = "",
                     materials_sha256: str = "", trigger: str = "",
-                    reason: str = "") -> dict:
+                    reason: str = "", obligation_id: str = "") -> dict:
     """登记一次已完成的 SOL 调用（CONSULT / PLAN / REVIEW 共用）。
 
     SOL 是建议层：REVIEW 的 findings 以 `advisory` 进入 Finding 台账，主代理
@@ -4112,6 +4419,19 @@ def record_sol_call(path: str, call: dict, *, mode: str = "",
     record["question"] = str(record.get("question") or "")[:4000]
     record["stage"] = str(record.get("stage") or "")[:40]
     record["progress_digest"] = str(record.get("progress_digest") or "")
+    # 事件快照：动态事件与后续调用只与“上次判断时的事实”比较，不需要重新推理，
+    # 也不把证据条数当作认知价值。缺这一项，真实记录上的实质证据变化/决策点/
+    # 合同修订就无法被判为“新增事件”，调度会退化成只在升级型信号上触发。
+    if resolved in ("CONSULT", "PLAN"):
+        if not isinstance(record.get("sol_event_snapshot"), dict):
+            record["sol_event_snapshot"] = RP.sol_event_snapshot(state)
+        if not record.get("closure_key"):
+            record["closure_key"] = RP.closure_key(state)
+        # 收口判断的身份：记录当时的最终验证摘要，后续去重/失效按它比较。调用方
+        # （生命周期调度）已在调用前确认摘要与义务一致；这里只兜底补齐。
+        if record["stage"] == "closure" \
+                and not record.get("final_verification_digest"):
+            record["final_verification_digest"] = closure_verification_digest(state)
     # 采纳状态：未登记时为空，由 record_sol_acceptance 显式回填。
     if not isinstance(record.get("acceptance"), dict):
         record["acceptance"] = {"status": "pending"}
@@ -4141,6 +4461,19 @@ def record_sol_call(path: str, call: dict, *, mode: str = "",
             "priority": len(record.get("priority") or []),
             "verify": len(record.get("verify") or []),
         })
+    # 调度结算：把真实调用结算到对应义务。义务编号过期只记录“未关联”，不丢
+    # 已经付费得到的记录（台账事实优先于调度簿记）。
+    if obligation_id:
+        record["obligation_id"] = str(obligation_id)
+        try:
+            resolve_sol_obligation(state, obligation_id, status="satisfied",
+                                   source="executed", call_id=record["call_id"])
+            record["obligation_link"] = "linked"
+        except GovernanceError as exc:
+            record["obligation_link"] = "unresolved"
+            record["obligation_link_note"] = str(exc)[:300]
+        detail["obligation"] = {"id": str(obligation_id),
+                                "link": record["obligation_link"]}
     state.setdefault(SOL_CALLS_KEY, []).append(record)
     _history(state, "sol_call_completed", detail)
     save_state(path, state)
@@ -4461,7 +4794,8 @@ def acceptance_quality(calls: list[dict]) -> dict:
 def record_sol_call_failure(path: str, *, mode: str = "CONSULT",
                             error_code: str = "", detail: str = "",
                             materials_sha256: str = "",
-                            model: str = "") -> dict:
+                            model: str = "", obligation_id: str = "",
+                            stage: str = "") -> dict:
     """登记一次失败的 SOL 调用；失败不改变任务阶段，也不阻断主代理继续。"""
     state = load_state(path)
     resolved = str(mode or "CONSULT").upper()
@@ -4472,6 +4806,8 @@ def record_sol_call_failure(path: str, *, mode: str = "CONSULT",
         "call_id": "SC" + secrets.token_hex(12),
         "task_id": str(state.get("task_id") or ""),
         "mode": resolved,
+        # 阶段只用于审计定位（例如收口窗口失败）：失败记录不构成任何结论。
+        "stage": str(stage or "")[:40],
         "status": "failed",
         "error": str(error_code or "sol_error"),
         "detail": str(detail or "")[:2000],
@@ -4479,6 +4815,17 @@ def record_sol_call_failure(path: str, *, mode: str = "CONSULT",
         "model": model,
         "created_at": now_iso(),
     }
+    # 失败也结算到义务：义务转为 failed（带真实错误码），不重试、不换 Provider。
+    if obligation_id:
+        record["obligation_id"] = str(obligation_id)
+        try:
+            resolve_sol_obligation(state, obligation_id, status="failed",
+                                   source="executed", call_id=record["call_id"],
+                                   reason=str(error_code or "sol_error"))
+            record["obligation_link"] = "linked"
+        except GovernanceError as exc:
+            record["obligation_link"] = "unresolved"
+            record["obligation_link_note"] = str(exc)[:300]
     state.setdefault(SOL_CALLS_KEY, []).append(record)
     _history(state, "sol_call_failed", {
         "call_id": record["call_id"],
@@ -5042,6 +5389,32 @@ def _gate_findings(state: dict) -> dict:
     return {"passed": not reasons, "reasons": reasons}
 
 
+def sol_schedule_warnings(state: dict) -> list[str]:
+    """收口时的 SOL 调度提醒（**非阻断**）：未执行义务与已漏调的窗口。
+
+    SOL 不是门禁：这些提醒只说明“调度上还有未兑现的认知窗口”，不改变 G1–G3，
+    也不阻止收口。收口快照会同时写入 `closure.sol_schedule`，便于事后核对。
+    """
+    rows = SS.obligations(state)
+    if not rows:
+        return []
+    pending = [item for item in rows
+               if isinstance(item, dict) and item.get("window") == "open"
+               and str(item.get("status") or "") in ("due", "claimed", "in_flight")]
+    missed = [item for item in rows if isinstance(item, dict) and SS.is_missed(item)]
+    warnings: list[str] = []
+    if pending:
+        ids = ", ".join(str(item.get("obligation_id")) for item in pending[:6])
+        warnings.append(
+            f"SOL 调度：收口时仍有 {len(pending)} 个未执行的调度义务（{ids}）；"
+            "SOL 不是门禁，收口不受影响，但覆盖率统计会体现这一项。")
+    if missed:
+        ids = ", ".join(str(item.get("obligation_id")) for item in missed[:6])
+        warnings.append(
+            f"SOL 调度：已关闭但未执行的窗口 {len(missed)} 个（{ids}），计为漏调。")
+    return warnings
+
+
 def closure_check(state: dict, *, task_dir: str = "",
                   cache: dict | None = None) -> dict:
     """三道门收口检查。`cache` 只在单次命令内复用证据摘要。"""
@@ -5066,10 +5439,11 @@ def closure_check(state: dict, *, task_dir: str = "",
             "gates": risks, "reasons": reasons,
             "quality": quality["quality"],
             "warnings": contract_source_warnings(state)
-            + evidence_warnings(state, task_dir=task_dir)}
+            + evidence_warnings(state, task_dir=task_dir)
+            + sol_schedule_warnings(state)}
 
 
-def close_task(path: str, *, by: str = "zcode-native",
+def close_task(path: str, *, by: str = "zcode-native", sol_entry: str = "",
                cache: dict | None = None) -> dict:
     if cache is None:
         cache = {}
@@ -5083,12 +5457,29 @@ def close_task(path: str, *, by: str = "zcode-native",
     if not check["passed"]:
         summary = "; ".join(f"{r.get('gate')}:{r.get('code')}" for r in check["reasons"])
         raise GovernanceError(f"G1–G3 未通过，不能收口：{summary}")
+    # 最终工程验证的确定性缺口：合同要求执行测试，却没有任何对应的验证痕迹。
+    # G1–G3 不解释合同 test_policy 的执行情况，所以这里单独判一次；这不是新增
+    # 门禁，而是把合同自己写明的要求落实到收口动作上（drive 与 closure 共用）。
+    tests_ok, _tests_source = test_verification_evidence(state)
+    if not tests_ok:
+        raise GovernanceError(
+            "合同要求执行的测试没有任何验证证据（执行报告或带 capture_cmd 的命令"
+            "输出）：最终工程验证尚未完成，不能收口；先执行测试并登记结果。")
     if _reopened_without_progress(state):
         # 重开后的 PASS 必须由重开之后的新进展支撑：否则直接 close 会绕过
         # evaluate 的同一判定，让“用户认为旧结论不成立”变成一句空话。
         raise GovernanceError(
             "任务重开后尚未产生新的实质进展（新证据、工作项结果或条件重核销）："
             "旧 PASS 不能直接复用；先完成重开要求的工作再收口。")
+    pending_acceptance = closure_acceptance_pending(state)
+    if pending_acceptance:
+        # 顺序：最终验证 → SOL 收口判断 → ZCode 独立验收 → G1–G3 收口。
+        # 缺这一步就收口，等于让自动路径跳过 ZCode 对 SOL 结论的判断；收口后再登记
+        # 又会被 CLOSED 拒绝。这里不要求 SOL PASS（rejected 同样有效）。
+        raise GovernanceError(
+            f"收口 CONSULT {pending_acceptance['call_id']} 还没有 ZCode 的采纳判断："
+            f"先执行 sol-accept --call-id {pending_acceptance['call_id']} "
+            "--status accepted|modified|rejected（并写明依据），再收口。")
     quality = quality_summary(state, cache=cache)
     # 原始质量结论与任务关闭状态分离：用户接受 PWW 不把 verdict 改写为 PASS。
     verdict = PWW if quality.get("verdict") == PWW else "pass"
@@ -5102,13 +5493,25 @@ def close_task(path: str, *, by: str = "zcode-native",
         "accepted_at": quality.get("accepted_at") or "",
         "binding_current": quality.get("binding_current"),
     }
+    # 收口前把调度窗口按事实关闭，并快照进 closure：收口之后仍能核对“当时还有
+    # 哪些义务未执行”。这不是门禁——closure_check 已在上方按 G1–G3 判定。
+    schedule_before = SS.summary(state)
+    sync_sol_schedule(state, closed=True)
+    schedule_snapshot = SS.summary(state)
+    schedule_snapshot["at_close"] = {
+        "pending_before_close": schedule_before.get("pending", 0),
+        "missed_before_close": schedule_before.get("missed", 0),
+    }
     state["closure"].update({
         "closed": True,
         "closed_by": by,
+        "sol_entry": str(sol_entry or "unspecified"),
+        "sol_schedule": schedule_snapshot,
         "verdict": verdict,
         "quality": closure_quality,
         "iteration_id": _current_iteration_id(state),
         "closed_at": now_iso(),
+        "final_verification_digest": closure_verification_digest(state),
         "gate": {"passed": True, "iteration_id": _current_iteration_id(state),
                  "reasons": []},
     })
@@ -5787,12 +6190,43 @@ def continuation(state: dict, *, cache: dict | None = None,
                                 "--block-id <id> --reason <依据>")
         return base
     if phase == "PASS":
+        # PASS 只说明 G1–G3 通过；最终工程验证（合同要求的测试真的执行过）仍可能
+        # 缺口。此时既不能执行收口 CONSULT，也不能收口：把缺口作为必须继续的
+        # 验证动作交回主代理，而不是让调用方去执行一个必然失败的 close。
+        readiness = ev.get("closure_readiness")
+        if not isinstance(readiness, dict):
+            readiness = closure_readiness(state, cache=cache)
+        if not readiness.get("ready"):
+            base.update({
+                "required": True,
+                "action": "verify",
+                "next_command": ("执行合同要求的必要测试并登记验证结果"
+                                 "（copilot_dispatch.py evidence --capture-cmd "
+                                 "<cmd> ... 或 report），再重新 drive"),
+                "reason": ("G1–G3 已通过，但最终工程验证尚未完成："
+                           + "；".join(closure_blockers_text(readiness))),
+            })
+            return base
         base.update({
             "required": True,
             "action": "close",
             "next_command": "copilot_auto.py drive --state <state>（G1–G3 已通过，立即收口）",
             "reason": "完成条件与 G1–G3 已通过：收口是下一步，不是等待用户",
         })
+        pending_acceptance = closure_acceptance_pending(state)
+        if pending_acceptance:
+            # 收口前还欠 ZCode 对 SOL 收口判断的独立验收（顺序：验证 → E → 验收 →
+            # G1–G3）。这不是 SOL 门禁：采纳、修改、否决任一记录都能继续。
+            base.update({
+                "action": "accept",
+                "next_command": (
+                    "copilot_dispatch.py sol-accept --state <state> --call-id "
+                    f"{pending_acceptance['call_id']} --status accepted|modified|rejected"
+                    " --rationale <依据>"),
+                "reason": ("收口 CONSULT "
+                           f"{pending_acceptance['call_id']} 等待 ZCode 独立验收："
+                           "先登记采纳/修改/否决，再收口"),
+            })
         return base
     ready = [str(a.get("id") or "") for a in ready_actions(state)]
     if ready:
@@ -5858,26 +6292,118 @@ def continuation(state: dict, *, cache: dict | None = None,
 
 def sol_advice_summary(state: dict, *, gates_passed: bool = False,
                        user_request: bool = False, review_requested: bool = False,
-                       triggers: list[str] | None = None) -> dict:
+                       triggers: list[str] | None = None,
+                       closure_ready: dict | None = None,
+                       cache: dict | None = None) -> dict:
     """SOL 默认认知建议（只读）：任务类型 + 复杂度 + 覆盖 + 新信号，不改变
     阶段与门禁。
 
     简单任务返回 `action=none`；非简单任务在启动阶段返回 `consult`、在形成现场
     事实后返回 `plan`；已有有效结论且无升级型新信号时返回 `reuse`；`review` 只在
     用户明确要求时给出。不设调用次数上限。
+
+    `closure_ready` 是 E 阶段（收口 CONSULT）的唯一准入：未给出时按当前状态现算。
+    收口判断只在“最终工程验证完成”后才成立，`gates_passed` 只是旧的兼容入参。
     """
     state_triggers = [str(t.get("name") or "")
                       for t in state.get("admission_triggers") or []
                       if isinstance(t, dict) and t.get("name")]
+    readiness = closure_ready if isinstance(closure_ready, dict) \
+        else closure_readiness(state, cache=cache)
     return RP.sol_advice(
         state,
         calls=[item for item in iter_sol_calls(state)
                if isinstance(item, dict) and item.get("status") == "completed"],
         triggers=list(triggers or []) + state_triggers,
         gates_passed=gates_passed,
+        closure_ready=readiness,
         user_request=user_request,
         review_requested=review_requested,
         workspace=str(state.get("workspace") or ""))
+
+
+def sync_sol_schedule(state: dict, *, closed: bool = False,
+                      advice: dict | None = None,
+                      now: str | None = None) -> dict:
+    """把当前生命周期建议物化为调度义务（只改内存状态，调用方负责保存）。
+
+    这是调度层的唯一写入口：义务的创建、刷新、复用满足、窗口关闭都在这里发生，
+    其它命令通过它读取「当前应当执行哪一次调用」。函数不调用模型、不读写其它
+    文件，也不改变阶段与 G1–G3。
+    """
+    moment = now or now_iso()
+    advice = advice if isinstance(advice, dict) else sol_advice_summary(state)
+    schedule = SS.ensure_schedule(state)
+    is_closed = closed or bool((state.get("closure") or {}).get("closed"))
+    changes = SS.sync(schedule, state, advice, now=moment, closed=is_closed)
+    if changes:
+        _history(state, "sol_schedule_sync", {
+            "changes": changes,
+            "summary": SS.summary(state),
+        })
+    return {"advice": advice, "changes": changes, "schedule": SS.summary(state)}
+
+
+def resolve_sol_obligation(state: dict, obligation_id: str, *, status: str,
+                           source: str = "executed", call_id: str = "",
+                           reason: str = "") -> dict | None:
+    """把一次真实调用/失败/跳过结算到对应义务（只改内存状态）。
+
+    结算不是完成证明：它只记录调度事实（谁执行、何时、结果引用）。义务必须属于
+    当前任务且仍处于打开窗口；重复结算幂等返回同一义务。
+    """
+    target = str(obligation_id or "").strip()
+    if not target:
+        return None
+    if status not in SS.OBLIGATION_STATUSES:
+        raise GovernanceError(f"未知义务状态：{status}")
+    for item in SS.obligations(state):
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("obligation_id") or "") != target:
+            continue
+        if str(item.get("task_id") or "") != str(state.get("task_id") or ""):
+            raise GovernanceError(
+                f"调度义务 {target} 不属于当前任务：拒绝跨任务结算。")
+        item["source"] = source
+        finished = now_iso()
+        item["finished_at"] = finished
+        if call_id:
+            item["call_id"] = call_id
+        if reason:
+            item["failure" if status == "failed" else "result_note"] = reason[:1000]
+        if status == "failed":
+            item["attempts"] = int(item.get("attempts") or 0) + 1
+        # 结算即关闭窗口：已执行的义务不应在收口时被算成“仍未执行”。
+        SS.settle(item, status=status, now=finished, reason=source)
+        return item
+    raise GovernanceError(f"当前任务的调度义务中不存在：{target}")
+
+
+def record_sol_obligation_error(state: dict, obligation_id: str, reason: str, *,
+                                max_attempts: int = 3) -> dict | None:
+    """前置条件失败时记一次尝试；连续失败后终止该义务，避免无限重试。
+
+    只处理“还没发起请求就失败”的情形（材料超限、参数不合法等）：请求本身失败
+    由 `record_sol_call_failure` 直接结算为 failed。
+    """
+    target = str(obligation_id or "").strip()
+    if not target:
+        return None
+    for item in SS.obligations(state):
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("obligation_id") or "") != target:
+            continue
+        item["attempts"] = int(item.get("attempts") or 0) + 1
+        item["last_error"] = str(reason or "")[:500]
+        if item["attempts"] >= max(1, int(max_attempts)):
+            item["failure"] = str(reason or "")[:1000]
+            finished = now_iso()
+            item["finished_at"] = finished
+            SS.settle(item, status="failed", now=finished, reason="attempts-exhausted")
+        return item
+    raise GovernanceError(f"当前任务的调度义务中不存在：{target}")
 
 
 def evaluate(state: dict, *, cache: dict | None = None) -> dict:
@@ -5889,8 +6415,13 @@ def evaluate(state: dict, *, cache: dict | None = None) -> dict:
     phase = result.get("phase")
     if phase in ("RUNNING", "PARTIAL", "PASS"):
         # SOL 建议只是提示：不派生工作项、不改变阶段、不影响门禁。
-        advice = sol_advice_summary(state, gates_passed=(phase == "PASS"))
+        # 收口准入只算一次：E 阶段（收口 CONSULT）不因工作项耗尽而成立，只有
+        # 最终工程验证真的完成才成立。
+        readiness = closure_readiness(state, cache=cache)
+        advice = sol_advice_summary(state, gates_passed=(phase == "PASS"),
+                                    closure_ready=readiness, cache=cache)
         result["sol"] = advice
+        result["closure_readiness"] = readiness
         if advice.get("action") in ("consult", "plan", "review", "think"):
             prefix = "可选" if advice.get("recommended_action") == "optional" else "建议"
             command = advice.get("command") or ""
@@ -5898,6 +6429,14 @@ def evaluate(state: dict, *, cache: dict | None = None) -> dict:
                 mode = advice.get("mode") or advice.get("action", "").upper()
                 result.setdefault("next_commands", []).insert(
                     0, f"{prefix}：{command}（SOL {mode}，advisory）")
+        # 调度摘要（只读）：把「应调用」变成可核对的义务编号；不改变阶段与门禁。
+        result["sol_schedule"] = SS.summary(state)
+        pending = result["sol_schedule"].get("next")
+        if pending:
+            result.setdefault("next_commands", []).append(
+                f"调度：义务 {pending['obligation_id']}"
+                f"（{pending['family']}/{pending['event']}，{pending['mode']}）待执行；"
+                "`sol-schedule` 给出可直接执行的命令")
     # 续跑判定：忽略它不会改变状态，但阶段报告与工作项回填必须据此继续。
     result["continuation"] = continuation(state, cache=cache, evaluation=result)
     return result
@@ -5999,6 +6538,17 @@ def render_status(state: dict, evaluation: dict | None = None, *,
             lines.append(f"阻塞[{scope}]：{block.get('reason')}"
                          f"（需要：{block.get('needs')}）")
     reason = ev.get("gate") or ev.get("reason")
+    readiness = ev.get("closure_readiness")
+    if ev.get("phase") == "PASS" and isinstance(readiness, dict):
+        digest = str(readiness.get("digest") or "")
+        if readiness.get("ready"):
+            lines.append("最终验证：已完成（摘要 " + digest
+                         + "）；SOL 收口判断与收口按调度执行")
+        else:
+            lines.append("最终验证：未完成（摘要 " + digest + "）；"
+                         "不收口、不执行收口 CONSULT")
+            lines.extend("  - " + item
+                         for item in closure_blockers_text(readiness))
     if ev.get("gate") is not None:
         gate = ev["gate"]
         if isinstance(gate, dict) and "gates" in gate:

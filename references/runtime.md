@@ -7,10 +7,13 @@
 
 - **本地判定**：阶段判定、工作项派生、门禁检查只读状态文件与证据文件，不调用网络、模型或
   子进程（命令采集只在 CLI 显式请求时执行）。`sol-consult` / `sol-plan` / `sol-review`
-  是仅有的例外：它们由主代理显式调用（CONSULT / PLAN 按生命周期建议、REVIEW 由用户
-  明确要求），结果统一写入 `sol_calls`（历史 `sol_reviews` / `sol_advisories` 只读兼容），
-  不自动改变阶段、不参与 PARTIAL 派生；CONSULT / PLAN 也不进入 Finding 台账或 G1–G3。
-  SOL 调用失败只登记真实原因，不产生阻塞或派生工作项。
+  是仅有的例外：结果统一写入 `sol_calls`（历史 `sol_reviews` / `sol_advisories` 只读
+  兼容），不自动改变阶段、不参与 PARTIAL 派生；CONSULT / PLAN 也不进入 Finding 台账或
+  G1–G3。SOL 调用失败只登记真实原因，不产生阻塞或派生工作项。
+- **SOL 由生命周期调度，不靠文案提醒**：v9.6 起 CONSULT / PLAN 按阶段物化为**调度义务**
+  并持久化在 `state.sol_schedule`；生命周期命令在自身事务内**有界执行**（每条命令最多
+  1 个义务、1 次请求），而不是只打印命令等主代理记得执行。义务执行与否都不改变阶段、
+  门禁、BLOCKED 判定或 `continuation`，详见 §5。
 - **PARTIAL 不是终点**：PARTIAL 表示还有工作可做，运行时必须派生下一步，而不是停止或
   等待外部判断。
 - **无人工上限**：没有轮次上限、Token 预算、费用阈值或评审次数限制。唯一的循环保护是
@@ -122,8 +125,11 @@
 2. CLOSED → 打印状态，退出 0；
 3. BLOCKED → 打印原因与 `needs`；若 `continuation.required` 为真（口径不一致）抛出内部
    错误，否则退出 11；
-4. PASS → `close_task`，退出 0；
-5. RUNNING → 取前 `--max-actions` 个 ready 项，写入调度领取并把工作单打印出来；
+4. PASS → 先查最终验证准入（`closure_readiness`）：有缺口就打印缺口并退出 10，既不执行
+   E 也不收口；准入通过才按 §5 消费 family E 的收口认知窗口（`--sol auto` 时真的执行一次
+   CONSULT），再 `close_task`，退出 0；
+5. RUNNING → 先按 §5 有界消费 1 个到期义务（每次 `drive` 最多一次，只展示或执行，
+   不改变阶段），再取前 `--max-actions` 个 ready 项，写入调度领取并把工作单打印出来；
    `backend=native` 且工作项属于已登记计划时，经 `native_bridge.build_dispatch` 写出
    `dispatch.json`（先派发、后领取，避免计划漂移）；退出 10。
 6. PARTIAL → `derive_work`；若派生成功则 `begin_iteration`（记录本轮工作项与证据快照，
@@ -216,12 +222,118 @@ BLOCKED/PASS 规避上限、以及新回合先 `status --json` 核实再继续�
 `closure-check` 的退出码与结论一致：PASS=0、FAIL=1（`--json` 同样），避免“检查过”被误当
 “通过”。
 
-## 5. 收口与重开
+## 5. SOL 生命周期调度（v9.6）
+
+SOL 仍是 advisory：调度只决定**什么时候该有一次认知判断**，不决定阶段、门禁或技术方案。
+实现分两层——`scripts/sol_schedule.py` 是纯策略/投影层（无网络、无文件 I/O、无门禁），
+`governance.py` 把义务落盘到 `state.sol_schedule`，`copilot_dispatch.py` 在生命周期命令内
+有界执行。
+
+**五个认知窗口（family A–E，与 `review_policy.sol_advice` 同一口径）**
+
+| 窗口 | 时机 | 模式 |
+|---|---|---|
+| A | 启动 / 未覆盖当前合同的 CONSULT | CONSULT（understanding） |
+| B | 调查后方案取舍（方案类任务、声明触发、中高复杂或 ≥2 工作项） | PLAN（planning） |
+| C | 重大新证据（六类事件：`material-evidence-change` / `decision-point` / `risk-escalation` / `replan-history` / `scope-changed` / `reopened`） | CONSULT（development） |
+| D | 里程碑复盘（中高复杂 + ≥2 完成项，或 ≥1 完成项 + 已核销条件；recommended） | CONSULT（stage） |
+| E | 收口综合判断（最终工程验证完成后、G1–G3 收口之前的非简单有进展任务，medium 也是 recommended） | CONSULT（closure） |
+
+**义务与窗口**：每条义务记录 `obligation_id`（`SO<n>`）、family / mode / stage / event /
+instance、`contract_sha256`、`level`、`status`、`window`。`status` 取值 `due` / `claimed` /
+`in_flight` / `satisfied` / `failed` / `skipped`；`window` 只有 `open` / `closed`。
+
+- **义务 key ≠ 复用 key**：义务 key 含实例与合同指纹（同一窗口不重复创建）；复用 key
+  只含认知对象，因此同一合同、同一材料、同一问题会被判为 `reuse` 并直接满足未闭合义务，
+  不再付费。
+- **窗口只在事实发生后关闭**：更晚窗口真的被满足时，更早仍未满足的窗口才记为
+  `superseded`（漏调可见）；刚创建、只给提示、预算耗尽都不关闭窗口，避免把“还没来得及
+  做”误判成漏调。`due` / `claimed` 落在已关闭窗口上即派生 `missed`。
+- **同一 family + event 只保留一个未执行窗口**：连续进展会反复打开同一里程碑窗口，旧的
+  未执行窗口在新建时即记 `skipped` + `skip_by=superseded-by-newer` 并关闭（历史状态里
+  已堆积的多条打开窗口在下一次同步时同样收敛成一条）；`in_flight` 不被取代。否则一次
+  连续进展就会堆出多条打开窗口，收口时被误算成多条漏调。
+- **D / E 都是 recommended（含 medium）**：里程碑复盘与收口综合判断对中高复杂有进展任务
+  是必需窗口；`due_obligations()` 只取 recommended，标成 optional 会让它们结构性无法自动
+  执行（`drive` / `closure` 永远取不到）。历史 `optional` 义务在收口时按
+  `skipped` + `skip_by=not-required` 结算为合理跳过，`missed` 只统计确实应执行而未执行的
+  窗口；收口前先结算“更晚窗口已满足”，更早的里程碑记 `superseded` 而不是漏调。
+- **收口覆盖最新里程碑**：E 已满足时仍未执行的 D 窗口记 `skipped` +
+  `skip_by=closure-covered`（收口综合判断覆盖了里程碑复盘的认知对象）——最后一批进展刚
+  打开 D 窗口就收口时不计漏调；其它更早窗口（A/B/C）仍按 `superseded` 记漏调。
+- **合同修订**：旧合同下仍在 open 的义务显式记为 `skipped` + `skip_by=contract-amended`
+  并关闭窗口——旧事实留在审计里，但不进入新合同的覆盖率分母。
+
+**有界执行**
+
+- 执行点：`start` / `plan` / `record` / `rerun` / `criterion` / `judgment` / `evidence` /
+  `report` / `accept` / `decide` / `block` / `unblock` 与 `drive` 的调度步
+  （`_sol_schedule_step`），以及 `closure --close` 与 `sol-schedule --execute`。
+- **上限 1 个义务 / 1 次请求 per 命令**：不存在每任务固定次数上限，也不自动重试；剩余
+  窗口留给下一条命令（`continuation` 仍要求继续，因此驱动链会自然走到）。
+- 策略 `--sol auto|advise|off`（默认 `auto`）：`auto` 直接经既有 SOL 通道执行到期义务；
+  `advise` 只打印可直接执行的命令与义务 id；`off` 静默。环境变量 `COPILOT_SOL_AUTO`
+  可覆盖：`off` 强制离线，`on` 允许执行；测试进程（`unittest` 已加载）默认不执行，只有
+  显式 `on` 的调度测试才走真实通道。
+- **只读命令永不执行**：`next` / `status` / `sol-schedule` / `sol-stats` / `closure-check`
+  只物化并展示义务，不写 state、不发请求。
+- **可执行命令只有一个来源**：`sol-schedule` 与调度步输出的命令带真实状态路径与
+  `--obligation`，可原样执行；`evaluate` / `review-admission` 里的 `sol.command` 仍是
+  含 `<>` 占位的**模板**，只用于说明意图，不能当作已执行或可直接执行。
+- **收口顺序固定**：最终工程验证完成（收口准入通过）→ SOL 收口综合判断（family E，
+  `prefer_family="E"`）→ ZCode 最终验收（`sol-accept`，accepted / modified / rejected 任一）
+  → `close_task` 的 G1–G3 收口。E 窗口不占用 `drive` RUNNING 分支的那个额度，
+  `close_task` 记录的 `closure.sol_entry`（`drive` / `closure-command`）标明本次收口由哪个
+  入口完成；收口时仍 open 的窗口记为 `pending_before_close`，未满足的记
+  `missed_before_close`。验收这一步是强制的顺序事实：`governance.closure_acceptance_pending()`
+  在当前摘要的收口 CONSULT 尚无裁决记录时让 `close_task` 失败关闭、`continuation` 给
+  `action="accept"`、`drive` / `closure --close` 停在 `EXIT_EXECUTE` / `EXIT_CONTINUE`。
+  裁决不是 SOL 批准权：三种结论都可继续，验收也不替代用户对质量报告的接受。
+- **收口准入唯一口径（v9.6.1）**：`governance.closure_readiness(state)` 是 E 窗口与收口
+  的唯一准入，返回 `ready` / `digest` / `all_actions_terminal` / `criteria_satisfied` /
+  `final_evidence_recorded` / `required_tests_completed` / `no_pending_required_work` /
+  `verification_passed` / `blockers`。先查便宜事实（工作项终态、完成条件、证据、必要
+  测试、重开后无进展、开放 finding），全部通过才算确定性门禁（不含质量报告的**用户
+  接受**——那是 ZCode 验收之后的用户一步，不能把 SOL 挡在它后面）。工作项全部关闭、
+  G1–G3 通过都**不等于**最终验证完成：合同 `test_policy.required=true` 时必须存在带
+  `capture_cmd` 的采集证据（词元按序匹配声明命令，允许插入 `-B` 等运行器参数）或结构化
+  质量报告给出 `required_tests_executed=true`。
+- **收口摘要（`final_verification_digest`）**：只含验证事实（合同指纹、重开迭代、条件状态
+  与引用证据、终态工作项、采集证据与报告摘要）与材料口径（`MATERIALS_SCHEMA`）的
+  `sha256[:16]`。E 义务的 instance 就是它：调度义务与当前摘要不符时拒绝付费调用；同一
+  摘要再次到达判 `reuse` 不二次付费；重跑测试、新增/修订证据或材料生成口径变化使摘要
+  变化，旧 E 结论不再覆盖新结果，需要新一轮验证后重新派生 E。材料内也自报口径版本，
+  审计能看出这份结论是按哪套材料规则得出的。
+- **入口一致**：`record` / `rerun` / `criterion` / `evidence` 等回填命令只更新义务，
+  `drive` 在验证缺口时返回 `EXIT_EXECUTE` 并拒绝执行 E，`closure --close` 在验证缺口时
+  直接失败（退出码 1）而不收口，`sol-consult --stage closure` 在缺口或摘要不符时拒绝调用，
+  `close_task` 对缺测试证据的任务拒绝收口、对等待验收的收口 CONSULT 同样拒绝收口。
+  任何入口都不能绕过验证、E 调度或 ZCode 验收。
+- **E 是 advisory**：收口 CONSULT 返回的风险与遗漏由 ZCode 独立核实、修复并定向验证；
+  它不是门禁，不需要 SOL PASS 才能收口，失败只降级。
+- **失败降级**：请求失败（配额、网络、超时、截断、模型身份不符等）按 `record_sol_obligation_error`
+  记录真实原因，`max_attempts=3` 后把义务置 `failed` 并继续工程推进；失败不冻结工作项、
+  不改变阶段、退出码仍为 0，只是 `sol_schedule_warnings` 里可见。
+- **并发**：SOL 通道由 `.sol-review.lock` 独占；拿不到锁抛 `LockBusyError`，命令回退为
+  “本轮不执行”，不排队重试、不重复付费。`sol-consult` / `sol-plan` 支持
+  `--lock-timeout <秒>`。
+
+**覆盖率统计（观测，不是门禁）**：`sol-stats --state <path>` 或 `--workspace <dir>` 按
+合同口径输出应调/实际执行/失败/复用/合理跳过/应调未执行与原因、CONSULT 与 PLAN 的阶段
+分布、六类事件分布、采纳（accepted/modified/rejected）、tokens 与延迟。分母只统计当前
+合同下的适用窗口（简单任务、无进展任务、用户明确要求 REVIEW 之外的窗口不计入），并且
+只有**真实请求成功**才计入执行；`reuse` 单独计数，打印命令、预检通过与模拟响应都不算
+执行。分母为 0 时输出 `not_registered` 而不是 100%。
+
+## 6. 收口与重开
 
 - `closure_check` 依次检查 G1–G3（工作项终态、合同/条件/证据/台账、无停摆），全部通过才
   `passed=true`；G4 已退役，不再参与。
-- `closure --close` 需要 G1–G3 通过，写入 `closure`（时间、`by`、`iteration_id`、门禁快照）
-  并把阶段固定为 CLOSED；未结束的迭代同时标记为 `CLOSED` 并补 `ended`，之后的修改一律拒绝。
+- `closure --close` 需要 G1–G3 通过，写入 `closure`（时间、`by`、`iteration_id`、门禁快照、
+  `sol_entry`）并把阶段固定为 CLOSED；未结束的迭代同时标记为 `CLOSED` 并补 `ended`，
+  之后的修改一律拒绝。收口前先消费 family E 的收口认知窗口（§5）：成功则是收口前的
+  最后一条认知记录，未执行则把仍 open 的窗口记入 `closure.sol_schedule.at_close`，
+  两者都不影响 CLOSED 的成立。
 - `reopen --reason ... --authorized-by user` 需要显式用户授权声明；它保存旧 closure 快照到
   `reopen_history`（含授权声明），清理收口状态，任务回到 RUNNING/PARTIAL，并开一条新迭代
   承接后续工作（已收口的旧迭代保持 `CLOSED`，不改写历史）。旧快照在写入前做深拷贝，避免
@@ -230,7 +342,7 @@ BLOCKED/PASS 规避上限、以及新回合先 `status --json` 核实再继续�
   稳定与历史复核的过期判断。**排除历史 `origin=g4-review` 工作项**以保持旧状态摘要稳定；
   新任务不再产生该类工作项。
 
-## 6. 状态保真与恢复
+## 7. 状态保真与恢复
 
 - **原子写入**：同目录临时文件 + `fsync` + `os.replace`，并 `fsync` 目录；中断不会留下半个
   JSON。
@@ -270,7 +382,7 @@ BLOCKED/PASS 规避上限、以及新回合先 `status --json` 核实再继续�
 - 连续无进展、token 异常增长、权限错误反复出现时先 `/goal pause` 并排查。
 - 不引入常驻服务、不递归启动 ZCode、不修改宿主安装包与运行时。
 
-## 7. 何时可以 BLOCKED
+## 8. 何时可以 BLOCKED
 
 只有以下情况才允许 `block --reason ... --needs ...`：
 
@@ -321,7 +433,7 @@ BLOCKED 阻止的是收口和受阻动作，不是事实记录。允许 `record`
 `contract --amend`：BLOCKED 下允许，但会更新合同指纹并使旧正式 REVIEW 授权失效，
 不属于上述受控写入白名单。
 
-## 8. 恢复清单
+## 9. 恢复清单
 
 中断或回到旧任务时按顺序核对：
 

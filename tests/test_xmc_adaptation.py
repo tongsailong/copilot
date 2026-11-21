@@ -79,6 +79,7 @@ class WorkspaceCase(unittest.TestCase):
     def run_guard(self, *, payload: dict | None = None, session: str | None = SESSION,
                   cwd: str | None = None):
         environment = dict(os.environ)
+        environment.setdefault("COPILOT_SOL_AUTO", "off")
         for key in ("COPILOT_STOP_GUARD", "COPILOT_STOP_GUARD_LOG",
                     "ZCODE_SESSION_ID", "CLAUDE_SESSION_ID",
                     "CLAUDE_CODE_SESSION_ID"):
@@ -185,7 +186,8 @@ class CrossTurnResumeTests(WorkspaceCase):
                                 "--state", self.state_path],
                                capture_output=True, text=True,
                                cwd=self.workspace,
-                               env={**os.environ, "ZCODE_SESSION_ID": NEW_SESSION})
+                               env={**os.environ, "ZCODE_SESSION_ID": NEW_SESSION,
+                                    "COPILOT_SOL_AUTO": "off"})
         self.assertIn(bound.returncode, (0, 10, 11), bound.stdout + bound.stderr)
 
         proc = self.run_guard(session=NEW_SESSION)

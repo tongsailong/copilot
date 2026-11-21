@@ -44,9 +44,13 @@
 | A 启动 | 非简单任务默认一次 CONSULT：目标与隐含需求、问题本质、关键矛盾、初步策略、风险、调查方向 | `sol-consult --stage understanding` |
 | B 调查后 | 多步骤 / 多方案 / 重要决策建议一次 PLAN：方案比较、取舍、优先级、阶段目标 | `sol-plan --stage planning` |
 | C 执行期 | 升级型新信号（风险升级/方案失败重规划/任务重开）或合同实质修订时追加 CONSULT | `sol-consult --stage development --force --trigger ...` |
-| D 阶段复盘 | 高复杂任务在重要阶段完成后可做一次成果复盘（可选） | `sol-consult --stage stage` |
-| E 收口前 | 高风险/高复杂任务建议一次综合判断：目标达成、遗漏与剩余风险 | `sol-consult --stage closure` |
+| D 阶段复盘 | 中高复杂任务在重要阶段完成后做一次成果复盘（recommended，同一进度不重复） | `sol-consult --stage stage` |
+| E 收口前 | 最终工程验证完成后（工作项终态、条件核销、证据与必要测试齐备）一次综合判断：目标达成、遗漏与剩余风险 | `sol-consult --stage closure` |
 
+- **E 的时机不是“最后一项关闭”**：收口 CONSULT 以 `closure_readiness` 为唯一准入——工作项
+  终态、条件核销、证据登记、合同必要测试的执行痕迹全部满足后才执行；G1–G3 通过本身不等于
+  最终验证完成。义务的 instance 是 `final_verification_digest`：摘要变化后旧结论不再覆盖新
+  结果，同一摘要不重复付费。机制见 `runtime.md` §5“收口准入”。
 - **追加而不是配额**：`--force --trigger <new-risk|scope-changed|stage-result|
   user-request|...> --reason ...` 是“为什么这次判断可能改变方案/优先级/风险”的决策价值
   声明，不是调用次数上限。
@@ -275,8 +279,8 @@ v8 起原生 Reviewer 已退役，正式 REVIEW 的独立意见只能来自 SOL 
 | 非简单任务启动 | 默认一次 CONSULT（understanding） |
 | 调查后多步骤 / 多方案 / 重要决策 | 建议一次 PLAN（planning） |
 | 出现升级型新信号（风险升级/重规划/重开）或合同修订 | 允许追加一次 CONSULT |
-| 高复杂任务重要阶段完成 | 可选一次阶段复盘 CONSULT（stage） |
-| 收口前高风险 / 高复杂 | 建议一次收口 CONSULT（closure） |
+| 中高复杂任务重要阶段完成 | 一次阶段复盘 CONSULT（stage，同一进度只一次） |
+| 收口前（最终工程验证已完成，含 medium） | 一次收口 CONSULT（closure）；验证缺口未补齐时不执行 |
 | 用户明确要求独立复核（`--review-request`） | 一次 REVIEW |
 | 用户明确要求 SOL 判断（`--user-request`） | 直接一次 CONSULT |
 
