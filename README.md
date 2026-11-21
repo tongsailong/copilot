@@ -1,5 +1,7 @@
 # Copilot — ZCode 原生 Agent 的协作治理 Skill
 
+[![CI](https://github.com/tongsailong/copilot/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/tongsailong/copilot/actions/workflows/ci.yml)
+
 Copilot 是运行在 ZCode 内的**轻量协作治理 Skill**。它把多步骤工程任务变成
 可追踪、可恢复、可审计的合同与状态机，同时**不接管工程执行与技术决策**。
 
@@ -92,6 +94,11 @@ CI 的安全边界（外部 PR 的代码视为不可信）：
 
 `legacy/tests` 有 146 项 v5 契约遗留的失败/错误（99 F + 47 E）与 32 个 skip，**不在 CI 门禁内**，
 也不代表当前版本回归。外部贡献者提交 PR 前请在本地跑通上面三条命令。
+
+当前 `main` 的 CI 为通过状态：运行
+[`44915220688`](https://github.com/tongsailong/copilot/actions/runs/44915220688) 在 Python
+3.10.22 与 3.12.16 上各 `Ran 849 tests` / `OK (skipped=1)`。徽章反映 `main` 最新一次运行结果，
+以 Actions 页面为准。
 
 ## 使用（最小闭环）
 

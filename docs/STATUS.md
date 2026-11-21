@@ -20,6 +20,10 @@
   `HEAD = 9f3d561ac67ae9cb0c9ae2a7b9420ff66b4d0d23`、默认分支 `main`、67 个 commit、
   96 个跟踪文件、823 个可达 blob，`README.md` / `LICENSE` / `scripts/governance.py` 可读，
   `git ls-remote` 的 `refs/heads/main` 与 HEAD 一致。观测时间 2026-11-21T14:24Z。
+  CI 建立后按同样条件再次匿名完整克隆（观测时间 2026-11-21T14:42Z）：
+  `HEAD = 829ac4261e79ca2f1302cb6e4e0c3e1b1585cf42`、`main`、69 个 commit、97 个跟踪文件、
+  830 个可达 blob，`.github/workflows/ci.yml` 在克隆中存在。823 是提交 `9f3d561` 的
+  公开口径，随提交增加而增长，不是固定不变的总数。
 - **记录口径（自引用限制）**：提交无法包含自身 SHA。本文件记录的是**取证时已核验的公开 tip**；
   写入该记录的文档提交本身必然晚于它。发布流程沿用既有惯例：代码提交 → 文档提交 →
   发布记录提交，不通过 amend/rebase/force push 制造同一提交内的自洽。
@@ -30,7 +34,15 @@
   `persist-credentials: false`、不使用 `pull_request_target`、不引用 Secrets、不调用 SOL、
   不访问本机运行时或知识库、不做运行时同步/提交/发布。Action 固定到完整 commit SHA
   （`actions/checkout@3d3c42e5…` v7.0.1、`actions/setup-python@6d4fd22b…` v7.1.0）。
-  真实运行结果见发布记录提交与 Actions 页面。
+- **真实 CI 运行（通过）**：首次运行（`44914580721`，提交 `8a87a2e`）在两个 Python 版本上
+  各失败 3 个用例——子模块 worktree 内 `git commit` 退出 128，因为子模块 config 不继承源仓库
+  身份、托管 runner 无全局 `user.name/user.email`，而本机有全局配置故此前被掩盖。修复：
+  `tests/test_code_scope_unified.py` 的 `run()` 注入 `GIT_AUTHOR_*` / `GIT_COMMITTER_*`
+  环境变量（断言与用例语义未改），并在清空身份变量、`HOME` 为空、
+  `GIT_CONFIG_GLOBAL=/dev/null`、`GIT_CONFIG_NOSYSTEM=1` 的环境下本地复现验证。
+  第二次运行 **`44915220688`**（提交 `829ac42`）**success**：Python 3.10.22 与 3.12.16
+  各 `Ran 849 tests` / `OK (skipped=1)`，两个 Job 的编译检查与 `--verify-baseline` 均通过。
+  页面：<https://github.com/tongsailong/copilot/actions/runs/44915220688>。
 - **邮箱隐私（外部阻塞）**：`gh` token 无 `user` scope，GitHub API 不提供
   「Keep my email addresses private」与「Block command line pushes」开关；本机 Chrome 无
   `github.com` 登录态，无法读取设置页提供的 noreply 地址。未拼接、未猜测地址。

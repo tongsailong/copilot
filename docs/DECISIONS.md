@@ -2042,6 +2042,14 @@
       `pull_request_target`、不引用 Secrets、不调用 SOL、不访问本机运行时/知识库、不做运行时
       同步或发布；Action 固定完整 commit SHA（checkout v7.0.1、setup-python v7.1.0）并保留
       可读注释。`legacy/tests` 的 146 项已知失败不纳入门禁，也不宣称全绿。
+    - **真实 CI 结果与随之修复的测试缺陷**：首次运行 `44914580721`（提交 `8a87a2e`）在 3.10 /
+      3.12 各失败 3 个用例：子模块 worktree 内 `git commit` 退出 128。根因不是 CI 配置，而是
+      测试依赖宿主全局 `user.name/user.email`——子模块仓库的 config 不继承源仓库身份，托管
+      runner 又没有全局身份，本机有全局配置故被掩盖。修复保持在测试侧（`run()` 注入
+      `GIT_AUTHOR_*` / `GIT_COMMITTER_*` 环境变量），不放宽断言、也不给 runner 预置身份去
+      掩盖该依赖。第二次运行 `44915220688`（提交 `829ac42`）**success**：3.10.22 / 3.12.16
+      各 `Ran 849 tests` / `OK (skipped=1)`，编译检查与 baseline 校验通过。结论：CI 状态以
+      其自身运行结果为准，本地通过不能替代；本轮不据此宣称 `legacy/tests` 全绿。
     - **邮箱隐私（外部阻塞，未完成）**：`gh` token 无 `user` scope（`/user/emails` 404），
       GitHub API 不提供「Keep my email addresses private」与「Block command line pushes」；
       本机 Chrome 无 github.com 登录态，设置页不可读。因此 noreply 地址无法按要求从 GitHub
