@@ -95,6 +95,9 @@ CI 的安全边界（外部 PR 的代码视为不可信）：
 `legacy/tests` 有 146 项 v5 契约遗留的失败/错误（99 F + 47 E）与 32 个 skip，**不在 CI 门禁内**，
 也不代表当前版本回归。外部贡献者提交 PR 前请在本地跑通上面三条命令。
 
+`main` 受分支保护（Repository Ruleset）：禁止强推与删除，改动必须经 PR 并通过上述两项 Check，
+不要求人工审批；具体流程见 [CONTRIBUTING](CONTRIBUTING.md#分支保护与合并流程)。
+
 当前 `main` 的 CI 为通过状态：运行
 [`44915220688`](https://github.com/tongsailong/copilot/actions/runs/44915220688) 在 Python
 3.10.22 与 3.12.16 上各 `Ran 849 tests` / `OK (skipped=1)`。徽章反映 `main` 最新一次运行结果，

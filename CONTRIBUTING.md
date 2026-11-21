@@ -53,6 +53,28 @@ PR 指向 `main` 时，`.github/workflows/ci.yml` 会在 Python **3.10 / 3.12** 
 - **`legacy/tests` 不参与门禁**：它保留 v5 契约，已知有失败；不要在 PR 中为“让它变绿”而
   改动历史断言。
 
+## 分支保护与合并流程
+
+`main` 由 Repository Ruleset `main-protection` 保护：禁止强推（`non_fast_forward`）、禁止删除
+（`deletion`）、必须经 PR 合并（`pull_request`）、必须通过 `Python 3.10` 与 `Python 3.12`
+两项 Check（`required_status_checks`）。规则对维护者同样生效（`bypass_actors` 为空）。
+
+日常流程：
+
+```bash
+git switch -c feat/short-topic          # 从最新 main 拉分支
+# 改动 + 本地跑通编译 / 活动套件 / baseline
+git push -u origin feat/short-topic
+gh pr create --base main --fill          # 或网页创建
+# 等 CI 两个 Job 变绿后合并
+gh pr merge --squash --delete-branch
+```
+
+- **不需要人工审批**：必需审批数为 0，单人维护者可直接合并自己的 PR，不会因缺少第二人而死锁。
+- **main 不接受直接推送**：`git push origin main` 会被拒绝（`GH006 protected branch`），这是预期行为。
+- **紧急维护**：临时修改或停用该 Ruleset 再推送，属于可审计的仓库设置变更；不要把它当成日常绕过 CI 的手段。
+- **合并方式**：merge / squash / rebase 均允许，按改动性质选择；合并后 `main` 上会再跑一次 CI。
+
 ## 提交
 
 - 只暂存明确路径（不要 `git add .`），提交前检查 `git diff --cached` 不含秘密或任务外改动。

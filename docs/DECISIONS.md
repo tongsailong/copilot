@@ -2057,3 +2057,29 @@
       实际地址；在此之前不宣称邮箱隐私已生效，也不改写已公开的历史提交元数据。
     - **不变量**：不改写历史、不 force push、不 amend；不修改 v9.6.1 运行逻辑、SOL 五阶段、
       G1–G3、Provider/模型路由与既有安全保护。
+
+79. **收口、main 分支保护与 v9.6.1 正式发布（2026-11-21，用户明确授权）。**
+    - **邮箱隐私改为已决**：用户明确决定「接受现有 Git 提交邮箱公开，不再要求更换 noreply
+      邮箱」，并授权修改原 CI 专项中与该要求相关的完成条件。据此用
+      `contract --amend --authorized-by user --authorization-note <用户原话>` 把 C4 修订为
+      「按用户决定处理」，用 `unblock --by user --quote …` 解除对应阻塞，登记用户决定与原因
+      （证据 E18），任务 `open-source-ci-20261121` 以 14/14 条件、20/20 工作项终态与 G1–G3
+      通过收口为 CLOSED / PASS。原阻塞原因、失败尝试与全部证据保留；未把 noreply 配置写成
+      已完成，也未删除条件制造 PASS。已公开的历史提交元数据保持原样。
+    - **分支保护选型**：采用官方 Repository Ruleset（比经典 Branch Protection 更易读回、
+      支持 `bypass_actors` 显式化），`main-protection`（id `27797379`）作用于
+      `~DEFAULT_BRANCH`，规则为 `deletion` + `non_fast_forward` + `pull_request`
+      （0 个必需审批、无 Code Owners、无最后推送审批、无强制讨论解决）+ `required_status_checks`
+      （`Python 3.10` / `Python 3.12`，非 strict）。Check 名称取自真实 check-run
+      （`app=github-actions`），不猜测。`bypass_actors=[]`、`current_user_can_bypass=never`，
+      维护者同样不能绕过；不启用 Merge Queue、不新增自定义 Reviewer、不要求人工审批。
+    - **单人开发流程**：feature branch → PR → CI → 合并。0 审批意味着维护者不需要自审，也不会
+      因无第二人而无法合并；main 不再接受直接推送。紧急路径是临时修改/停用 Ruleset（可审计的
+      设置变更），不作为日常绕过手段。
+    - **发布口径**：Annotated Tag `v9.6.1`（对象 `bf3eaa90…`）指向 CI 已通过（`44915400161`）
+      的提交 `c5a3e1c`；Release 为正式 Published，非 draft、非 prerelease、无二进制附件
+      （本轮未构建产物，不添加未验证附件）。Release Notes 只写真实能力、真实测试结果与已知
+      限制，不声明未经验证的跨平台兼容性。
+    - **不变量**：不 force push、不改写历史、不删除既有 Release、不扩大工程范围；不修改
+      SOL 调度、G1–G3、Provider/模型路由、ZCode 宿主程序与既有安全设置（Secret Scanning /
+      Push Protection 保持启用）。
