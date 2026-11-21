@@ -43,7 +43,7 @@ import agent_policy as AP  # noqa: E402
 import review_policy as RP  # noqa: E402
 import sol_review as SR  # noqa: E402
 
-__version__ = "9.5.0"
+__version__ = "9.5.1"
 
 
 class CLIError(Exception):
@@ -228,6 +228,11 @@ def _print_continuation(path: str) -> int:
 
 
 # ── 命令实现 ───────────────────────────────────────────────────────────────
+def _under_tasks_dir(path: str) -> bool:
+    parts = os.path.abspath(path).split(os.sep)
+    return ".copilot-tasks" in parts
+
+
 def cmd_start(args) -> int:
     contract = _read_text(args.contract_file) if args.contract_file else ""
     criteria = _load_criteria(args.criteria_file) if args.criteria_file else None
@@ -245,6 +250,10 @@ def cmd_start(args) -> int:
         triggers=args.trigger or [])
     print(f"任务已创建：{state['task_id']}")
     print(f"状态文件：{os.path.abspath(state_path)}")
+    if not _under_tasks_dir(state_path):
+        print("提示：状态文件不在 .copilot-tasks/ 下。Stop/SessionStart/UserPromptSubmit 只扫描"
+              " <workspace>/.copilot-tasks/*/state.json，该任务不会被钩子发现、也不会自动"
+              "续跑或恢复；建议移到 .copilot-tasks/<task>/state.json。")
     if state.get("workspace"):
         print(f"任务工作区：{state['workspace']}")
     print(f"完成条件：{len(state['contract']['criteria'])} 条 "

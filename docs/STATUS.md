@@ -1,7 +1,59 @@
 # STATUS
 
 更新：2026-11-21 CST。本文件只记录现场可核实的事实；规划与未完成事项单独标注。
-当前版本：v9.5.0（持续推进：调度领取、恢复提示与阻塞边界）。
+当前版本：v9.5.1（宿主集成修正：startup 恢复、钩子可发现性、工作单条件归属）。
+
+## 宿主集成与真实宿主验收（2026-11-21，v9.5.1）
+
+- **Hook 安装（用户级，已授权）**：备份后写入 `~/.zcode/cli/config.json`：`Stop`（1 组，
+  timeout 10）、`SessionStart`（matcher `startup|resume|compact`）、`UserPromptSubmit`
+  （`user-prompt`）各 1 组，`PreToolUse` 保持原有 0 组；非钩子配置（模型、MCP、插件等）
+  在安装前后一致。备份：`config.json.bak-20261121143827`（首次安装前）、
+  `config.json.bak-20261121144420`（matcher 修正前）。重复执行 `install --user --apply`
+  不产生重复组，字节内容不变。
+- **宿主**：ZCode 0.18.0 headless（`node /opt/ZCode/resources/glm/zcode.cjs`，默认
+  `--mode yolo`），`--resume <sess_id>` 复用同一会话；钩子判定用
+  `COPILOT_STOP_GUARD_LOG` 逐次落盘 JSONL（`note` 字段可逐条核对）。
+- **场景 A（PARTIAL 自动续跑）**：`user-prompt-inject:1` → `drive` 领取 A1 并执行回填 →
+  代理尝试结束回合 → Stop 返回 2（`RUNNING/execute/bound`）→ 代理执行 A2 → `CLOSED` 2/2；
+  之后 Stop `out-of-scope:0` 放行。全程无用户提示。
+- **场景 B（新用户回合续跑）**：首回合绑定任务；第二回合 `--resume` 另一会话 ID →
+  `session-start-pointer:resume:1` + `user-prompt-inject:1`；代理在本回合补齐授权后执行
+  `unblock --by user --quote "允许创建 allowed.txt 测试文件"`（`resolved_by=user`）→
+  `CLOSED` 1/1，未重复派发。
+- **场景 C（全新会话恢复）**：新会话启动 → `session-start-pointer:startup:1` +
+  `user-prompt-inject:1`；代理 `status --json` 核实现场、`drive` 绑定并接管，执行 c1/c2 →
+  `CLOSED` 2/2。注入的是可执行入口（任务、阶段、条件、续接命令），不是仅摘要。
+- **场景 D（单项阻塞隔离）**：A1 `block --work-item`（reason + needs：用户提供凭据），
+  A2/A3 继续执行完成；任务停在 `BLOCKED`（含 reason/needs），未伪造 PASS。
+- **场景 E（重复/并发/中断）**：
+  - 并发领取：`owner1` 领 A1、`owner2` 领 A2、`owner3` 得到 `wait` + 退出码 11，
+    状态中无重复领取。
+  - TTL 接管：`COPILOT_CLAIM_TTL=0` 后另一 owner 接管成功；`handoff_count` 连续累计
+    （1→2→3），中断/接管不重置为 1。
+  - 重复触发：同一 payload 连续两次 `user-prompt` 输出完全相同、state SHA-256 不变
+    （钩子只读）；`install` 重复执行不产生重复 Hook。
+  - 中断恢复：阶段一以 `COPILOT_STOP_GUARD=0` 只执行 `drive` 后结束（A1 已领取、未回填、
+    无产物）；阶段二 `--resume` 同一会话 → `session-start-inject:resume`，工作项未丢失、
+    重新领取并执行 A1/A2，每个动作只登记一次 `action_recorded` 与一份证据，产物只在恢复
+    回合生成，最终 `CLOSED` 2/2。
+- **修复（真实宿主暴露）**：① `SESSION_START_MATCHER` 补 `startup`（宿主新会话只发
+  `startup`，原 `resume|compact` 匹配不到）；② `start` 对 `.copilot-tasks/` 之外的状态
+  文件给出告警（钩子只扫描该目录，此前测试夹具放在工作区根目录导致钩子全部空转）；
+  ③ `work_order` 的条件提示改用本工作项 `target_criteria`（原先固定提示 `C1`，A2 会把
+  证据记到 C1）；④ `handoff_count` 跨过期租约累计。对应回归：
+  `test_v95_scheduling`（工作单提示、目录告警、TTL 接管计数）、`test_stop_guard`
+  （matcher 断言）。
+- **测试**：活动套件 **782 项 OK**（重编译字节码后 54.9 s，首轮 75.9 s；baseline 重建后
+  全绿，含 `test_real_manifest_matches_git_tracked_source`）；`legacy/tests` 853 项
+  （skip 32）= 99 failures + 47 errors = **146**，失败/错误用例名集合与 `12ed456` 临时
+  worktree 逐行相同（`diff` 0 行）。
+- **运行时同步**：`--apply` 补齐 1 个文件；`--check` 缺失 0 / 不同 0（`hm.txt` 非受管
+  保留）；SKILL.md、references 与 4 个脚本源/运行时 SHA-256 逐一相同；`--baseline`
+  23 个 Git 跟踪项，`--verify-baseline` 通过。
+- **未验证 / 边界**：未实现后台守护或自派生 resume 子进程（宿主 `xmc=3` 上限不变）；
+  “执行中断”验证的是“领取后正常结束回合 + `--resume` 恢复”，未覆盖进程被强杀的时序；
+  跨会话真并发以 3 个独立 owner 的 CLI 驱动验证，未在三个真实 ZCode 会话同时运行。
 
 ## 持续推进：调度领取、恢复提示与阻塞边界（2026-11-21，v9.5.0）
 
@@ -32,7 +84,7 @@
   `UserPromptSubmit` 钩子，每轮注入最多 3 个打开任务的只读提醒与四条判断规则
   （用户本轮给出授权 → `unblock --by user --quote` 后 `drive`；否则不要自行续跑；
   不是授权；不要重复派发），失败一律 exit 0。`install`/`uninstall` 同时维护 Stop、
-  SessionStart（`resume|compact`）与 UserPromptSubmit 三处。
+  SessionStart（`startup|resume|compact`）与 UserPromptSubmit 三处。
 - **测试**：新增 `tests/test_v95_scheduling.py`（20 项，覆盖 C1 自动续跑、C2 派生→调度→
   执行→核销闭环、C3 单项阻塞隔离、C4 授权变更恢复、C5 条件变更恢复、C6 重复调度防护与
   领取不永久丢失、C7 上下文重载续跑、C8 真实 BLOCKED 的原因与 needs、C9 PASS 只在全部
@@ -51,6 +103,8 @@
   调用，未在真实 ZCode 回合中观察注入；安装到用户级 `~/.zcode/cli/config.json` 属全局
   配置变更，未授权未执行（当前宿主仍只装 Stop/SessionStart）。跨会话真实并发（两个会话
   同时 `drive`）未做宿主级 E2E，领取互斥由进程内测试覆盖。
+  **上述限制已由 v9.5.1 章节的真实宿主验收覆盖**（用户授权安装用户级钩子并执行场景 A–E），
+  该段只保留为 v9.5.0 交付时点的现场记录。
 
 ## 项目上下文与长期记忆衔接（2026-11-21，v9.4.0）
 

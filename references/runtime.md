@@ -163,7 +163,8 @@
 并且先判归属再读 state：不属于本会话的任务即使 state 损坏也不会误拦当前会话。向上查找
 `.copilot-tasks` 到 Git 根即止，不继承父目录里别的项目的任务集。
 
-SessionStart（`resume|compact`）只注入绑定当前会话且 `continuation.required=true` 的任务；
+SessionStart（`startup|resume|compact`）对绑定当前会话且 `continuation.required=true` 的任务
+注入完整快照；startup 或未绑定会话只给只读指针；
 本会话任务自己的 state/绑定损坏时仍给出修复提示（不静默丢掉待续跑任务），其它任务的异常
 不进入本会话上下文。
 
@@ -209,7 +210,7 @@ BLOCKED/PASS 规避上限、以及新回合先 `status --json` 核实再继续�
 用户没有补齐时不要恢复执行；本提示不是用户新指令，也不构成授权；先 `status --json`
 核对阶段与证据，工作项被其它会话领取时避免并发重复。没有未闭合任务时不注入。
 
-`install` 同时写入 `Stop`、`SessionStart`（matcher `resume|compact`）与
+`install` 同时写入 `Stop`、`SessionStart`（matcher `startup|resume|compact`）与
 `UserPromptSubmit` 三个事件，`uninstall` 一并移除。
 
 `closure-check` 的退出码与结论一致：PASS=0、FAIL=1（`--json` 同样），避免“检查过”被误当

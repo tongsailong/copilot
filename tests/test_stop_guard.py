@@ -505,7 +505,7 @@ class HookInstallTests(unittest.TestCase):
         events = self.read_config()["hooks"]["events"]
         self.assertEqual(len(events["SessionStart"]), 1)
         group = events["SessionStart"][0]
-        self.assertEqual(group.get("matcher"), "resume|compact")
+        self.assertEqual(group.get("matcher"), "startup|resume|compact")
         self.assertIn("session-start", json.dumps(group, ensure_ascii=False))
         before = read_bytes(self.config_path)
         again = self.run_cli("install", "--workspace", self.workspace, "--apply")

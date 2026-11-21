@@ -66,11 +66,28 @@ def work_order(state: dict, action: dict, state_path: str,
                next_eid: str = "E1") -> str:
     constraints = str(action.get("constraints") or "").strip()
     match = re.match(r"^AUTO-(C[1-9][0-9]{0,2})", str(action.get("id") or ""))
-    criterion_hint = match.group(1) if match else "C1"
     unmet = [str(item.get("criterion_id") or "")
              for item in (state.get("contract") or {}).get("criteria") or []
              if isinstance(item, dict)
              and str(item.get("status") or "pending") != "met"]
+    # 条件提示必须来自本工作项的真实归属，不能一律写 C1：计划动作可用
+    # target_criteria 声明条件，AUTO-C<n> 天然承载 C<n>，其余动作才回退到
+    # 第一条未闭合条件（仍可能与本项无关，故用占位说明而非假装确定）。
+    targets = [str(cid) for cid in (action.get("target_criteria") or [])
+               if str(cid).strip()]
+    target_unmet = [cid for cid in targets if cid in unmet]
+    if target_unmet:
+        criterion_hint = target_unmet[0]
+        criterion_extra = target_unmet[1:]
+    elif match:
+        criterion_hint = match.group(1)
+        criterion_extra = []
+    elif unmet:
+        criterion_hint = unmet[0]
+        criterion_extra = []
+    else:
+        criterion_hint = "<C?>"
+        criterion_extra = []
     blocked = G._blocked_items_summary(state)
     claim = G.active_claims(state).get(str(action.get("id") or ""))
     field = []
@@ -116,7 +133,9 @@ def work_order(state: dict, action: dict, state_path: str,
         f"2. 回填工作项：`copilot_dispatch.py record --state {state_path} "
         f"--id {action.get('id')} --status done --result \"实际结果\" --evidence {next_eid}`",
         f"3. 若完成条件因此闭合：`copilot_dispatch.py criterion --state ... "
-        f"--id {criterion_hint} --status met --evidence {next_eid}`",
+        f"--id {criterion_hint} --status met --evidence {next_eid}`"
+        + (f"（本工作项还对应 {'、'.join(criterion_extra)}，分别执行同一命令）"
+           if criterion_extra else ""),
         "4. 继续推进：`copilot_auto.py drive --state ...`",
         "",
         "## 授权提醒",

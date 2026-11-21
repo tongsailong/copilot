@@ -5,6 +5,12 @@ Copilot 是运行于 ZCode 内的**轻量协作治理 Skill**：用户侧 ChatGP
 调试、测试与验证；Copilot 负责任务合同、完成条件、状态、证据、审计与收口门禁，并用 PARTIAL
 派生持续推进任务；SOL 作为默认认知引擎按需提供判断，用户明确要求时可执行一次独立复核。
 
+**v9.5.1 宿主集成修正**：真实 ZCode 宿主验收暴露并修复四处偏差——SessionStart matcher
+补 `startup`（否则新会话发现不到未闭合任务）；状态文件不在 `.copilot-tasks/` 时 `start`
+明确警告（钩子只扫描该目录）；`work_order` 的条件提示改为本工作项 `target_criteria`
+而非固定 `C1`；`handoff_count` 跨过期租约累计。详见 `docs/STATUS.md` 与
+`docs/DECISIONS.md` 第 73 条。
+
 **v9.5.0 持续推进：调度领取、恢复提示与阻塞边界**：派生项不再只是列表——`drive` 领取
 选中的工作项并写入 `state["claims"]`（owner、TTL、handoff），其它会话看不到、也不会重复
 执行同一条；只剩其它会话的领取项时 `continuation` 返回 `wait` 而不是空转派生。`block`

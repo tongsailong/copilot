@@ -9,7 +9,7 @@ when_to_use: >
   直接由 ZCode 原生完成，不进入本 Skill。
 ---
 
-# copilot：轻量协作治理（v9.5.0）
+# copilot：轻量协作治理（v9.5.1）
 
 Copilot 是运行在 ZCode 内的**协作治理层**，不是决策模型，也不是执行体。它负责把任务变成可
 追踪的合同、状态、证据与收口条件，并在任务没有真正完成时继续推进。
@@ -227,6 +227,10 @@ PASS 才表示目标达成、证据充分、可以结束；BLOCKED 只在剩余�
 连续续跑 3 次，且原因文本必须非空）。它只读状态、不调用模型、不改任务状态，CLOSED / 真实
 BLOCKED / 所有剩余工作均被项级阻塞时一律放行。
 
+**状态文件位置是硬条件**：任务必须建在 `<workspace>/.copilot-tasks/<task>/state.json`。
+三个钩子只扫描该目录；放在工作区根目录或别处时 CLI 仍能手工推进，但不会被自动续跑、
+恢复或回合提醒发现（`start` 会提示）。这不是路径偏好，而是 Hook 能看见任务的唯一入口。
+
 **归属绑定（取代时间过期）**：守卫不按“多久没更新”放行。Copilot CLI 在处理任务的命令里把当前
 `ZCODE_SESSION_ID` 记到任务目录 `session.json`；守卫只拦截“本会话真正推进过”的任务，
 其它会话、其它工作区、以及从未绑定过当前会话的旧任务都不参与判定。这样既不会因为旧任务
@@ -234,7 +238,8 @@ BLOCKED / 所有剩余工作均被项级阻塞时一律放行。
 运行一次会改写状态的命令（如 `drive`），绑定即建立。
 
 安装（默认工作区级；若本机 `Stop` 钩子未获 `workspaceHookAdmission` 则不触发，此时装用户级）。
-同一条安装命令同时写入 `Stop` 与 `SessionStart`（仅 `resume|compact`）两个钩子：
+同一条安装命令同时写入 `Stop`、`SessionStart`（`startup|resume|compact`）与
+`UserPromptSubmit` 三个钩子：
 
 ```bash
 python3 -B ~/.zcode/skills/copilot/scripts/copilot_stop_guard.py \
@@ -250,12 +255,13 @@ python3 -B ~/.zcode/skills/copilot/scripts/copilot_stop_guard.py \
 这两条守卫命令，不动其它配置；重复安装会把多条/过期记录收敛为一条，不产生重复
 Hook。`ZCODE_USER_CONFIG` 可覆盖目标路径（测试用）。新会话生效（配置在会话启动时加载）。
 
-**恢复注入（`SessionStart`，仅 `resume|compact`）**：上下文因恢复会话或压缩而丢失时，钩子向
-宿主注入一段只读快照——绑定本会话且 `continuation.required=true` 的任务、当前阶段与原因、
-未闭合条件、下一条命令与可粘贴的续接命令，并提示先核实现场、复用已完成工作与已登记证据。
-它只在 `source=resume|compact` 时触发（`startup`/`clear` 与普通用户消息不注入），只注入绑定
-本会话的任务，不绑定新任务、不写状态、不消费 Stop 次数；任何异常一律静默退出 0，不阻断
-会话启动。没有快照时主代理仍按 `status --json` 自行恢复。
+**恢复注入（`SessionStart`，`startup|resume|compact`）**：`resume`/`compact` 且任务绑定本会话
+时，钩子注入只读快照——任务、当前阶段与原因、未闭合条件、下一条命令与可粘贴的续接命令，
+并提示先核实现场、复用已完成工作与已登记证据。`startup`（全新会话）或会话尚未绑定任务时，
+只注入“存在未闭合任务”的只读指针（阶段、阻塞原因/所需条件、归属会话），不注入任务正文、
+不自动绑定、不强制续跑；由当前会话 `status --json` 核实后自行决定是否 `drive` 接管。
+`clear` 与普通用户消息不注入。所有路径都不写状态、不消费 Stop 次数；任何异常一律静默
+退出 0，不阻断会话启动。
 
 **放行路径**：`COPILOT_STOP_GUARD=0`、工作区 `.copilot-tasks/.stop-guard-off`、任务目录
 `.stop-guard-off`、任务 state 的 `stop_guard=false`，或 `disable --state <state> --reason "<原因>"`
@@ -618,7 +624,7 @@ REVIEW 输出契约：总体结论 `verdict=pass|partial|blocked`；`findings` �
 - `capture`：读任务状态与证据，生成带任务/证据溯源、去重前置、住所待判定的候选草稿到任务
   目录，并打印 `candidate_write.py` 命令；工具本身不写 Vault 与原生 Memory。
 
-接线：SessionStart(resume|compact) 快照追加项目现场/Memory 可用性与上述命令（失败即省略，
+接线：SessionStart(startup|resume|compact) 快照/指针追加项目现场/Memory 可用性与上述命令（失败即省略，
 不阻断启动）；`status` 人工输出附一行提示，JSON 契约不变。历史线索与现场冲突时以现场为准，
 并在报告中写出卡路径、差异与核验时间。详见 `docs/CONTEXT-ENGINE.md`。
 
@@ -726,7 +732,20 @@ CONSULT / PLAN 输出契约（`copilot-sol-think/v2`）：`judgment`、`goal_und
 
 ## 版本
 
-当前 **v9.5.0（持续推进：调度领取、恢复提示与阻塞边界）**：
+当前 **v9.5.1（宿主集成修正：startup 恢复、钩子可发现性、工作单条件归属）**：
+
+- **SessionStart matcher 含 startup**：宿主只在全新会话发 `source=startup`；匹配器为
+  `startup|resume|compact`。startup 只给只读指针（不注入任务正文、不自动绑定、不强制
+  续跑），resume/compact 且绑定本会话时仍给完整快照。
+- **状态文件位置是硬条件**：任务必须位于 `<workspace>/.copilot-tasks/<task>/state.json`，
+  三个钩子只扫描该目录；`start` 对目录外路径给出提示。
+- **工作单条件归属**：`work_order` 优先使用本工作项 `target_criteria`（`AUTO-C<n>` 次之），
+  多条件工作项提示“还对应 Cx、Cy”，不再一律写 C1。
+- **交办次数跨过期租约累计**：中断后被其它会话接管仍记第 2 次；主动释放/完成后重新领取
+  从 1 计数。
+- **不变量**：G1–G3、PARTIAL 强制续跑、SOL-first advisory、授权边界与 G4 退役状态不变。
+
+**v9.5.0（持续推进：调度领取、恢复提示与阻塞边界）**：
 
 - **调度领取（claims）**：`drive` 在 RUNNING 阶段把工作项领取落盘（`claims`：owner 会话、
   `claim_id`、`expires_at`、`handoff_count`；默认 TTL 1800s，`COPILOT_CLAIM_TTL` 可调）。
@@ -740,7 +759,7 @@ CONSULT / PLAN 输出契约（`copilot-sol-think/v2`）：`judgment`、`goal_und
   三个事件；`user-prompt` 只读列出未闭合任务（含 BLOCKED 的 reason/needs）与判断规则。
   用户本回合补齐授权/决策时，先用其原话登记 `unblock --by user --quote "<原话>"`，再
   `drive` 继续；提示本身不是用户新指令，也不构成授权。没有未闭合任务时不注入。
-- **恢复可发现性**：SessionStart(resume|compact) 对本会话绑定任务注入完整快照；startup
+- **恢复可发现性**：SessionStart(startup|resume|compact) 对本会话绑定任务注入完整快照，startup 只给指针；
   或重启后会话标识变化时只注入只读指针（任务阶段、可执行项、阻塞原因/需要、归属标注），
   不绑定、不接管、不强制续跑。快照与 status 均显示阻塞原因与所需条件。
 - **阻塞边界与解除来源**：仍有可执行工作项时，`block --scope task` 被拒绝，必须显式
@@ -757,7 +776,7 @@ CONSULT / PLAN 输出契约（`copilot-sol-think/v2`）：`judgment`、`goal_und
   按 `sha256[:16]` 定位项目记忆、白名单有界召回（预算/零命中/失败/截断可区分、短期缓存）、
   按目标装配上下文包（self/sol/subagent 三档字符上限）、收尾生成带任务与证据溯源的候选
   草稿。全程只读、零模型调用、不建记忆库、不写正式知识。
-- **恢复与交接**：SessionStart(resume|compact) 快照追加项目现场（根/分支/HEAD/工作区）、
+- **恢复与交接**：SessionStart(startup|resume|compact) 快照追加项目现场（根/分支/HEAD/工作区）、
   原生 Memory 与 Vault 可用性以及召回/交接命令（失败即省略，不阻断启动）；`status` 人工
   输出附一行上下文提示，JSON 契约不变；子 Agent 用 `pack --target subagent`（≤5,000 字符）
   显式交接，不假设其继承 Memory/AGENTS。

@@ -24,10 +24,10 @@ Copilot 的 `EXIT_CONTINUE=10` 只是命令退出码，模型可以忽略它并�
 
 只读任务状态、不调用模型。退出码：0 放行，2 要求续跑。
 
-恢复注入（SessionStart）只覆盖上下文真正丢失的事件：`source=resume|compact`。它只向
-绑定当前会话、且 `continuation.required=true` 的任务提供一段只读快照（阶段、未闭合条件、
-可粘贴的续接命令），不绑定新任务、不写状态、不消费 Stop 次数；任何异常一律退出 0 且不注入，
-不阻断会话启动。
+恢复注入（SessionStart）区分两类事件：`source=resume|compact` 给绑定本会话且仍有可执行
+工作的任务一段只读快照（阶段、未闭合条件、可粘贴的续接命令）；`source=startup` 或会话
+尚未绑定任何任务时只给“存在未闭合任务”的只读指针（含阻塞原因/所需条件），不注入任务正文、
+不绑定、不写状态、不消费 Stop 次数。任何异常一律退出 0 且不注入，不阻断会话启动。
 
 用法：
   copilot_stop_guard.py                     # Stop 钩子模式（stdin 读事件 JSON）
@@ -73,7 +73,9 @@ REASON_LIMIT = 3900
 # SessionStart 只在这些事件注入恢复快照：resume/compact 是上下文真正丢失的时点。
 # startup 不推断旧任务的归属（避免把无关会话引向旧任务），clear 尊重用户的清空动作。
 SESSION_START_SOURCES = ("resume", "compact")
-SESSION_START_MATCHER = "resume|compact"
+# startup 也必须在 matcher 内：宿主在新会话启动时只发 source=startup，
+# 排除它会让“全新会话发现未闭合任务”这条路径根本触发不到钩子。
+SESSION_START_MATCHER = "startup|resume|compact"
 # 新会话（startup）与换了会话标识的 resume/compact 只拿到“有未闭合任务”的指针，
 # 不注入任务正文、不绑定、不强制续跑；由用户/主代理决定是否接管。
 POINTER_SOURCES = ("startup", "resume", "compact")

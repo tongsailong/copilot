@@ -72,7 +72,7 @@ python3 -B scripts/context_engine.py capture --state <state.json> \
 
 ## 4. 接线
 
-- **SessionStart(resume|compact)**：`copilot_stop_guard.py` 在任务状态快照后追加项目现场
+- **SessionStart(startup|resume|compact)**：`copilot_stop_guard.py` 在任务状态快照后追加项目现场
   （根/分支/HEAD/工作区）、原生 Memory 与 Vault 可用性，以及 `recall` / `pack` 命令；
   只读、失败即省略、总长仍受 `SESSION_START_LIMIT` 约束，任何异常都不阻断会话启动。
   该路径的单次 git 调用收紧到 1 s（钩子总超时 10 s），`git status` 失败时显示「未知」

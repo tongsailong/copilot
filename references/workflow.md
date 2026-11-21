@@ -8,7 +8,10 @@ CONSULT / PLAN 失败只记录并降级，不阻断工程推进。
 
 ## 1. 状态文件
 
-- 默认路径由调用方指定（`--state`）；建议放在任务目录，例如 `<task>/state.json`。
+- 默认路径由调用方指定（`--state`）；**任务状态应放在
+  `<workspace>/.copilot-tasks/<task>/state.json`**：Stop / SessionStart / UserPromptSubmit
+  三个钩子只扫描该目录。放在别处时任务仍可手工推进，但不会被自动续跑、恢复或回合提醒
+  发现（`start` 对目录外的状态文件给出提示）。
 - 同名辅助文件：`<state-basename>.dispatch.json`（原生派发）、`evidence/`（命令采集输出）、
   `.state.json.lock`（并发锁，短生命周期，文件名随状态文件名）。
 - 单文件 JSON，`schema=copilot-governance/v1`、`version=1`；写入为

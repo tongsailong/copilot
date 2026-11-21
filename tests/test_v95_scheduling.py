@@ -15,6 +15,8 @@ C9 PASS 只在条件与门禁满足时产生，PARTIAL/BLOCKED 不被包装成 P
 """
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import sys
@@ -294,7 +296,10 @@ class C6DuplicateSchedulingTests(SchedulingBase):
         self.claim(["A1"], owner="sess_a", ttl=0)
         takeover = self.claim(["A1"], owner="sess_b")
         self.assertEqual(takeover["claimed"], ["A1"])
-        self.assertEqual(G.active_claims(self.state())["A1"]["owner"], "sess_b")
+        claim = G.active_claims(self.state())["A1"]
+        self.assertEqual(claim["owner"], "sess_b")
+        # 中断/崩溃后的接管仍算“第 2 次交办”，否则重复失败没有提示。
+        self.assertEqual(claim["handoff_count"], 2)
 
     def test_block_releases_claim(self):
         self.claim(["A1"], owner="sess_a")
@@ -367,6 +372,16 @@ class C8TrueBlockedTests(SchedulingBase):
         self.assertEqual(block["scope"], "task")
 
 
+class WorkOrderHintTests(SchedulingBase):
+    def test_work_order_hints_the_target_criterion(self):
+        import copilot_auto as A
+        state = self.state()
+        action = next(item for item in state["actions"] if item["id"] == "A2")
+        text = A.work_order(state, action, self.state_path, "E9")
+        self.assertIn("--id C2 --status met", text)
+        self.assertNotIn("--id C1 --status met", text)
+
+
 class C9AccuratePassTests(SchedulingBase):
     def test_pass_and_close_only_when_all_conditions_met(self):
         eid = self.evidence()
@@ -393,6 +408,35 @@ class C9AccuratePassTests(SchedulingBase):
         self.assertEqual(proc.returncode, 11, proc.stdout + proc.stderr)
         self.assertNotIn("任务已收口", proc.stdout)
         self.assertFalse(self.state()["closure"]["closed"])
+
+
+class StartPathWarningTests(unittest.TestCase):
+    """钩子只扫描 .copilot-tasks；目录外的任务必须显式提示，否则会静默失去续跑。"""
+
+    def _start(self, path: str) -> str:
+        import copilot_dispatch as D
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        criteria = os.path.join(os.path.dirname(path), "criteria.json")
+        with open(criteria, "w", encoding="utf-8") as fh:
+            json.dump(["C1: 文件存在"], fh)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = D.main(["start", "--state", path, "--goal", "路径提示",
+                           "--task-kind", "mechanical",
+                           "--criteria-file", criteria])
+        self.assertEqual(code, 0)
+        return buf.getvalue()
+
+    def test_outside_tasks_dir_warns(self):
+        with tempfile.TemporaryDirectory() as d:
+            out = self._start(os.path.join(d, "state.json"))
+        self.assertIn("状态文件不在 .copilot-tasks/ 下", out)
+        self.assertIn(".copilot-tasks", out)
+
+    def test_inside_tasks_dir_is_quiet(self):
+        with tempfile.TemporaryDirectory() as d:
+            out = self._start(os.path.join(d, ".copilot-tasks", "t1", "state.json"))
+        self.assertNotIn("状态文件不在 .copilot-tasks/ 下", out)
 
 
 if __name__ == "__main__":

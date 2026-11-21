@@ -1512,6 +1512,10 @@ def claim_actions(state: dict, ids: list[str], *, owner: str = "",
     active = active_claims(state, now=now)
     claims = [claim for claim in state.get("claims") or []
               if isinstance(claim, dict) and _claim_active(claim, now)]
+    # 交办次数跨“租约过期”累计：崩溃/中断后由另一会话接管时仍应显示第 2 次，
+    # 否则反复失败的工作项会永远显示“第 1 次交办”，失去重复失败的提示意义。
+    history = {str(claim.get("work_item_id") or ""): claim
+               for claim in state.get("claims") or [] if isinstance(claim, dict)}
     by_aid = {str(claim.get("work_item_id") or ""): claim for claim in claims}
     expires_at = (now + timedelta(seconds=ttl)).isoformat()
     claimed: list[str] = []
@@ -1524,7 +1528,7 @@ def claim_actions(state: dict, ids: list[str], *, owner: str = "",
         if current is not None and str(current.get("owner") or "") != resolved_owner:
             busy.append(aid)
             continue
-        previous = by_aid.get(aid) or {}
+        previous = by_aid.get(aid) or history.get(aid) or {}
         handoff = int(previous.get("handoff_count") or 0) + 1
         record = {
             "work_item_id": aid,
