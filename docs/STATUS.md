@@ -35,9 +35,11 @@
 
 ## 治理一致性与续跑绑定加固（2026-11-21，v9.3.0）
 
-现场基线：交付前 `HEAD=0e5f5b1`（= `origin/main`）；全部改动**未提交、未推送**（用户边界
-要求 Git 只读）。未跟踪的 `scripts/knowledge_handoff.py`、`tests/test_knowledge_handoff.py`
-与 `.copilot-tasks/` 保持原样。
+交付前 `HEAD=0e5f5b1`（= `origin/main`）。本变更集以提交 `cf29439`（父 `0e5f5b1`，21 个文件
++1169/−110）普通快进推送至 `origin/main`；本地 HEAD / `origin/main` / 远端 `refs/heads/main`
+三方一致、ahead/behind 0/0，未使用 force push / rebase / reset / clean。未跟踪的
+`scripts/knowledge_handoff.py`、`tests/test_knowledge_handoff.py` 与 `.copilot-tasks/`
+保持原样，未纳入提交。
 
 - **修复清单（全部有定向测试）**：
   1. 合同修订绕过完成条件 → 净未核销条件减少或 `test_policy.required` 由真变假要求

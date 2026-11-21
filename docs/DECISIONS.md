@@ -1169,6 +1169,13 @@
       与测试，未重跑评审。
     - **不变量**：G1–G3 语义、证据不可静默替换、PARTIAL 续跑、G4 退役、授权边界不变。证据
       文件一经登记不可覆盖，修订后的交付报告以新证据 id 登记，旧记录归档保留。
+    - **交付（2026-11-21，用户明确授权 commit / 普通快进 push / 运行时同步）**：源码以提交
+      `cf29439`（父 `0e5f5b1`，21 个文件 +1169/−110）交付，普通快进推送 `origin/main`，本地
+      HEAD / `origin/main` / 远端 `refs/heads/main` 三方一致、ahead/behind 0/0；未 force
+      push / rebase / reset / clean。交付前活动套件 **708 项 OK**（52.0 s），`legacy/tests`
+      853 项 99F+47E+32S=146 与基线名单 `diff` 为空；运行时 `--apply` 写入 0、`--check`
+      缺失 0/不同 0、`--baseline` 21 项、`--verify-baseline` 通过、`__version__=9.3.0`，
+      Stop / SessionStart 钩子配置未改。受保护未跟踪文件保持原样、未纳入提交。
 
 ## 建议（未采纳）
 
