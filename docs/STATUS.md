@@ -3,6 +3,32 @@
 更新：2026-11-21 CST。本文件只记录现场可核实的事实；规划与未完成事项单独标注。
 当前版本：v9.6.1（收口时序：最终工程验证完成才执行收口 CONSULT）。
 
+## 收口、main 分支保护与 v9.6.1 Release（2026-11-21）
+
+- **旧任务收口**：`open-source-ci-20261121` 阶段 **CLOSED**，完成条件 14/14 met，工作项 20/20
+  终态，G1–G3 通过（`verdict=pass iteration=I1 by=zcode-native`）。邮箱隐私按用户决定
+  修订条件并以用户授权解除阻塞（详见下节），未把 noreply 配置冒充为已完成，也未删除条件
+  制造 PASS；原阻塞、失败尝试与证据（E1–E19）完整保留。
+- **main 分支保护（Ruleset `27797379`，`main-protection`，active）**：目标
+  `~DEFAULT_BRANCH`；规则 `deletion`（禁止删除）、`non_fast_forward`（禁止强推）、
+  `pull_request`（`required_approving_review_count=0`、无 Code Owners、无最后推送审批、
+  无强制讨论解决、允许 merge/squash/rebase）、`required_status_checks`（
+  `Python 3.10` / `Python 3.12`，`strict_required_status_checks_policy=false`）。
+  `bypass_actors=[]`，`current_user_can_bypass=never`——维护者同样不能绕过。
+- **单人开发流程**：`feature branch → PR → CI（Python 3.10 / 3.12）→ 合并`；0 人工审批，
+  无需自审或第二个 Reviewer，不会因缺少审批而死锁。main 不再接受直接推送：本地
+  `git push origin main` 会被拒（`GH006 protected branch`），需改走 PR。紧急维护路径是
+  临时修改/停用该 Ruleset 再推送，属可审计的仓库设置变更，不是日常绕过手段。
+- **v9.6.1 正式发布**：Annotated Tag `v9.6.1`（对象 `bf3eaa90…`）指向提交
+  `c5a3e1c6ac3cd9fae9bc6e1a48af753a536a2e88`（该提交的 CI 运行 `44915400161` success）；
+  GitHub Release **Published**（非 draft、非 prerelease、无附件）：
+  <https://github.com/tongsailong/copilot/releases/tag/v9.6.1>，发布时间
+  2026-11-21T15:00:56Z。未登录访问：Release 页面 200、源码归档
+  `archive/refs/tags/v9.6.1.tar.gz` 可下载（1,129,874 字节）。此前的 `v9.6.1` Tag/Release
+  不存在，非重复创建；未移动任何既有 Tag。
+- **运行时**：本轮只改 GitHub 配置与文档，未改受管源码；`--check` 缺失 0 / 不同 0、
+  `--verify-baseline` 通过、`copilot_dispatch.py --version` = 9.6.1。
+
 ## 开源维护专项：公开记录修正与 GitHub Actions CI（2026-11-21）
 
 - **blob 统计复算（公开口径）**：以 `refs/heads/main`（= 当前全部公开 refs，单分支、无标签）
@@ -43,11 +69,12 @@
   第二次运行 **`44915220688`**（提交 `829ac42`）**success**：Python 3.10.22 与 3.12.16
   各 `Ran 849 tests` / `OK (skipped=1)`，两个 Job 的编译检查与 `--verify-baseline` 均通过。
   页面：<https://github.com/tongsailong/copilot/actions/runs/44915220688>。
-- **邮箱隐私（外部阻塞）**：`gh` token 无 `user` scope，GitHub API 不提供
-  「Keep my email addresses private」与「Block command line pushes」开关；本机 Chrome 无
-  `github.com` 登录态，无法读取设置页提供的 noreply 地址。未拼接、未猜测地址。
-  需用户在 GitHub **Settings → Emails** 开启两项，并提供页面显示的实际 noreply 地址；
-  在此之前不宣称邮箱隐私已生效。已公开的历史提交元数据保持原样、未改写。
+- **邮箱隐私（已由用户决定关闭）**：2026-11-21 用户明确决定接受现有 Git 作者邮箱公开，
+  不再要求 noreply、不清洗历史，该项由外部阻塞转为已决事项（历史记录保留：设置尝试、
+  `gh` token 无 `user` scope、API 无该开关、Chrome 无登录态、未拼接地址）。
+  合同条件 C4 经 `contract --amend --authorized-by user` 修订为「按用户决定处理」，
+  阻塞以 `unblock --by user` 解除，任务 `open-source-ci-20261121` 收口为 **CLOSED / PASS**
+  （14/14 条件、20/20 工作项终态、G1–G3 通过）。
 - **运行时**：未改 v9.6.1 任何受管文件；`--check` 缺失 0 / 不同 0、
   `--verify-baseline` 通过、`copilot_dispatch.py --version` = 9.6.1。
 
