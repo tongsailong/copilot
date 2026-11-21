@@ -5,6 +5,15 @@ Copilot 是运行于 ZCode 内的**轻量协作治理 Skill**：用户侧 ChatGP
 调试、测试与验证；Copilot 负责任务合同、完成条件、状态、证据、审计与收口门禁，并用 PARTIAL
 派生持续推进任务；SOL 作为默认认知引擎按需提供判断，用户明确要求时可执行一次独立复核。
 
+**v9.5.0 持续推进：调度领取、恢复提示与阻塞边界**：派生项不再只是列表——`drive` 领取
+选中的工作项并写入 `state["claims"]`（owner、TTL、handoff），其它会话看不到、也不会重复
+执行同一条；只剩其它会话的领取项时 `continuation` 返回 `wait` 而不是空转派生。`block`
+必须指明工作项或 `--scope task`，任务级阻塞仍有可执行项时须 `--force` 并记录现场；
+`unblock --by user --quote` 留下解除来源，新授权可与旧阻塞区分。恢复侧：SessionStart 对
+startup/未绑定会话输出只读指针，新增 `UserPromptSubmit` 每轮提醒打开任务与授权判断规则。
+计划动作可用 `target_criteria` 绑定合同条件，不改变计划指纹。详见 `docs/STATUS.md` 与
+`docs/DECISIONS.md` 第 72 条。
+
 **v9.4.0 项目上下文与长期记忆衔接**：新增 `scripts/context_engine.py`，把原生项目
 Memory、正式 Vault、Copilot Task Memory 与工程现场拼成一条确定性数据流——
 `resolve`（按 `sha256[:16]` 定位项目记忆，同名不同路径不串库）、`recall`（白名单有界

@@ -567,8 +567,9 @@ class HookInstallTests(unittest.TestCase):
 class SessionStartRecoveryTests(StopGuardBase):
     """SessionStart 恢复注入：只补上下文，不绑定、不写状态、失败放行。
 
-    ZCode 只在 `resume` / `compact` 真正丢失上下文时注入；`startup` 不推断旧任务，
-    `clear` 尊重用户清空。未绑定当前会话的任务不披露任何任务内容。
+    resume/compact 且任务绑定本会话：注入完整恢复快照。
+    其它情况（startup、任务归属其它会话或未绑定）：只注入只读指针，不披露完整
+    任务正文（状态路径/续接命令），避免把无关会话引向旧任务。
     """
 
     def run_session_start(self, *, source: str = "resume",
@@ -608,18 +609,25 @@ class SessionStartRecoveryTests(StopGuardBase):
             self.assertEqual(proc.stdout.strip(), "")
             self.assertEqual(proc.stderr.strip(), "")
 
-    def test_other_session_task_is_not_injected(self):
+    def test_other_session_task_gets_pointer_not_snapshot(self):
         # 任务绑定的是 SESSION；当前会话是 OTHER_SESSION，属于其它会话的任务。
-        proc = self.run_session_start(session=OTHER_SESSION)
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(proc.stdout.strip(), "")
+        # 只给只读指针（避免重启换会话标识后彻底丢失现场），不给恢复快照、不绑定。
+        text = self.injected(self.run_session_start(session=OTHER_SESSION))
+        self.assertIn("<copilot-task-pointer>", text)
+        self.assertIn(self.state()["task_id"], text)
+        self.assertIn("归属其它会话", text)
+        self.assertIn("不是用户新指令", text)
+        self.assertNotIn("<copilot-session-recovery>", text)
+        self.assertNotIn(self.state_path, text)
 
-    def test_unbound_task_is_not_injected(self):
+    def test_unbound_task_gets_pointer_not_snapshot(self):
         os.unlink(os.path.join(self.task_dir, "session.json"))
-        proc = self.run_session_start()
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(proc.stdout.strip(), "")
-        self.assertNotIn("task_id", proc.stdout)
+        text = self.injected(self.run_session_start())
+        self.assertIn("<copilot-task-pointer>", text)
+        self.assertIn("未绑定会话", text)
+        self.assertIn("不是用户新指令", text)
+        self.assertNotIn("<copilot-session-recovery>", text)
+        self.assertNotIn(self.state_path, text)
 
     def test_missing_session_id_does_not_inject(self):
         proc = self.run_session_start(session=None)
@@ -648,16 +656,19 @@ class SessionStartRecoveryTests(StopGuardBase):
         self.assertIn("任务状态读取异常", text)
         self.assertIn("不得伪造 PASS", text)
 
-    def test_unbound_corrupt_state_is_not_injected(self):
-        # 不属于本会话的损坏任务不进入本会话上下文；只有绑定本会话的任务才注入。
+    def test_unbound_corrupt_state_gets_pointer_repair_hint(self):
+        # 不属于本会话的损坏任务不注入完整恢复快照；但只读指针仍提示异常，
+        # 避免会话误以为工作区没有未完成工作而丢弃现场。
         bad = os.path.join(self.workspace, ".copilot-tasks", "bad")
         os.makedirs(bad, exist_ok=True)
         with open(os.path.join(bad, "state.json"), "w", encoding="utf-8") as fh:
             fh.write("{not json")
         os.unlink(os.path.join(self.task_dir, "session.json"))
-        proc = self.run_session_start()
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(proc.stdout.strip(), "")
+        text = self.injected(self.run_session_start())
+        self.assertIn("<copilot-task-pointer>", text)
+        self.assertIn("任务状态读取异常", text)
+        self.assertIn("不得伪造 PASS", text)
+        self.assertNotIn("<copilot-session-recovery>", text)
 
     def test_closed_task_is_not_injected(self):
         state = self.state()
@@ -684,6 +695,85 @@ class SessionStartRecoveryTests(StopGuardBase):
         text = self.injected(self.run_session_start())
         self.assertNotIn(other_ws.name, text)
         self.assertIn(self.workspace, text)
+
+    def test_startup_with_unbound_task_gets_pointer(self):
+        # 新会话（startup）没有绑定任务，但工作区仍有未完成现场：只给指针。
+        os.unlink(os.path.join(self.task_dir, "session.json"))
+        text = self.injected(self.run_session_start(source="startup"))
+        self.assertIn("<copilot-task-pointer>", text)
+        self.assertIn("未绑定会话", text)
+        self.assertNotIn("<copilot-session-recovery>", text)
+        self.assertNotIn(self.state_path, text)
+
+    def test_pointer_includes_blocked_reason_and_needs(self):
+        G.add_block(self.state_path, "缺少真机", "设备可用",
+                    work_items=["A2"], criteria=["C2"])
+        os.unlink(os.path.join(self.task_dir, "session.json"))
+        text = self.injected(self.run_session_start(source="startup"))
+        self.assertIn("缺少真机", text)
+        self.assertIn("需要：设备可用", text)
+
+
+class UserPromptHookTests(StopGuardBase):
+    """UserPromptSubmit：用户每回合带进新授权时重新提示未闭合任务。"""
+
+    def run_prompt(self, *, payload: dict | None = None,
+                   text: str | None = None, env: dict | None = None):
+        return self.run_guard(args=["user-prompt"], payload=payload,
+                              text=text, env=env)
+
+    def injected(self, proc) -> str:
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        data = json.loads(proc.stdout)
+        out = data["hookSpecificOutput"]
+        self.assertEqual(out["hookEventName"], "UserPromptSubmit")
+        return out["additionalContext"]
+
+    def test_open_task_is_injected_with_resume_rules(self):
+        text = self.injected(self.run_prompt())
+        self.assertIn("<copilot-task-pointer>", text)
+        self.assertIn(self.state()["task_id"], text)
+        self.assertIn("不是用户新指令", text)
+        self.assertIn("unblock --by user --quote", text)
+        self.assertIn("先 status --json", text)
+        self.assertLessEqual(len(text), 1800)
+
+    def test_blocked_task_shows_reason_and_needs(self):
+        G.add_block(self.state_path, "等待官方答复", "官方工单回复",
+                    work_items=["A1"], criteria=["C1"])
+        text = self.injected(self.run_prompt())
+        self.assertIn("等待官方答复", text)
+        self.assertIn("官方工单回复", text)
+        self.assertIn("A1", text)
+
+    def test_no_open_task_does_not_inject(self):
+        state = self.state()
+        state["closure"] = {"closed": True}
+        self.save(state)
+        proc = self.run_prompt()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "")
+
+    def test_marker_off_does_not_inject(self):
+        marker = os.path.join(self.workspace, ".copilot-tasks", ".stop-guard-off")
+        with open(marker, "w", encoding="utf-8") as fh:
+            fh.write("{}")
+        proc = self.run_prompt()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "")
+
+    def test_malformed_input_fails_open(self):
+        proc = self.run_prompt(text="{not json")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "")
+
+    def test_prompt_hook_is_read_only(self):
+        tracked = [self.state_path, os.path.join(self.task_dir, "session.json")]
+        before = {path: read_bytes(path) for path in tracked}
+        self.run_prompt(text=json.dumps({"cwd": self.workspace,
+                                         "prompt": "继续"}))
+        self.assertEqual(before, {path: read_bytes(path) for path in tracked},
+                         "用户回合提示不得写状态或绑定文件")
 
 
 if __name__ == "__main__":

@@ -26,7 +26,7 @@ import secrets
 import sys
 import tempfile
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import code_scope as CS
 import review_policy as RP
@@ -224,6 +224,9 @@ def _default_state() -> dict:
         "save_seq": 0,
         "iteration_seq": 0,
         "actions": [],
+        # 调度领取记录：drive 把工作项交给某个会话时落盘，避免并发重复执行。
+        # 记录本身不是执行证明；工作项终态仍以 status/result/evidence 为准。
+        "claims": [],
         "plans": [],
         "iterations": [],
         "judgments": [],
@@ -1253,6 +1256,11 @@ def _validate_actions(raw: object, known_ids: set[str]) -> list[dict]:
         if not isinstance(deps, list):
             raise GovernanceError(f"{aid}.depends_on 必须是数组。")
         deps = [str(d).strip() for d in deps if str(d).strip()]
+        targets = item.get("target_criteria") or []
+        if not isinstance(targets, list):
+            raise GovernanceError(f"{aid}.target_criteria 必须是数组。")
+        targets = list(dict.fromkeys(
+            str(cid).strip() for cid in targets if str(cid).strip()))
         out.append({
             "id": aid,
             "title": title[:300],
@@ -1261,6 +1269,9 @@ def _validate_actions(raw: object, known_ids: set[str]) -> list[dict]:
             "constraints": str(item.get("constraints") or "").strip()[:2000],
             "expected_evidence": expected[:2000],
             "depends_on": deps,
+            # 计划工作项可以声明自己承载的完成条件：派生/调度据此避免对同一条件
+            # 重复生成工作项，阻塞时也能自动归属条件。值必须真实存在于合同中。
+            "target_criteria": targets,
         })
     edges = {item["id"]: item["depends_on"] for item in out}
     universe = known_ids | {item["id"] for item in out}
@@ -1286,6 +1297,20 @@ def plan_state(path: str, plan: dict, *, source: str = "zcode") -> dict:
     raw_actions = plan.get("actions")
     known = {str(a.get("id") or "") for a in state.get("actions") or []}
     actions = _validate_actions(raw_actions, known)
+    known_criteria = {str(c.get("criterion_id") or "")
+                      for c in (state.get("contract") or {}).get("criteria") or []}
+    declared_targets: dict[str, list[str]] = {}
+    for item in actions:
+        # target_criteria 不进入计划摘要：它是调度/归属元数据，不改变计划正文；
+        # 放进摘要会让既有计划的指纹全部漂移（native 派发会判定 plan_drift）。
+        targets = item.pop("target_criteria", [])
+        unknown = [cid for cid in targets if cid not in known_criteria]
+        if unknown:
+            raise GovernanceError(
+                f"{item['id']}.target_criteria 引用了不存在的完成条件："
+                + "、".join(unknown) + "。")
+        if targets:
+            declared_targets[item["id"]] = targets
     plan_sha = _sha256_text(canonical_json({"summary": summary, "actions": actions}))
     for existing in state.get("plans") or []:
         if str(existing.get("sha256") or "") == plan_sha:
@@ -1312,6 +1337,8 @@ def plan_state(path: str, plan: dict, *, source: str = "zcode") -> dict:
             "created": now,
             "updated": now,
         })
+        if declared_targets.get(item["id"]):
+            action["target_criteria"] = declared_targets[item["id"]]
         state["actions"].append(action)
         created.append(action)
     record = {
@@ -1401,13 +1428,134 @@ def _blocked_criteria(state: dict) -> set[str]:
     return out
 
 
-def ready_actions(state: dict) -> list[dict]:
+def _action_criteria(action: dict) -> list[str]:
+    """工作项声明（或由 AUTO-C<n> 隐含）的完成条件。"""
+    declared = action.get("target_criteria") or action.get("criteria") or []
+    if isinstance(declared, str):
+        declared = [declared]
+    out = [str(item or "").strip() for item in declared
+           if str(item or "").strip()]
+    if not out:
+        match = re.fullmatch(r"AUTO-C([0-9]{1,3})", str(action.get("id") or ""))
+        if match:
+            out = [f"C{match.group(1)}"]
+    return out
+
+
+# ── 调度领取（claims）────────────────────────────────────────────────────
+# `drive` 把工作项交给某个会话时写入一条短租约：并发会话不会拿到同一项；
+# 租约到期自动失效，不会把工作永久锁死。领取只是调度事实，不是执行完成。
+CLAIM_TTL_ENV = "COPILOT_CLAIM_TTL"
+DEFAULT_CLAIM_TTL = 1800
+LOCAL_CLAIM_OWNER = "local"
+
+
+def claim_owner() -> str:
+    """当前领取方：会话标识；无会话标识（手工/测试）时用 local。"""
+    return current_session_id() or LOCAL_CLAIM_OWNER
+
+
+def _claim_ttl() -> int:
+    raw = str(os.environ.get(CLAIM_TTL_ENV, "")).strip()
+    if not raw:
+        return DEFAULT_CLAIM_TTL
+    try:
+        value = int(raw)
+    except ValueError:
+        return DEFAULT_CLAIM_TTL
+    return value if value >= 0 else DEFAULT_CLAIM_TTL
+
+
+def _claim_active(claim: dict, now: datetime | None = None) -> bool:
+    expires = _parse_time(claim.get("expires_at"))
+    if expires is None:
+        return False
+    if expires.tzinfo is None:
+        expires = expires.replace(tzinfo=timezone.utc)
+    return expires > (now or datetime.now(timezone.utc))
+
+
+def active_claims(state: dict, *, now: datetime | None = None) -> dict[str, dict]:
+    """未过期领取记录：work_item_id → claim。"""
+    out: dict[str, dict] = {}
+    for claim in state.get("claims") or []:
+        if not isinstance(claim, dict):
+            continue
+        aid = str(claim.get("work_item_id") or "")
+        if aid and _claim_active(claim, now):
+            out[aid] = claim
+    return out
+
+
+def _drop_claim(state: dict, aid: str) -> None:
+    """工作项回填、撤销或阻塞后，对应租约不再有意义。"""
+    claims = state.get("claims")
+    if not isinstance(claims, list):
+        state["claims"] = []
+        return
+    state["claims"] = [claim for claim in claims
+                       if not (isinstance(claim, dict)
+                               and str(claim.get("work_item_id") or "")
+                               == str(aid or ""))]
+
+
+def claim_actions(state: dict, ids: list[str], *, owner: str = "",
+                  ttl: int | None = None) -> dict:
+    """为本次调度领取工作项；返回 owner / claimed / busy / ttl。
+
+    同一领取方可重复领取（重试或再次 drive），不同领取方的有效租约不会被抢占。
+    过期租约在本次领取时被清理，因此崩溃后最多等待 TTL 即可重新领取。
+    """
+    resolved_owner = str(owner or "").strip() or claim_owner()
+    now = datetime.now(timezone.utc)
+    ttl = _claim_ttl() if ttl is None else max(0, int(ttl))
+    active = active_claims(state, now=now)
+    claims = [claim for claim in state.get("claims") or []
+              if isinstance(claim, dict) and _claim_active(claim, now)]
+    by_aid = {str(claim.get("work_item_id") or ""): claim for claim in claims}
+    expires_at = (now + timedelta(seconds=ttl)).isoformat()
+    claimed: list[str] = []
+    busy: list[str] = []
+    for raw in ids:
+        aid = str(raw or "").strip()
+        if not aid:
+            continue
+        current = active.get(aid)
+        if current is not None and str(current.get("owner") or "") != resolved_owner:
+            busy.append(aid)
+            continue
+        previous = by_aid.get(aid) or {}
+        handoff = int(previous.get("handoff_count") or 0) + 1
+        record = {
+            "work_item_id": aid,
+            "owner": resolved_owner,
+            "claim_id": "K" + _sha256_text(canonical_json(
+                [state.get("task_id"), aid, resolved_owner,
+                 now.isoformat(), handoff]))[:12],
+            "acquired": now.isoformat(),
+            "expires_at": expires_at,
+            "handoff_count": handoff,
+        }
+        claims = [claim for claim in claims
+                  if str(claim.get("work_item_id") or "") != aid]
+        claims.append(record)
+        by_aid[aid] = record
+        claimed.append(aid)
+    state["claims"] = claims
+    return {"owner": resolved_owner, "claimed": claimed, "busy": busy,
+            "ttl": ttl}
+
+
+def ready_actions(state: dict, *, owner: str | None = None,
+                  include_claimed: bool = False) -> list[dict]:
     if bool((state.get("closure") or {}).get("closed")):
         return []
     # 任务级阻塞冻结全部工作；项级阻塞只冻结被标记的工作项。
     if _task_blocks(state):
         return []
     blocked_ids = set(_item_block_map(state))
+    mine = claim_owner() if owner is None else str(owner or "")
+    claims = {} if include_claimed else active_claims(state)
     actions = _tracked_actions(state)
     done = {a["id"] for a in actions
             if str(a.get("status") or "") == "done"}
@@ -1415,7 +1563,11 @@ def ready_actions(state: dict) -> list[dict]:
     for action in actions:
         if str(action.get("status") or "") != "pending":
             continue
-        if str(action.get("id") or "") in blocked_ids:
+        aid = str(action.get("id") or "")
+        if aid in blocked_ids:
+            continue
+        claim = claims.get(aid)
+        if claim is not None and str(claim.get("owner") or "") != mine:
             continue
         if all(dep in done for dep in action.get("depends_on") or []):
             out.append(action)
@@ -1515,6 +1667,8 @@ def record_action_state(state: dict, aid: str, status: str, *,
         action["result"] = result[:MAX_RESULT_CHARS]
     action["evidence_ids"] = [r["id"] for r in refs]
     action["updated"] = now_iso()
+    # 回填即表示该次领取已结束；无论结果是 done/failed/blocked，租约都不再有效。
+    _drop_claim(state, aid)
     if status == "failed":
         action["fail_streak"] = int(action.get("fail_streak") or 0) + 1
     elif status == "done":
@@ -1563,6 +1717,7 @@ def rerun_action(path: str, aid: str, *, reason: str = "") -> dict:
     action["fail_streak"] = 0
     action["rerun_count"] = int(action.get("rerun_count") or 0) + 1
     action["updated"] = now_iso()
+    _drop_claim(state, aid)
     _history(state, "action_rerun", {"id": aid, "previous": current,
                                      "reason": (reason or "").strip()[:500]})
     save_state(path, state)
@@ -1609,6 +1764,7 @@ def _sync_criterion_work_items(state: dict, cid: str) -> list[str]:
             item["result"] = f"随完成条件 {cid} 核销自动撤销：条件已 met，无独立工作"
             item["auto_closed_for"] = cid
             item["updated"] = now_iso()
+            _drop_claim(state, aid)
             changed.append(aid)
             _history(state, "work_auto_closed", {"id": aid, "criterion_id": cid})
         else:
@@ -1694,13 +1850,18 @@ def record_judgment(path: str, status: str, summary: str, *,
 
 def add_block(path: str, reason: str, needs: str,
               *, work_items: list[str] | None = None,
-              criteria: list[str] | None = None) -> dict:
+              criteria: list[str] | None = None,
+              force: bool = False) -> dict:
     """登记真实阻塞。
 
     `work_items` 非空时只冻结这些工作项（其余工作继续推进），这是授权缺口
     （commit / push / 部署 / 生产数据 / 付费 / 用户决策）的默认用法；不指定
     工作项即任务级阻塞，只在目标或资源整体不可推进时使用。`criteria` 用于声明
     这些工作项同时卡住的完成条件，避免对不可执行的缺口重复派生工作项。
+
+    `force` 只用于任务级阻塞：登记时仍有可执行工作项时，调用方必须显式确认
+    “整体不可推进”。函数把该事实写入 block 供审计；CLI 会拒绝未加 --force 的
+    任务级阻塞，避免单项授权缺口冻结其余工作。
     """
     state = load_state(path)
     # 已有阻塞时仍要允许登记第二个真实阻塞；否则只能改写旧记录或丢失事实。
@@ -1720,17 +1881,12 @@ def add_block(path: str, reason: str, needs: str,
         # 工作项可以在计划期声明自己承载的完成条件（target_criteria），派生工作项
         # AUTO-C<n> 天然承载 C<n>。阻塞时自动归属这些条件：否则条件悬空会被反复
         # 派生为新的“可执行”工作项，任务永远到不了真实 BLOCKED。
-        declared = action.get("target_criteria") or action.get("criteria") or []
-        if isinstance(declared, str):
-            declared = [declared]
-        if not declared:
-            match = re.fullmatch(r"AUTO-C([0-9]{1,3})", aid)
-            if match:
-                declared = [f"C{match.group(1)}"]
-        for raw_cid in declared:
-            cid = str(raw_cid or "").strip()
-            if cid and cid not in auto_criteria:
+        for cid in _action_criteria(action):
+            if cid not in auto_criteria:
                 auto_criteria.append(cid)
+    ready_now = [] if items else [
+        str(action.get("id") or "") for action in
+        ready_actions(state, include_claimed=True)]
     criterion_ids: list[str] = []
     known = {str(c.get("criterion_id") or "")
              for c in (state.get("contract") or {}).get("criteria") or []}
@@ -1755,6 +1911,10 @@ def add_block(path: str, reason: str, needs: str,
         "criteria": criterion_ids,
         "reason": reason[:MAX_REPORT_CHARS],
         "needs": needs[:MAX_REPORT_CHARS],
+        # 任务级阻塞登记时仍存在可执行项：记录事实，供审计判断是否本应只阻塞
+        # 单项。CLI 默认拒绝这种用法，只有显式 --force 才会写入。
+        "ready_at_creation": ready_now,
+        "forced_scope": bool(ready_now and force),
         "created": now_iso(),
         "resolved_at": None,
         "resolved_by": None,
@@ -1771,6 +1931,8 @@ def add_block(path: str, reason: str, needs: str,
         action["blocked_reason"] = block["reason"]
         action["blocked_needs"] = block["needs"]
         action["updated"] = now
+        # 阻塞即中止本次领取；解除阻塞后重新进入 pending，由下一次 drive 领取。
+        _drop_claim(state, aid)
     _history(state, "block_added", {"block_id": block["block_id"],
                                     "scope": block["scope"],
                                     "work_items": items,
@@ -1779,13 +1941,23 @@ def add_block(path: str, reason: str, needs: str,
     return block
 
 
-def resolve_block(path: str, reason: str, block_id: str = "") -> dict:
+def resolve_block(path: str, reason: str, block_id: str = "", *,
+                  by: str = "zcode", quote: str = "") -> dict:
     state = load_state(path)
     if bool((state.get("closure") or {}).get("closed")):
         raise GovernanceError("任务已收口（CLOSED），不能解除阻塞；请先 reopen。")
     reason = (reason or "").strip()
     if not reason:
         raise GovernanceError("解除阻塞必须说明依据（--reason）。")
+    resolved_by = str(by or "zcode").strip().lower()
+    if resolved_by not in ("user", "zcode", "agent"):
+        raise GovernanceError(
+            f"unblock --by={by!r} 非法；只能是 user / zcode / agent。")
+    quote = (quote or "").strip()
+    if resolved_by == "user" and not quote:
+        raise GovernanceError(
+            "unblock --by user 必须同时提供 --quote \"<用户原话>\"："
+            "用户授权是调用方声明，需要保留原话供审计核对，不能只写结论。")
     active = [b for b in state.get("blocks") or [] if not b.get("resolved_at")]
     if not active:
         raise GovernanceError("当前没有未解除的阻塞。")
@@ -1805,7 +1977,12 @@ def resolve_block(path: str, reason: str, block_id: str = "") -> dict:
         target = active
     for block in target:
         block["resolved_at"] = now_iso()
-        block["resolved_by"] = "zcode"
+        block["resolved_by"] = resolved_by
+        # 与合同修订/重开同一口径：user 是调用方自报声明，不是可验证凭证；
+        # 原话留在记录里供审计核对授权范围。
+        block["authorization_source"] = (
+            "caller-declared" if resolved_by == "user" else "")
+        block["authorization_quote"] = quote[:MAX_REPORT_CHARS]
         block["resolution"] = reason[:MAX_REPORT_CHARS]
     ids = [str(b.get("block_id") or "") for b in target]
     # 项级阻塞解除后，被它冻结的工作项恢复可执行；这是「用户授权更新后对应
@@ -1839,10 +2016,12 @@ def resolve_block(path: str, reason: str, block_id: str = "") -> dict:
             resumed.append(aid)
     _history(state, "block_resolved", {"count": len(target), "block_ids": ids,
                                        "resumed_work_items": resumed,
+                                       "resolved_by": resolved_by,
+                                       "quote": quote[:500],
                                        "reason": reason[:200]})
     save_state(path, state)
     return {"resolved": len(target), "block_ids": ids, "resumed": resumed,
-            "reason": reason}
+            "resolved_by": resolved_by, "reason": reason}
 
 
 def add_decision(path: str, text: str, *, source: str = "user") -> dict:
@@ -5152,11 +5331,19 @@ def derive_work(state: dict, *, reason: str = "partial",
     unmet = _unmet_criteria(state)
     accept_derived = False
     blocked_cids = _blocked_criteria(state)
+    # 已被其它会话领取的工作项覆盖的条件，不再派生 AUTO-C<n>：否则两个会话会
+    # 对同一条件各执行一遍。租约到期后这里自动恢复派生。
+    claimed_actions = {str(a.get("id") or ""): a for a in _tracked_actions(state)}
+    claimed_cids: set[str] = set()
+    for aid in active_claims(state):
+        action = claimed_actions.get(aid)
+        if action is not None:
+            claimed_cids.update(_action_criteria(action))
     for criterion in unmet[:MAX_DERIVED_PER_CALL]:
         cid = str(criterion.get("criterion_id") or "")
         # 已随工作项一起声明的阻塞条件不再派生：缺授权/决策时重复派生只会
         # 制造无法执行的工作单。
-        if cid in blocked_cids:
+        if cid in blocked_cids or cid in claimed_cids:
             continue
         acceptance = criterion.get("acceptance")
         if isinstance(acceptance, dict):
@@ -5579,6 +5766,7 @@ def continuation(state: dict, *, cache: dict | None = None,
         "blocked_items": ev.get("blocked_items") or [],
         "dependency_blocked": ev.get("dependency_blocked") or [],
         "unattributed_criteria": ev.get("unattributed_criteria") or [],
+        "claimed_by_others": [],
         "next_command": "",
         "reason": "",
     }
@@ -5612,8 +5800,21 @@ def continuation(state: dict, *, cache: dict | None = None,
             "reason": "存在可领取工作项：继续执行，不要结束回合",
         })
         return base
+    # 其它会话的有效领取：先算出来，避免把“对方正在做”误判成本会话可派生。
+    mine = claim_owner()
+    actions = {str(a.get("id") or ""): a for a in _tracked_actions(state)}
+    others = []
+    for aid, claim in active_claims(state).items():
+        action = actions.get(aid)
+        if action is None or str(action.get("status") or "") in TERMINAL:
+            continue
+        if str(claim.get("owner") or "") == mine:
+            continue
+        others.append(aid)
     derivable = _dry_derive_ids(state, cache=cache)
-    if derivable:
+    # 只剩通用的 AUTO-NEXT 兜底时，说明具体缺口已被对方领取/阻塞；此时派生
+    # AUTO-NEXT 只会让两个会话各自重新规划同一任务，应等待对方回填或租约到期。
+    if derivable and not (others and set(derivable) <= {"AUTO-NEXT"}):
         hint = ""
         if base["unattributed_criteria"]:
             hint = ("；条件 " + "、".join(base["unattributed_criteria"]) +
@@ -5625,6 +5826,19 @@ def continuation(state: dict, *, cache: dict | None = None,
             "derivable": derivable,
             "next_command": "copilot_auto.py drive --state <state>（派生下一步并执行）",
             "reason": "任务仍处于 PARTIAL 且可派生下一步工作项：继续推进" + hint,
+        })
+        return base
+    # 没有本会话可领取/可派生的下一步，但工作项已被其它会话领取：等待该会话
+    # 回填或租约到期。这不是整体 BLOCKED（不需要用户授权），也不是任务终点；
+    # 不重复执行同一工作项，也不把租约当成永久锁。
+    if others:
+        base.update({
+            "action": "wait",
+            "claimed_by_others": sorted(others),
+            "next_command": ("copilot_stop_guard.py status（查看领取方）；或等租约到期后 "
+                             "重新 drive"),
+            "reason": ("工作项已被其它会话领取：" + "、".join(sorted(others))
+                       + "；等待其回填或租约到期，避免并发重复执行"),
         })
         return base
     base.update({
@@ -5763,6 +5977,16 @@ def render_status(state: dict, evaluation: dict | None = None, *,
         for action in actions:
             lines.append(f"- {action.get('id')} [{action.get('status')}] "
                          f"{action.get('title')}")
+    claims = active_claims(state)
+    if claims:
+        lines.append("调度领取（短租约；不是执行证明）：")
+        for aid, claim in sorted(claims.items()):
+            handoff = int(claim.get("handoff_count") or 0)
+            lines.append(f"- {aid} 由 {claim.get('owner') or '-'} 领取 · "
+                         f"到期 {claim.get('expires_at') or '-'} · 第 {handoff} 次交办")
+            if handoff >= 3:
+                lines.append("  警告：同一工作项已多次交办仍未回填；先确认是否真的受阻，"
+                             "必要时 record failed 并换路线（AUTO-REPLAN）。")
     blocks = _active_blocks(state)
     if blocks:
         for block in blocks:
@@ -5800,6 +6024,9 @@ def render_status(state: dict, evaluation: dict | None = None, *,
         if cont.get("dependency_blocked"):
             lines.append("等待阻塞解除后才能开始：" +
                          "、".join(cont.get("dependency_blocked") or []))
+        if cont.get("claimed_by_others"):
+            lines.append("由其它会话领取（等待回填/租约到期）：" +
+                         "、".join(cont.get("claimed_by_others") or []))
     next_commands = ev.get("next_commands") or []
     if next_commands:
         lines.append("下一步：")

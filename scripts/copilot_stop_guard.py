@@ -74,11 +74,23 @@ REASON_LIMIT = 3900
 # startup 不推断旧任务的归属（避免把无关会话引向旧任务），clear 尊重用户的清空动作。
 SESSION_START_SOURCES = ("resume", "compact")
 SESSION_START_MATCHER = "resume|compact"
+# 新会话（startup）与换了会话标识的 resume/compact 只拿到“有未闭合任务”的指针，
+# 不注入任务正文、不绑定、不强制续跑；由用户/主代理决定是否接管。
+POINTER_SOURCES = ("startup", "resume", "compact")
 SESSION_START_LIMIT = 1600
+POINTER_LIMIT = 1200
 CONTEXT_HINT_MAX = 720
 SESSION_START_MAX_TASKS = 2
 SESSION_START_OPEN = "<copilot-session-recovery>"
 SESSION_START_CLOSE = "</copilot-session-recovery>"
+POINTER_OPEN = "<copilot-task-pointer>"
+POINTER_CLOSE = "</copilot-task-pointer>"
+# UserPromptSubmit：用户每回合都能带进新授权/决策/条件，因此逐回合重新提示
+# 未闭合任务（含 BLOCKED 的原因与需要）。只在有未闭合任务时注入，且不把用户
+# 输入或快照当作用户授权。
+USER_PROMPT_EVENT = "UserPromptSubmit"
+USER_PROMPT_LIMIT = 1800
+USER_PROMPT_MAX_TASKS = 3
 
 
 def _env_off() -> bool:
@@ -209,11 +221,34 @@ def _unmet_criteria(state: dict) -> list[str]:
             and str(item.get("criterion_id") or "")]
 
 
-def collect(root: str, *, session: str = "") -> tuple[list[dict], list[dict]]:
+def _open_blocks(state: dict) -> list[dict]:
+    """未解除阻塞（只读）：恢复/提示时给出原因与所需条件，便于用户补齐授权。"""
+    out: list[dict] = []
+    for block in state.get("blocks") or []:
+        if not isinstance(block, dict) or block.get("resolved_at"):
+            continue
+        out.append({
+            "id": str(block.get("id") or block.get("block_id") or ""),
+            "reason": str(block.get("reason") or ""),
+            "needs": str(block.get("needs") or block.get("need") or ""),
+            "work_items": [str(item) for item in block.get("work_items") or []
+                           if str(item or "").strip()],
+            "criteria": [str(item) for item in block.get("criteria") or []
+                         if str(item or "").strip()],
+            "scope": str(block.get("scope") or ""),
+        })
+    return out
+
+
+def collect(root: str, *, session: str = "",
+            include_open: bool = False) -> tuple[list[dict], list[dict]]:
     """返回 (要求续跑的任务, 异常)。
 
     任务是否“要求续跑”只由 Copilot 的本地判定决定；这里的会话绑定只决定
     本会话是否为该任务的负责方。未绑定（旧任务）与其它会话的任务不拦截。
+
+    `include_open=True` 额外纳入“没有续跑动作但仍有未解除阻塞”的任务（BLOCKED），
+    用于恢复提示与用户回合提示；不改变 Stop 的拦截口径。
     """
     rows: list[dict] = []
     anomalies: list[dict] = []
@@ -274,7 +309,10 @@ def collect(root: str, *, session: str = "") -> tuple[list[dict], list[dict]]:
                               "detail": f"{type(exc).__name__}: {exc}"})
             continue
         if not cont.get("required"):
-            continue
+            # BLOCKED 只在显式要求提示时纳入：Stop 不能因“等用户授权”反复续跑。
+            blocks = _open_blocks(state)
+            if not include_open or not blocks:
+                continue
         rows.append({
             "task_id": str(state.get("task_id") or name),
             "task_dir": task_dir,
@@ -287,6 +325,7 @@ def collect(root: str, *, session: str = "") -> tuple[list[dict], list[dict]]:
             "blocked_items": list(cont.get("blocked_items") or []),
             "unattributed_criteria": list(cont.get("unattributed_criteria") or []),
             "unmet_criteria": _unmet_criteria(state),
+            "blocks": _open_blocks(state),
             "next_command": cont.get("next_command") or "",
             "updated": str(state.get("updated") or ""),
             "binding": binding,
@@ -334,6 +373,11 @@ def render(row: dict, *, total: int = 1, anomalies: list[dict] | None = None,
         lines.append("- 未归属完成条件：" + "、".join(row["unattributed_criteria"])
                      + "；若确由已阻塞工作项承载，先用 block --work-item ... "
                        "--criterion ... 归属")
+    for block in row.get("blocks") or []:
+        scope = "、".join(block["work_items"] or block["criteria"]) or "任务级"
+        lines.append(f"- 阻塞 {block['id'] or '（未编号）'}（{scope}）："
+                     f"{block['reason'] or '原因未记录'}；需要："
+                     f"{block['needs'] or '未写明'}")
     if row["next_command"]:
         lines.append("- 下一步命令：" + row["next_command"].replace(
             "<state>", row["state_path"]))
@@ -551,6 +595,104 @@ def _project_context(root: str, row: dict) -> list[str]:
     return kept
 
 
+def _block_line(block: dict) -> str:
+    """一条阻塞的单行摘要：作用对象 + 原因 + 需要什么才能解除。"""
+    scope = "、".join(block.get("work_items") or block.get("criteria") or []) or "任务级"
+    return (f"阻塞 {block.get('id') or '（未编号）'}（{scope}）："
+            f"{block.get('reason') or '原因未记录'}；需要："
+            f"{block.get('needs') or '未写明'}")
+
+
+def _row_open_line(row: dict) -> str:
+    """任务的一行现状：阶段 + 可执行下一步 + 未解除阻塞（原因/需要）。"""
+    parts: list[str] = []
+    if row["executable"]:
+        parts.append("可执行 " + "、".join(row["executable"]))
+    elif row["derivable"]:
+        parts.append("可派生 " + "、".join(row["derivable"]))
+    elif not row["blocks"]:
+        parts.append(row["reason"] or "仍有未完成工作")
+    if row["blocks"]:
+        parts.append("；".join(_block_line(block) for block in row["blocks"]))
+    return f"- 任务 {row['task_id']} · 阶段 {row['phase']} · " + "｜".join(parts)
+
+
+def _fit_lines(lines: list[str], limit: int, closing: str) -> str:
+    """按整行截断：宁可少一行，也不把命令/路径切成半截。"""
+    text = "\n".join(lines)
+    if len(text) <= limit:
+        return text
+    kept = lines[:2]
+    for line in lines[2:-1]:
+        trial = "\n".join(kept + [line, "...（已截断）", closing])
+        if len(trial) > limit:
+            break
+        kept.append(line)
+    return "\n".join(kept + ["...（已截断）", closing])
+
+
+def _pointer_text(rows: list[dict], anomalies: list[dict] | None = None,
+                  session: str = "") -> str:
+    """新会话/换会话标识后的只读指针：告诉会话“有未闭合任务”，不接管、不绑定。"""
+    lines = [
+        POINTER_OPEN,
+        "本工作区存在未闭合的 Copilot 任务（只读提示；不是用户新指令，也不是授权；"
+        "Stop 守卫只强制续跑已绑定本会话的任务）。",
+    ]
+    for row in rows[:SESSION_START_MAX_TASKS]:
+        line = _row_open_line(row)
+        if session and session in (row.get("sessions") or []):
+            line += "（本会话）"
+        elif row.get("sessions"):
+            line += "（归属其它会话，可能仍在推进）"
+        else:
+            line += "（未绑定会话）"
+        lines.append(line)
+    if len(rows) > SESSION_START_MAX_TASKS:
+        lines.append(f"- 另有 {len(rows) - SESSION_START_MAX_TASKS} 个未闭合任务；"
+                     "用 status 查看。")
+    if anomalies:
+        lines.append(f"- 另有 {len(anomalies)} 处任务状态读取异常；先按 status 的 fix 提示"
+                     "处理，不得忽略，也不得伪造 PASS。")
+    lines.append("若用户当前要做的正是其中之一：先 status --json 核实现场（阶段、"
+                 "已完成工作项、证据、阻塞），再 drive 继续（会绑定本会话）。"
+                 "若它归属其它会话且该会话仍活跃，不要并发接管；先看 status 的领取与"
+                 "更新时间。否则忽略本提示，不要执行无关任务。")
+    lines.append(POINTER_CLOSE)
+    return _fit_lines(lines, POINTER_LIMIT, POINTER_CLOSE)
+
+
+def _user_prompt_text(rows: list[dict], anomalies: list[dict] | None = None,
+                      session: str = "") -> str:
+    """用户回合提示：带进新授权/决策时立即恢复执行，而不是重复报告。"""
+    lines = [
+        POINTER_OPEN,
+        "本工作区有未闭合的 Copilot 任务（只读状态；不是用户新指令，也不构成授权）：",
+    ]
+    for row in rows[:USER_PROMPT_MAX_TASKS]:
+        line = _row_open_line(row)
+        if session and row.get("sessions") and session not in row["sessions"]:
+            line += "（归属其它会话）"
+        lines.append(line)
+    if len(rows) > USER_PROMPT_MAX_TASKS:
+        lines.append(f"- 另有 {len(rows) - USER_PROMPT_MAX_TASKS} 个未闭合任务；"
+                     "用 status 查看。")
+    if anomalies:
+        lines.append(f"- 另有 {len(anomalies)} 处任务状态读取异常；先按 status 的 fix 提示"
+                     "处理，不得忽略，也不得伪造 PASS。")
+    lines.append("本回合判断（按顺序）：")
+    lines.append("1) 用户这条消息是否补齐了上面某个阻塞所需的授权/决策/条件，或明确要求"
+                 "继续该任务？")
+    lines.append("2) 是 → 用用户原话登记解除（unblock --by user --quote \"<用户原话>\"，"
+                 "或补齐对应条件），然后 drive 继续执行到下一个真实终点；不要只回总结、"
+                 "也不要把“已理解”当成已执行。")
+    lines.append("3) 否 → 不要恢复执行；用户明确要求停止/切换时按其指示，本提示不是授权。")
+    lines.append("4) 不重复已完成工作：先 status --json 核对阶段与证据；工作项若已被其它"
+                 "会话领取，避免并发重复执行。")
+    lines.append(POINTER_CLOSE)
+    return _fit_lines(lines, USER_PROMPT_LIMIT, POINTER_CLOSE)
+
+
 def _session_start_text(rows: list[dict], anomalies: list[dict] | None = None,
                         root: str = "") -> str:
     """恢复快照：只给定位阶段与续接入口所需的信息，不复制任务正文。"""
@@ -563,6 +705,8 @@ def _session_start_text(rows: list[dict], anomalies: list[dict] | None = None,
                      f"{row['reason'] or '仍有未完成工作'}")
         if row["unmet_criteria"]:
             lines.append("  未闭合条件：" + "、".join(row["unmet_criteria"]))
+        for block in row.get("blocks") or []:
+            lines.append("  " + _block_line(block))
         if row["next_command"]:
             lines.append("  下一步命令：" + row["next_command"].replace(
                 "<state>", row["state_path"]))
@@ -592,7 +736,12 @@ def _session_start_text(rows: list[dict], anomalies: list[dict] | None = None,
 
 
 def cmd_session_start() -> int:
-    """SessionStart 钩子模式：只读恢复快照；任何异常都放行且不注入。"""
+    """SessionStart 钩子模式：只读恢复快照；任何异常都放行且不注入。
+
+    resume/compact 且任务绑定本会话：注入完整恢复快照。
+    startup，或没有任何任务绑定本会话：只注入“存在未闭合任务”的只读指针，
+    不绑定、不接管、不强制续跑（换会话标识后的重启也能重新发现现场）。
+    """
     try:
         if _env_off():
             _log(0, "", note="session-start-env-off")
@@ -602,7 +751,7 @@ def cmd_session_start() -> int:
             _log(0, "", note="session-start-payload-error")
             return 0
         source = str(payload.get("source") or payload.get("hook_source") or "").strip().lower()
-        if source not in SESSION_START_SOURCES:
+        if source not in POINTER_SOURCES:
             _log(0, "", note=f"session-start-skip:{source or 'unknown'}")
             return 0
         session = _session_from(payload)
@@ -625,12 +774,30 @@ def cmd_session_start() -> int:
         # 待续跑任务，从而丢掉真正需要处理的那个任务。
         bound_anomalies = [item for item in anomalies
                            if item.get("binding") in ("bound", "corrupt")]
-        if not bound and not bound_anomalies:
-            _log(0, root, note=f"session-start-out-of-scope:{len(rows)}", session=session)
+        if bound or bound_anomalies:
+            if source not in SESSION_START_SOURCES:
+                # startup 不重复注入：本回合已有会话级上下文，避免启动噪音。
+                _log(0, root, note=f"session-start-startup-bound:{len(bound)}",
+                     session=session)
+                return 0
+            text = _session_start_text(bound, bound_anomalies, root=root)
+            _log(0, root, task_id=bound[0]["task_id"] if bound else "",
+                 session=session, note=f"session-start-inject:{source}")
+            print(json.dumps({"hookSpecificOutput": {
+                "hookEventName": "SessionStart",
+                "additionalContext": text,
+            }}, ensure_ascii=False))
             return 0
-        text = _session_start_text(bound, bound_anomalies, root=root)
-        _log(0, root, task_id=bound[0]["task_id"] if bound else "",
-             session=session, note=f"session-start-inject:{source}")
+        # 没有本会话任务：给只读指针（含 BLOCKED 的原因/需要），不自动绑定。
+        # 归属其它会话的任务也列出并标注，否则重启换了会话标识就再也发现不了现场；
+        # 是否接管由用户/主代理判断，Stop 仍只强制绑定本会话的任务。
+        all_rows, all_anomalies = collect(root, session="", include_open=True)
+        if not all_rows:
+            _log(0, root, note="session-start-no-open-task", session=session)
+            return 0
+        text = _pointer_text(all_rows, all_anomalies, session=session)
+        _log(0, root, task_id=all_rows[0]["task_id"], session=session,
+             note=f"session-start-pointer:{source}:{len(all_rows)}")
         print(json.dumps({"hookSpecificOutput": {
             "hookEventName": "SessionStart",
             "additionalContext": text,
@@ -638,6 +805,40 @@ def cmd_session_start() -> int:
         return 0
     except Exception as exc:  # noqa: BLE001 - 恢复注入失败不得阻断会话启动
         _log(0, "", note=f"session-start-error:{type(exc).__name__}")
+        return 0
+
+
+def cmd_user_prompt() -> int:
+    """UserPromptSubmit 钩子模式：逐回合提示未闭合任务；任何异常都放行。"""
+    try:
+        if _env_off():
+            _log(0, "", note="user-prompt-env-off")
+            return 0
+        payload, payload_error = _read_payload()
+        if payload_error:
+            _log(0, "", note="user-prompt-payload-error")
+            return 0
+        start = _cwd_from_payload(payload)
+        root = find_tasks_root(start)
+        if not root:
+            _log(0, start, note="user-prompt-no-tasks-dir")
+            return 0
+        if os.path.exists(os.path.join(root, TASKS_DIR, OFF_MARKER)):
+            _log(0, root, note="user-prompt-marker-off")
+            return 0
+        rows, anomalies = collect(root, session="", include_open=True)
+        if not rows:
+            _log(0, root, note="user-prompt-no-open-task")
+            return 0
+        text = _user_prompt_text(rows, anomalies, session=_session_from(payload))
+        _log(0, root, task_id=rows[0]["task_id"], note=f"user-prompt-inject:{len(rows)}")
+        print(json.dumps({"hookSpecificOutput": {
+            "hookEventName": USER_PROMPT_EVENT,
+            "additionalContext": text,
+        }}, ensure_ascii=False))
+        return 0
+    except Exception as exc:  # noqa: BLE001 - 提示注入失败不得阻断用户回合
+        _log(0, "", note=f"user-prompt-error:{type(exc).__name__}")
         return 0
 
 
@@ -691,11 +892,13 @@ def _hook_group(*, subcommand: str = "", matcher: str = "") -> dict:
 
 
 def _install_targets() -> tuple[tuple[str, dict], ...]:
-    """两个事件各一条：Stop 管回合内续跑，SessionStart 只管恢复快照。"""
+    """三个事件各一条：Stop 管回合内续跑，SessionStart 管恢复快照，
+    UserPromptSubmit 管用户新回合带来的授权/决策重新评估。"""
     return (
         ("Stop", _hook_group()),
         ("SessionStart", _hook_group(subcommand="session-start",
                                      matcher=SESSION_START_MATCHER)),
+        (USER_PROMPT_EVENT, _hook_group(subcommand="user-prompt")),
     )
 
 
@@ -835,7 +1038,7 @@ def cmd_uninstall(args) -> int:
     hooks = data.get("hooks") or {}
     events = hooks.get("events") or {}
     removed = 0
-    for event in ("Stop", "SessionStart"):
+    for event in ("Stop", "SessionStart", USER_PROMPT_EVENT):
         groups = events.get(event) or []
         kept = [group for group in groups if not _is_guard_group(group)]
         removed += len(groups) - len(kept)
@@ -916,8 +1119,10 @@ def main(argv: list[str] | None = None) -> int:
     p_status.add_argument("--session", default="",
                           help="按指定会话判定归属（默认读 ZCODE_SESSION_ID）")
     sub.add_parser("session-start",
-                   help="SessionStart 恢复注入（resume|compact；只读、失败放行）")
-    p_config = sub.add_parser("config", help="打印 Stop/SessionStart 钩子配置片段")
+                   help="SessionStart 恢复注入（resume|compact 快照；startup 只给指针）")
+    sub.add_parser("user-prompt",
+                   help="UserPromptSubmit 逐回合提示未闭合任务（只读、失败放行）")
+    p_config = sub.add_parser("config", help="打印 Stop/SessionStart/UserPromptSubmit 钩子配置片段")
     p_config.add_argument("--workspace", default="")
     p_install = sub.add_parser("install", help="把守卫写入工作区/用户级配置")
     p_install.add_argument("--workspace", default="", help="工作区级：写入 <ws>/.zcode/config.json")
@@ -942,6 +1147,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.command == "session-start":
         return cmd_session_start()
+    if args.command == "user-prompt":
+        return cmd_user_prompt()
     if args.command == "status":
         return cmd_status(args)
     if args.command == "config":

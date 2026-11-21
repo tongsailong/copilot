@@ -12,6 +12,16 @@ Copilot 是运行于 ZCode 内的**轻量协作治理 Skill**：负责任务承�
 （CONSULT / PLAN）按生命周期提供整体判断，用户明确要求时执行一次独立复核（REVIEW），均由
 `gpt-6.2-sol` 零工具单轮调用完成。
 
+- **v9.5.0 起派生项以“领取”进入调度事实**：`drive` 为选中的工作项写
+  `state["claims"]`（owner 会话、TTL `COPILOT_CLAIM_TTL` 默认 1800 s、`handoff_count`），
+  `ready_actions`/`derive_work` 尊重其它 owner 的领取，`record`/`rerun`/条件核销/`block`/
+  `drop` 自动释放，过期失效；只剩其它会话领取项时 `continuation.action="wait"` 而非空转
+  派生。领取是调度事实，不是完成证据，不影响 G1–G3。`block` 必须指明 `--work-item` 或
+  `--scope task`，任务级阻塞仍有 `ready_actions` 时须 `--force` 并记录
+  `ready_at_creation`/`forced_scope`；`unblock --by user --quote` 记录
+  `resolved_by`/`authorization_source=caller-declared`。SessionStart 对 startup/未绑定
+  会话只给只读指针，新增 `UserPromptSubmit` 每轮提醒打开任务（均不写状态、异常 exit 0，
+  用户级安装需单独授权）。计划动作的 `target_criteria` 不进入计划 SHA。
 - **v9.4.0 起项目上下文统一走只读 Context Engine**：`scripts/context_engine.py` 提供
   `resolve`（Git 根 + `sha256[:16]` 定位原生 Memory）、`recall`（knowledge-manager 白名单
   有界检索，零命中/失败/截断可区分，文件集摘要 + TTL 缓存）、`pack`（self 12k / sol 8k /

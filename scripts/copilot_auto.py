@@ -67,6 +67,28 @@ def work_order(state: dict, action: dict, state_path: str,
     constraints = str(action.get("constraints") or "").strip()
     match = re.match(r"^AUTO-(C[1-9][0-9]{0,2})", str(action.get("id") or ""))
     criterion_hint = match.group(1) if match else "C1"
+    unmet = [str(item.get("criterion_id") or "")
+             for item in (state.get("contract") or {}).get("criteria") or []
+             if isinstance(item, dict)
+             and str(item.get("status") or "pending") != "met"]
+    blocked = G._blocked_items_summary(state)
+    claim = G.active_claims(state).get(str(action.get("id") or ""))
+    field = []
+    if unmet:
+        field.append("- 未闭合完成条件：" + "、".join(unmet))
+    if blocked:
+        field.append("- 已阻塞工作项：" + "；".join(
+            f"{item['id']}（{item['block_id']}）原因 {item['reason']}；需要 "
+            f"{item['needs']}" for item in blocked))
+    if claim:
+        handoff = int(claim.get("handoff_count") or 0)
+        field.append(f"- 本次调度已领取：{claim.get('claim_id')} · 领取方 "
+                     f"{claim.get('owner')} · 第 {handoff} 次交办 · 租约到期 "
+                     f"{claim.get('expires_at')}")
+        if handoff >= 3:
+            field.append("- 注意：同一工作项已多次交办仍未回填。先判断是否真的受阻；"
+                         "受阻就 block 写明原因/所需条件，路线失败就 record failed "
+                         "让运行时派生 AUTO-REPLAN，不要原样重复。")
     lines = [
         f"# 工作项 {action.get('id')} · {action.get('title')}",
         "",
@@ -81,6 +103,10 @@ def work_order(state: dict, action: dict, state_path: str,
         "## 约束",
         constraints or "（无额外约束；仍须遵守用户原始授权与项目规则）",
         "",
+    ]
+    if field:
+        lines.extend(["## 任务现场", *field, ""])
+    lines.extend([
         "## 期望证据",
         str(action.get("expected_evidence") or "").strip(),
         "",
@@ -96,7 +122,7 @@ def work_order(state: dict, action: dict, state_path: str,
         "## 授权提醒",
         "工作单不是授权：不得越过用户原始授权；commit / push / 发布 / 部署 / 付费 / "
         "生产数据 / Provider 或安全策略修改仍需用户明确授权。",
-    ]
+    ])
     return "\n".join(lines)
 
 
@@ -219,9 +245,36 @@ def drive(args) -> int:
                     dispatch_path = _write_dispatch(state, dispatchable, path, args)
                 except NB.BridgeError as exc:
                     raise AutoError(f"生成原生派发失败 [{exc.code}]：{exc}") from None
+                # 原生派发已改写状态（save_seq 递增），必须重新读取再领取，
+                # 否则领取写入会被 CAS 拒绝。
+                state = G.load_state(path)
+            # 调度领取落盘：同一工作项不会同时交给两个会话；租约到期自动失效，
+            # 崩溃不会永久锁死工作。领取只是交办事实，不是执行完成。
+            try:
+                claimed = G.claim_actions(state, [a["id"] for a in chosen])
+                if claimed["claimed"]:
+                    G.save_state(path, state)
+            except G.GovernanceError as exc:
+                raise AutoError(
+                    "状态在求值与领取之间被其它会话推进；请重新运行 drive："
+                    f"{exc}") from None
+            if not claimed["claimed"]:
+                # 另一个会话刚领取了这些项：回到求值，不要重复打印。
+                print("工作项已被其它会话领取；重新求值。")
+                continue
+            print(f"调度领取：{', '.join(claimed['claimed'])}（领取方 "
+                  f"{claimed['owner']}，租约 {claimed['ttl']}s；回填后自动释放）")
+            if claimed["busy"]:
+                print("未领取（其它会话持有有效租约）：" + "、".join(claimed["busy"]))
             _print_work_orders(state, chosen, path, dispatch_path)
             return EXIT_EXECUTE
         # PARTIAL：本地派生下一步，不等待任何外部判断。
+        cont = evaluation.get("continuation") or {}
+        if not cont.get("required") and cont.get("action") == "wait":
+            # 唯一可能：工作项已被其它会话领取且没有其它可派生缺口。等待对方的
+            # 回填或租约到期即可，这不是整体 BLOCKED，也不需要用户授权。
+            print(f"等待其它会话回填：{cont.get('reason')}")
+            return EXIT_WAIT
         before = G.progress_digest(state)
         created = G.derive_work(state, cache=cache)
         if not created:

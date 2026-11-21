@@ -43,7 +43,7 @@ import agent_policy as AP  # noqa: E402
 import review_policy as RP  # noqa: E402
 import sol_review as SR  # noqa: E402
 
-__version__ = "9.4.0"
+__version__ = "9.5.0"
 
 
 class CLIError(Exception):
@@ -490,9 +490,21 @@ def cmd_block(args) -> int:
             "不得冻结整个任务。")
     if items and scope == "task":
         raise CLIError("--work-item 与 --scope task 不能同时使用。")
+    if scope == "task" and not getattr(args, "force", False):
+        # 任务级阻塞会把仍有可执行路径的工作一起冻结。只有在目标/资源整体不可
+        # 推进时才允许；仍有可领取项时必须显式 --force，并优先改写为项级阻塞。
+        state = G.load_state(_state_path(args))
+        ready = [str(a.get("id") or "") for a in
+                 G.ready_actions(state, include_claimed=True)]
+        if ready:
+            raise CLIError(
+                "仍有可执行工作项（" + "、".join(ready) + "），不得直接用 "
+                "--scope task 冻结整个任务。请改成 --work-item <id> 只阻塞受阻项；"
+                "只有确认目标/资源整体不可推进时，才加 --force 登记任务级阻塞。")
     block = G.add_block(_state_path(args), args.reason, args.needs,
                         work_items=items,
-                        criteria=list(getattr(args, "criterion", None) or []))
+                        criteria=list(getattr(args, "criterion", None) or []),
+                        force=bool(getattr(args, "force", False)))
     if block.get("work_items"):
         print(f"已阻塞工作项：{', '.join(block['work_items'])}（{block['block_id']}）")
     else:
@@ -521,8 +533,13 @@ def cmd_block(args) -> int:
 
 def cmd_unblock(args) -> int:
     result = G.resolve_block(_state_path(args), args.reason,
-                             block_id=args.block_id or "")
+                             block_id=args.block_id or "",
+                             by=args.by or "zcode",
+                             quote=args.quote or "")
     print(f"已解除 {result['resolved']} 条阻塞：{result['reason']}")
+    print(f"解除方：{result.get('resolved_by') or 'zcode'}"
+          + ("（调用方声明；原话已记录）" if result.get("resolved_by") == "user"
+             else ""))
     if result.get("block_ids"):
         print("block_id：" + ", ".join(result["block_ids"]))
     if result.get("resumed"):
@@ -1765,6 +1782,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="同时卡住的完成条件（可重复）；避免该条件被反复派生")
     p.add_argument("--scope", choices=["task"], default="",
                    help="任务级阻塞；仅当目标/资源整体不可推进时使用")
+    p.add_argument("--force", action="store_true",
+                   help="仍存在可执行工作项时强制登记任务级阻塞（需先确认整体不可推进）")
     p.set_defaults(func=cmd_block)
 
     p = sub.add_parser("unblock", help="解除阻塞")
@@ -1772,6 +1791,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--reason", required=True)
     p.add_argument("--block-id", default="",
                    help="存在多条未解除阻塞时必填，只解除指定 block")
+    p.add_argument("--by", choices=["user", "zcode", "agent"], default="zcode",
+                   help="解除方；只有用户授权解除时用 user，并须给出 --quote")
+    p.add_argument("--quote", default="",
+                   help="用户授权解除的原话（--by user 时必填）")
     p.set_defaults(func=cmd_unblock)
 
     p = sub.add_parser("closure-check", help="检查 G1–G3")

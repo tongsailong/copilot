@@ -1,7 +1,56 @@
 # STATUS
 
 更新：2026-11-21 CST。本文件只记录现场可核实的事实；规划与未完成事项单独标注。
-当前版本：v9.4.0（项目上下文与长期记忆衔接）。
+当前版本：v9.5.0（持续推进：调度领取、恢复提示与阻塞边界）。
+
+## 持续推进：调度领取、恢复提示与阻塞边界（2026-11-21，v9.5.0）
+
+- **问题（现场复现）**：派生项只出现在 `derive` 输出里，没有“谁在执行、何时领取”的
+  状态事实，主代理可以合法停在 PARTIAL；`block --scope task` 不检查是否仍有可执行工作，
+  一个工作项或一次缺授权就冻结整任务；`unblock` 不记录是谁解除的，新授权无法与旧阻塞
+  区分；SessionStart 只对绑定本会话的任务给快照，重启/新会话/其它会话的任务只剩
+  `evaluate` 里一行摘要，恢复等于重新调查。
+- **调度领取（`claims`）**：`governance.py` 新增 `claim_actions`/`active_claims`/
+  `claim_owner` 与 `K`+`sha256[:12]` 领取 ID，写 `state["claims"]`：owner（会话 ID 或
+  `local`）、claimed_at、TTL（`COPILOT_CLAIM_TTL`，默认 1800 s）、`handoff_count`；
+  过期与 owner 不一致的领取自动失效。`ready_actions` 默认隐藏其它 owner 的领取项；
+  `derive_work` 跳过已被领取的条件；`record`/`rerun`/条件核销/`block`/`drop` 成功后
+  释放对应领取。`continuation` 在“仅剩其它会话领取项”时返回 `action=wait` +
+  `claimed_by_others`，不再回退成 `AUTO-NEXT` 空转；`drive` 在 RUNNING 分支领取选中的
+  工作项后保存（CAS 失败报错不吞），PARTIAL 且 `wait` 时以 `EXIT_WAIT` 结束。
+- **条件归属**：计划动作可声明 `target_criteria`（必须是合同已有条件），派生项通过
+  `_action_criteria` 与真实条件绑定，领取与续跑判断按条件而非仅按动作 ID；
+  `target_criteria` 在计算计划 SHA 前剥离、动作创建后回填，native dispatch 指纹不变。
+- **阻塞边界**：`block` 必须给 `--work-item` 或 `--scope task`（二者不可同时）；
+  任务级阻塞无 `--force` 时若仍有 `ready_actions` 直接拒绝，并提示改用 `--work-item`；
+  强制任务级阻塞记录 `ready_at_creation`/`forced_scope`。`unblock --by user --quote`
+  记录 `resolved_by`/`authorization_source=caller-declared`/`authorization_quote` 与历史，
+  `by=user` 无引用文本拒绝执行（自报不是凭证）。
+- **恢复提示**：`copilot_stop_guard.py` 的 SessionStart 区分“resume/compact + 绑定本会话”
+  （完整快照，保留 v9.4 上下文追加）与 startup/未绑定（只读指针：任务、阶段、未闭合
+  条件/阻塞原因与 needs、续接命令，标注本会话/归属其它会话/未绑定）；新增
+  `UserPromptSubmit` 钩子，每轮注入最多 3 个打开任务的只读提醒与四条判断规则
+  （用户本轮给出授权 → `unblock --by user --quote` 后 `drive`；否则不要自行续跑；
+  不是授权；不要重复派发），失败一律 exit 0。`install`/`uninstall` 同时维护 Stop、
+  SessionStart（`resume|compact`）与 UserPromptSubmit 三处。
+- **测试**：新增 `tests/test_v95_scheduling.py`（20 项，覆盖 C1 自动续跑、C2 派生→调度→
+  执行→核销闭环、C3 单项阻塞隔离、C4 授权变更恢复、C5 条件变更恢复、C6 重复调度防护与
+  领取不永久丢失、C7 上下文重载续跑、C8 真实 BLOCKED 的原因与 needs、C9 PASS 只在全部
+  条件满足时成立）；`tests/test_stop_guard.py` 扩到 61 项（指针契约、UserPromptSubmit
+  注入/关闭/畸形输入/只读放行）。活动套件 **779 项 OK / 77.9 s**（baseline 重建后全绿，
+  含 `test_real_manifest_matches_git_tracked_source`）；`legacy/tests` 853 项（skip 32）
+  99 failures + 47 errors = **146**，失败/错误用例名集合与 `261563d` 临时 worktree 逐行
+  相同（`diff` 0 行）。
+- **运行时同步**：`--apply` 写入 7 个文件；`--check` 缺失 0 / 不同 0（`hm.txt` 非受管
+  保留）；源/运行时 4 个改动脚本 SHA-256 相同（`governance.py` `49907511…`、
+  `copilot_auto.py` `471fb9eb…`、`copilot_dispatch.py` `409c568f…`、
+  `copilot_stop_guard.py` `69e6a92e…`），`copilot_dispatch.__version__=9.5.0`；
+  `--baseline` 在暂存后重建为 **23 个 Git 跟踪项**（分发集合未变，新测试不参与分发），
+  `--verify-baseline` 通过。
+- **未完成 / 未验证**：`UserPromptSubmit` 与新版 SessionStart 只做了单元测试与直接 CLI
+  调用，未在真实 ZCode 回合中观察注入；安装到用户级 `~/.zcode/cli/config.json` 属全局
+  配置变更，未授权未执行（当前宿主仍只装 Stop/SessionStart）。跨会话真实并发（两个会话
+  同时 `drive`）未做宿主级 E2E，领取互斥由进程内测试覆盖。
 
 ## 项目上下文与长期记忆衔接（2026-11-21，v9.4.0）
 

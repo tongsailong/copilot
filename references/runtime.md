@@ -59,6 +59,7 @@
 | PASS | `close` | true |
 | 有 ready 项 | `execute` | true |
 | 无 ready 但可派生（dry-run 预演） | `derive` | true |
+| 具体缺口已被其它会话领取 | `wait`（`claimed_by_others`） | false |
 | 无 ready 且无可派生 | `none` | false |
 
 `evaluate`、`next`、`status`、`drive`、`record`、`rerun`、`criterion`、`report`、`block`、
@@ -95,6 +96,12 @@
   同时求值不会把 `AUTO-C1` 复制成 `-R2`/`-R3`。
 - 已随 `block --criterion` 声明为阻塞的完成条件不再派生 `AUTO-C<n>`，避免制造无法执行的
   工作单；解除阻塞后自动恢复派生。
+- **已被有效领取的条件不再派生**：领取中的工作项若通过 `target_criteria`（计划期声明）或
+  `AUTO-C<n>` 隐含承载某条件，该条件在本轮派生中跳过；租约到期或被释放后自动恢复派生。
+  只剩通用 `AUTO-NEXT` 兜底、且具体缺口都在其它会话手里时，`continuation` 返回
+  `action=wait`（`required=false`），`drive` 退出 11，不制造第二个“重新规划”工作项。
+- **计划工作项可声明 `target_criteria`**：值必须是合同内真实存在的条件；用于领取去重与
+  阻塞自动归属。该字段不进入计划摘要，既有计划指纹与 native dispatch 绑定不变。
 - 已有 `pending`/`running` 的 `AUTO-REPLAN` 时，同一缺口不再派生第 4 次同路径尝试，等替代
   路线产出结果；替代路线已结束（`done`/`failed`/`dropped`）而缺口仍未闭合时，派生新的
   `AUTO-REPLAN` 并要求说明上一路线为何未闭合，不由通用 `AUTO-NEXT` 兜底静默续跑。
@@ -116,8 +123,9 @@
 3. BLOCKED → 打印原因与 `needs`；若 `continuation.required` 为真（口径不一致）抛出内部
    错误，否则退出 11；
 4. PASS → `close_task`，退出 0；
-5. RUNNING → 取前 `--max-actions` 个 ready 项打印工作单；`backend=native` 且工作项属于
-   已登记计划时，经 `native_bridge.build_dispatch` 写出 `dispatch.json`，退出 10；
+5. RUNNING → 取前 `--max-actions` 个 ready 项，写入调度领取并把工作单打印出来；
+   `backend=native` 且工作项属于已登记计划时，经 `native_bridge.build_dispatch` 写出
+   `dispatch.json`（先派发、后领取，避免计划漂移）；退出 10。
 6. PARTIAL → `derive_work`；若派生成功则 `begin_iteration`（记录本轮工作项与证据快照，
    并把上一轮未结束的迭代标记为 `ENDED`）并保存，比较 `progress_digest`；若派生结果为空，
    退出 12；
@@ -131,6 +139,19 @@
 证据 id 与摘要、收口状态计算。派生前后摘要不变且没有 `AUTO-NEXT` 时输出警告；同一缺口
 反复派生（`AUTO-C*` / `AUTO-R-*` 各自累计 ≥3 次）会附带 `AUTO-REPLAN`，
 要求换路线而不是重复执行。
+
+**调度领取（`state.claims`）**：`drive` 在 RUNNING 阶段把本次交办写入短租约，记录
+`work_item_id`、`owner`（会话标识；无会话时为 `local`）、`claim_id`、`acquired`、
+`expires_at`、`handoff_count`。默认 TTL 1800s，可用 `COPILOT_CLAIM_TTL` 调整（0 表示立即
+过期，便于测试与快速回收）。语义：
+
+- **不是执行证明**：领取只表示“已交给某个会话”；工作项终态仍由 `status`/`result`/证据决定。
+- **不重复交办**：其它会话的有效租约不会被抢占，`ready_actions` 对非领取方隐藏该项；
+  重试/再次 `drive` 可由同一领取方续租（`handoff_count` 递增）。
+- **不会永久锁死**：租约到期自动失效；`record` / `rerun` / 条件 `met` / `block` 会删除
+  对应领取，进程崩溃最多等到 TTL 结束即可重新领取。
+- **等待不是阻塞**：具体缺口都被其它会话领取时，本会话 `continuation.action=wait`
+  （`required=false`），`drive` 退出 11；这不是整体 BLOCKED，也不需要用户授权。
 
 **Stop 续跑守卫（`copilot_stop_guard.py`）**：退出码 10 只在调用方读取时才有效；模型可以直接
 结束回合。守卫把同一判定接到 ZCode `Stop` 钩子：stdin 读事件 JSON（`session_id`、`cwd`、
@@ -170,12 +191,26 @@ BLOCKED/PASS 规避上限、以及新回合先 `status --json` 核实再继续�
 排查时可设 `COPILOT_STOP_GUARD_LOG=<path>`，每次判定追加一行 JSON（退出码、工作区、
 会话、任务与阶段），默认不写任何文件。
 
-**恢复注入（`SessionStart`，`resume|compact`）**：`copilot_stop_guard.py session-start` 处理
-`SessionStart` 事件；只在 `source=resume|compact` 时工作（`startup`/`clear` 静默），只对本会话
-已绑定的任务输出一段只读快照：任务 id、阶段与原因、未闭合条件、下一条命令、可粘贴续接命令，
-并提示先核实现场、复用已完成工作与已登记证据。它不绑定任务、不写 state/session、不消费
-Stop 次数；无绑定任务、文件损坏或输入非法时一律静默退出 0（fail-open），不阻断会话启动。
-安装/卸载与 Stop 守卫共用同一命令，同时覆盖两个事件。
+**恢复注入（`SessionStart`）**：`copilot_stop_guard.py session-start` 处理 `SessionStart`
+事件：
+
+- `resume|compact` 且任务绑定本会话：输出完整只读快照（任务 id、阶段与原因、未闭合条件、
+  阻塞原因/`needs`、下一条命令、可粘贴续接命令、项目现场与 Memory 可用性），提示先核实
+  现场、复用已完成工作与已登记证据。
+- `startup` 或没有任何任务绑定本会话：只输出**只读指针**（任务阶段、可执行项、阻塞
+  原因/需要、归属标注），不披露状态路径与续接命令，不绑定、不接管、不强制续跑。这样
+  重启后会话标识变化仍能发现现场，但不会把无关会话引向旧任务。
+- 它不写 state/session、不消费 Stop 次数；无未闭合任务、文件损坏或输入非法时一律静默
+  退出 0（fail-open），不阻断会话启动。
+
+**用户回合提示（`UserPromptSubmit`）**：`copilot_stop_guard.py user-prompt` 只读列出工作区
+未闭合任务（含 BLOCKED 的 `reason`/`needs`）与判断规则：用户本回合补齐授权/决策/条件时，
+先用其原话 `unblock --by user --quote "<原话>"`（或补齐条件），再 `drive` 继续执行；
+用户没有补齐时不要恢复执行；本提示不是用户新指令，也不构成授权；先 `status --json`
+核对阶段与证据，工作项被其它会话领取时避免并发重复。没有未闭合任务时不注入。
+
+`install` 同时写入 `Stop`、`SessionStart`（matcher `resume|compact`）与
+`UserPromptSubmit` 三个事件，`uninstall` 一并移除。
 
 `closure-check` 的退出码与结论一致：PASS=0、FAIL=1（`--json` 同样），避免“检查过”被误当
 “通过”。
@@ -204,7 +239,8 @@ Stop 次数；无绑定任务、文件损坏或输入非法时一律静默退出
 - **schema 守卫**：只接受 `copilot-governance/v1` + `version=1`；v1/v2 SOL 状态不被驱动，
   只能用 `legacy-status` 只读查看。
 - **上下文恢复**：状态里保留目标、合同、条件、工作项与结果、证据与摘要、判断、报告、决策、
-  阻塞、复核记录、迭代与完整 `history`。中断后从状态继续，不重建任务、不覆盖已有状态。
+  阻塞、调度领取、复核记录、迭代与完整 `history`。中断后从状态继续，不重建任务、不覆盖
+  已有状态；租约随状态保存，未过期时其它会话不会重复领取，过期后自动回收。
   **没有单独的 `--resume` 开关**：续跑就是继续使用同一 `--state` 文件——先 `status --json`
   核实现场，再 `drive`。
 - **历史不可改写**：`history` 只追加；证据不可替换；收口后不可修改。

@@ -1790,3 +1790,30 @@
     - **取舍**：未自动在 `start` 阶段强制召回（会变成新的门禁与隐含成本）；未接管宿主
       `project_memory_extract`（职责在宿主）；未把 `knowledge_handoff` 并入新模块（保持
       交接块校验单一职责）。
+
+72. **v9.5.0 持续推进：把“派生”变成可观察的调度事实，阻塞与恢复按项成立（2026-11-21，用户专项任务）。**
+    依据：用户《Copilot 任务持续推进能力》专项，要求 PARTIAL 后必须真正调度、单项阻塞
+    不冻结整任务、新授权能恢复、上下文中断后恢复执行而不是只给摘要；不得新增门禁、
+    模型调用或付费资源。
+    - **现场事实**：v9.4.0 的 `derive` 只返回动作列表，状态里没有领取/执行事实；
+      `continuation` 在只剩单项阻塞或外部会话可执行项时会回退 `AUTO-NEXT`；
+      `block --scope task` 无前置检查；`unblock` 不记录解除来源；SessionStart 只在绑定
+      会话且 `continuation.required` 时输出快照。
+    - **决定一：领取是调度事实，不是完成证明。** 引入 `state["claims"]`（owner/TTL/
+      handoff_count），`ready_actions` 与 `derive_work` 尊重其它 owner 的领取，
+      `continuation` 返回 `wait` 而不是空转派生；领取在记录、核销、阻塞、放弃后释放，
+      过期自动失效。领取不改变 G1–G3，也不能替代 `record`/`rerun` 证据。
+    - **决定二：阻塞按工作项成立，任务级阻塞须显式强制。** `block` 必须指明工作项或
+      `--scope task`；任务级且仍有可执行项时无 `--force` 拒绝；强制时记录
+      `ready_at_creation`/`forced_scope` 供审计。`unblock --by user --quote` 记录
+      解除来源，`caller-declared` 只表示调用方声明，不构成凭证。
+    - **决定三：恢复提示只读、不劫持。** SessionStart 对 startup/未绑定会话给指针而非
+      完整状态，`UserPromptSubmit` 每轮提醒打开任务与授权判断规则；两者都不写状态、
+      不自动绑定会话、不消费 Stop 次数，异常 exit 0。是否安装到用户级配置属全局变更，
+      需用户单独授权，不由版本升级自动执行。
+    - **决定四：`target_criteria` 不进入计划指纹。** 条件归属在计划 SHA 计算前剥离、
+      动作创建后回填，保证 native dispatch 绑定的计划摘要不变，同时让派生项与合同条件
+      一一对应。
+    - **边界**：未引入自动派发子代理、后台守护或模型调用；`xmc=3` 的宿主续跑上限不变；
+      G1–G3、SOL-first advisory、G4 退役状态不变；真实跨会话并发与真实宿主钩子注入
+      仍属未验证项（见 `docs/STATUS.md`）。

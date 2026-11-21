@@ -1,6 +1,6 @@
 ---
 name: copilot
-description: "Copilot v9.3 轻量协作治理：任务承接、合同与完成条件、状态与证据登记、PARTIAL 强制续跑、SOL（gpt-6.2-sol，high，零工具）默认认知引擎 CONSULT / PLAN。PARTIAL 是连续执行状态而不是终点：只要仍有原始授权内的可执行工作，就必须派生并继续；阻塞按工作项成立，单项缺授权不冻结整个任务。SOL-first 生命周期：简单/机械任务 0 调用；非简单任务启动默认 CONSULT，调查后按需 PLAN，执行期出现升级型新信号才追加 CONSULT，高复杂任务可做阶段复盘与收口综合判断；REVIEW 仅在用户明确要求时执行。SOL 与 G1–G3 共用合同、条件与证据，统一记录在 sol_calls，采纳结论由主代理显式登记。SOL 只提供认知输入，ZCode 是唯一技术决策与工程执行主体；G4 原生只读复核已退役，历史台账只读保留。"
+description: "Copilot v9.5 轻量协作治理：任务承接、合同与完成条件、状态与证据登记、PARTIAL 强制续跑与调度领取、SOL（gpt-6.2-sol，high，零工具）默认认知引擎 CONSULT / PLAN。PARTIAL 是连续执行状态而不是终点：只要仍有原始授权内的可执行工作，就必须派生、领取并继续；阻塞按工作项成立，单项缺授权不冻结整个任务。drive 把工作项领取落盘（短租约）避免并发重复，回填/阻塞自动释放；SessionStart 与 UserPromptSubmit 只读提示未闭合任务，用户补齐授权后立即恢复执行。SOL-first 生命周期：简单/机械任务 0 调用；非简单任务启动默认 CONSULT，调查后按需 PLAN，执行期出现升级型新信号才追加 CONSULT，高复杂任务可做阶段复盘与收口综合判断；REVIEW 仅在用户明确要求时执行。SOL 只提供认知输入，ZCode 是唯一技术决策与工程执行主体；G4 原生只读复核已退役，历史台账只读保留。"
 when_to_use: >
   需要把多步骤工程任务纳入可追踪治理时：任务合同/完成条件需要固定、证据与审计需要绑定、
   长任务需要 PARTIAL 持续推进与上下文恢复、非简单任务需要 SOL 默认认知（启动 CONSULT、
@@ -9,7 +9,7 @@ when_to_use: >
   直接由 ZCode 原生完成，不进入本 Skill。
 ---
 
-# copilot：轻量协作治理（v9.4.0）
+# copilot：轻量协作治理（v9.5.0）
 
 Copilot 是运行在 ZCode 内的**协作治理层**，不是决策模型，也不是执行体。它负责把任务变成可
 追踪的合同、状态、证据与收口条件，并在任务没有真正完成时继续推进。
@@ -726,7 +726,31 @@ CONSULT / PLAN 输出契约（`copilot-sol-think/v2`）：`judgment`、`goal_und
 
 ## 版本
 
-当前 **v9.4.0（项目上下文与长期记忆衔接）**：
+当前 **v9.5.0（持续推进：调度领取、恢复提示与阻塞边界）**：
+
+- **调度领取（claims）**：`drive` 在 RUNNING 阶段把工作项领取落盘（`claims`：owner 会话、
+  `claim_id`、`expires_at`、`handoff_count`；默认 TTL 1800s，`COPILOT_CLAIM_TTL` 可调）。
+  同一工作项不会被两个会话同时领取；其它会话的有效租约不抢占，到期自动回收；`record` /
+  `rerun` / 条件 `met` / `block` 自动释放。**领取是交办事实，不是执行证明**，工作项终态
+  仍以 `status` / `result` / 证据为准。只剩通用 `AUTO-NEXT` 兜底且具体缺口已被其它会话
+  领取时，`continuation.action=wait`（`required=false`）且 `drive` 返回 11，不重复规划。
+- **计划目标条件**：`plan` 工作项可声明 `target_criteria`（必须真实存在于合同），用于领取
+  去重、阻塞自动归属；该字段不进入计划摘要，native dispatch 的计划指纹保持不变。
+- **UserPromptSubmit 逐回合提示**：`install` 写入 Stop / SessionStart / UserPromptSubmit
+  三个事件；`user-prompt` 只读列出未闭合任务（含 BLOCKED 的 reason/needs）与判断规则。
+  用户本回合补齐授权/决策时，先用其原话登记 `unblock --by user --quote "<原话>"`，再
+  `drive` 继续；提示本身不是用户新指令，也不构成授权。没有未闭合任务时不注入。
+- **恢复可发现性**：SessionStart(resume|compact) 对本会话绑定任务注入完整快照；startup
+  或重启后会话标识变化时只注入只读指针（任务阶段、可执行项、阻塞原因/需要、归属标注），
+  不绑定、不接管、不强制续跑。快照与 status 均显示阻塞原因与所需条件。
+- **阻塞边界与解除来源**：仍有可执行工作项时，`block --scope task` 被拒绝，必须显式
+  `--force` 并记录 `ready_at_creation` / `forced_scope`；单项授权缺口走 `--work-item`。
+  `unblock --by user` 必须同时给出 `--quote`，状态记录 `resolved_by`、
+  `authorization_source=caller-declared` 与原话，供审计核对。
+- **不变量**：G1–G3、PARTIAL 强制续跑、SOL-first advisory、证据完整性、授权边界、ZCode
+  唯一工程执行主体与 G4 退役状态全部不变。
+
+**v9.4.0（项目上下文与长期记忆衔接）**：
 
 - **Context Engine**：新增 `scripts/context_engine.py`（`resolve`/`recall`/`pack`/`capture`），
   把原生项目 Memory、正式 Vault、Copilot Task Memory 与工程现场拼成一条确定性数据流：
