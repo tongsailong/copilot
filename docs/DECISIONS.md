@@ -1767,3 +1767,26 @@
       口径不变。指标只用于观察机制质量，不是验证率、KPI 或门禁。
     - **不变量**：SOL-first 生命周期、零工具、单轮、advisory、G1–G3、PARTIAL 续跑与授权
       边界不变；不新增模型调用、不新增审批门。
+
+71. **项目上下文与长期记忆衔接：新增只读 Context Engine，四层信息一条数据流（2026-11-21，v9.4.0，用户专项任务）。**
+    依据：用户《Copilot 项目上下文与长期记忆能力升级》，要求复用原生 Memory、Knowledge
+    Manager 与 Task Memory，不重复建设、不新增模型调用、不改变授权与写入规则。
+    - **现场事实**：`knowledge_handoff.py` 只做交接块校验与渲染，没有项目识别、召回或装配；
+      SessionStart 快照只含 Copilot 状态，不含项目身份/工程基线/记忆可用性；实测 `Explore`
+      与 `general-purpose` 的 system prompt 均无 Memory 段落与 `MEMORY.md` 索引，
+      `injectAgentsMd=false`——子 Agent 不继承任何项目记忆。
+    - **架构**：新增 `scripts/context_engine.py`，`resolve`（Git 根 + `sha256[:16]` 精确定位
+      原生 Memory，缺 `absent`/不可读 `unreadable`）→ `recall`（knowledge-manager 白名单
+      有界检索，零命中/失败/预算截断可区分，文件集摘要 + TTL 缓存，台账写任务目录）→
+      `pack`（self 12k / sol 8k / subagent 5k 字符，按固定顺序分级裁剪）→ 交接或恢复；
+      收尾 `capture` 生成带任务与证据溯源、去重前置、住所待判定的候选草稿。
+    - **可信度**：命中带核验时间/`source_commit`；无核验标「视为未核实」，来源提交与当前
+      HEAD 不一致标「基线漂移」；冲突统一「以现场为准 + 写明卡路径、差异与核验时间」。
+    - **接线**：SessionStart(resume|compact) 追加项目现场/Memory 可用性/召回与交接命令
+      （只读、失败省略、总长受既有上限约束）；`status` 人工输出加提示，JSON 契约不变。
+    - **边界**：零模型调用、无网络、不建记忆库、不做语义检索；不写 Vault/原生 Memory；
+      正式写入仍走 `candidate_write.py`/`vault_write.py` 与既有授权；G1–G3、PARTIAL 续跑、
+      SOL-first advisory、G4 退役状态不变。
+    - **取舍**：未自动在 `start` 阶段强制召回（会变成新的门禁与隐含成本）；未接管宿主
+      `project_memory_extract`（职责在宿主）；未把 `knowledge_handoff` 并入新模块（保持
+      交接块校验单一职责）。

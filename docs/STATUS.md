@@ -1,7 +1,52 @@
 # STATUS
 
 更新：2026-11-21 CST。本文件只记录现场可核实的事实；规划与未完成事项单独标注。
-当前版本：v9.3.0（治理一致性与续跑绑定加固）。
+当前版本：v9.4.0（项目上下文与长期记忆衔接）。
+
+## 项目上下文与长期记忆衔接（2026-11-21，v9.4.0）
+
+- **新增**：`scripts/context_engine.py`（`resolve`/`recall`/`pack`/`capture`）、
+  `tests/test_context_engine.py`（43 项）、`docs/CONTEXT-ENGINE.md`。四层信息（原生
+  Memory / 正式 Vault / Task Memory / 工程现场）走一条只读数据流；零模型调用、无网络、
+  不建记忆库、不写 Vault 与原生 Memory。
+- **接线**：`copilot_stop_guard.py` 的 SessionStart(resume|compact) 快照在任务状态后追加
+  项目现场（根/分支/HEAD/工作区）、原生 Memory 与 Vault 可用性、`recall`/`pack` 命令；
+  `copilot_dispatch.py status` 人工输出附一行上下文提示，JSON 契约不变。两处都是可选
+  能力：模块缺失、路径不存在或任何异常时省略且不影响原有输出。
+- **可信度**：记忆与 Vault 命中带 `path:line:snippet` 与核验时间/`source_commit`；无核验
+  标注「视为未核实」，来源提交与当前 HEAD 不一致标注「基线漂移」；冲突统一「以现场为准
+  + 写明卡路径、差异与核验时间」。
+- **独立只读复核（2026-11-21）**：`independent-readonly` 子代理通读实现与接线，报 12 条
+  发现 + 2 条待验证风险；逐条核实后全部确认并修复——`capture` 在证据为治理写入的
+  `{id,sha256}` 对象时崩溃（TypeError）、有来源失败/截断被标成 `ok`/`zero_hit`、缓存键
+  漏掉扫描预算、正文水平分隔线被误判为 frontmatter、记忆根不可读退化成 absent、`--cwd`
+  子目录记忆并入当前项目、detail_level=3 丢弃命中却仍显示 ok、召回片段未脱敏、无参
+  `pack` 打印 traceback（退出码 1）、证据路径字段取错、提示命令未做 shell 引用、
+  SessionStart 把 git 状态未知显示成 clean；边界另加白名单 realpath 校验与不可读子树报错，
+  SessionStart 单次 git 超时收紧到 1 s。每条修复都有对应回归测试（新增 14 项），
+  没有修复时这些用例失败。
+- **实测（本机，2026-11-21，进程内 5 次中位）**：`resolve` 13.4 ms（11.9–14.2）；
+  `recall` 冷启动 35.8 ms（139 文件 / 687,386 字节 / 7,714 行，含 realpath 边界校验与片段
+  脱敏），缓存命中 6.3 ms（键含全部扫描预算与文件集 `path+size+mtime_ns` 摘要，只有完整
+  结果入缓存）；`pack --target subagent` 0.3 ms（不含召回）；模型调用与 token 消耗均为
+  **0**。CLI 子进程另含约 70–90 ms Python 启动与 git 调用开销（resolve ~104 ms）。
+- **测试**：活动套件 **751 项 OK / 54.7 s**（v9.3.0 基线 708 + 新增 43）；`legacy/tests`
+  853 项（skip 32）99 failures + 47 errors = **146**，失败/错误用例名集合与 `19ee58e`
+  临时 worktree 逐行相同（差异 0 行）——均为 v5 历史用例依赖已退役 `references/role.md`
+  等文件的既有失败，与本次改动无关。
+- **运行时同步**：`--apply` 写入 3 个受管理文件（`context_engine.py`、`copilot_dispatch.py`、
+  `copilot_stop_guard.py`）；`--check` 缺失 0 / 不同 0（`hm.txt` 非受管文件保留）；
+  `--baseline` 重建 22 个 Git 跟踪项并提示未跟踪的 `scripts/context_engine.py` 不进
+  manifest；`--verify-baseline` 通过；源/运行时三个脚本 SHA-256 分别相同
+  （`context_engine.py` `3f80f4a0…`、`copilot_dispatch.py` `ccdac863…`、
+  `copilot_stop_guard.py` `8557fdb5…`）。
+- **真实命令复验**：用真实任务状态跑 `capture`（此前会因证据对象崩溃）生成 2,750 字符
+  草稿并通过 `candidate_write.validate_content`；真实 Vault 召回 40 行预算截断时返回
+  `budget_exhausted` 且 `truncated=true`；`pack --target subagent` 3,863/5,000 字符；
+  `status` 提示正常追加且 JSON 契约不变。
+- **未完成 / 未验证**：未提交、未推送、未发布（任务未授权）；因此 manifest 暂不含未跟踪
+  的新模块与测试，提交后需再次 `--baseline`/`--verify-baseline`。真实 Vault 召回只做了
+  本机只读冒烟，未做跨项目知识正确性人工抽检；SessionStart 10 s 钩子预算未做慢盘压测。
 
 ## 仓库版本管理收口（2026-11-21）
 

@@ -9,7 +9,7 @@ when_to_use: >
   直接由 ZCode 原生完成，不进入本 Skill。
 ---
 
-# copilot：轻量协作治理（v9.3.0）
+# copilot：轻量协作治理（v9.4.0）
 
 Copilot 是运行在 ZCode 内的**协作治理层**，不是决策模型，也不是执行体。它负责把任务变成可
 追踪的合同、状态、证据与收口条件，并在任务没有真正完成时继续推进。
@@ -599,6 +599,29 @@ REVIEW 输出契约：总体结论 `verdict=pass|partial|blocked`；`findings` �
 从材料确认的事项。PASS 与 blocking/major 或未验证项冲突时自动降级为 PARTIAL 并记录
 `verdict_adjusted`。
 
+### 项目上下文入口（Context Engine，v9.4.0）
+
+四层信息（原生 Memory / Vault / Task Memory / 工程现场）的确定性衔接统一走
+`scripts/context_engine.py`，只读、零模型调用：
+
+- `resolve`：按 Git 根与 `sha256[:16]` 精确定位项目记忆目录（同名不同路径不串库），
+  输出分支/HEAD/工作区、Memory 索引统计与规则文件是否存在；缺失为 `absent`，不可读为
+  `unreadable`，两者都不是零命中。
+- `recall`：只在 knowledge-manager 正式白名单与当前项目 Memory 内检索（关键词必填，
+  `|`/`,` 分隔），跳过 `01-Inbox`/`03-Daily-Reviews`；默认 40 行 / 24 MB / 5 s 预算，
+  `zero_hit`、`failed`、`budget_exhausted` 严格区分；结果带 `path:line:snippet`、核验时间、
+  `source_commit`；按（项目、关键词、scope、预算、文件集摘要）短期缓存，文件变化即失效。
+- `pack`：装配项目身份、工程基线、任务合同与完成条件、历史线索、可信度提示与验收要求；
+  `self` 12,000 / `sol` 8,000 / `subagent` 5,000 字符，超限按固定顺序裁剪并标 `trimmed`。
+  子 Agent 不继承 Memory/AGENTS 注入，派发前用 `--target subagent` 生成并放进 prompt；
+  已有交接块用 `--handoff-file` 组合。
+- `capture`：读任务状态与证据，生成带任务/证据溯源、去重前置、住所待判定的候选草稿到任务
+  目录，并打印 `candidate_write.py` 命令；工具本身不写 Vault 与原生 Memory。
+
+接线：SessionStart(resume|compact) 快照追加项目现场/Memory 可用性与上述命令（失败即省略，
+不阻断启动）；`status` 人工输出附一行提示，JSON 契约不变。历史线索与现场冲突时以现场为准，
+并在报告中写出卡路径、差异与核验时间。详见 `docs/CONTEXT-ENGINE.md`。
+
 CONSULT / PLAN 输出契约（`copilot-sol-think/v2`）：`judgment`、`goal_understanding`、
 `essence`、`strategy` 为字符串；`alternatives`、`tradeoffs`、`risks`、`priority`、
 `investigation`、`phase_goals`、`assumptions`、`omissions`、`decisions`、`verify`、
@@ -696,11 +719,28 @@ CONSULT / PLAN 输出契约（`copilot-sol-think/v2`）：`judgment`、`goal_und
 | SOL CONSULT/PLAN/REVIEW、单轮调用、正式 REVIEW、缺陷分级、台账与历史 G4 记录 | `references/review.md` |
 | 原生 Bridge v2 执行信封、错误码 | `references/agent-bridge.md` |
 | Agent 调度与内置 Explore/general-purpose 能力基线 | `copilot_dispatch.py agent-policy`；`references/agent-bridge.md` |
+| 项目上下文（resolve/recall/pack/capture）、四层信息与验收映射 | `docs/CONTEXT-ENGINE.md` |
 | 历史 REVIEW 台账与旧审计（只读） | `references/review-ledger.md` |
 | 版本沿革、G4 退役与 SOL 升级记录 | `references/history.md` |
 
 
 ## 版本
+
+当前 **v9.4.0（项目上下文与长期记忆衔接）**：
+
+- **Context Engine**：新增 `scripts/context_engine.py`（`resolve`/`recall`/`pack`/`capture`），
+  把原生项目 Memory、正式 Vault、Copilot Task Memory 与工程现场拼成一条确定性数据流：
+  按 `sha256[:16]` 定位项目记忆、白名单有界召回（预算/零命中/失败/截断可区分、短期缓存）、
+  按目标装配上下文包（self/sol/subagent 三档字符上限）、收尾生成带任务与证据溯源的候选
+  草稿。全程只读、零模型调用、不建记忆库、不写正式知识。
+- **恢复与交接**：SessionStart(resume|compact) 快照追加项目现场（根/分支/HEAD/工作区）、
+  原生 Memory 与 Vault 可用性以及召回/交接命令（失败即省略，不阻断启动）；`status` 人工
+  输出附一行上下文提示，JSON 契约不变；子 Agent 用 `pack --target subagent`（≤5,000 字符）
+  显式交接，不假设其继承 Memory/AGENTS。
+- **可信度**：命中一律带核验时间与 `source_commit`；无核验标注「视为未核实」，来源提交
+  与当前 HEAD 不一致标注「基线漂移」；冲突以现场为准并写出卡路径、差异与核验时间。
+- **不变量**：G1–G3、PARTIAL 强制续跑、SOL-first advisory、证据完整性、授权边界、ZCode
+  唯一工程执行主体与 G4 退役状态全部不变。
 
 当前 **v9.3.0（治理一致性与续跑绑定加固）**：
 

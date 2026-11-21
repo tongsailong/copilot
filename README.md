@@ -5,6 +5,15 @@ Copilot 是运行于 ZCode 内的**轻量协作治理 Skill**：用户侧 ChatGP
 调试、测试与验证；Copilot 负责任务合同、完成条件、状态、证据、审计与收口门禁，并用 PARTIAL
 派生持续推进任务；SOL 作为默认认知引擎按需提供判断，用户明确要求时可执行一次独立复核。
 
+**v9.4.0 项目上下文与长期记忆衔接**：新增 `scripts/context_engine.py`，把原生项目
+Memory、正式 Vault、Copilot Task Memory 与工程现场拼成一条确定性数据流——
+`resolve`（按 `sha256[:16]` 定位项目记忆，同名不同路径不串库）、`recall`（白名单有界
+召回，零命中/失败/截断可区分，短期缓存随文件变化失效）、`pack`（self/sol/subagent 三档
+字符上限的上下文包）、`capture`（带任务与证据溯源的候选草稿，写入仍走
+`candidate_write.py`）。SessionStart(resume|compact) 快照追加项目现场与召回/交接命令，
+`status` 附非阻断提示；全程只读、零模型调用、不新增记忆库与知识库写入口。详见
+`docs/CONTEXT-ENGINE.md` 与 `docs/DECISIONS.md` 第 70 条。
+
 **v9.3.0 治理一致性与续跑绑定加固**：合同修订不再能通过删条件或改弱措辞绕过 G2
 （破坏性修订须 `--authorized-by user` 留痕）；条件核销自动撤销其空包装项；任务重开后没有
 新证据不得复用旧 PASS；多阻塞按项解除、恢复项家族不嵌套；Hooks 只在命令成功后绑定会话、
@@ -104,6 +113,7 @@ copilot/
 │   ├── copilot_auto.py      # 驱动：drive（推进/工作单/派生）与 ingest（执行信封回填）
 │   ├── sol_review.py        # SOL 三模式（CONSULT/PLAN/REVIEW）：请求/解析/审计（唯一远程调用）
 │   ├── knowledge_handoff.py # 知识交接块：校验 read 摘录来源并渲染 Memory/Vault → SOL/子 Agent
+│   ├── context_engine.py    # 项目上下文：resolve/recall/pack/capture（只读、零模型调用）
 │   ├── native_bridge.py     # Native Bridge v2 执行信封协议与校验
 │   ├── native_agent.py      # 从宿主运行记录生成正式执行信封
 │   ├── agent_policy.py      # Agent 调度建议（只读纯函数）

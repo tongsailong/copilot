@@ -29,6 +29,7 @@ import hashlib
 import json
 import os
 import secrets
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -42,7 +43,7 @@ import agent_policy as AP  # noqa: E402
 import review_policy as RP  # noqa: E402
 import sol_review as SR  # noqa: E402
 
-__version__ = "9.3.0"
+__version__ = "9.4.0"
 
 
 class CLIError(Exception):
@@ -262,6 +263,40 @@ def cmd_start(args) -> int:
     return 0
 
 
+def _context_hint(state_path: str, state: dict) -> str:
+    """status 的人工输出附一行上下文提示（非阻断、可选能力）。
+
+    JSON 契约不变：结构化输出里不混入提示。Context Engine 缺失或任何异常都返回空串，
+    status 的可用性不依赖它。
+    """
+    try:
+        import context_engine as CE
+        workspace = str(state.get("workspace") or "")
+        if not workspace:
+            return ""
+        info = CE.resolve(workspace)
+    except Exception:  # noqa: BLE001 - 可选能力，失败即不提示
+        return ""
+    try:
+        entries = [m for m in info.get("memory") or [] if m.get("role") == "root"]
+        memory = next((m for m in entries if m.get("stable")), {})
+        mem = memory.get("status") or "未知"
+        if mem == "available":
+            mem = f"available（索引 {memory.get('index_lines') or 0} 行）"
+        elif not memory and any(m.get("status") == "unreadable" for m in entries):
+            mem = "unreadable（不是 absent）"
+        git = info.get("git") or {}
+        head = (git.get("head") or "")[:12] if git.get("available") else ""
+        where = info["project"]["root"] + (f" · {git.get('branch')}@{head}" if head else "")
+        engine = os.path.join(HERE, "context_engine.py")
+        return ("上下文（可选）：" + where + f" · 原生 Memory {mem}\n"
+                "  需要历史证据或子 Agent 交接包时：python3 -B " + shlex.quote(engine)
+                + f" recall --workspace {shlex.quote(info['project']['root'])}"
+                  " --keywords '词1|词2' --state " + shlex.quote(state_path))
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def cmd_next(args) -> int:
     state = G.load_state(_state_path(args))
     cache: dict = {}
@@ -270,6 +305,9 @@ def cmd_next(args) -> int:
         _print({"task_id": state.get("task_id"), **ev})
     else:
         print(G.render_status(state, ev, cache=cache))
+        hint = _context_hint(_state_path(args), state)
+        if hint:
+            print(hint)
     return 0
 
 

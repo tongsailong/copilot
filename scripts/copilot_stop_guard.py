@@ -75,6 +75,7 @@ REASON_LIMIT = 3900
 SESSION_START_SOURCES = ("resume", "compact")
 SESSION_START_MATCHER = "resume|compact"
 SESSION_START_LIMIT = 1600
+CONTEXT_HINT_MAX = 720
 SESSION_START_MAX_TASKS = 2
 SESSION_START_OPEN = "<copilot-session-recovery>"
 SESSION_START_CLOSE = "</copilot-session-recovery>"
@@ -490,7 +491,68 @@ def _check() -> int:
                          continued=continued))
 
 
-def _session_start_text(rows: list[dict], anomalies: list[dict] | None = None) -> str:
+def _project_context(root: str, row: dict) -> list[str]:
+    """恢复快照里的项目现场片段：只读、确定、可失败省略。
+
+    原生 Memory 每轮注入只发生在主会话启动时；compaction/resume 之后会话容易只剩
+    任务状态而丢失“这是哪个项目、基线是什么、记忆在哪”。这里用 Context Engine 的
+    只读定位补齐这三点，并给出召回/交接命令。任何异常都返回空列表：恢复注入的
+    可用性优先于附加信息，不得因为缺少上下文模块而阻断会话启动。
+    """
+    try:
+        import context_engine as CE  # 同目录模块，惰性导入
+    except Exception:  # noqa: BLE001 - 可选能力
+        return []
+    try:
+        # SessionStart 钩子有 10s 超时：单次 git 调用收紧到 1s，最坏 4s 仍留足余量。
+        info = CE.resolve(root, cwd=root, git_timeout=1.0)
+    except Exception:  # noqa: BLE001 - 可选能力
+        return []
+    lines: list[str] = []
+    git = info.get("git") or {}
+    if git.get("available"):
+        head = (git.get("head") or "")[:12] or "未知"
+        dirty, untracked = git.get("dirty"), git.get("untracked")
+        if dirty is None or untracked is None:
+            state = "未知"  # git status 失败不是 clean
+        else:
+            state = "clean" if not dirty and not untracked else f"已修改 {dirty} · 未跟踪 {untracked}"
+        lines.append(f"- 项目现场：{info['project']['root']} · "
+                     f"{git.get('branch') or '未知'}@{head} · 工作区 {state}")
+    entries = [m for m in info.get("memory") or [] if m.get("role") == "root"]
+    memory = next((m for m in entries if m.get("stable")), {})
+    if memory.get("status") == "available":
+        mem_text = (f"available（索引 {memory.get('index_lines') or 0} 行 / "
+                    f"{memory.get('index_pointers') or 0} 条指针）")
+    elif memory.get("status"):
+        mem_text = f"{memory.get('status')}（不是零命中）"
+    elif any(m.get("status") == "unreadable" for m in entries):
+        mem_text = "unreadable（不是 absent）"
+    else:
+        mem_text = "absent（不是零命中）"
+    vault_text = (info.get("vault") or {}).get("status") or "未知"
+    lines.append(f"- 原生 Memory：{mem_text} · Vault：{vault_text}")
+    engine = os.path.join(HERE, "context_engine.py")
+    state_path = shlex.quote(row["state_path"])
+    lines.append("- 历史召回（确定性）：python3 -B " + shlex.quote(engine)
+                 + f" recall --workspace {shlex.quote(info['project']['root'])}"
+                 " --keywords '词1|词2' --state " + state_path)
+    lines.append("- 子 Agent 交接包：python3 -B " + shlex.quote(engine)
+                 + " pack --state " + state_path
+                 + " --target subagent --out "
+                 + shlex.quote(os.path.join(row["task_dir"], "context", "subagent-pack.md")))
+    kept: list[str] = []
+    used = 0
+    for line in lines:
+        if used + len(line) + 1 > CONTEXT_HINT_MAX:
+            break
+        kept.append(line)
+        used += len(line) + 1
+    return kept
+
+
+def _session_start_text(rows: list[dict], anomalies: list[dict] | None = None,
+                        root: str = "") -> str:
     """恢复快照：只给定位阶段与续接入口所需的信息，不复制任务正文。"""
     lines = [
         SESSION_START_OPEN,
@@ -505,6 +567,8 @@ def _session_start_text(rows: list[dict], anomalies: list[dict] | None = None) -
             lines.append("  下一步命令：" + row["next_command"].replace(
                 "<state>", row["state_path"]))
         lines.append("  可粘贴续接命令：" + _resume_command(row))
+    if rows and root:
+        lines.extend(_project_context(root, rows[0]))
     if len(rows) > SESSION_START_MAX_TASKS:
         lines.append(f"- 另有 {len(rows) - SESSION_START_MAX_TASKS} 个本会话任务要求续跑；"
                      "用 status 查看。")
@@ -564,7 +628,7 @@ def cmd_session_start() -> int:
         if not bound and not bound_anomalies:
             _log(0, root, note=f"session-start-out-of-scope:{len(rows)}", session=session)
             return 0
-        text = _session_start_text(bound, bound_anomalies)
+        text = _session_start_text(bound, bound_anomalies, root=root)
         _log(0, root, task_id=bound[0]["task_id"] if bound else "",
              session=session, note=f"session-start-inject:{source}")
         print(json.dumps({"hookSpecificOutput": {

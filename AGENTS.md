@@ -12,6 +12,14 @@ Copilot 是运行于 ZCode 内的**轻量协作治理 Skill**：负责任务承�
 （CONSULT / PLAN）按生命周期提供整体判断，用户明确要求时执行一次独立复核（REVIEW），均由
 `gpt-6.2-sol` 零工具单轮调用完成。
 
+- **v9.4.0 起项目上下文统一走只读 Context Engine**：`scripts/context_engine.py` 提供
+  `resolve`（Git 根 + `sha256[:16]` 定位原生 Memory）、`recall`（knowledge-manager 白名单
+  有界检索，零命中/失败/截断可区分，文件集摘要 + TTL 缓存）、`pack`（self 12k / sol 8k /
+  subagent 5k 字符上下文包）与 `capture`（带任务/证据溯源的候选草稿）。全程零模型调用、
+  不建记忆库、不写 Vault 与原生 Memory；SessionStart(resume|compact) 快照追加项目现场与
+  召回/交接命令（失败省略、不阻断），`status` 加非阻断提示且 JSON 契约不变。子 Agent 不
+  继承 Memory/AGENTS，派发前须用 `pack --target subagent` 显式交接。四层职责与验收映射见
+  `docs/CONTEXT-ENGINE.md`；G1–G3、PARTIAL 续跑、SOL-first advisory 与 G4 退役不变。
 - **v9.0.0 起 SOL 成为默认认知引擎（CONSULT / PLAN）**：`SOL_MODES=("CONSULT","PLAN",
   "REVIEW")`，`COGNITIVE_MODES=("CONSULT","PLAN")`；THINK 是 v8.4–v8.5 的只读别名，读取
   时归一为 CONSULT。`start/contract --task-kind` 声明 16 类任务：简单/机械类型默认 0 调用，

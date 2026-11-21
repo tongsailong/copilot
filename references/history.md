@@ -12,7 +12,24 @@
 > CONSULT / PLAN，THINK 只作读取别名；v9.1.0（2026-11-20）完善 SOL 采纳记录
 > （实际决策/理由/证据关联/非阻断提示）与质量指标；v9.2.0（2026-11-20）接入
 > SessionStart 恢复注入并给 SKILL 上下文瘦身；v9.3.0（2026-11-21）加固合同修订、
-> 续跑绑定与条件包装项同步**。
+> 续跑绑定与条件包装项同步；v9.4.0（2026-11-21）新增只读 Context Engine，衔接原生
+> Memory / Vault / Task Memory / 工程现场**。
+
+## v9.4.0（2026-11-21）项目上下文与长期记忆衔接
+
+- **背景**：Copilot 已有合同/条件/证据/状态，但“这是哪个项目、以前确认过什么、压缩恢复
+  后丢了什么、子 Agent 需要知道什么、这次经验该不该沉淀”仍靠模型自觉：原生 Memory 只在
+  主会话每轮注入，子 Agent 实测不继承 Memory/AGENTS，`knowledge_handoff.py` 只校验渲染，
+  SessionStart 快照不含项目身份与工程基线。
+- **新增**：`scripts/context_engine.py` 的 `resolve` / `recall` / `pack` / `capture`——
+  `sha256[:16]` 项目记忆定位、白名单有界召回（零命中/失败/截断可区分，文件集摘要 + TTL
+  缓存）、三档字符上限上下文包（self 12k / sol 8k / subagent 5k）、带任务与证据溯源的
+  候选草稿；零模型调用、无网络、不建记忆库。
+- **接线**：SessionStart(resume|compact) 快照追加项目现场/Memory 可用性/召回与交接命令，
+  只读且失败省略；`status` 人工输出加非阻断提示，JSON 契约不变；`docs/CONTEXT-ENGINE.md`
+  记录四层职责、数据流与 C1–C10 验收映射。
+- **边界**：不接管宿主记忆抽取、不改知识库写入规则、不自动在 `start` 强制召回、不新增
+  Provider；G1–G3、PARTIAL 续跑、SOL-first advisory 与 G4 退役状态不变。
 
 ## v9.3.0（2026-11-21）治理一致性与续跑绑定加固
 
