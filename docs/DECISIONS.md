@@ -2011,3 +2011,8 @@
       `legacy/tests` 的 146 项已知失败/错误在公开文档中如实说明，不作为“全绿”宣称。
     - 第 76 条末尾的“本轮未提交、未推送、未发布”是该轮事实；其代码与文档已由提交
       `2981a3f` 提交并普通快进推送到 `origin/main`。
+    - **可见性变更已执行（2026-11-21）**：公开前 8 项条件核对通过后，用受支持的
+      `gh repo edit --visibility public` 改为公开（`visibility=PUBLIC`、`licenseInfo=MIT`），
+      未绕过 GitHub 的确认步骤。公开后启用 secret scanning 与 push protection，未降低任何保护；
+      fork 保持允许（用户已接受“公开后无法收回已 clone/fork 的副本”）。未登录取证：
+      raw 文件 200、匿名 clone 成功且 HEAD 与推送 SHA 一致、`--check` 与基线复核不受影响。

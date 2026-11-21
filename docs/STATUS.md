@@ -24,6 +24,18 @@
 - **公开文档**：新增 `LICENSE`（MIT，版权主体 `tongsailong`）、`SECURITY.md`、
   `CONTRIBUTING.md`；`README.md` 重写为公开说明（角色边界、依赖、安装、最小闭环、SOL 配置、
   安全边界、已知限制、版本演进）；`.gitignore` 增补 `reports/`。
+- **可见性变更（已执行）**：`gh repo edit --visibility public` →
+  `visibility=PUBLIC`、`isPrivate=false`、`licenseInfo=MIT`；同时设置仓库描述与 7 个 topics。
+  公开后启用 **secret scanning + push protection**（只增强未降低）；`dependabot security
+  updates` 保持 disabled（无第三方运行时依赖）；`allow_forking=true`、issues 开、projects 开、
+  wiki/discussions 关、单协作者 admin。
+- **未登录可读验证**：`raw.githubusercontent.com` 的 README / LICENSE / SECURITY.md /
+  CONTRIBUTING.md / SKILL.md / `scripts/governance.py` / `docs/DECISIONS.md` 均 HTTP 200；
+  仓库页匿名可读（title、描述、MIT 许可、文件树与 README 正文渲染）；匿名 `git clone`
+  （显式禁用 credential helper 与交互提示）成功且 `HEAD = f001e0b`；`info/refs` 200。
+  匿名 REST API 因共享出口 IP 触发限流（403），改用 HTML 与 git 协议取证，不视为失败。
+- **不可撤回**：公开后他人可能已克隆或 fork，改回 Private 无法收回；用户已明确知悉并接受。
+- **运行时不受影响**：`--version` 9.6.1、`--check` 缺失 0 / 不同 0、`--verify-baseline` 通过。
 
 ## 收口时序精准修复（2026-11-21，v9.6.1）
 
