@@ -23,7 +23,13 @@
   删除模块的副本中 CLI 仍启动，使用 `--knowledge-file` 返回 exit 2
   `KNOWLEDGE_EXTENSION_MISSING`；运行时 `--apply` 写入 1 个文件（`copilot_dispatch.py`），
   `--check` 0/0、baseline 22 项校验通过、源/运行时 `knowledge_handoff.py` 同为 `c85335f3…`。
-- **未处理**：本文档提交后远端尚未推送（用户要求先本地收口、报告后再确认推送）。
+- **推送（2026-11-21 完成）**：三个提交 `c799a5c`、`06d4f3d`、`3b3e2d9` 以普通快进推送
+  `origin/main`（`dd1e601..3b3e2d9`），未 force / rebase / reset / clean；推送后本地 HEAD、
+  `origin/main` 与远端 `refs/heads/main` 三方同为 `3b3e2d9`，ahead/behind 0/0。本段其余
+  内容中“尚未推送”的表述是撰写当时的现场记录，已由该推送闭合；本节随后由文档跟进提交
+  `docs(copilot): record repository hygiene delivery` 再次普通快进推送，最终本地与远端一致、
+  工作区干净。knowledge_handoff 源码与测试已随 `c799a5c` 正式纳入版本管理，
+  `.copilot-tasks/` 仍只是本地治理运行数据（Git 忽略、磁盘文件全部保留）。
 
 ## 收尾核查：测试数量、耗时口径、授权真实性与评审记录（2026-11-21，v9.3.0 收尾）
 
