@@ -17,9 +17,20 @@ sys.path.insert(0, os.path.join(ROOT, "scripts"))
 import code_scope as CS  # noqa: E402
 
 
+# 子模块 worktree 的 config 不继承源仓库的本地身份，CI 托管 runner 也没有
+# 全局 user.name / user.email；用环境变量固定身份，测试不依赖宿主 git 配置。
+GIT_IDENTITY = {
+    "GIT_AUTHOR_NAME": "t",
+    "GIT_AUTHOR_EMAIL": "t@example.invalid",
+    "GIT_COMMITTER_NAME": "t",
+    "GIT_COMMITTER_EMAIL": "t@example.invalid",
+}
+
+
 def run(*args, cwd):
+    env = dict(os.environ, **GIT_IDENTITY)
     return subprocess.run(args, cwd=cwd, check=True, capture_output=True,
-                          text=True)
+                          text=True, env=env)
 
 
 class CodeScopeUnifiedTests(unittest.TestCase):
