@@ -2016,3 +2016,36 @@
       未绕过 GitHub 的确认步骤。公开后启用 secret scanning 与 push protection，未降低任何保护；
       fork 保持允许（用户已接受“公开后无法收回已 clone/fork 的副本”）。未登录取证：
       raw 文件 200、匿名 clone 成功且 HEAD 与推送 SHA 一致、`--check` 与基线复核不受影响。
+
+78. **开源维护专项：blob 统计复算、匿名 Clone 证据与 GitHub Actions CI（2026-11-21，用户任务与授权）。**
+    - **blob 统计复算**：第 77 条记录的「1,118 个可达 blob」在当前对象库不可复现。2026-11-21
+      以 `git rev-list --objects <ref>` 取对象 ID，再用 `git cat-file --batch-check` 按
+      `%(objecttype)` 过滤并去重：`refs/heads/main`（= 全部公开 refs，单分支、无标签）可达唯一
+      **blob = 823**；总对象 1,204（823 blob + 314 tree + 67 commit）；本地对象库另有 5 个不可达
+      blob。逐提交检查 67 个提交：可达对象数 1,156–1,204、blob 数 776–823，**没有任何提交等于
+      1,118**。另一数字 `+1133/−101` 是 v8.5.0 提交 `00bc903` 的 diffstat，从未表示 blob 数。
+      结论：公开口径统一为 **823**，并固定范围（单分支）、命令与观测时间。匿名完整克隆复算
+      同样得到 823，可交叉复现。
+    - **匿名 Clone 口径**：STATUS 原先记录 `HEAD = f001e0b`，而真实远端 tip 已是 `9f3d561`。
+      重新取证条件：公共 HTTPS、隔离 `HOME`、`GIT_CONFIG_NOSYSTEM=1`、`GIT_CONFIG_GLOBAL=/dev/null`、
+      `credential.helper` 置空、`GIT_TERMINAL_PROMPT=0`、`GIT_ASKPASS=/bin/true`，未传入任何
+      token 环境变量。因本机到 `github.com` 的 pack 传输不稳定（`info/refs` 200，pack 阶段
+      curl 28 超时），使用本机代理 `127.0.0.1:7897` **仅做传输**（代理无认证、不引入身份）。
+      浅克隆与完整克隆均成功：HEAD `9f3d561`、默认分支 `main`、67 commit、96 个跟踪文件、
+      823 可达 blob，README/LICENSE/`scripts/governance.py` 可读，`ls-remote` 与 HEAD 一致。
+    - **自引用限制**：Git 提交无法包含自身 SHA。沿用既有发布惯例：代码提交 → 文档提交 →
+      发布记录提交；发布记录写「上一发布 tip 的已核验 SHA」并显式标注该记录提交晚于它，
+      不通过 amend/rebase/force push 制造同一提交内的自洽。
+    - **GitHub Actions CI**：新增 `.github/workflows/ci.yml`：`push` / `pull_request` → `main`；
+      Python 3.10 / 3.12；编译检查、活动套件（本地基线 849 项）与 `--verify-baseline`。
+      安全边界：`permissions: contents: read`、`persist-credentials: false`、不使用
+      `pull_request_target`、不引用 Secrets、不调用 SOL、不访问本机运行时/知识库、不做运行时
+      同步或发布；Action 固定完整 commit SHA（checkout v7.0.1、setup-python v7.1.0）并保留
+      可读注释。`legacy/tests` 的 146 项已知失败不纳入门禁，也不宣称全绿。
+    - **邮箱隐私（外部阻塞，未完成）**：`gh` token 无 `user` scope（`/user/emails` 404），
+      GitHub API 不提供「Keep my email addresses private」与「Block command line pushes」；
+      本机 Chrome 无 github.com 登录态，设置页不可读。因此 noreply 地址无法按要求从 GitHub
+      读取，未拼接、未猜测。解除条件：用户在 **Settings → Emails** 开启两项并提供页面显示的
+      实际地址；在此之前不宣称邮箱隐私已生效，也不改写已公开的历史提交元数据。
+    - **不变量**：不改写历史、不 force push、不 amend；不修改 v9.6.1 运行逻辑、SOL 五阶段、
+      G1–G3、Provider/模型路由与既有安全保护。

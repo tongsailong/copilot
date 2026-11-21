@@ -2,12 +2,17 @@
 
 ## 报告安全问题
 
-请**不要**用公开 Issue 报告安全漏洞。使用 GitHub 的
-[Private vulnerability reporting](https://github.com/tongsailong/copilot/security/advisories/new)
-（仓库 **Security → Advisories → Report a vulnerability**）提交，并附上：影响范围、复现步骤、
-版本（`copilot_dispatch.py --version`）与必要的日志片段（请先脱敏）。
+请**不要**用公开 Issue 披露漏洞细节。
 
-维护者会在确认后回复处理计划。修复发布前请不要公开细节。
+仓库的 **Private vulnerability reporting 当前未启用**（2026-11-21 核实：GitHub API
+`repos/tongsailong/copilot/private-vulnerability-reporting` 返回 `enabled=false`），因此
+Security → Advisories → Report a vulnerability 入口目前不可用。在此之前：
+
+1. 先在公开 Issue 中**只**说明「需要一个私下报告渠道」，不要写影响面、复现步骤或利用细节；
+2. 等待维护者启用 Private vulnerability reporting 或提供其它私下渠道后再提交完整报告。
+
+报告请附：影响范围、复现步骤、版本（`copilot_dispatch.py --version`）与必要的脱敏日志片段。
+修复发布前请不要公开细节。本项目不承诺响应时间或 SLA，以维护者的实际回复为准。
 
 ## 适用范围
 
@@ -43,6 +48,16 @@
 - `copilot_stop_guard.py` 的 `SessionStart` / `UserPromptSubmit` / `Stop` 钩子**只读**任务状态，
   不写状态、不消费续跑计数，异常时退出码 0（不阻断宿主）。
 - `install` 会修改**用户级** hook 配置，属全局配置变更，需你自行确认后执行；`uninstall` 可回退。
+
+### 5. CI 与外部贡献
+
+- 工作流 `.github/workflows/ci.yml` 使用普通 `pull_request` 事件（**不用** `pull_request_target`），
+  顶层权限只有 `contents: read`，`actions/checkout` 关闭凭据持久化。
+- 不引用任何 Secrets，不调用 SOL，不访问本机 Provider、知识库、运行时目录或私有 runner；
+  fork PR 的代码与主仓库 PR 在同一套无特权托管 runner 上运行。
+- Action 固定到完整 commit SHA；CI 只做编译、活动测试与 baseline 只读校验，不执行
+  `sync_runtime.py --apply`，不提交、不推送、不发布。
+- CI 通过不代表发布授权；发布仍由维护者显式执行。
 
 ## 支持的版本
 

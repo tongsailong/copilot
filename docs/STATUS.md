@@ -3,6 +3,42 @@
 更新：2026-11-21 CST。本文件只记录现场可核实的事实；规划与未完成事项单独标注。
 当前版本：v9.6.1（收口时序：最终工程验证完成才执行收口 CONSULT）。
 
+## 开源维护专项：公开记录修正与 GitHub Actions CI（2026-11-21）
+
+- **blob 统计复算（公开口径）**：以 `refs/heads/main`（= 当前全部公开 refs，单分支、无标签）
+  为范围，按 Git 对象类型验证去重，可达唯一 **blob = 823**；同一范围总对象 1,204
+  （823 blob + 314 tree + 67 commit），本地对象库另有 5 个不可达 blob。复算命令：
+  `git rev-list --objects refs/heads/main | awk '{print $1}' | git cat-file --batch-check='%(objecttype) %(objectname)' | awk '$1=="blob"{print $2}' | sort -u | wc -l`。
+  观测时间 2026-11-21T14:17Z。逐提交检查 67 个提交，可达对象数为 1,156–1,204、blob 数为
+  776–823，**没有任何提交等于 1,118**；此前记录的「1,118 个可达 blob」不可复现，已由 823
+  取代。另一处 `+1133/−101` 是 v8.5.0 提交 `00bc903` 的 diffstat，不是 blob 统计。
+  匿名完整克隆（见下）得到相同的 823，交叉验证成立。详见 `docs/DECISIONS.md` 第 78 条。
+- **匿名 Clone（已取证）**：公共 HTTPS、隔离 `HOME`、`GIT_CONFIG_NOSYSTEM=1`、
+  `GIT_CONFIG_GLOBAL=/dev/null`、`credential.helper` 置空、`GIT_TERMINAL_PROMPT=0`、
+  `GIT_ASKPASS=/bin/true`、未传入任何 token 环境变量；本机到 `github.com` 的 pack 传输不稳定，
+  仅用本机代理 `127.0.0.1:7897` 做无认证传输。浅克隆与完整克隆均成功：
+  `HEAD = 9f3d561ac67ae9cb0c9ae2a7b9420ff66b4d0d23`、默认分支 `main`、67 个 commit、
+  96 个跟踪文件、823 个可达 blob，`README.md` / `LICENSE` / `scripts/governance.py` 可读，
+  `git ls-remote` 的 `refs/heads/main` 与 HEAD 一致。观测时间 2026-11-21T14:24Z。
+- **记录口径（自引用限制）**：提交无法包含自身 SHA。本文件记录的是**取证时已核验的公开 tip**；
+  写入该记录的文档提交本身必然晚于它。发布流程沿用既有惯例：代码提交 → 文档提交 →
+  发布记录提交，不通过 amend/rebase/force push 制造同一提交内的自洽。
+- **GitHub Actions CI（已建立）**：`.github/workflows/ci.yml`，`push` / `pull_request` 指向
+  `main`；Python **3.10 / 3.12** 矩阵；执行编译检查、活动套件
+  （`python3 -B -m unittest discover -s tests -p 'test_*.py'`，本地基线 849 项）与
+  `sync_runtime.py --verify-baseline`。边界：`permissions: contents: read`、
+  `persist-credentials: false`、不使用 `pull_request_target`、不引用 Secrets、不调用 SOL、
+  不访问本机运行时或知识库、不做运行时同步/提交/发布。Action 固定到完整 commit SHA
+  （`actions/checkout@3d3c42e5…` v7.0.1、`actions/setup-python@6d4fd22b…` v7.1.0）。
+  真实运行结果见发布记录提交与 Actions 页面。
+- **邮箱隐私（外部阻塞）**：`gh` token 无 `user` scope，GitHub API 不提供
+  「Keep my email addresses private」与「Block command line pushes」开关；本机 Chrome 无
+  `github.com` 登录态，无法读取设置页提供的 noreply 地址。未拼接、未猜测地址。
+  需用户在 GitHub **Settings → Emails** 开启两项，并提供页面显示的实际 noreply 地址；
+  在此之前不宣称邮箱隐私已生效。已公开的历史提交元数据保持原样、未改写。
+- **运行时**：未改 v9.6.1 任何受管文件；`--check` 缺失 0 / 不同 0、
+  `--verify-baseline` 通过、`copilot_dispatch.py --version` = 9.6.1。
+
 ## 正式交付与公开发布准备（2026-11-21）
 
 - **交付**：提交 `2981a3f`（20 个文件，+4511 / −140），普通快进推送 `75a6fa1 → 2981a3f`；
@@ -14,10 +50,11 @@
   `copilot_dispatch.py --version` = 9.6.1；`--verify-baseline` 通过。
 - **manifest 23 → 24**：`scripts/sol_schedule.py` 此前未跟踪，`--baseline` 只记录 Git 跟踪文件
   因而漏记；本次随提交进入基线后重建为 24 项。此后新增分发文件必须先 `git add` 再建基线。
-- **公开前审计**：1,118 个可达 blob + 当前工作树全量扫描，无真实凭据/私钥/Token/连接串；
-  `assign-secret-long` 命中均为显式假夹具；单分支、无标签、无 Actions、无 Release、单协作者；
-  依赖仅标准库（可选 `Pillow`；`PyYAML` 仅 legacy 测试），无第三方代码与版权声明。详见
-  `docs/DECISIONS.md` 第 77 条。
+- **公开前审计**：该轮以「1,118 个可达 blob」为口径 + 当前工作树全量扫描，无真实凭据/私钥/
+  Token/连接串；**该数字不可复现，已由本轮按对象类型验证的 823 取代**（见上节与
+  `docs/DECISIONS.md` 第 78 条）。`assign-secret-long` 命中均为显式假夹具；单分支、无标签、
+  无 Actions、无 Release、单协作者；依赖仅标准库（可选 `Pillow`；`PyYAML` 仅 legacy 测试），
+  无第三方代码与版权声明。详见 `docs/DECISIONS.md` 第 77 条。
 - **文档脱敏**：62 处替换（个人署名/邮箱、本机绝对路径、内部宿主入口、跨项目业务名 →
   通用描述），二次运行 0 处；原始内容可由 `2981a3f` 恢复，未改写历史。
   代码内本机默认路径（`context_engine` / `knowledge_handoff`）按第 77 条保留不动。
@@ -32,7 +69,8 @@
 - **未登录可读验证**：`raw.githubusercontent.com` 的 README / LICENSE / SECURITY.md /
   CONTRIBUTING.md / SKILL.md / `scripts/governance.py` / `docs/DECISIONS.md` 均 HTTP 200；
   仓库页匿名可读（title、描述、MIT 许可、文件树与 README 正文渲染）；匿名 `git clone`
-  （显式禁用 credential helper 与交互提示）成功且 `HEAD = f001e0b`；`info/refs` 200。
+  （显式禁用 credential helper 与交互提示）成功且当时 `HEAD = f001e0b`；`info/refs` 200。
+  该记录随后被发布记录提交 `9f3d561` 取代；最新匿名取证为 `HEAD = 9f3d561`（见上节）。
   匿名 REST API 因共享出口 IP 触发限流（403），改用 HTML 与 git 协议取证，不视为失败。
 - **不可撤回**：公开后他人可能已克隆或 fork，改回 Private 无法收回；用户已明确知悉并接受。
 - **运行时不受影响**：`--version` 9.6.1、`--check` 缺失 0 / 不同 0、`--verify-baseline` 通过。

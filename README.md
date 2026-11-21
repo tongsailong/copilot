@@ -40,7 +40,7 @@ Copilot 是运行在 ZCode 内的**轻量协作治理 Skill**。它把多步骤�
 
 ## 运行环境
 
-- **Python 3.10+**（开发与验证环境 3.12）。**仅用标准库**，无第三方运行时依赖。
+- **Python 3.10+**（开发与验证环境 3.12；CI 矩阵 **3.10 / 3.12**）。**仅用标准库**，无第三方运行时依赖。
 - **可选依赖**
   - `Pillow`：只有把图片作为证据时必需（完整性校验）。缺失时采集端**拒绝**图片证据，不降级放行。
   - `PyYAML`：只有运行 `legacy/tests` 历史回归时可能用到。
@@ -70,6 +70,28 @@ python3 -B scripts-sync/sync_runtime.py --check    # 期望：缺失 0、不同 
 **恢复钩子**（可选，默认不装）：`scripts/copilot_stop_guard.py install` 会写用户级 hook 配置，
 属于修改全局配置，需你自行确认后执行；`uninstall` 可回退。钩子只读任务状态，不写状态、
 不消费续跑次数。
+
+## 持续集成（CI）
+
+`.github/workflows/ci.yml` 在 **push 到 `main`** 与 **指向 `main` 的 Pull Request** 上运行，
+矩阵为 Python **3.10 / 3.12**，每个 Job 依次执行：
+
+```bash
+python3 -m compileall -q scripts scripts-sync tests                    # 编译检查
+python3 -B -m unittest discover -s tests -p 'test_*.py'               # 活动套件（本地基线 849 项）
+python3 -B scripts-sync/sync_runtime.py --verify-baseline             # manifest / baseline 只读校验
+```
+
+CI 的安全边界（外部 PR 的代码视为不可信）：
+
+- 使用普通 `pull_request` 事件，**不使用** `pull_request_target`；
+- 顶层 `permissions: contents: read`，`actions/checkout` 设 `persist-credentials: false`；
+- 不引用任何 Secrets，不调用 SOL，不访问本机 Provider、知识库、运行时目录或私有网络；
+- 只做只读检查，不执行 `sync_runtime.py --apply`、不写入运行时、不提交、不发布；
+- Action 固定到完整 commit SHA，避免可变标签带来的供应链漂移。
+
+`legacy/tests` 有 146 项 v5 契约遗留的失败/错误（99 F + 47 E）与 32 个 skip，**不在 CI 门禁内**，
+也不代表当前版本回归。外部贡献者提交 PR 前请在本地跑通上面三条命令。
 
 ## 使用（最小闭环）
 
@@ -115,7 +137,8 @@ python3 .../copilot_dispatch.py closure --state ... --close
   （本版未提供 CLI 开关）。
 - **`legacy/tests` 不是全绿**：它验证 v5 历史行为，含 146 个已知失败/错误（99 F + 47 E）与
   32 个 skip，属历史契约保留，不作为当前规则判定依据。当前套件 `tests/` 全绿。
-- **无 CI**：仓库不含 GitHub Actions，验证在本地运行。
+- **CI 只覆盖活动套件**：GitHub Actions 运行 `tests/`、编译检查与 baseline 校验，不运行
+  `legacy/tests`（已知非全绿），也不代替真实宿主验证。
 - **续跑次数上限由宿主决定**：ZCode 单回合的 Stop 续跑次数有硬上限，超出会被静默忽略；
   钩子无法读取或修改该计数。
 - **平台**：脚本面向 POSIX（用到 `fcntl`），Windows 原生环境未验证。

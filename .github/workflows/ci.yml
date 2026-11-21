@@ -1,0 +1,57 @@
+name: CI
+
+# 只响应目标分支的 push 与普通 pull_request。
+# 不使用 pull_request_target：来自 fork 的代码始终在无特权、无 Secrets 的环境运行。
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# 最小权限：工作流只需要读取仓库内容（checkout 与 git ls-files）。
+permissions:
+  contents: read
+
+# 同一分支的旧运行被新运行取代，避免排队浪费。
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          # 不把 GITHUB_TOKEN 持久化进 .git/config，贡献者代码拿不到可用凭据。
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Show interpreter
+        run: python3 -VV
+
+      - name: Compile project sources
+        # 只编译实际项目源码；不编译 legacy/ 与本地缓存目录。
+        run: python3 -m compileall -q scripts scripts-sync tests
+
+      - name: Run active test suite
+        run: |
+          set -o pipefail
+          python3 -B -m unittest discover -s tests -p 'test_*.py' 2>&1 | tee unittest.log
+          # 防止“发现 0 个用例”被当成通过。
+          grep -Eq '^Ran [1-9][0-9]* tests? in ' unittest.log
+
+      - name: Verify manifest baseline
+        # 只读校验：不会写入运行时、不会执行 --apply。
+        run: python3 -B scripts-sync/sync_runtime.py --verify-baseline
