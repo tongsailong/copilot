@@ -3,6 +3,28 @@
 更新：2026-11-21 CST。本文件只记录现场可核实的事实；规划与未完成事项单独标注。
 当前版本：v9.3.0（治理一致性与续跑绑定加固）。
 
+## 仓库版本管理收口（2026-11-21）
+
+- **盘点**：`git status --short --untracked-files=all` 共 **40 个未跟踪文件、154,498 字节**；
+  A 正式资产 2、C 治理任务数据 38、D 临时/生成 0、E 真实敏感信息 0（扫描命中的 `sk-…` 是
+  测试日志里的 17–19 字符夹具）。逐文件清单在
+  `.copilot-tasks/repo-hygiene-2026-11-21/evidence/inventory.md`（本地，不纳入 Git）。
+- **纳入 Git**：`scripts/knowledge_handoff.py`、`tests/test_knowledge_handoff.py`（提交
+  `c799a5c`）。README 目录树、SKILL.md 与 `references/workflow.md` 早已描述该扩展与
+  `--knowledge-file`，未跟踪属版本管理缺口；基线由 21 增至 **22 个跟踪项**。
+- **本地化**：`.copilot-tasks/`（任务状态、合同、证据、SOL 原始输出、会话绑定）加入
+  `.gitignore`，**文件全部保留在磁盘**。此前该目录内只有 `state.json` 被既有规则忽略、
+  `session.json`/`evidence/` 等未被忽略，口径已统一。`.git/info/exclude` 的两条本机规则
+  （`task-v612-g4-final4/`、`reports/junit.xml`）未改。
+- **提示修正**：扩展现已随仓库分发，`KNOWLEDGE_EXTENSION_MISSING` 文案由“不随仓库分发”
+  改为“缺少 `scripts/knowledge_handoff.py`”。
+- **验证**：活动 **708 OK / 50.7 s**；`git archive` 干净 checkout 下 CLI 启动、知识交接
+  `check`/`build` 与 `sol-consult --knowledge-file --dry-run`（materials 1,239 字符）正常；
+  删除模块的副本中 CLI 仍启动，使用 `--knowledge-file` 返回 exit 2
+  `KNOWLEDGE_EXTENSION_MISSING`；运行时 `--apply` 写入 1 个文件（`copilot_dispatch.py`），
+  `--check` 0/0、baseline 22 项校验通过、源/运行时 `knowledge_handoff.py` 同为 `c85335f3…`。
+- **未处理**：本文档提交后远端尚未推送（用户要求先本地收口、报告后再确认推送）。
+
 ## 收尾核查：测试数量、耗时口径、授权真实性与评审记录（2026-11-21，v9.3.0 收尾）
 
 针对上一段交付中“684→706”“51.6 s→71.4 s”“五路评审”等说法做独立复核，结论如下

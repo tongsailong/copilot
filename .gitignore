@@ -21,6 +21,8 @@ venv/
 
 # 运行时状态、审计与数据库
 .audit/
+# 治理任务运行时数据（任务状态、证据、SOL 原始输出；本地保留，不纳入版本库）
+.copilot-tasks/
 state.json
 *.state.json
 dispatch.json

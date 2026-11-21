@@ -37,9 +37,9 @@ Read 的 Memory/Vault 卡片渲染为带状态、核验时间与必要摘录的�
 `index-only`/`unverified` 不得冒充已读。`read` 是主代理声明 + 脚本核对来源，不证明
 宿主同轮工具调用；可选 `read_evidence` 记录会话/工具证据。
 子 Agent 使用同一工具生成 `--target subagent`
-块并由主 Agent 放入 prompt。**该扩展当前按用户指令保持未跟踪**：文件存在于工作区与运行时，
-但不进入 Git 提交；`manifests/source-baseline.sha256` 只记录 Git 跟踪文件，因此干净
-checkout 不包含该扩展。
+块并由主 Agent 放入 prompt。该扩展自 2026-11-21 起纳入 Git 与分发基线（提交 `c799a5c`），
+干净 checkout 自带；缺少该文件时 CLI 仍可启动，只有使用 `--knowledge-file` 才返回
+`KNOWLEDGE_EXTENSION_MISSING`。
 
 **v8.3.0 SOL 主动介入（历史）**：触发判断从“风险标签 + 门禁是否全绿”升级为**确定性
 复杂度 + 覆盖判断**，简单任务 0 调用，中高复杂任务一次，只有升级型新信号才追加；v8.4
@@ -114,6 +114,7 @@ copilot/
 ├── legacy/                  # v5 SOL 实现与历史测试（不分发，仅追溯）
 ├── tests/                   # 当前开发测试（不分发）
 ├── docs/                    # 项目管理文档（不分发）
+├── .copilot-tasks/          # 治理任务本地数据：状态、证据、SOL 原始输出（不分发、不纳入 Git）
 ├── manifests/               # 源码 SHA-256 基线（不分发）
 └── scripts-sync/            # 源码→运行时同步工具（不分发）
 ```

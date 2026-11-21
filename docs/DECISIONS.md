@@ -1129,7 +1129,10 @@
       查询绑定会把 Stop 拦截转嫁给错误的会话。
     - **P1 干净 checkout**：`knowledge_handoff` 改为惰性导入，缺失时只在显式使用
       `--knowledge-file` 时报错。理由：该扩展按用户指令保持未跟踪，硬导入使仓库 HEAD 无法
-      运行；不修改、不提交该文件本身。
+      运行；不修改、不提交该文件本身。**2026-11-21 更新**：用户在《仓库未提交文件全面盘点
+      与规范收口》中解除该限制，扩展经核定属正式功能（README/SKILL/references 均有文档、
+      `--knowledge-file` 已集成、17 项测试）并随 `c799a5c` 纳入 Git 与分发基线；惰性导入
+      作为“文件缺失”兜底保留，提示文案改为“缺少 scripts/knowledge_handoff.py”。
     - **延后项（P2，经核实非默认链路的数据完整性缺陷）**：
       (a) `native` 信封的 `execution_binding` 可缺席——这是已文档化的旧信封兼容，默认后端为
       `legacy`，且条件证据仍由 G2 重读校验摘要；(b) 执行者/模型身份来自信封自报——影响审计
@@ -1176,6 +1179,22 @@
       853 项 99F+47E+32S=146 与基线名单 `diff` 为空；运行时 `--apply` 写入 0、`--check`
       缺失 0/不同 0、`--baseline` 21 项、`--verify-baseline` 通过、`__version__=9.3.0`，
       Stop / SessionStart 钩子配置未改。受保护未跟踪文件保持原样、未纳入提交。
+
+70. **仓库版本管理收口：正式资产入 Git、任务运行数据留本地（2026-11-21，用户维护任务）。**
+    依据：用户《Copilot 仓库未提交文件全面盘点与规范收口》，要求正式资产全部受 Git 管理、
+    临时运行数据留在本地、不得为了 clean 删除文件或笼统加忽略。
+    - **纳入 Git**：`scripts/knowledge_handoff.py`、`tests/test_knowledge_handoff.py`（`c799a5c`）。
+      判据：README 目录树、SKILL.md、`references/workflow.md` 均有文档；`--knowledge-file`
+      已集成进 `sol-*`；17 项测试覆盖校验/CLI/dispatch 组合；运行时本已在分发范围内
+      （同步脚本按文件系统扫描，与 Git 跟踪无关）。基线由 21 增至 22 项。
+    - **本地忽略**：`.copilot-tasks/` 加入项目 `.gitignore`，磁盘文件全部保留。理由：任务
+      状态、合同、证据、SOL 原始输出与会话绑定是运行时数据，含会话 ID 与模型原文；且同目录
+      `state.json` 原本已被既有忽略规则覆盖，其余文件未覆盖，属口径不一致。`.git/info/exclude`
+      的本机条目（`task-v612-g4-final4/`、`reports/junit.xml`）不改。
+    - **内容归属**：不整体提交任务目录；长期结论写入 `docs/DECISIONS.md`/`docs/STATUS.md`，
+      原始证据按本地路径可追溯（`evidence/inventory.md` 有逐文件清单）。
+    - **不变量**：不删除/覆盖任何原有文件；不用忽略规则隐藏源码、测试或未完成工作；不改历史
+      提交、不 amend、不使用 `git add -A`/`git add .`。
 
 ## 建议（未采纳）
 
