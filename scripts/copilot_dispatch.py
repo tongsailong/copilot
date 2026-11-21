@@ -75,8 +75,8 @@ def _compose_materials(materials: str, knowledge_file: str) -> tuple[str, dict]:
     module = _knowledge_module()
     if module is None:
         raise CLIError("[KNOWLEDGE_EXTENSION_MISSING] 知识交接扩展未安装（"
-                       "scripts/knowledge_handoff.py 不随仓库分发）；去掉 --knowledge-file，"
-                       "或把该文件放进 scripts/ 后重试。")
+                       "缺少 scripts/knowledge_handoff.py）；去掉 --knowledge-file，"
+                       "或恢复该文件后重试。")
     try:
         block = module.render_file(knowledge_file, target="sol")
     except module.HandoffError as exc:
