@@ -425,8 +425,8 @@ v6.4 基于《测试体系与独立复核机制过度设计专项审计报告》
   都重算代码快照，未登记源码变化按 fail-closed 拒绝。真实宿主 metadata 的
   `createdAt`/`prompt`/`workspaceRoot` 与 attempt 绑定，旧会话/旧工作区不能复用。
 
-v6.3 基于 10 个真实任务的复核复盘（ad-strategy 7 轮复核、Honor 7 次 G4 尝试、review-perf
-4 次正式 REVIEW、gromore / 腾讯 / journey 等）收敛“无效评审多、重复取证”的机制问题：补齐
+v6.3 基于 10 个真实任务的复核复盘（某广告策略项目 7 轮复核、某广告项目 7 次 G4 尝试、某复核专项
+4 次正式 REVIEW、gromore / 腾讯 / 某投放链路 等）收敛“无效评审多、重复取证”的机制问题：补齐
 真实只读命令白名单（`git rev-list` / `git cat-file` / `git ls-tree` / `paste` 等）与危险
 长选项缩写拒绝，`&&` 与 `;`/`|` 同等串联只读命令；放宽围栏 JSON 解析的真实变体；finding
 增加稳定 ID/根因/状态/去重；新增 `review-context`、`review-metrics` 与无效信封审计；

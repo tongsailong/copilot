@@ -9,7 +9,7 @@
 | 层 | 住所 | 谁维护 | Context Engine 的作用 |
 |---|---|---|---|
 | 原生项目 Memory | `<workspace basename[:48]>-<sha256(realpath)[:16]>/memory/` | ZCode 宿主自动抽取 + 用户 Memory 规则 | 只读定位、统计索引、召回卡片；不写、不复制、不重建抽取 |
-| 长期知识 Vault | `/media/vdb/knowledge/codex-knowledge`（白名单目录） | `knowledge-manager` Skill | 白名单有界召回；保留卡路径/核验时间/`source_commit`；不写正式区 |
+| 长期知识 Vault | `<knowledge-vault>`（白名单目录） | `knowledge-manager` Skill | 白名单有界召回；保留卡路径/核验时间/`source_commit`；不写正式区 |
 | Copilot Task Memory | `.copilot-tasks/<task>/state.json` | `governance.py` 状态机 | 读合同/条件/证据，装配恢复快照与上下文包 |
 | 工程现场 | Git、`AGENTS.md`、源码、测试 | 用户与 ZCode | 采集分支/HEAD/工作区状态；历史与现场冲突显式标注、现场优先 |
 

@@ -1,211 +1,176 @@
-# Copilot × ZCode 原生 Agent 协作系统
+# Copilot — ZCode 原生 Agent 的协作治理 Skill
 
-Copilot 是运行于 ZCode 内的**轻量协作治理 Skill**：用户侧 ChatGPT 负责需求与产品层目标、
-交接与验收；ZCode 原生 Agent（主代理）是工程执行与技术决策主体，负责现场调查、规划、实现、
-调试、测试与验证；Copilot 负责任务合同、完成条件、状态、证据、审计与收口门禁，并用 PARTIAL
-派生持续推进任务；SOL 作为默认认知引擎按生命周期提供判断（启动理解、方案取舍、重大新证据、
-里程碑复盘、收口综合），用户明确要求时可执行一次独立复核。
+Copilot 是运行在 ZCode 内的**轻量协作治理 Skill**。它把多步骤工程任务变成
+可追踪、可恢复、可审计的合同与状态机，同时**不接管工程执行与技术决策**。
 
-**v9.6.1 收口时序**：收口 CONSULT（E 窗口）此前可能在最后一个工作项关闭时立刻执行——
-此时合同要求的测试、最终证据与条件核销可能都没完成。现在 `closure_readiness` 是 E 与收口的
-唯一准入（工作项终态、条件核销、证据、合同必要测试的执行痕迹、finding 台账），并以
-`final_verification_digest` 作为义务身份：验证缺口存在时 `drive`/`closure --close`/手动
-`--stage closure` 都拒绝执行，验证完成后自动执行一次真实收口 CONSULT，再由 ZCode 完成最终
-验收与 G1–G3 收口；重跑测试会改变摘要，旧结论不再覆盖新结果，同一摘要不重复付费。详见
-`docs/DECISIONS.md` 第 75 条与 `references/runtime.md` §5。
+## 角色与边界
 
-**v9.6.0 SOL 生命周期主动调度**：SOL 不再只是“建议 + 打印命令”——A–E 五个认知窗口
-（启动 CONSULT、调查后 PLAN、重大新证据的动态 CONSULT、里程碑复盘、收口综合判断）由
-`review_policy` 判定后物化为**调度义务**持久化在 `state.sol_schedule`，由 `start`/`drive`/
-`record`/`criterion`/`report`/`closure` 等生命周期命令在自身事务内**有界执行**（每条命令
-最多 1 个义务 / 1 次请求），`--sol auto|advise|off` 控制开关；同一合同同一问题直接复用不
-重复付费，合同修订把旧义务显式跳过，失败按真实原因降级且不阻断工程。`sol-stats` 给出
-显式分母的覆盖率（应调/执行/失败/复用/合理跳过/应调未执行），只统计真实请求成功。详见
-`docs/STATUS.md`、`docs/DECISIONS.md` 第 74 条与 `references/runtime.md` §5。
+| 角色 | 职责 | 边界 |
+|---|---|---|
+| **ZCode 主 Agent** | 现场调查、技术选型、实现、调试、测试、集成与交付 | **唯一工程执行与技术决策主体** |
+| **Copilot（本项目）** | 任务合同、完成条件、状态机、证据登记、G1–G3 收口门禁、PARTIAL 续跑、审计 | 是本地脚本与状态，不是模型；不实施工程、不替代技术决策、门禁不可绕过 |
+| **SOL** | 默认认知引擎：理解目标、方案取舍、风险与再咨询条件（CONSULT / PLAN），用户明确要求时执行一次独立复核（REVIEW） | 零工具、单轮、**advisory**；结论不构成证据、门禁或授权，失败只降级不阻断 |
+| 用户 | 目标、优先级、取舍、授权与最终验收 | 提交、推送、发布、付费、生产变更仍须显式授权 |
 
-**v9.5.1 宿主集成修正**：真实 ZCode 宿主验收暴露并修复四处偏差——SessionStart matcher
-补 `startup`（否则新会话发现不到未闭合任务）；状态文件不在 `.copilot-tasks/` 时 `start`
-明确警告（钩子只扫描该目录）；`work_order` 的条件提示改为本工作项 `target_criteria`
-而非固定 `C1`；`handoff_count` 跨过期租约累计。详见 `docs/STATUS.md` 与
-`docs/DECISIONS.md` 第 73 条。
+三条不可混淆的边界：
 
-**v9.5.0 持续推进：调度领取、恢复提示与阻塞边界**：派生项不再只是列表——`drive` 领取
-选中的工作项并写入 `state["claims"]`（owner、TTL、handoff），其它会话看不到、也不会重复
-执行同一条；只剩其它会话的领取项时 `continuation` 返回 `wait` 而不是空转派生。`block`
-必须指明工作项或 `--scope task`，任务级阻塞仍有可执行项时须 `--force` 并记录现场；
-`unblock --by user --quote` 留下解除来源，新授权可与旧阻塞区分。恢复侧：SessionStart 对
-startup/未绑定会话输出只读指针，新增 `UserPromptSubmit` 每轮提醒打开任务与授权判断规则。
-计划动作可用 `target_criteria` 绑定合同条件，不改变计划指纹。详见 `docs/STATUS.md` 与
-`docs/DECISIONS.md` 第 72 条。
+1. **Copilot 不执行工程**。它记录事实、判定状态、暴露缺口，具体改代码由 ZCode 主 Agent 完成。
+2. **SOL 不是工程执行主体**。它只输出判断，采纳与否由主 Agent 决定，采纳记录用 `sol-accept` 留痕。
+3. **命令不是授权**。`copilot_dispatch.py` 能做的事不代表被授权去做。
 
-**v9.4.0 项目上下文与长期记忆衔接**：新增 `scripts/context_engine.py`，把原生项目
-Memory、正式 Vault、Copilot Task Memory 与工程现场拼成一条确定性数据流——
-`resolve`（按 `sha256[:16]` 定位项目记忆，同名不同路径不串库）、`recall`（白名单有界
-召回，零命中/失败/截断可区分，短期缓存随文件变化失效）、`pack`（self/sol/subagent 三档
-字符上限的上下文包）、`capture`（带任务与证据溯源的候选草稿，写入仍走
-`candidate_write.py`）。SessionStart(resume|compact) 快照追加项目现场与召回/交接命令，
-`status` 附非阻断提示；全程只读、零模型调用、不新增记忆库与知识库写入口。详见
-`docs/CONTEXT-ENGINE.md` 与 `docs/DECISIONS.md` 第 70 条。
+## 它做什么
 
-**v9.3.0 治理一致性与续跑绑定加固**：合同修订不再能通过删条件或改弱措辞绕过 G2
-（破坏性修订须 `--authorized-by user` 留痕）；条件核销自动撤销其空包装项；任务重开后没有
-新证据不得复用旧 PASS；多阻塞按项解除、恢复项家族不嵌套；Hooks 只在命令成功后绑定会话、
-任务根查找止于 `.git`、守卫异常 fail-closed；`knowledge_handoff` 改为惰性导入，仓库只保留
-跟踪文件时 CLI 仍可用。详见 `docs/STATUS.md` 与 `docs/DECISIONS.md` 第 68 条。
+- **任务合同与完成条件**：结构化条件、破坏性修订留痕（`--authorized-by user`）。
+- **状态机**：`RUNNING` / `PARTIAL` / `PASS` / `BLOCKED` / `CLOSED`；PARTIAL 是连续执行状态，
+  仍有可执行工作时返回 `EXIT_CONTINUE=10` 并派生下一项（`AUTO-C*` / `AUTO-R-*` / `AUTO-FIX-*` …）。
+- **证据与绑定**：证据先登记再消费，执行/复核结果绑定 `task/contract/plan/work_item/result sha256`；
+  文件型证据重读校验摘要。
+- **收口门禁 G1–G3（fail-closed）**：工作项终态、合同/条件/证据完整性、Finding 台账与停摆检查。
+- **SOL 生命周期调度**：A–E 五个认知窗口物化为持久化义务（`state.sol_schedule`），由生命周期
+  命令在自身事务内**有界执行**（每条命令最多 1 个义务 / 1 次请求），`--sol auto|advise|off` 控制；
+  `sol-stats` 给出显式分母的覆盖率统计。
+- **收口时序（v9.6.1）**：`closure_readiness` 是收口 CONSULT 与 G1–G3 的唯一准入——最终工程验证
+  完成前不执行收口判断；验证完成 → SOL 收口 CONSULT → 主 Agent 用 `sol-accept` 登记独立判断 →
+  G1–G3 收口。同一验证摘要复用结论，摘要变化即旧结论失效。
+- **工作项领取**：`drive` 为选中工作项写入短租约（owner / TTL / handoff），避免并发重复执行。
+- **恢复与续跑**：`SessionStart` / `UserPromptSubmit` / `Stop` 钩子只读提示未闭合任务与续接命令
+  （钩子不写状态、异常退出码 0）。
+- **项目上下文（只读）**：`context_engine.py` 的 `resolve` / `recall` / `pack` / `capture`，全程
+  零模型调用，不新建记忆库、不写知识库。
 
-**v9.0.0 SOL-first 默认认知引擎**：SOL 恢复为 `CONSULT` / `PLAN` / `REVIEW` 三模式，
-CONSULT 与 PLAN 成为非简单任务的默认认知活动（`THINK` 只作读取别名）。生命周期：
-`start` 声明任务类型 → 起点 CONSULT（理解目标/本质/风险/调查方向）→ 调查后 PLAN
-（方案比较/优先级/阶段目标）→ 新证据或方案失败时动态 CONSULT → 高复杂阶段复盘 →
-收口前一次综合判断；没有硬性次数或 Token 上限，每次必须有明确问题与决策价值。
-`sol-accept` 记录主代理的采纳/修改/否决；`review-metrics` 输出覆盖率、重复率、采纳与
-usage/latency（缺失标 `unavailable`）。简单/机械任务 0 调用；正式 REVIEW 仍只在用户
-明确要求时执行。SOL 零工具、单轮、advisory，不改变阶段、不影响 G1–G3，失败只登记并
-降级（退出码 0）不阻断工程推进。
+## 运行环境
 
-**v8.5.0 PARTIAL 强制续跑**：`continuation` 判定进入 `next`/`status`/`drive` 以及
-`record`/`rerun`/`criterion`/`report`/`block`/`unblock`；仍有原始授权内的可执行工作时返回
-`EXIT_CONTINUE=10`，阶段报告不再是任务终点。阻塞按工作项成立（`block --work-item`），
-单项缺授权不冻结其余工作；`--criterion` 声明被卡住的条件，`unblock` 自动恢复被冻结项；
-只有全部剩余工作真实受阻时才整体 BLOCKED。G1–G3、SOL 语义与授权边界不变。
+- **Python 3.10+**（开发与验证环境 3.12）。**仅用标准库**，无第三方运行时依赖。
+- **可选依赖**
+  - `Pillow`：只有把图片作为证据时必需（完整性校验）。缺失时采集端**拒绝**图片证据，不降级放行。
+  - `PyYAML`：只有运行 `legacy/tests` 历史回归时可能用到。
+- **ZCode 宿主**：Skill 发现、子 Agent 派发与 `Stop` / `SessionStart` / `UserPromptSubmit` 钩子
+  需要 ZCode；纯 CLI 部分（`copilot_dispatch.py` / `copilot_auto.py`）不依赖宿主。
+- **SOL（可选）**：需要本机存在 OpenAI 兼容端点 `http(s)://127.0.0.1:8317`（Responses API），
+  提供 `gpt-6.2-sol`，且 `~/.zcode/v2/provider_config.json` 中有对应凭据。非本机地址一律拒绝。
+  没有该环境时用 `--sol off` 完全离线运行，任务照样可以推进到 PASS/BLOCKED。
 
-**v8.4.0 SOL 默认认知引擎铺垫（历史）**：v8.4 曾把 CONSULT / PLAN 并入单一的 `THINK`
-模式与一份结构化输出；v9 按生命周期重新拆为 CONSULT / PLAN，THINK 保留为读取别名。
-简单任务 0 调用；REVIEW 只在用户明确要求时执行。认知材料上限 120,000 字符。
-
-**知识交接扩展（2026-11-18）**：新增 `scripts/knowledge_handoff.py`，把主 Agent 已实际
-Read 的 Memory/Vault 卡片渲染为带状态、核验时间与必要摘录的交接块；`sol-think` /
-`sol-review` 支持 `--knowledge-file`，`read` 摘录必须能在卡片正文中找到，
-`index-only`/`unverified` 不得冒充已读。`read` 是主代理声明 + 脚本核对来源，不证明
-宿主同轮工具调用；可选 `read_evidence` 记录会话/工具证据。
-子 Agent 使用同一工具生成 `--target subagent`
-块并由主 Agent 放入 prompt。该扩展自 2026-11-21 起纳入 Git 与分发基线（提交 `c799a5c`），
-干净 checkout 自带；缺少该文件时 CLI 仍可启动，只有使用 `--knowledge-file` 才返回
-`KNOWLEDGE_EXTENSION_MISSING`。
-
-**v8.3.0 SOL 主动介入（历史）**：触发判断从“风险标签 + 门禁是否全绿”升级为**确定性
-复杂度 + 覆盖判断**，简单任务 0 调用，中高复杂任务一次，只有升级型新信号才追加；v8.4
-把当时的 `PLAN`/`CONSULT` 两种模式并入 THINK。
-
-**v8.2.0 SOL 与 G1–G3 融合（历史）**：三种 SOL 模式共用一条调用管线、一份任务上下文
-（合同/条件/证据）与一份记录流（`sol_calls`，历史 `sol_reviews`/`sol_advisories` 只读兼容）、
-统一审计 `sol-audit.jsonl`；`review-admission` 先算本地 G1–G3。
-
-**v8.1.0 SOL 升级 GPT-6.2（历史）**：SOL 统一 `gpt-6.2-sol`（Responses API `/v1/responses`，既有
-本机 CPA `127` 出口）、`reasoning.effort="high"`、`standard` 模式、零工具、单轮；不按角色
-降级推理强度，不静默回退旧模型或别名，上游回显的模型/推理强度/模式不一致即拒绝消费。新增
-`copilot_dispatch.py sol-advisory --mode CONSULT|PLAN` 提供建议性问题分析与规划辅助，结论写入
-`sol_advisories`，不进入 Finding 台账、不影响 G1–G3、不阻断任务；DECIDE 不恢复，ZCode 仍是
-唯一工程执行与技术决策主体。
-
-**v8.0.1 安全与效率加固**：SOL 错误详情统一脱敏限长，本机 CPA 出口在解析凭据前无条件
-校验并禁用环境代理；远程成功后审计/落盘失败不再被误报为调用失败，可恢复结果避免同材料
-重复付费，并加任务级互斥锁；Finding 合并完全幂等，advisory 复核不能把已解决的 authoritative
-finding 单方面提级为不可驳回阻断。dry-run 与真实调用共用材料校验。
-
-**v8.0.0 起 G4 原生只读复核正式退役**：删除 `g4_attest.py`、`g4_shadow.py`、
-`test_execution.py`、原生复核信封与 `native_agent.py review/review-context/capability`。
-收口门禁收敛为 G1–G3（工作项终态、合同/条件/证据与 Finding 台账、无停摆），不再产生
-`g4_eligible`、G4 PASS、G4 BLOCKED、`AUTO-G4*` 或 `host_capability_missing`；高风险任务
-不再绑定 native 后端。原 G4 的“未闭合 blocking/major 阻断收口”安全职责并入 G2，对所有
-风险等级生效。历史 `native_reviews` / `review_attempts` / `g4_attestations` 只读保留用于
-审计，不参与新任务准入或收口。
-
-**v7.0.0 起独立模型复核走 SOL 零工具单轮复核（历史）**：主代理完成开发、自检与测试后，
-调用 `copilot_dispatch.py sol-review` 一次；v7 使用既有本机 CPA `127` 通道的 `gpt-6.1-sol`
-（v8.1.0 起升级为 `gpt-6.2-sol`）。工具定义不会出现在请求体中（并显式
-`tool_choice="none"`）。一次复核只发一次请求；失败不重试、不换 Provider。SOL 是 advisory，
-不构成收口门禁，也不证明宿主只读权限；修复与验证仍由主代理完成。v8.4 起 REVIEW 只在用户
-明确要求时执行，开发期的主动认知建议由 THINK 承担。
-
-**v6.11.0 起命令开销按“一次命令一次快照”收敛**：`sync_runtime.py --apply` 同步后预编译
-运行时字节码（文档命令用 `python3 -B`，只禁止写 `.pyc`），单次命令不再重复编译源码；
-代码快照、`git_root` 结果在单次命令内复用，工作区只扫描一次；工作区根与 HEAD 合并为一次
-`rev-parse`。门禁、漂移检测与证据绑定规则不变。
-
-**v6.0.0 起 SOL 决策通道退役**（v7 恢复一次性 REVIEW，v8.1 恢复建议性 CONSULT/PLAN，v8.2 融合为统一按需认知能力）：
-不再有远程模型决策依赖，不再有等待 SOL 返回的状态门禁，也不新增其他远程大模型充当强制
-决策节点。历史调用记录、REVIEW 裁决、任务台账与证据原样保留，可只读查看。角色边界见
-`docs/PROJECT-CHARTER.md`。
+## 安装
 
 本仓库是**唯一源码**；`~/.zcode/skills/copilot` 是构建产物，只允许从本仓库单向下发。
-旧 Reviewer 全局 Profile 已退役。工作区保留一个**通用只读能力载体**
-`.zcode/agents/independent-readonly.md`（Read/Grep/Glob，无 Bash/Write/Edit），
-只提供宿主级权限，供主代理按需做独立只读调查；它不定义 Reviewer 身份、不参与收口门禁，
-普通任务不强制使用。
+
+```bash
+git clone https://github.com/tongsailong/copilot.git
+cd copilot
+python3 -B scripts-sync/sync_runtime.py --check    # 查看与现有运行时的差异
+python3 -B scripts-sync/sync_runtime.py --apply    # 单向写入 ~/.zcode/skills/copilot
+python3 -B scripts-sync/sync_runtime.py --check    # 期望：缺失 0、不同 0
+```
+
+分发范围：`SKILL.md`、`scripts/**/*.py`、`references/**/*.md`。`tests/`、`legacy/`、`docs/`、
+`manifests/`、`scripts-sync/`、`README.md`、`AGENTS.md` 不分发。同步原子替换并写后复核 SHA-256。
+
+新开的 ZCode 会话才会加载新版本（Skill 元数据在会话启动时缓存）。
+
+**恢复钩子**（可选，默认不装）：`scripts/copilot_stop_guard.py install` 会写用户级 hook 配置，
+属于修改全局配置，需你自行确认后执行；`uninstall` 可回退。钩子只读任务状态，不写状态、
+不消费续跑次数。
+
+## 使用（最小闭环）
+
+```bash
+cd /path/to/your-project
+
+# 1) 建任务与合同（--task-kind 决定 SOL 认知调用量；机械任务默认 0 调用）
+python3 ~/.zcode/skills/copilot/scripts/copilot_dispatch.py start \
+  --state .copilot-tasks/demo/state.json \
+  --goal "把登录接口的错误码收敛为统一枚举" \
+  --criteria-file criteria.json --risk medium --task-kind standard
+
+# 2) 计划 → 执行 → 证据 → 回填
+python3 .../copilot_dispatch.py plan --state ... --plan plan.json
+python3 .../copilot_dispatch.py evidence --state ... --add --id E1 --file out/test.log
+python3 .../copilot_dispatch.py record --state ... --work-item A1 --status done \
+  --result-file out/result.json --evidence E1
+
+# 3) 推进与收口（EXIT_EXECUTE=10 表示还有下一步，EXIT_DONE=0 表示已收口）
+python3 .../copilot_auto.py drive --state ...
+python3 .../copilot_dispatch.py closure --state ... --close
+```
+
+完整命令见 `references/workflow.md`；状态机与持续推进语义见 `references/runtime.md`。
+所有任务数据（状态、证据、SOL 原始输出）落在 `.copilot-tasks/`，已被 `.gitignore` 排除。
+
+## 安全边界
+
+- **授权**：commit、push、发布、部署、付费、生产数据与 Provider/安全策略修改都须用户明确授权；
+  Copilot 命令本身不构成授权。
+- **fail-closed**：证据缺失、绑定不符、门禁未过时一律失败关闭，不用“看起来合理”替代验证；
+  SOL 结论也不等于证据或授权。
+- **不存凭据**：仓库与分发物中不含 API Key、凭据、真实审计日志或任务状态。SOL 只从本机既有配置
+  读取凭据，只允许本机回环出口，失败不重试、不换 Provider、不自动降级模型。
+- **不删除历史**：历史审计、证据与只读台账保留，不因退役而改写。
+
+## 已知限制
+
+- **SOL 模型固定**为 `gpt-6.2-sol`（`reasoning.effort=high`、零工具、单轮），不做别名回退；
+  上游回显不一致即拒绝消费。公共环境没有该模型时应显式 `--sol off`。
+- **知识库路径是作者本机默认值**：`context_engine.py` 可用 `--vault-root` 改；
+  `knowledge_handoff.py` 的白名单根目录（`ALLOWED_ROOTS`）写死在源码中，换目录需自行调整该常量
+  （本版未提供 CLI 开关）。
+- **`legacy/tests` 不是全绿**：它验证 v5 历史行为，含 146 个已知失败/错误（99 F + 47 E）与
+  32 个 skip，属历史契约保留，不作为当前规则判定依据。当前套件 `tests/` 全绿。
+- **无 CI**：仓库不含 GitHub Actions，验证在本地运行。
+- **续跑次数上限由宿主决定**：ZCode 单回合的 Stop 续跑次数有硬上限，超出会被静默忽略；
+  钩子无法读取或修改该计数。
+- **平台**：脚本面向 POSIX（用到 `fcntl`），Windows 原生环境未验证。
 
 ## 目录
 
 ```text
 copilot/
-├── AGENTS.md                # 项目执行规则（不分发）
 ├── SKILL.md                 # Skill 入口与运行契约（分发）
 ├── scripts/                 # 运行时脚本（分发）
-│   ├── governance.py        # 本地治理引擎：合同、状态、阶段、G1–G3、PARTIAL 派生
-│   ├── copilot_dispatch.py  # CLI：任务、计划、证据、收口、SOL 认知/复核、正式 REVIEW、历史只读
-│   ├── copilot_auto.py      # 驱动：drive（推进/工作单/派生）与 ingest（执行信封回填）
-│   ├── sol_review.py        # SOL 三模式（CONSULT/PLAN/REVIEW）：请求/解析/审计（唯一远程调用）
-│   ├── sol_schedule.py      # SOL 生命周期调度：义务/窗口/覆盖率统计（纯策略，零网络零 I/O）
-│   ├── knowledge_handoff.py # 知识交接块：校验 read 摘录来源并渲染 Memory/Vault → SOL/子 Agent
-│   ├── context_engine.py    # 项目上下文：resolve/recall/pack/capture（只读、零模型调用）
-│   ├── native_bridge.py     # Native Bridge v2 执行信封协议与校验
-│   ├── native_agent.py      # 从宿主运行记录生成正式执行信封
-│   ├── agent_policy.py      # Agent 调度建议（只读纯函数）
-│   ├── bridge_evidence.py   # 证据采集：脱敏、截断标记、清单
-│   └── lib_common.py        # 公共工具
+│   ├── governance.py        # 治理引擎：合同、状态、阶段、G1–G3、PARTIAL 派生
+│   ├── copilot_dispatch.py  # CLI：任务、计划、证据、收口、SOL 认知/复核
+│   ├── copilot_auto.py      # 驱动：drive / ingest
+│   ├── sol_review.py        # SOL CONSULT/PLAN/REVIEW（唯一远程调用，单轮零工具）
+│   ├── sol_schedule.py      # SOL 生命周期调度（纯策略、零网络零 I/O）
+│   ├── knowledge_handoff.py # 知识交接块（校验 read 摘录来源）
+│   ├── context_engine.py    # 项目上下文 resolve/recall/pack/capture（只读）
+│   ├── copilot_stop_guard.py# Stop / SessionStart / UserPromptSubmit 钩子
+│   └── …                    # native_bridge / bridge_evidence / agent_policy / lib_common
 ├── references/              # 协议与操作参考（分发）
-├── .zcode/agents/independent-readonly.md # 通用只读权限 Profile（不分发）
 ├── legacy/                  # v5 SOL 实现与历史测试（不分发，仅追溯）
-├── tests/                   # 当前开发测试（不分发）
-├── docs/                    # 项目管理文档（不分发）
-├── .copilot-tasks/          # 治理任务本地数据：状态、证据、SOL 原始输出（不分发、不纳入 Git）
-├── manifests/               # 源码 SHA-256 基线（不分发）
-└── scripts-sync/            # 源码→运行时同步工具（不分发）
+├── tests/                   # 当前开发测试
+├── docs/                    # 决策、状态与路线图
+├── manifests/               # 源码 SHA-256 基线
+└── scripts-sync/            # 源码 → 运行时同步工具
 ```
 
-## 开发方式
+## 开发
 
-1. 只修改本仓库；不直接编辑运行时副本。
-2. 运行当前测试与历史回归：
+```bash
+python3 -B -m unittest discover -s tests -p 'test_*.py'          # 当前套件（849 项）
+python3 -B -m unittest discover -s legacy/tests -p 'test_*.py'   # 历史回归（已知非全绿）
+python3 -B scripts-sync/sync_runtime.py --apply                  # 改动后单向下发
+python3 -B scripts-sync/sync_runtime.py --baseline --verify-baseline
+```
 
-   ```bash
-   cd /media/vdb/projects/copilot
-   python3 -B -m unittest discover -s tests -p 'test_*.py'
-   python3 -B -m unittest discover -s legacy/tests -p 'test_*.py'
-   ```
+新增行为需要有对应测试；不为通过而放宽断言或删除测试。提交只暂存明确路径。详见
+`CONTRIBUTING.md`、`AGENTS.md` 与 `docs/DECISIONS.md`。
 
-   `legacy/tests` 只验证 v5 历史行为（含若干历史文档契约跳过），不参与当前规则判定。
+## 版本演进
 
-3. 检查实际 diff（本地 Git 仓库，`main` 分支保留可回溯提交；提交只含明确路径，
-   push/发布/部署需单独授权，详见 `AGENTS.md` 与 `docs/DECISIONS.md`）。
-4. 单向同步并复查：
+| 版本 | 要点 |
+|---|---|
+| **v9.6.1** | 收口时序：最终工程验证完成才执行收口 CONSULT；验证摘要纳入材料口径；`sol-accept` 成为收口前的强制步骤 |
+| v9.6.0 | SOL A–E 五阶段义务化调度、`--sol auto\|advise\|off`、覆盖率统计 |
+| v9.5.x | 工作项领取与短租约、阻塞按项成立、SessionStart/UserPromptSubmit 恢复提示 |
+| v9.4.0 | 只读 Context Engine（resolve/recall/pack/capture） |
+| v9.3.0 | 合同破坏性修订留痕、条件核销自动撤销空包装项、重开不得复用旧 PASS |
+| v9.0.0 | SOL-first：CONSULT / PLAN 生命周期 + `sol-accept` 采纳记录 |
+| v8.5.0 | PARTIAL 强制续跑（`EXIT_CONTINUE=10`） |
+| v8.0.0 | G4 原生只读复核退役，门禁收敛为 G1–G3 |
+| v7.0.0 | 独立模型复核改为 SOL 零工具单轮复核（advisory） |
 
-   ```bash
-   python3 scripts-sync/sync_runtime.py --check
-   python3 scripts-sync/sync_runtime.py --apply
-   python3 scripts-sync/sync_runtime.py --check
-   ```
+完整记录见 `docs/STATUS.md` 与 `docs/DECISIONS.md`。
 
-   `--check` 退出码：0 = 受管理文件缺失 0、不同 0；1 = 存在漂移；2 = 参数或安全校验错误。
-   运行时多出的文件默认保留；`--prune` 必须与 `--apply` 一起显式使用。
+## 许可证
 
-5. 新的 ZCode 会话才加载新运行时版本。
-
-## 同步边界
-
-- 分发：`SKILL.md`、`scripts/**/*.py`、`references/**/*.md`。
-- 不分发：`legacy/`、`tests/`、`docs/`、`manifests/`、`scripts-sync/`、`README.md`、`AGENTS.md`。
-- 永不同步：`.env*`、密钥/凭据、`.audit/` 审计日志、临时状态、`__pycache__`、符号链接。
-- 每次运行检查 Skill 受管理文件（`SKILL.md`、`scripts/`、`references/`）的一致性；
-  Reviewer Profile 不再分发。
-- 同步写入使用同目录临时文件 + `os.replace` 原子替换，写后重新校验 SHA-256。
-
-## 安全与授权
-
-- Copilot 命令不是授权：commit、push、发布、部署、付费、生产数据与 Provider/安全策略修改
-  仍须用户明确授权。
-- SOL 复核复用既有本机 CPA 配置，不新增 Provider、账户、密钥或付费方案；审计只记脱敏元数据，
-  不回显凭据。
-- G1–G3 门禁保持 fail-closed；SOL 复核是 advisory，不替代证据、测试或授权判断。
-- 不在源码仓库或运行时分发物中保存 API Key、凭据、真实审计日志或临时任务状态。
-- 不删除历史审计与证据；历史材料只读保留。
+[MIT](LICENSE) © 2026 tongsailong

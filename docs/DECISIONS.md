@@ -5,7 +5,7 @@
 
 ## 已确认
 
-1. **唯一源码是 `/media/vdb/projects/copilot`。**
+1. **唯一源码是 `<repo>`。**
    运行时 `~/.zcode/skills/copilot` 是构建产物，只允许由
    `scripts-sync/sync_runtime.py` 单向下发；禁止双向维护，禁止把运行时当第二开发工作区。
    阶段九起旧 Reviewer 全局 Profile（`agents/reviewer.md` → `~/.zcode/agents/reviewer.md`）
@@ -99,8 +99,8 @@
     `--accept-evidence-truncation <理由>` 显式放行并随轮次/审计留痕。已入账轮次的截断
     条目继续沿用并标注，不永久锁死后续复核（避免一次历史截断把任务卡死）。同时新增
     `bridge_evidence.py --attest REPO[::标签]`：由 git 机器生成 HEAD、工作区状态、
-    逐文件 sha256 与 `diff --stat HEAD`，非 git 工作区失败关闭。依据：2026-11-04 荣耀买量
-    任务 `honor-multi-ad-activation-20261104`——R2 E21 正文被截断 6214 字符后送审，SOL 据此
+    逐文件 sha256 与 `diff --stat HEAD`，非 git 工作区失败关闭。依据：2026-11-04 某买量投放项目
+    任务 `某买量投放任务-20261104`——R2 E21 正文被截断 6214 字符后送审，SOL 据此
     给出无法闭合的缺证裁决；4/4 轮都在追问「被审代码是哪一份」，执行方只能用文字自述。
     ⚠ **部分替代注（2026-11-09）**：真正的现行规则是「截断证据失败关闭 + 代码状态机器绑定」，
     这部分继续有效；G1–G4、Reviewer 独立性、证据 SHA 与审计绑定不变，该闸门只拦「明知不完整
@@ -611,7 +611,7 @@
     与工作区 Profile 不进入运行时。退役脚本不进入分发清单。依据：第 2 条分发边界在 v6
     的延续；阶段九起旧 Reviewer 全局 Profile 不再分发。
 
-35. **v6.1 复核收敛与自主推进优化（2026-11-13）。** 基于最近两个真实任务（tencent 6 轮、
+35. **v6.1 复核收敛与自主推进优化（2026-11-13）。** 基于最近两个真实任务（某广告平台 6 轮、
     honor 7 次 G4 尝试）的复盘，确认主要浪费不是 Reviewer 判断质量，而是复核机制本身：
     只读白名单过窄导致 Reviewer 自己作废自己（`sed -n`/`for` 循环被判越界）、要求自报命令与
     文件并逐字比对、每条复核都重新读全部证据、合同修订在 BLOCKED 下被拒导致阻塞往返、
@@ -647,8 +647,8 @@
     频繁打断的流程管理器；同时明确不得降低安全门禁、不得为减少轮次掩盖缺陷。上述改动只
     减少重复劳动与无效作废，未放宽 G1–G4、证据完整性、宿主记录或 fail-closed 语义。
 
-36. **v6.2 实战复盘收敛（2026-11-13）。** 基于 5 个真实任务（v6.1 自升级、步数宝 GroMore、
-    Honor ECPM、腾讯插屏、journey 激励）的只读台账复盘，只修有证据的问题：
+36. **v6.2 实战复盘收敛（2026-11-13）。** 基于 5 个真实任务（v6.1 自升级、某应用、
+    某广告变现项目（ECPM）、某插屏广告项目、某投放链路 激励）的只读台账复盘，只修有证据的问题：
 
     - **只读复核策略的真实盲区**：`_is_readonly_prefix` 按整段字符串匹配，绝对路径
       可执行文件（`/media/.../build-tools/36.0.0/aapt2 dump ...`）被误拒——改为对
@@ -689,9 +689,9 @@
     真实验证：7 份有效复核信封（152 条命令）+ 1 份被拒的无效尝试（32 条）重放 0 拒绝，
     活动 166 + 历史 853 测试通过；未在真实 GUI 会话中验证运行时加载，未重跑完整 G4 链路。
 
-37. **v6.3 Reviewer 多轮评审根因收敛（2026-11-14）。** 基于 10 个真实任务（ad-strategy 7 轮
-    复核 0 份入库、Honor 7 次 G4 尝试、review-perf 4 次正式 REVIEW、gromore/腾讯/journey/
-    usb-debug/perf-ads/splash）的台账与复核信封复盘。结论：返工主要来自机制，不是
+37. **v6.3 Reviewer 多轮评审根因收敛（2026-11-14）。** 基于 10 个真实任务（某广告策略项目 7 轮
+    复核 0 份入库、某广告项目 7 次 G4 尝试、某复核专项 4 次正式 REVIEW、gromore/腾讯/某投放链路/
+    usb-debug/某性能优化项目/splash）的台账与复核信封复盘。结论：返工主要来自机制，不是
     Reviewer 判断质量；不降低标准、不设硬轮次上限、不放宽 G1–G4。处理：
 
     - **只读策略补真实缺口**：加入真实复核用过但被误拒的只读命令（`git rev-list`、
@@ -737,19 +737,19 @@
       `rerun`、`evidence --add`、`criterion`、`report`、`judgment`、额外 `block`，以及
       已授权的 `authorize-review` / `formal-review`（含 amendment）；这些写入不解除阻塞、
       不改变合同/授权，`close` 仍拒绝未解除的阻塞。`plan`、`decide`、`evidence --drop`
-      继续拒绝；`contract --amend` 保持独立语义。依据：perf-ads 4 次、Honor 4 次
+      继续拒绝；`contract --amend` 保持独立语义。依据：某性能优化项目 4 次、某广告项目 4 次
       `unblock → 登记 → block` 循环，均非安全需要。
     - **复核顺序与 PASS 收口**：最终 G4 复核必须在完成条件核销、证据登记完整、目标摘要
       稳定之后进行；`AUTO-G4` 工作单要求先读 `review-context` 的 warnings/scope_reason。
       PASS 后 minor/info 记录为 findings/residual_risks，不修改已通过证据重开完整复核；
       后续实质变化仍必须重新判断原 PASS 是否覆盖新快照，G4 继续绑定 `final_evidence_digest`。
-      依据：ad-strategy 在 PASS 后为 minor/info 修改证据并再次完整复核（13 条重复命令）；
+      依据：某广告策略项目 在 PASS 后为 minor/info 修改证据并再次完整复核（13 条重复命令）；
       v6.3 e2e 第 1 轮因条件未核销而 stale。
     - **正式 REVIEW amendment**：正式 REVIEW 结论只登记一次；非实质修订用
       `--amend <review_id> --reason` 追加，目标摘要变化时拒绝，必须用
       `--supersedes <review_id>` 登记新结论；原记录、授权快照与 verdict 不被覆盖。
       `review-metrics` 分别统计 `formal_reviews_total`、`formal_review_amendments_total`、
-      `superseded_formal_reviews_total`、`active_formal_reviews_total`。依据：review-perf
+      `superseded_formal_reviews_total`、`active_formal_reviews_total`。依据：某复核专项
       4 次 pass，v2/v3 只改证据引用/口径，结论未变。
 
     不变：G1–G4 fail-closed、Reviewer 独立性/只读、宿主记录重核、证据 SHA 与目标摘要绑定、
@@ -1628,7 +1628,7 @@
       `general-purpose`（`tools=["*"]`）与 `Explore`
       （`tools=[Bash,Glob,Grep,Read,WebFetch,WebSearch,TodoWrite]`），二者
       `source:"built-in"`。`independent-readonly` 的真实快照为 `source:"project"`、
-      `path=/media/vdb/projects/copilot/.zcode/agents/independent-readonly.md`，是
+      `path=<repo>/.zcode/agents/independent-readonly.md`，是
       **项目级自定义 Agent 定义**，不是内置 Agent，也不只是内置 Agent 的权限配置。
     - **原生隔离能力结论**：`Agent` 工具参数只有 `description/prompt/subagent_type/
       run_in_background`，没有派发期 `tools`/`allowedTools`；子代理工具集来自 Profile
@@ -1988,3 +1988,26 @@
     - **不变量**：五阶段调度架构、G1–G3 语义、PARTIAL 续跑、SOL 零工具 advisory（E 不是门禁、
       不需要 SOL PASS）、REVIEW 仅用户明确要求、G4 退役、Provider/模型/账户与授权边界不变；
       本轮未提交、未推送、未发布。
+
+77. **公开发布准备：MIT、文档脱敏与完整历史审计（2026-11-21，用户任务与授权）。**
+    用户确认公开仓库采用 **MIT**，版权主体写 GitHub 账号名 `tongsailong`
+    （不写法定姓名、不写企业归属、不做任何推断）。已确认：
+
+    - **脱敏口径**：保留 `docs/STATUS.md`、`docs/DECISIONS.md`、`references/history.md` 的
+      工程记录与结论，只替换四类内容——个人署名与邮箱、本机绝对路径、内部宿主入口、
+      跨项目业务名（改为“某广告变现项目”“某买量投放项目”等通用描述）。共替换 62 处，
+      二次运行 0 处（幂等）。原始内容可由提交 `2981a3f` 完整恢复，不做历史改写。
+    - **代码内本机默认路径不改**：`context_engine.DEFAULT_VAULT_ROOT` 与
+      `knowledge_handoff.ALLOWED_ROOTS` 属功能默认值，改动会改变运行行为且当前无对应测试，
+      本轮只在 `README.md` / `SECURITY.md` 中说明“作者本机默认值”，并提示用 `--vault-root`
+      指定自己的目录。若要改成可配置，作为独立任务加测试后再改。
+    - **审计结论（公开前）**：`git rev-list --objects --all` 可达 1,118 个 blob 与当前工作树
+      全量扫描，未发现真实凭据、私钥、Token、数据库连接串或带口令 URL；
+      `assign-secret-long` 命中全部是显式假夹具（`{literal-secret-…}`、`<redacted:…>`、
+      明显序列值）；仓库只有 `main` 一个分支，无标签、无 Actions、无 Release、单协作者；
+      运行时依赖仅标准库（可选 `Pillow` 用于图片证据完整性；`PyYAML` 仅 `legacy/tests`），
+      无第三方代码与版权声明需要随附。
+    - **不变量**：不改写 Git 历史、不 force push、不为公开降低既有安全保护；
+      `legacy/tests` 的 146 项已知失败/错误在公开文档中如实说明，不作为“全绿”宣称。
+    - 第 76 条末尾的“本轮未提交、未推送、未发布”是该轮事实；其代码与文档已由提交
+      `2981a3f` 提交并普通快进推送到 `origin/main`。

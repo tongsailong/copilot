@@ -39,6 +39,9 @@ round-*-evidence.md
 round-*-prompt.md
 round-*-reply.md
 
+# 本地报告产物（可选：junit / 覆盖率报告）
+reports/
+
 # 临时与本地备份
 *.tmp
 *.bak

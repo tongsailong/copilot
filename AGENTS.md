@@ -1,6 +1,6 @@
 # AGENTS.md — Copilot 源码仓库规则
 
-本文件只约束 `/media/vdb/projects/copilot` 仓库。用户级全局 `AGENTS.md` 的授权边界与
+本文件只约束 `<repo>` 仓库。用户级全局 `AGENTS.md` 的授权边界与
 安全规则优先；本文件只补充项目定位、角色、模型路由、闭环与交付纪律。详细协议以
 `SKILL.md`、`references/` 与 `docs/` 为准，本文件不重复展开。
 

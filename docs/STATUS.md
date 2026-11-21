@@ -3,6 +3,28 @@
 更新：2026-11-21 CST。本文件只记录现场可核实的事实；规划与未完成事项单独标注。
 当前版本：v9.6.1（收口时序：最终工程验证完成才执行收口 CONSULT）。
 
+## 正式交付与公开发布准备（2026-11-21）
+
+- **交付**：提交 `2981a3f`（20 个文件，+4511 / −140），普通快进推送 `75a6fa1 → 2981a3f`；
+  本地 HEAD、`origin/main`、`git ls-remote` 三方一致，ahead/behind 0/0。
+- **测试（最终代码）**：`discover -s tests` **849 OK**（含 `test_sol_scheduling` 67 项）；
+  `legacy/tests` 853 项 = 99 F + 47 E + 32 S，与 HEAD 干净工作树的失败集合逐条 diff 为空
+  （同基线、无回归）。历史套件非全绿属 v5 契约保留，不作为当前判定依据。
+- **运行时**：`--check` 缺失 0 / 不同 0；manifest 24 个文件逐个 SHA-256 与运行时一致；
+  `copilot_dispatch.py --version` = 9.6.1；`--verify-baseline` 通过。
+- **manifest 23 → 24**：`scripts/sol_schedule.py` 此前未跟踪，`--baseline` 只记录 Git 跟踪文件
+  因而漏记；本次随提交进入基线后重建为 24 项。此后新增分发文件必须先 `git add` 再建基线。
+- **公开前审计**：1,118 个可达 blob + 当前工作树全量扫描，无真实凭据/私钥/Token/连接串；
+  `assign-secret-long` 命中均为显式假夹具；单分支、无标签、无 Actions、无 Release、单协作者；
+  依赖仅标准库（可选 `Pillow`；`PyYAML` 仅 legacy 测试），无第三方代码与版权声明。详见
+  `docs/DECISIONS.md` 第 77 条。
+- **文档脱敏**：62 处替换（个人署名/邮箱、本机绝对路径、内部宿主入口、跨项目业务名 →
+  通用描述），二次运行 0 处；原始内容可由 `2981a3f` 恢复，未改写历史。
+  代码内本机默认路径（`context_engine` / `knowledge_handoff`）按第 77 条保留不动。
+- **公开文档**：新增 `LICENSE`（MIT，版权主体 `tongsailong`）、`SECURITY.md`、
+  `CONTRIBUTING.md`；`README.md` 重写为公开说明（角色边界、依赖、安装、最小闭环、SOL 配置、
+  安全边界、已知限制、版本演进）；`.gitignore` 增补 `reports/`。
+
 ## 收口时序精准修复（2026-11-21，v9.6.1）
 
 - **根因（现场证据）**：`review_policy.sol_advice` 的 E 分支只看 `all_done`（工作项是否
@@ -190,7 +212,7 @@
   在安装前后一致。备份：`config.json.bak-20261121143827`（首次安装前）、
   `config.json.bak-20261121144420`（matcher 修正前）。重复执行 `install --user --apply`
   不产生重复组，字节内容不变。
-- **宿主**：ZCode 0.18.0 headless（`node /opt/ZCode/resources/glm/zcode.cjs`，默认
+- **宿主**：ZCode 0.18.0 headless（`node <zcode-cli-entry>`，默认
   `--mode yolo`），`--resume <sess_id>` 复用同一会话；钩子判定用
   `COPILOT_STOP_GUARD_LOG` 逐次落盘 JSONL（`note` 字段可逐条核对）。
 - **场景 A（PARTIAL 自动续跑）**：`user-prompt-inject:1` → `drive` 领取 A1 并执行回填 →
@@ -1151,13 +1173,13 @@ manifest、advisory 消费路径）保持未独立验证；本轮只按现场代
 ### 现场证据（真实宿主）
 
 - 宿主版本：`dpkg` 记录 `zcode 3.18.2-10443`；`capability` 从
-  `/opt/ZCode/resources/app.asar` 的 `package.json` 读到 `version=3.18.2`
+  `<zcode-resources>/app.asar` 的 `package.json` 读到 `version=3.18.2`
   (`name=@zcode/desktop`)。`host_version()` 每次重新探测，不缓存。
 - 工作区只读 Profile 在当前会话真实加载：系统提供的 Agent 列表包含
   `independent-readonly (Tools: Read, Grep, Glob)`；一次实测派发的
   `metadata.profileSnapshot` 为 `tools=[Read,Grep,Glob]`、
   `disallowedTools=[Write,Edit,Bash,WebFetch,WebSearch,Agent,Task,TodoWrite,NotebookEdit]`、
-  `source=project`、`workspaceRoot=/media/vdb/projects/copilot`。
+  `source=project`、`workspaceRoot=<repo>`。
 - 实测子会话（`sess_subagent_agent_3de333ee-…`）：宿主工具列表实际只有
   `Read/Grep/Glob/RespondToCoordinator`；`totalToolUseCount=2`，`tool_usage` 只有
   `Read`、`Glob`（`read_only=1`），无 Bash/Write/Edit；子会话自述与宿主记录一致。
@@ -1216,7 +1238,7 @@ manifest、advisory 消费路径）保持未独立验证；本轮只按现场代
   `g4_attest` 74 项检查 0 拒绝 → `g4_source=candidate` → `drive` PASS/CLOSED。
   **该 E2E 使用项目级自定义 Profile，按原定架构不属于合规 G4 载体**；它只证明
   技术只读链可用，不作为正式 G4 PASS 证据。证据保留在
-  `/media/vdb/projects/copilot/.copilot-tasks/task-v612-g4-final4/`。
+  `<repo>/.copilot-tasks/task-v612-g4-final4/`。
 - **架构合规结论（2026-11-17 复核）**：
   - `independent-readonly` 是 project 级自定义 Agent（`source:"project"`），不是内置
     Agent；宿主内置只有 `Explore`（含 Bash）与 `general-purpose`（全工具）。
@@ -1309,7 +1331,7 @@ manifest、advisory 消费路径）保持未独立验证；本轮只按现场代
   OK（skip 32），34/34 场景通过，`all_layers_ok` 与 `all_scenarios_ok` 均为 true
   （`/tmp/copilot-bench/t4-freeze.json`，临时文件不进仓库）。
 - 新会话加载（已实测）：全新 headless ZCode 会话
-  （`node /opt/ZCode/resources/glm/zcode.cjs -p …`，空目录、只读提问）加载运行时 Skill，
+  （`node <zcode-cli-entry> -p …`，空目录、只读提问）加载运行时 Skill，
   正确回答版本 `v6.11.0`、`capture_code_snapshot` 单次进程快照复用规则，以及
   `risk=low/medium` 默认不派 Reviewer、`risk=high` 恒走 G4。
 - 运行时一致：`--check` 缺失 0 / 不同 0（28 个受管理文件），8 个未受管理历史文件保留；
@@ -1799,7 +1821,7 @@ G1–G4 判定、fail-closed、证据/代码范围绑定、漂移与篡改检测
 不成立，专用只读 Profile 仍必须保留（见“未完成/限制”）。本轮完成的是 G4 判定口径与
 调用链的去标识化：
 
-- **P0 调查（静态证据）**：`/opt/ZCode/resources/glm/zcode.cjs` 中 Agent 工具入参只有
+- **P0 调查（静态证据）**：`<zcode-cli-entry>` 中 Agent 工具入参只有
   `description`/`prompt`/`subagent_type`/`run_in_background`；profile frontmatter 才支持
   `tools`/`disallowedTools`；`tools: []` 等于继承父工具。
 - **P0 调查（真实宿主探针）**：`/tmp/copilot-probe-UPrxnK/ws` 用**非 `reviewer` 名称**的
@@ -2322,7 +2344,7 @@ Bash 白名单、rollout 强依赖与重复校验入口退役。
 - **BLOCKED 受控写入**：`record`、`rerun`、`evidence --add`、`criterion`、`report`、
   `judgment`、额外 `block`、已授权的 `authorize-review` / `formal-review`（含 amendment）
   在 BLOCKED 下允许登记；不解除阻塞、不改变合同/授权、`close` 仍拒绝。`plan`、`decide`、
-  `evidence --drop` 继续拒绝。依据：perf-ads 4 次、Honor 4 次 `unblock → 登记 → block`。
+  `evidence --drop` 继续拒绝。依据：某性能优化项目 4 次、某广告项目 4 次 `unblock → 登记 → block`。
 - **复核顺序**：`AUTO-G4` 工作单要求先核销条件、稳定证据与摘要，再读取 `review-context`
   的 warnings/scope_reason 做最终复核；PASS 后 minor/info 记录为 findings/residual_risks，
   不修改已通过证据重开完整复核；后续实质变化仍必须重新判断原 PASS 是否覆盖新快照。
@@ -2376,7 +2398,7 @@ Bash 白名单、rollout 强依赖与重复校验入口退役。
   `native_review_code_scope_drift`，这是 fail-closed 的正确结果。探针只证明当时真实
   宿主的字段/会话绑定，不作为当前仓库的 G4 结论。
 - **Headless 新会话加载**：用独立 `node zcode.cjs -p ... --json --surface terminal
-  --cwd /media/vdb/projects/copilot --mode plan` 启动新会话
+  --cwd <repo> --mode plan` 启动新会话
   `sess_86c0a3dc-4976-4eac-afc8-6b1a5aa69632`；rollout 记录实际调用
   `Skill(skill="copilot")`、`Read(.../skills/copilot/SKILL.md)`、
   `Read(.../agents/reviewer.md)`；返回 `skill_loaded=true`、标题
@@ -2394,10 +2416,10 @@ Bash 白名单、rollout 强依赖与重复校验入口退役。
 
 本批次在用户任务授权下完成，**未提交、未推送、未发布**（用户明确本任务不授权 Git 提交/推送/发布）。
 
-- **动机（10 个真实任务复盘）**：ad-strategy（7 轮复核、0 份信封入库）、Honor ECPM
-  （7 次 G4 尝试、3 次机械有效、最终 1 份 partial）、review-perf（1 份有效复核 + 4 次
-  正式 REVIEW、证据编号频繁漂移）、gromore（A10/A13 各 8 条 finding）、腾讯插屏、
-  tencent / journey / usb-debug / perf-ads / splash。真正造成返工的是机制摩擦而非
+- **动机（10 个真实任务复盘）**：某广告策略项目（7 轮复核、0 份信封入库）、某广告变现项目（ECPM）
+  （7 次 G4 尝试、3 次机械有效、最终 1 份 partial）、某复核专项（1 份有效复核 + 4 次
+  正式 REVIEW、证据编号频繁漂移）、gromore（A10/A13 各 8 条 finding）、某插屏广告项目、
+  某广告平台 / 某投放链路 / usb-debug / 某性能优化项目 / splash。真正造成返工的是机制摩擦而非
   Reviewer 判断质量：安全命令缺失导致整轮作废（`git rev-list`、`paste -sd+`）、危险
   长选项缩写未覆盖（`git log --out=`、`git show --ext-d`、`git cat-file --filt`）、
   围栏 JSON 变体被判不可解析、`cd` 后相对路径被判“未访问证据”、finding 无可复用 ID/
@@ -2432,7 +2454,7 @@ Bash 白名单、rollout 强依赖与重复校验入口退役。
   `totalToolUseCount`）。
 - **回放事实**：11 份真实复核信封的 298 条唯一命令在 v6.2 与 v6.3 下均 0 拒绝；宿主仍保留
   的 1 份真实 Reviewer rollout（120 条唯一 Bash 命令）在 v6.2 下 1 条被拒（`awk '…'
-  app/build/test-results/*/*.xml`），v6.3 下 0 拒绝。被拒的 `cd … && ls …`（review-perf A8）
+  app/build/test-results/*/*.xml`），v6.3 下 0 拒绝。被拒的 `cd … && ls …`（某复核专项 A8）
   原始命令文本未保留，按同一模式补了回归用例。
 - **真实端到端（2026-11-14 18:39–18:55 CST，`/tmp/v63-e2e`，risk=high）**：真实
   dispatch → 真实执行子代理 → 4 轮真实 Reviewer → G4 信封 → ingest → `drive` 收口，
@@ -2458,10 +2480,10 @@ Bash 白名单、rollout 强依赖与重复校验入口退役。
   `time_to_pass_seconds=0` 统计，过期性只在 `closure-check`/G4 反映。
 - **测试**：活动套件 `192 tests OK`（新增 `tests/test_v63_convergence.py` 26 项）；
   历史套件 `853 tests OK (skipped=31)`。
-- **新会话加载验证（2026-11-14）**：桌面 GUI 入口不可用于验证——`/opt/ZCode/zcode` 实际是
+- **新会话加载验证（2026-11-14）**：桌面 GUI 入口不可用于验证——`<zcode-binary>` 实际是
   Electron 单实例应用，`--help` 会接管/复用现有桌面进程，会干扰用户当前会话，故未启动
   GUI 新会话。改用同版本 CLI 的 headless 新进程
-  （`node /opt/ZCode/resources/glm/zcode.cjs -p … --cwd /media/vdb/projects/copilot`）实测：
+  （`node <zcode-cli-entry> -p … --cwd <repo>`）实测：
   `skills list` 发现 `copilot`；新进程内派生的 Reviewer
   （`agent_9244436c…`，独立 `sess_8e575ffd…`）`profileSnapshot.systemPrompt` 为 16,073 字符，
   含 v6.3 的 `git rev-list`、`paste`、`&&`、`$?`、`python3` 说明，只读工具集
@@ -2478,8 +2500,8 @@ Bash 白名单、rollout 强依赖与重复校验入口退役。
 
 本批次在用户任务授权下完成，**未提交、未推送、未发布**（用户明确本任务不授权 Git 提交/推送/发布）。
 
-- **动机（5 个真实任务复盘）**：v6.1 自升级、步数宝 GroMore、Honor ECPM、腾讯插屏、
-  journey 激励。真正造成返工的仍是复核机制可避免的摩擦，而不是 Reviewer 判断：
+- **动机（5 个真实任务复盘）**：v6.1 自升级、某应用、某广告变现项目（ECPM）、某插屏广告项目、
+  某投放链路 激励。真正造成返工的仍是复核机制可避免的摩擦，而不是 Reviewer 判断：
   SDK 工具用绝对路径被前缀白名单误拒（gromore `A10.review.json` 第 22 条命令）、
   无法读取 APK 内 dex（只能 `unzip -l`）、未加引号通配符使整轮复核作废（honor
   `G4-review-notes.md` 第 2/3 轮）、G4 失败只说“复核 A12 不可用”不说明哪里过期、
@@ -2525,7 +2547,7 @@ Bash 白名单、rollout 强依赖与重复校验入口退役。
 
 本批次在用户任务授权下完成，**未提交、未推送、未发布**（用户明确本任务不授权 Git 提交/推送/发布）。
 
-- **动机（真实任务复盘）**：最近两个真实任务（tencent 6 轮复核、honor 7 次 G4 尝试）中，
+- **动机（真实任务复盘）**：最近两个真实任务（某广告平台 6 轮复核、honor 7 次 G4 尝试）中，
   主要浪费来自复核机制本身而非 Reviewer 判断质量：只读白名单过窄使 Reviewer 自己作废自己
   （`sed -n`、`for` 循环被判越界）、要求自报命令并与记录逐字比对、每轮重读全部证据、
   BLOCKED 下无法修订合同、已终结工作项修复后无法重验。
@@ -2670,14 +2692,14 @@ Bash 白名单、rollout 强依赖与重复校验入口退役。
 
 | 项目 | 实际值 |
 |---|---|
-| 唯一源码 | `/media/vdb/projects/copilot` |
-| 运行时 Skill | `/home/ctyun/.zcode/skills/copilot` |
-| Reviewer 运行时 | `/home/ctyun/.zcode/agents/reviewer.md` |
+| 唯一源码 | `<repo>` |
+| 运行时 Skill | `~/.zcode/skills/copilot` |
+| Reviewer 运行时 | `~/.zcode/agents/reviewer.md` |
 | 同步工具 | `scripts-sync/sync_runtime.py` |
 | 分发的 Skill 文件 | 21 个（`SKILL.md` + 9 个 `scripts/*.py` + 11 个 `references/*.md`） |
 | 分发的 Reviewer 文件 | 1 个（`agents/reviewer.md`） |
 | 首次同步 | 2026-11-02 20:25–20:26 CST |
-| 同步前备份 | `/home/ctyun/.zcode/backups/copilot-presync-20261102-202527` |
+| 同步前备份 | `~/.zcode/backups/copilot-presync-20261102-202527` |
 | 最近同步 | 2026-11-10（自评审整改后四次 `--apply`：① `SKILL.md`、`scripts/call_gpt.py`、`scripts/copilot_auto.py`、`scripts/copilot_dispatch.py`；② R2 补同步 `references/agent-bridge.md`、`agents/reviewer.md`、`scripts/native_bridge.py`、`scripts/review_ledger.py`（该次未逐条登记，据运行时与源码逐字节一致复原）；③ `references/agent-bridge.md`、`scripts/copilot_auto.py`、`scripts/copilot_dispatch.py`、`scripts/native_agent.py`；④ `SKILL.md` 精简后再次下发。最终 `--check` 缺失 0 / 不同 0，Reviewer `same`；相对 HEAD 变更的 9 个分发文件运行时全部一致） |
 
 首次同步结果：
@@ -2724,7 +2746,7 @@ Bash 白名单、rollout 强依赖与重复校验入口退役。
 ## 仓库正式化（2026-11-03）
 
 - Git：`main` 分支已建立本地初始提交；无远端、无 push。Git 用户
-  `阿稳 <tongsailong@foxmail.com>`（继承全局配置）。
+  ``<maintainer>``（继承全局配置）。
 - 纳入版本管理：`AGENTS.md`、`SKILL.md`、`README.md`、`.gitignore`、`agents/`、
   `scripts/`、`scripts-sync/`、`references/`、`tests/`（含 fixtures）、`manifests/`、`docs/`。
 - `.gitignore` 排除：`__pycache__`、`.env*`、密钥/证书、`.audit/`、`*.sqlite*`/`*.db`、
@@ -2739,7 +2761,7 @@ Bash 白名单、rollout 强依赖与重复校验入口退役。
   三对文件 SHA-256 与源码一致。
 - 新会话验证（2026-11-03 12:13，headless 新进程）：项目 `AGENTS.md` 已加载，模型能原样
   引用第 2、3 节内容；Skill 列表发现 `copilot`，入口
-  `/home/ctyun/.zcode/skills/copilot/SKILL.md`；调用 Skill 工具加载正文后引用到
+  `~/.zcode/skills/copilot/SKILL.md`；调用 Skill 工具加载正文后引用到
   “ZCode 主代理（继承当前会话模型）”等更新后原文。Skill 正文为按需加载，启动时只发现
   description 属正常行为。
 
@@ -2804,7 +2826,7 @@ Bash 白名单、rollout 强依赖与重复校验入口退役。
   `scripts/call_gpt.py`、`scripts/review_ledger.py`）；13:27 二次 `--apply` 只补写后两者
   的措辞。两次后 `--check` 均缺失 0、不同 0、Reviewer `same`；源与运行时四个文件
   SHA-256 一致。同步前备份
-  `/home/ctyun/.zcode/backups/copilot-review-elastic-20261104-132205`（含 `SHA256SUMS`）。
+  `~/.zcode/backups/copilot-review-elastic-20261104-132205`（含 `SHA256SUMS`）。
 - **未改变**：G1–G4 fail-closed、Reviewer 独立性、高风险证据/身份/授权要求、
   SOL 模型（`gpt-6.1-sol` + `reasoning.effort=high`）与 CPA 路由；未发起真实 SOL 调用。
 - **已本地提交（四阶段优化合并提交），未推送、未部署**；仓库无远端。
@@ -2846,8 +2868,8 @@ Bash 白名单、rollout 强依赖与重复校验入口退役。
 
 ## 证据完整性收口（2026-11-04）
 
-- **触发（只看历史日志的只读复盘）**：荣耀买量 ACTIVATION 任务
-  `honor-multi-ad-activation-20261104`（`/tmp/copilot/honor-v1`）。R2 E21 正文被截断
+- **触发（只看历史日志的只读复盘）**：某买量投放项目 ACTIVATION 任务
+  `某买量投放任务-20261104`（`/tmp/copilot/honor-v1`）。R2 E21 正文被截断
   6214 字符仍送审，SOL 据此给出无法闭合的缺证裁决；4/4 轮都在追问「被审的是哪份代码」，
   执行方只能用文字自述。证据包 66.8k → 252.3k 字符、SOL 输入 36.9k → 97.7k tokens。
 - **截断闸门**：`review_ledger.py` 只从条目元数据区（围栏之前）解析「- 截断：省略 N 字符」，
@@ -3088,7 +3110,7 @@ Bash 白名单、rollout 强依赖与重复校验入口退役。
 
 ## 实战复盘与失败指引补齐（2026-11-10）
 
-- **样本**：运行时审计 `/home/ctyun/.zcode/skills/copilot/.audit/copilot.jsonl` 共 **144 次**
+- **样本**：运行时审计 `~/.zcode/skills/copilot/.audit/copilot.jsonl` 共 **144 次**
   真实 SOL 调用（2026-10-25 → 2026-11-10），**126 成功 / 18 失败（12.5%）**；`/tmp/copilot/**`
   下 **16 份**可解析的正式 REVIEW 台账；rili / lele-pedometer-xin / designwise 的 Git 提交与
   两个真实 dispatch 状态（`rili-rules-20261109`、`agents-prose-autoloop-20261108`）。
@@ -3285,7 +3307,7 @@ Bash 白名单、rollout 强依赖与重复校验入口退役。
     `746aa618…` 并非矛盾：审计摘要计算的是 `extract_text()` 返回值，该函数对拼接结果
     `.strip()`；`--out` 落盘写 `text + "\n"`。文件 4,722 字节，去掉唯一尾部 LF 后为 4,721 字节，
     摘要恰为 `36af7dbc…`（`reply_chars=2,299` 是字符数，非字节数）。未改动任何历史记录。
-  - **F3（缺证，已补）** rollout 第 16 次调用曾被截断在 `/media/vdb/project`：本轮按未截断原文
+  - **F3（缺证，已补）** rollout 第 16 次调用曾被截断在 `<repo>`：本轮按未截断原文
     导出全部 16 次调用（含 `call_id` 与完整命令）。信封重生成、`cmp`、`ingest` 均给出完整 argv、
     工作目录与独立退出码（0/0/0）；`ingest` 在状态副本上重放得 `duplicate=true`，副本摘要前后
     一致，`native_reviews` 仍为 1。
@@ -3574,7 +3596,7 @@ Bash 白名单、rollout 强依赖与重复校验入口退役。
   **缺失 0 / 不同 0 / Reviewer same**；14 个分发文件逐个 SHA-256 与源码一致
   （`SKILL.md 1ee44090…`、`lib_common 09845be3…`、`review-ledger a6f0c2d2…`）；
   基线 `manifests/source-baseline.sha256` 更新为 15 个文件。
-- **新会话加载验收**：全新 headless 进程（`node /opt/ZCode/resources/glm/zcode.cjs -p …`，
+- **新会话加载验收**：全新 headless 进程（`node <zcode-cli-entry> -p …`，
   cwd 为空目录）用 Skill 工具加载成功，正文含 `references/review-ledger.md` 两处引用；
   `SKILL.md` 96,666 字节 / sha `1ee44090…`、Reviewer `8d283b29…`、`review-ledger.md` 47 行 /
   `a6f0c2d2…` 全部与源码一致；`call_gpt.py --help` 与 `review_ledger.py --budget` 退出码 0
