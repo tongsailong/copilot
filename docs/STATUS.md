@@ -1,7 +1,92 @@
 # STATUS
 
-更新：2026-11-20 CST。本文件只记录现场可核实的事实；规划与未完成事项单独标注。
-当前版本：v9.2.0（ZCode 原生恢复衔接与上下文瘦身）。
+更新：2026-11-21 CST。本文件只记录现场可核实的事实；规划与未完成事项单独标注。
+当前版本：v9.3.0（治理一致性与续跑绑定加固）。
+
+## 收尾核查：测试数量、耗时口径、授权真实性与评审记录（2026-11-21，v9.3.0 收尾）
+
+针对上一段交付中“684→706”“51.6 s→71.4 s”“五路评审”等说法做独立复核，结论如下
+（详细数据见 `.copilot-tasks/copilot-review-2026-11-21/evidence/` 的
+`test-count-diff.txt`、`timing-comparison.md`、`authorization-review.md`、`review-audit.md`）：
+
+- **测试数量**：同一发现口径逐条比对测试 id，+18 `test_v93_hardening.*`、+5
+  `test_stop_guard.*`、−1 被替换的旧用例 = **+22**；没有参数化/发现规则变化，历史基线未改。
+  被替换的 `test_corrupt_state_fails_open_with_hint` 与新 fail-closed 契约相反，由两条更精确
+  的用例取代。本轮补 2 条 CLI 级用例（破坏性修订授权说明、reopen 来源标注端到端），
+  活动套件当前 **708 项**。
+- **耗时**：51.6 s 与 71.4 s **不可直接比较**（前者无原始日志，字节码缓存与机器负载不同）。
+  受控对比用同构导出树（都无 `__pycache__`、同机顺序执行）：684 项 71.6/73.7 s，
+  706 项 74.8/76.7 s，**+22 项 ≈ +3.1 s（≈145 ms/项）**；预编译字节码的真实仓库 708 项
+  52.0 s（两轮 51.8/52.2 s）。没有单项或公共初始化变慢的证据，也没有为提速删测试。
+- **延迟**：差异来自字节码缓存状态，不是代码。源码刚改过时 `status` P50 237 ms（每次运行
+  重编译改动模块）；`compileall` 后源码树 133 ms、运行时目录 130–142 ms，与 v9.2.0 的
+  137.3 ms 一致。20 样本（运行时）：Stop 77–81 ms、SessionStart 75–80 ms、`drive` 74–76 ms。
+- **授权真实性**：`authorized_by` 在 `contract --amend` / `reopen` / `authorize-review`
+  三处都是**调用方自报声明**，架构内没有可验证的用户凭证——这是如实记录的限制。最小加固：
+  破坏性修订必须另写 `--authorization-note "用户原话/要求"`，历史记录
+  `authorization_source=caller-declared`、说明文本、新增/删除未核销条数；`reopen_history`
+  标注同一来源。拒绝仍是 state 零写入（失败尝试不落历史，仅在 stderr 与“无对应
+  contract_amended 记录”上可追溯）。
+- **评审记录**：实际是主 Agent 八维度合并评审（`review-findings.md`）+ 1 个 `Explore`
+  只读子代理做证据链专项，**没有五份独立子代理评审报告**；按五个范围（治理 / CLI 续跑 /
+  Hooks / SOL / 证据绑定）逐条把结论对回最终源码与测试，P0/P1 均有代码与测试落点，
+  P2 与未验证项记录准确。E1–E13 逐文件重算 SHA-256 全部一致。
+- **仍未验证**：宿主真实 `compact` 事件、GUI 新会话；严格性能 A/B 不可得（改为受控同构对比）。
+
+## 治理一致性与续跑绑定加固（2026-11-21，v9.3.0）
+
+现场基线：交付前 `HEAD=0e5f5b1`（= `origin/main`）；全部改动**未提交、未推送**（用户边界
+要求 Git 只读）。未跟踪的 `scripts/knowledge_handoff.py`、`tests/test_knowledge_handoff.py`
+与 `.copilot-tasks/` 保持原样。
+
+- **修复清单（全部有定向测试）**：
+  1. 合同修订绕过完成条件 → 净未核销条件减少或 `test_policy.required` 由真变假要求
+     `authorized_by="user"` + `authorization_note`（用户要求），历史留 `removed_criteria` /
+     `test_policy_weakened` / `authorization_source` / 新增删除条数。
+  2. 条件 met 后 `AUTO-C<n>` 仍 pending → 自动 `dropped`（`auto_closed_for`），条件回退时重开；
+     计划内工作项与已开工包装项不动。
+  3. 重开后可立即复用旧 PASS → `reopen` 记录进展基线，`evaluate`/`close` 双处 fail-closed。
+  4. 多阻塞共用一个 `blocked_by` → 全部解除才恢复，否则改指向剩余 block。
+  5. `AUTO-R-*` 重启后嵌套膨胀 → 家族归一（`AUTO-R-<base>-R<n>`）。
+  6. Hooks 会话绑定过早/过泛 → 只在成功（0/10）且非只读后绑定；只读集合补 `quality`；
+     `evidence --list`、`contract --show` 不绑定；任务根查找在 `.git` 停止。
+  7. 恢复快照对未绑定损坏任务也提示、命令可能被截断 → 只处理 `bound`/`corrupt`，摘要按整行
+     截断；`check` 任何异常 fail-closed（exit 2 + `internal-error`）。
+  8. SOL 单轮复用键不敏感 → materials `strip()` + 提示词模板哈希 + `--force` 优先；
+     CPA 端点拒绝 query/fragment/额外路径。
+  9. CLI 退出码不一致 → `plan`/`finding`/`accept`/`reopen`/`contract --amend` 返回 10。
+  10. **干净 checkout 不可用**（P1）：`copilot_dispatch.py` 硬导入未跟踪的
+      `knowledge_handoff`；改为惰性导入，仅 `--knowledge-file` 缺失时报
+      `KNOWLEDGE_EXTENSION_MISSING`。
+- **测试**：`tests/` 活动全量 **708 项 OK**（交付提交前复跑 52.0 s，含新增 `tests/test_v93_hardening.py`
+  20 项与 CLI 级授权/重开用例；收尾核查后由 706 增至 708，见上一节口径说明）；`legacy/tests` 853 项，99 failures +
+  47 errors + 32 skips = 146，失败/错误用例名与既有基线逐条一致（`diff` 为空）。
+- **同步**：`--apply` 写入 10 个受管理文件（惰性导入修复后补 1 个）；`--check` 缺失 0/不同 0
+  （运行时 `hm.txt` 属用户未受管理文件，保留）；`--baseline` 重建 21 个 Git 跟踪项（未跟踪
+  `knowledge_handoff.py` 不写入）；`--verify-baseline` 通过；运行时 `__version__=9.3.0`。
+- **干净 checkout 复核**：`git ls-files` 导出的仅跟踪文件树中 `copilot_dispatch.py --version`
+  返回 9.3.0、`status` 退出 0（`HEAD` 归档旧代码仍复现 `ModuleNotFoundError`，证明修复有效）。
+- **Hooks 隔离 E2E**（运行时脚本，`/tmp/v93-hookcheck*`）：绑定会话 Stop exit 2 且提示含
+  宿主 3 次上限与续接命令；其它会话 exit 0；畸形 JSON exit 2；`COPILOT_STOP_GUARD=0` exit 0；
+  `resume`/`compact` 注入含任务 id、阶段、未闭合条件与完整命令；`startup`/`clear` 0 字节；
+  失败命令（`criterion` 缺证据）与只读命令（`status`/`quality`/`contract --show`/
+  `evidence --list`）均不产生绑定；绑定任务 state 损坏时 `session-start` 注入异常提示且
+  Stop exit 2，未绑定损坏任务静默；含 `.git` 的子目录不继承祖先 `.copilot-tasks`。
+- **延迟**（运行时脚本、7 次中位数、隔离工作区）：Stop 守卫 81.7 ms、`session-start`
+  81.3 ms、`status` 143.8 ms、`review-admission` 145.2 ms；v9.2.0 交付记录为
+  81.4 / 80.2 / 137.3 ms。夹具不同，只能说明同量级，不作严格 A/B；另一次轻量夹具测得
+  73.4 / 73.7 / 126.3 ms，属同一量级波动。收尾核查的 20 样本复测（运行时目录）为
+  Stop 77.2 / SessionStart 79.6 / `status` 130.0 / `drive` 73.6 ms（P50），详见上一节。
+- **SKILL.md**：58,303 B（收尾核查后；v9.2.0 交付时 56,707 B，增量来自 v9.3 版本段与授权
+  说明，未新增规则章节）。
+- **SOL / 子代理**：本任务未发起真实 SOL 调用（真实模型调用不在本次授权内），按
+  `unavailable` 降级，不阻断；使用 1 个只读子代理做证据链专项调查，其结论由主代理逐项
+  核实后分级（详见 `docs/DECISIONS.md` 第 68 条）。
+- **未验证 / 限制**：宿主真实 `compact` 事件与 GUI 新会话仍未单独复现（与 `resume` 共用注入
+  路径，单测覆盖 `source=compact`）；严格性能 A/B 不可得（旧数据无原始日志），已改为同构
+  导出树受控对比（见上一节）；`wait` 退出码、task 级阻塞在仍有可执行工作时的判定、
+  `_tracked_actions` 的 AUTO-G4 过滤、legacy 后端 G2 未强制 `test_policy`、若干去重重构与
+  SOL 脱敏广度按 P2 记录，未在本次实施。
 
 ## ZCode 原生恢复衔接与上下文瘦身（2026-11-20，v9.2.0）
 

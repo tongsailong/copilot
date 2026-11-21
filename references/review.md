@@ -168,10 +168,13 @@ python3 -B scripts/copilot_dispatch.py sol-review --state <state.json> \
 
 - 一次调用只发一次请求。相同认知对象（合同 + 材料 + 问题 + 阶段 + 提示词版本）再次调用
   直接复用已有结论，不重复付费。CONSULT / PLAN / REVIEW 各自独立判定，不互相复用。
-- **复用键**（`review_subject_sha256`）：提示词版本 `PROMPT_VERSION`、模型与推理强度、
-  任务目标、合同正文与边界、完成条件描述、证据集合摘要、主代理材料、模式与阶段；辅助分析
-  额外绑定问题。条件从 pending 变 met 不失效；合同、证据集合、提示词版本或材料变化即失效，
-  不会复用过期判断。
+- **复用键**（`review_subject_sha256`）：提示词版本 `PROMPT_VERSION`、**提示词模板摘要**
+  （`MODE_INSTRUCTIONS` + `STAGE_FOCUS` 的 SHA-256，改了模板但忘记 bump 版本也会失效）、
+  模型与推理强度、任务目标、合同正文与边界、完成条件描述、证据集合摘要、主代理材料
+  （按发送时的 `strip()` 归一）、模式与阶段；辅助分析额外绑定问题。条件从 pending 变 met
+  不失效；合同、证据集合、提示词版本/模板或材料变化即失效，不会复用过期判断。
+- `--force` 覆盖“相同材料”的复用命中：进度或上下文变了但主体键不变时，明确要求重新咨询
+  不会被复用分支挡回。
 - 再次调用必须 `--force --trigger <user-request|scope-changed|new-risk|materials-omitted|
   strategy-failed|major-uncertainty|stage-result> --reason <说明>`，并换新材料或新阶段。
 - 超时、429/5xx、网络、截断、响应格式、模型身份、推理强度/模式回显不符：记录真实原因与

@@ -209,7 +209,12 @@ def _read_env_value(path: str, key: str) -> str | None:
 
 
 def _is_local_cpa_url(raw: str) -> bool:
-    """严格判定本机 CPA 端点：协议 http(s)、回环主机、无 userinfo。"""
+    """严格判定本机 CPA 端点：http(s)、回环主机、无 userinfo、无 query/fragment。
+
+    `base_url` 会被原样拼到 `<base>/responses` 并写进任务状态与 `--json` 输出；
+    只允许裸端点或 `/v1`，拒绝其它 path 与 query/fragment，避免把
+    `?token=...` 之类的敏感内容带进持久化位置。
+    """
     try:
         parsed = urllib.parse.urlsplit(raw)
         port = parsed.port
@@ -220,6 +225,9 @@ def _is_local_cpa_url(raw: str) -> bool:
     if parsed.username or parsed.password:
         return False
     if parsed.hostname not in ("127.0.0.1", "localhost", "::1"):
+        return False
+    if parsed.path.rstrip("/") not in ("", "/v1") or parsed.query \
+            or parsed.fragment:
         return False
     return port == 8317
 
@@ -1407,6 +1415,13 @@ def evidence_digest(state: dict) -> str:
         json.dumps(rows, sort_keys=True).encode("utf-8")).hexdigest()
 
 
+def prompt_template_sha256() -> str:
+    """模式指令与阶段重点的摘要，用于让模板变更自动使旧结论失效。"""
+    blob = json.dumps({"modes": MODE_INSTRUCTIONS, "stages": STAGE_FOCUS},
+                      ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
+
+
 def review_subject_sha256(state: dict, materials: str, *, mode: str = "",
                           question: str = "", stage: str = "") -> str:
     """单轮判定用的稳定主体摘要（同一份上下文只允许一次调用）。
@@ -1429,6 +1444,9 @@ def review_subject_sha256(state: dict, materials: str, *, mode: str = "",
                          str(item.get("description") or "")])
     blob = {
         "prompt_version": PROMPT_VERSION,
+        # 模板本身也进键：改了模式指令/阶段重点却忘记 bump PROMPT_VERSION 时，
+        # 旧结论不能在“新提示词”下被复用。
+        "prompt_template": prompt_template_sha256(),
         "model": MODEL,
         "reasoning_effort": REASONING_EFFORT,
         "goal": str(state.get("goal") or ""),
@@ -1436,7 +1454,9 @@ def review_subject_sha256(state: dict, materials: str, *, mode: str = "",
         "boundaries": str(contract.get("boundaries") or ""),
         "criteria": criteria,
         "evidence_digest": evidence_digest(state),
-        "materials": materials,
+        # 发送的提示词用 materials.strip()，键必须与之一致；否则仅首尾空白差异
+        # 就会让同一提示词被当成新对象而重复付费。
+        "materials": str(materials or "").strip(),
     }
     if mode:
         resolved_mode = normalize_mode(mode)
@@ -1498,7 +1518,9 @@ def single_round_decision(state: dict, materials_sha256: str, *,
                if record_mode(item) == resolved_mode]
     same = [item for item in records
             if str(item.get("materials_sha256") or "") == materials_sha256]
-    if same:
+    # `--force` 必须能覆盖复用命中：上下文/进度变了但主体键不变时（工作项、风险、
+    # 证据绑定等不进键），复用分支不能把“明确要求重新咨询”的调用挡回去。
+    if same and not force:
         return {"action": "reuse", "review": same[-1],
                 "note": "相同材料已完成同模式 SOL 调用；直接复用结论，不重复调用。"}
     if not records:

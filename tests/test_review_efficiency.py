@@ -518,9 +518,10 @@ class CliEfficiencyTests(unittest.TestCase):
         proc = F.run_cli("copilot_dispatch.py", "evidence", "--state", self.state,
                          "--add", "--id", "E1", "--text", "修复证据")
         self.assertEqual(proc.returncode, 0, proc.stderr)
+        # finding 回填后任务仍要求续跑：用 EXIT_CONTINUE 提示继续，不冒充终点。
         proc = F.run_cli("copilot_dispatch.py", "finding", "--state", self.state,
                          "--id", "F1", "--status", "fixed", "--evidence", "E1")
-        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.returncode, 10, proc.stderr)
         proc = F.run_cli("copilot_dispatch.py", "finding", "--state", self.state,
                          "--id", "F1", "--status", "verified")
         self.assertEqual(proc.returncode, 2)
@@ -528,7 +529,7 @@ class CliEfficiencyTests(unittest.TestCase):
         proc = F.run_cli("copilot_dispatch.py", "finding", "--state", self.state,
                          "--id", "F1", "--status", "verified",
                          "--evidence", "E1")
-        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.returncode, 10, proc.stderr)
         proc = F.run_cli("copilot_dispatch.py", "finding", "--state", self.state,
                          "--list", "--json")
         self.assertEqual(proc.returncode, 0, proc.stderr)

@@ -618,7 +618,8 @@ class PwwCliTests(PwwFixture):
         accepted = F.run_cli("copilot_dispatch.py", "accept", "--state",
                              self.state_path, "--accept", "W1,R1",
                              "--by", "user", "--quote", "我接受 W1 和 R1")
-        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+        # 接受后仍要收口：命令以 EXIT_CONTINUE 提示继续，不冒充任务终点。
+        self.assertEqual(accepted.returncode, 10, accepted.stderr)
         self.assertIn("→ accepted", accepted.stdout)
 
         quality = F.run_cli("copilot_dispatch.py", "quality", "--state",

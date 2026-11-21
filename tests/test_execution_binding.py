@@ -455,11 +455,28 @@ class TestPolicyCliTests(unittest.TestCase):
         self.assertEqual(stored["commands"], [COMMAND])
         self.assertTrue(stored["require_test_result"])
         self.assertEqual(stored["report"], "reports/junit.xml")
+        # 放松 test_policy 属破坏性修订：没有用户明确授权时 fail-closed。
         proc = F.run_cli(
             "copilot_dispatch.py", "contract", "--state", self.state,
             "--amend", "--contract-file", self.contract,
             "--test-policy", json.dumps({"required": False}))
-        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("authorized-by", proc.stderr)
+        proc = F.run_cli(
+            "copilot_dispatch.py", "contract", "--state", self.state,
+            "--amend", "--contract-file", self.contract,
+            "--test-policy", json.dumps({"required": False}),
+            "--authorized-by", "user")
+        # 只声明 user 不足以留痕：必须写明用户要求，否则事后无法核对授权范围。
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("authorization-note", proc.stderr)
+        proc = F.run_cli(
+            "copilot_dispatch.py", "contract", "--state", self.state,
+            "--amend", "--contract-file", self.contract,
+            "--test-policy", json.dumps({"required": False}),
+            "--authorized-by", "user",
+            "--authorization-note", "用户同意本次不强制测试")
+        self.assertEqual(proc.returncode, 10, proc.stderr)
         stored = G.load_state(self.state)["contract"]["test_policy"]
         self.assertFalse(stored["required"])
         self.assertEqual(stored["commands"], [])

@@ -373,16 +373,22 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    # 会话绑定：drive/ingest 表示本会话正在负责该任务，供 Stop 守卫判定归属。
-    G.touch_session(str(getattr(args, "state", "") or ""))
     try:
-        return args.func(args) or 0
+        code = args.func(args) or 0
     except (AutoError, G.GovernanceError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return EXIT_ERROR
     except OSError as exc:
         print(f"ERROR: 状态写入/文件操作失败：{exc}", file=sys.stderr)
         return EXIT_ERROR
+    # 会话绑定：drive/ingest 成功推进（0/10/11）后才表示本会话负责该任务。
+    # 出错（12）时状态未推进，不留下会把 Stop 误触发到本会话的绑定。
+    if code != EXIT_ERROR:
+        try:
+            G.touch_session(str(getattr(args, "state", "") or ""))
+        except Exception:  # noqa: BLE001 - 旁路绑定失败不能改变命令结论
+            pass
+    return code
 
 
 if __name__ == "__main__":

@@ -95,7 +95,7 @@ def _read_payload() -> tuple[dict, str]:
         return {}, ""
     try:
         data = json.loads(raw)
-    except (ValueError, TypeError) as exc:
+    except (ValueError, TypeError, RecursionError) as exc:
         return {}, f"钩子输入不是合法 JSON（{type(exc).__name__}）"
     if not isinstance(data, dict):
         return {}, "钩子输入不是 JSON 对象"
@@ -127,12 +127,18 @@ def _cwd_from_payload(payload: dict) -> str:
 
 
 def find_tasks_root(start: str, *, max_up: int = 4) -> str:
-    """从 cwd 向上有限层查找 `.copilot-tasks`；不扫全盘。"""
+    """从 cwd 向上有限层查找 `.copilot-tasks`；不扫全盘，也不越过 Git 根。
+
+    Git 根是项目边界：再往上找到的 `.copilot-tasks` 属于别的项目（例如共享父目录
+    里的任务集）。把它们算进当前工作区会让 Stop 误拦、SessionStart 误注入。
+    """
     current = os.path.abspath(start)
     seen = 0
     while current and seen <= max_up:
         if os.path.isdir(os.path.join(current, TASKS_DIR)):
             return current
+        if os.path.isdir(os.path.join(current, ".git")):
+            break
         parent = os.path.dirname(current)
         if parent == current:
             break
@@ -226,31 +232,13 @@ def collect(root: str, *, session: str = "") -> tuple[list[dict], list[dict]]:
             continue
         if os.path.exists(os.path.join(task_dir, OFF_MARKER)):
             continue
-        try:
-            state = G.load_state(path)
-        except (G.GovernanceError, OSError, ValueError, TypeError) as exc:
-            anomalies.append({"kind": "state", "task_id": name,
-                              "task_dir": task_dir, "state_path": path,
-                              "detail": f"{type(exc).__name__}: {exc}"})
-            continue
-        if _task_disabled(state):
-            continue
-        try:
-            cont = G.continuation(state)
-        except Exception as exc:  # noqa: BLE001 - 任何异常都不能变成静默放行
-            anomalies.append({"kind": "evaluate", "task_id": name,
-                              "task_dir": task_dir, "state_path": path,
-                              "detail": f"{type(exc).__name__}: {exc}"})
-            continue
-        if not cont.get("required"):
-            continue
+        # 先判归属再读 state：会话模式下，不能归属本会话的任务根本不参与判定。
+        # 否则其它会话/旧任务的 state 损坏会被当成本工作区的异常，误拦所有会话；
+        # 同时省掉无关任务的 state 解析与合同校验开销（Stop 每次都会跑）。
         ids, bind_error = _recorded_sessions(task_dir)
         if bind_error:
-            # 状态明确要求续跑，但绑定文件坏了：按本会话负责处理（fail-closed），
+            # 绑定文件坏了，无法证明该任务属于谁：按本会话负责处理（fail-closed），
             # 同时把修复命令给出来，而不是悄悄跳过这条任务。
-            anomalies.append({"kind": "binding", "task_id": name,
-                              "task_dir": task_dir, "state_path": path,
-                              "detail": bind_error})
             binding = "corrupt"
         elif not ids:
             binding = "unbound"
@@ -260,6 +248,32 @@ def collect(root: str, *, session: str = "") -> tuple[list[dict], list[dict]]:
             binding = "unknown-session"
         else:
             binding = "foreign"
+        if session and binding not in ("bound", "corrupt"):
+            continue
+        if bind_error:
+            anomalies.append({"kind": "binding", "task_id": name,
+                              "task_dir": task_dir, "state_path": path,
+                              "binding": binding, "detail": bind_error})
+        try:
+            state = G.load_state(path)
+        except (G.GovernanceError, OSError, ValueError, TypeError) as exc:
+            anomalies.append({"kind": "state", "task_id": name,
+                              "task_dir": task_dir, "state_path": path,
+                              "binding": binding,
+                              "detail": f"{type(exc).__name__}: {exc}"})
+            continue
+        if _task_disabled(state):
+            continue
+        try:
+            cont = G.continuation(state)
+        except Exception as exc:  # noqa: BLE001 - 任何异常都不能变成静默放行
+            anomalies.append({"kind": "evaluate", "task_id": name,
+                              "task_dir": task_dir, "state_path": path,
+                              "binding": binding,
+                              "detail": f"{type(exc).__name__}: {exc}"})
+            continue
+        if not cont.get("required"):
+            continue
         rows.append({
             "task_id": str(state.get("task_id") or name),
             "task_dir": task_dir,
@@ -284,6 +298,8 @@ def collect(root: str, *, session: str = "") -> tuple[list[dict], list[dict]]:
 def _binding_note(row: dict) -> str:
     if row["binding"] == "bound":
         return "本会话"
+    if row["binding"] == "corrupt":
+        return "绑定文件损坏，无法核对归属（fail-closed 拦截）；修好或 disable 后重试"
     if row["binding"] == "unknown-session":
         return "会话标识不可用，按最近更新判定"
     return "未绑定"
@@ -402,6 +418,20 @@ def _block(text: str) -> int:
 
 
 def cmd_check() -> int:
+    """Stop 钩子入口：钩子契约只有 0/2，任何内部异常都按 fail-closed 返回 2。"""
+    try:
+        return _check()
+    except Exception as exc:  # noqa: BLE001 - traceback + 退出码 1 会破坏 0/2 契约
+        _log(2, "", note=f"internal-error:{type(exc).__name__}")
+        return _block(
+            "[COPILOT 续跑守卫] 内部异常，本次不放行（fail-closed）：\n"
+            f"- {type(exc).__name__}: {exc}\n"
+            "- fix：检查 .copilot-tasks 下的状态与绑定文件；确认无误后重试。\n"
+            "- 临时退出：COPILOT_STOP_GUARD=0 或创建 .copilot-tasks/.stop-guard-off"
+        )
+
+
+def _check() -> int:
     if _env_off():
         _log(0, "", note="env-off")
         return 0
@@ -487,8 +517,14 @@ def _session_start_text(rows: list[dict], anomalies: list[dict] | None = None) -
     text = "\n".join(lines)
     if len(text) <= SESSION_START_LIMIT:
         return text
-    tail = "\n...（已截断）\n" + SESSION_START_CLOSE
-    return text[:SESSION_START_LIMIT - len(tail)] + tail
+    # 按整行截断：续接命令要么完整保留、要么整条省略，不能把 --state 路径切成半截。
+    kept = lines[:2]
+    for line in lines[2:-1]:
+        trial = "\n".join(kept + [line, "...（已截断）", SESSION_START_CLOSE])
+        if len(trial) > SESSION_START_LIMIT:
+            break
+        kept.append(line)
+    return "\n".join(kept + ["...（已截断）", SESSION_START_CLOSE])
 
 
 def cmd_session_start() -> int:
@@ -520,12 +556,17 @@ def cmd_session_start() -> int:
             return 0
         rows, anomalies = collect(root, session=session)
         bound = [row for row in rows if row["binding"] == "bound"]
-        if not bound:
+        # 只披露本会话任务目录的异常：其它任务的异常不属于本会话，不应诱导它越界处理。
+        # 本会话任务自己的状态/绑定损坏时仍要提示修复——静默跳过会让会话以为没有
+        # 待续跑任务，从而丢掉真正需要处理的那个任务。
+        bound_anomalies = [item for item in anomalies
+                           if item.get("binding") in ("bound", "corrupt")]
+        if not bound and not bound_anomalies:
             _log(0, root, note=f"session-start-out-of-scope:{len(rows)}", session=session)
             return 0
-        text = _session_start_text(bound, anomalies)
-        _log(0, root, task_id=bound[0]["task_id"], session=session,
-             note=f"session-start-inject:{source}")
+        text = _session_start_text(bound, bound_anomalies)
+        _log(0, root, task_id=bound[0]["task_id"] if bound else "",
+             session=session, note=f"session-start-inject:{source}")
         print(json.dumps({"hookSpecificOutput": {
             "hookEventName": "SessionStart",
             "additionalContext": text,

@@ -1,6 +1,6 @@
 ---
 name: copilot
-description: "Copilot v9.2 轻量协作治理：任务承接、合同与完成条件、状态与证据登记、PARTIAL 强制续跑、SOL（gpt-6.2-sol，high，零工具）默认认知引擎 CONSULT / PLAN。PARTIAL 是连续执行状态而不是终点：只要仍有原始授权内的可执行工作，就必须派生并继续；阻塞按工作项成立，单项缺授权不冻结整个任务。SOL-first 生命周期：简单/机械任务 0 调用；非简单任务启动默认 CONSULT，调查后按需 PLAN，执行期出现升级型新信号才追加 CONSULT，高复杂任务可做阶段复盘与收口综合判断；REVIEW 仅在用户明确要求时执行。SOL 与 G1–G3 共用合同、条件与证据，统一记录在 sol_calls，采纳结论由主代理显式登记。SOL 只提供认知输入，ZCode 是唯一技术决策与工程执行主体；G4 原生只读复核已退役，历史台账只读保留。"
+description: "Copilot v9.3 轻量协作治理：任务承接、合同与完成条件、状态与证据登记、PARTIAL 强制续跑、SOL（gpt-6.2-sol，high，零工具）默认认知引擎 CONSULT / PLAN。PARTIAL 是连续执行状态而不是终点：只要仍有原始授权内的可执行工作，就必须派生并继续；阻塞按工作项成立，单项缺授权不冻结整个任务。SOL-first 生命周期：简单/机械任务 0 调用；非简单任务启动默认 CONSULT，调查后按需 PLAN，执行期出现升级型新信号才追加 CONSULT，高复杂任务可做阶段复盘与收口综合判断；REVIEW 仅在用户明确要求时执行。SOL 与 G1–G3 共用合同、条件与证据，统一记录在 sol_calls，采纳结论由主代理显式登记。SOL 只提供认知输入，ZCode 是唯一技术决策与工程执行主体；G4 原生只读复核已退役，历史台账只读保留。"
 when_to_use: >
   需要把多步骤工程任务纳入可追踪治理时：任务合同/完成条件需要固定、证据与审计需要绑定、
   长任务需要 PARTIAL 持续推进与上下文恢复、非简单任务需要 SOL 默认认知（启动 CONSULT、
@@ -9,7 +9,7 @@ when_to_use: >
   直接由 ZCode 原生完成，不进入本 Skill。
 ---
 
-# copilot：轻量协作治理（v9.2.0）
+# copilot：轻量协作治理（v9.3.0）
 
 Copilot 是运行在 ZCode 内的**协作治理层**，不是决策模型，也不是执行体。它负责把任务变成可
 追踪的合同、状态、证据与收口条件，并在任务没有真正完成时继续推进。
@@ -702,18 +702,34 @@ CONSULT / PLAN 输出契约（`copilot-sol-think/v2`）：`judgment`、`goal_und
 
 ## 版本
 
-当前 **v9.2.0（ZCode 原生恢复衔接与上下文瘦身）**：
+当前 **v9.3.0（治理一致性与续跑绑定加固）**：
 
-- **SessionStart 恢复注入**：`copilot_stop_guard.py session-start` 在宿主 `resume` / `compact`
-  时，为**绑定当前会话且 `continuation.required=true`** 的任务注入一段只读快照（阶段、
-  未闭合条件、可粘贴续接命令）。它不绑定新任务、不写状态、不消费 Stop 次数，异常一律退出 0
-  且不注入；`startup` 不推断旧任务归属，`clear` 尊重用户清空。`install` / `uninstall`
-  同时维护 `Stop` 与 `SessionStart` 两个条目（matcher `resume|compact`）。
-- **Skill 上下文瘦身**：版本沿革移到 `references/history.md`，本文件只保留现行规则与当前版本
-  要点；加载体积由 84 KB 降到约 57 KB，规则、门禁与命令面没有删减。
+- **合同修订授权门**：`contract --amend` 不再能悄悄减少未闭环条件或关掉 `test_policy`。
+  净减少未核销条件（含把条件改写成更弱表述）或 `required` 由真变假时，必须显式
+  `--authorized-by user` 并写明 `--authorization-note "用户要求"`；拒绝时状态不变。
+  合同历史记录 `authorized_by`、`authorization_source=caller-declared`、授权说明、新增/
+  删除的未核销条数、`removed_criteria` 与 `test_policy_weakened`。`authorized_by` 是调用方
+  自报声明而非可验证凭证：它是“执行方声称用户同意”，审计须核对授权说明与用户原话。
+  `reopen` 同理，`reopen_history` 标注 `authorization_source=caller-declared`。
+- **条件与包装项同步**：完成条件转 `met` 时，自动撤销仍无结果的 `AUTO-C<n>` 包装项
+  （`auto_closed_for`），不再出现“条件已完成但永远差一条工作项”；条件回退 `pending`
+  时重开该项。计划中的业务工作项即使声明 `target_criteria` 也不被顺带撤销。
+- **重开不得复用旧 PASS**：`reopen` 记录当时的进展基线（证据数、终态工作项、条件状态），
+  没有新证据、新工作项结果或条件变化的收口请求返回 PARTIAL，`close` 直接拒绝；`evaluate`
+  同步 fail-closed。
+- **阻塞与恢复项**：同一工作项被多个 block 引用时，只有全部解除才恢复；恢复支路
+  `AUTO-R-*` 重启后归一到同一家族（不再出现 `AUTO-R-AUTO-R-…`）。
+- **Hooks 续跑绑定**：会话只在命令成功（0/10）且非只读命令后绑定；任务根查找在 `.git`
+  处停止，不继承祖先目录；`resume` 摘要按整行截断以保证命令可粘贴；损坏/未绑定任务不注入，
+  绑定任务损坏时给出修复提示；守卫自身异常 fail-closed（exit 2 + `internal-error`）。
+- **SOL 单轮键**：同材料/同模板的单轮复用键先 `strip()` 再哈希，并纳入提示词模板哈希，
+  `--force` 优先于复用；CPA 端点拒绝带 query/fragment 或额外路径。
+- **CLI 一致性**：`plan` / `finding` / `accept` / `reopen` / `contract --amend` 在仍有续跑
+  工作时同样返回 `EXIT_CONTINUE=10`，不再以 0 结束回合。
 - **不变量**：G1–G3、PARTIAL 强制续跑、SOL-first advisory、证据完整性、授权边界、ZCode
   唯一工程执行主体与 G4 退役状态全部不变。
 
-历史版本（v9.1.0 及更早，含 v9.0.0（SOL-first 默认认知生命周期）、v8.5.0 PARTIAL 强制续跑、
-v8.0.0 G4 退役、v7.0.0 SOL 零工具单轮复核、v6.x 治理收敛与 v5.x 退役说明）见
+历史版本（v9.2.0 及更早，含 v9.2.0（ZCode 原生恢复衔接与上下文瘦身）、v9.1.0（SOL 采纳记录）、
+v9.0.0（SOL-first 默认认知生命周期）、v8.5.0 PARTIAL 强制续跑、v8.0.0 G4 退役、
+v7.0.0 SOL 零工具单轮复核、v6.x 治理收敛与 v5.x 退役说明）见
 `references/history.md`；本文件不再重复历史正文。

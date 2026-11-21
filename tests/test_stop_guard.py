@@ -345,6 +345,61 @@ class SessionBindingTests(StopGuardBase):
         self.assertFalse(os.path.exists(
             os.path.join(self.task_dir, "session.json")))
 
+    def test_failed_write_command_does_not_bind(self):
+        # 命令失败（未写状态）时不建立会话绑定：否则会把一个没被本会话实际
+        # 接手（也没改动）的任务变成“本会话负责”，Stop 时误拦。
+        os.unlink(os.path.join(self.task_dir, "session.json"))
+        environment = dict(os.environ)
+        environment["ZCODE_SESSION_ID"] = SESSION
+        proc = subprocess.run(
+            [sys.executable, "-B", DISPATCH, "criterion", "--state",
+             self.state_path, "--id", "C1", "--status", "met"],
+            capture_output=True, text=True, cwd=self.workspace, env=environment)
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertFalse(os.path.exists(
+            os.path.join(self.task_dir, "session.json")))
+
+    def test_read_only_subcommands_do_not_bind(self):
+        # quality / evidence --list 都是纯读取：查看旧任务不得变成接手它。
+        cases = [
+            ["quality", "--state", self.state_path, "--json"],
+            ["evidence", "--state", self.state_path, "--list"],
+            ["contract", "--state", self.state_path, "--show"],
+        ]
+        for argv in cases:
+            with self.subTest(argv=argv[0]):
+                binding = os.path.join(self.task_dir, "session.json")
+                if os.path.exists(binding):
+                    os.unlink(binding)
+                environment = dict(os.environ)
+                environment["ZCODE_SESSION_ID"] = SESSION
+                proc = subprocess.run(
+                    [sys.executable, "-B", DISPATCH, *argv],
+                    capture_output=True, text=True, cwd=self.workspace,
+                    env=environment)
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertFalse(os.path.exists(binding), argv)
+
+    def test_git_root_stops_ancestor_task_lookup(self):
+        # 仓库内的会话不继承父目录（例如容器/家目录）里的 .copilot-tasks：
+        # 越过 git 根向上找任务会把无关会话永久绑到别人的任务上。
+        parent = tempfile.TemporaryDirectory()
+        self.addCleanup(parent.cleanup)
+        task_dir = os.path.join(parent.name, ".copilot-tasks", "t9")
+        os.makedirs(task_dir)
+        state_path = os.path.join(task_dir, "state.json")
+        G.start_state(state_path, goal="父目录任务", contract=CONTRACT,
+                      test_policy={"required": False}, workspace=parent.name)
+        G.plan_state(state_path, PLAN)
+        payload = {"sessions": [{"session_id": SESSION, "at": "2026-11-20T00:00:00+00:00"}],
+                   "updated": "2026-11-20T00:00:00+00:00"}
+        with open(os.path.join(task_dir, "session.json"), "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, ensure_ascii=False, indent=2)
+        repo = os.path.join(parent.name, "repo")
+        os.makedirs(os.path.join(repo, ".git"))
+        proc = self.run_guard(payload={"cwd": repo, "session_id": SESSION})
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
     def test_touch_session_keeps_multiple_sessions(self):
         G.touch_session(self.state_path, session=OTHER_SESSION)
         with open(os.path.join(self.task_dir, "session.json"), encoding="utf-8") as fh:
@@ -582,14 +637,23 @@ class SessionStartRecoveryTests(StopGuardBase):
         self.save(state)
         self.assertEqual(self.run_session_start().stdout.strip(), "")
 
-    def test_corrupt_state_fails_open_with_hint(self):
+    def test_bound_corrupt_state_still_gets_repair_hint(self):
+        # 本会话负责的任务状态损坏时不能静默跳过：否则会话会以为没有待续跑任务。
         bad = os.path.join(self.workspace, ".copilot-tasks", "bad")
         os.makedirs(bad, exist_ok=True)
         with open(os.path.join(bad, "state.json"), "w", encoding="utf-8") as fh:
             fh.write("{not json")
+        self.bind(SESSION, task_dir=bad)
         text = self.injected(self.run_session_start())
         self.assertIn("任务状态读取异常", text)
-        # 只有损坏状态、没有绑定任务时不注入任何东西。
+        self.assertIn("不得伪造 PASS", text)
+
+    def test_unbound_corrupt_state_is_not_injected(self):
+        # 不属于本会话的损坏任务不进入本会话上下文；只有绑定本会话的任务才注入。
+        bad = os.path.join(self.workspace, ".copilot-tasks", "bad")
+        os.makedirs(bad, exist_ok=True)
+        with open(os.path.join(bad, "state.json"), "w", encoding="utf-8") as fh:
+            fh.write("{not json")
         os.unlink(os.path.join(self.task_dir, "session.json"))
         proc = self.run_session_start()
         self.assertEqual(proc.returncode, 0, proc.stderr)

@@ -56,8 +56,9 @@ class LegacyCliTests(unittest.TestCase):
         proc = self.start()
         self.assertEqual(proc.returncode, 0, proc.stderr)
         plan = write_json(os.path.join(self.dir, "plan.json"), PLAN)
+        # plan 之后仍有可执行工作项：命令以 EXIT_CONTINUE 提示继续，不冒充终点。
         self.assertEqual(F.run_cli("copilot_dispatch.py", "plan", "--state", self.state,
-                                   "--plan", plan).returncode, 0)
+                                   "--plan", plan).returncode, 10)
 
         proc = F.run_cli("copilot_auto.py", "drive", "--state", self.state)
         self.assertEqual(proc.returncode, 10, proc.stderr)
@@ -263,8 +264,9 @@ class NativeCliTests(unittest.TestCase):
                          "--test-policy", '{"required": false}')
         self.assertEqual(proc.returncode, 0, proc.stderr)
         plan = write_json(os.path.join(self.dir, "plan.json"), PLAN)
+        # plan 之后仍有可执行工作项：命令以 EXIT_CONTINUE 提示继续，不冒充终点。
         self.assertEqual(F.run_cli("copilot_dispatch.py", "plan", "--state", self.state,
-                                   "--plan", plan).returncode, 0)
+                                   "--plan", plan).returncode, 10)
         self.evidence = os.path.join(self.dir, "result.txt")
         with open(self.evidence, "w", encoding="utf-8") as fh:
             fh.write("done\n")

@@ -41,13 +41,21 @@ import governance as G  # noqa: E402
 import agent_policy as AP  # noqa: E402
 import review_policy as RP  # noqa: E402
 import sol_review as SR  # noqa: E402
-import knowledge_handoff as KH  # noqa: E402
 
-__version__ = "9.2.0"
+__version__ = "9.3.0"
 
 
 class CLIError(Exception):
     pass
+
+
+def _knowledge_module():
+    """知识交接是本地可选扩展：仓库不跟踪，只在用到 `--knowledge-file` 时才需要。"""
+    try:
+        import knowledge_handoff as module
+    except ImportError:
+        return None
+    return module
 
 
 def _read_text(path: str) -> str:
@@ -64,9 +72,14 @@ def _compose_materials(materials: str, knowledge_file: str) -> tuple[str, dict]:
     """把已校验的知识交接块追加到 SOL materials；路径不能替代正文。"""
     if not knowledge_file:
         return materials, {}
+    module = _knowledge_module()
+    if module is None:
+        raise CLIError("[KNOWLEDGE_EXTENSION_MISSING] 知识交接扩展未安装（"
+                       "scripts/knowledge_handoff.py 不随仓库分发）；去掉 --knowledge-file，"
+                       "或把该文件放进 scripts/ 后重试。")
     try:
-        block = KH.render_file(knowledge_file, target="sol")
-    except KH.HandoffError as exc:
+        block = module.render_file(knowledge_file, target="sol")
+    except module.HandoffError as exc:
         raise CLIError(f"[{exc.code}] {exc.message}") from None
     if any(line.strip() == "<!-- copilot-knowledge-handoff -->"
            for line in materials.splitlines()):
@@ -75,7 +88,7 @@ def _compose_materials(materials: str, knowledge_file: str) -> tuple[str, dict]:
     composed = materials.rstrip() + "\n\n" + block
     return composed, {
         "knowledge_file": os.path.abspath(knowledge_file),
-        "knowledge_block_sha256": KH.block_sha256(block),
+        "knowledge_block_sha256": module.block_sha256(block),
         "knowledge_entries": sum(1 for line in block.splitlines()
                                  if line.startswith("### ")),
     }
@@ -163,8 +176,24 @@ EXIT_CONTINUE = 10
 # 只读命令不写任何文件（含 session.json 会话绑定）：它们的契约是“只看不改”。
 READ_ONLY_COMMANDS = frozenset({
     "closure-check", "review-metrics", "review-admission", "agent-policy",
-    "handoff", "legacy-status", "next", "brief", "render", "status",
+    "handoff", "legacy-status", "next", "brief", "render", "status", "quality",
 })
+
+
+def _is_read_only(args) -> bool:
+    """按实际动作判定只读：查看旧任务不能被当成本会话“负责”这个任务。
+
+    `evidence --list/--next-id` 与 `contract --show` 是纯读取；`--add/--drop/--amend`
+    才写状态。按命令名一刀切会让查看动作留下会话绑定，进而触发 Stop 误拦。
+    """
+    command = str(getattr(args, "command", "") or "")
+    if command in READ_ONLY_COMMANDS:
+        return True
+    if command == "evidence":
+        return not (getattr(args, "add", None) or getattr(args, "drop", None))
+    if command == "contract":
+        return not getattr(args, "amend", None)
+    return False
 
 
 def _print_continuation(path: str) -> int:
@@ -250,11 +279,11 @@ def cmd_plan(args) -> int:
     result = G.plan_state(_state_path(args), plan, source=args.source or "zcode")
     if result["idempotent"]:
         print(f"计划已存在（{result['plan']['plan_id']}），未重复登记。")
-        return 0
+        return _print_continuation(_state_path(args))
     print(f"计划已登记：{result['plan']['plan_id']}")
     for action in result["actions"]:
         print(f"- {action['id']} [{action['assignee']}] {action['title']}")
-    return 0
+    return _print_continuation(_state_path(args))
 
 
 def cmd_record(args) -> int:
@@ -360,7 +389,7 @@ def cmd_accept(args) -> int:
     else:
         print("全部警告/残余风险已接受；原始 verdict 保持 "
               f"{report.get('raw_verdict')}，不改写为 PASS。")
-    return 0
+    return _print_continuation(_state_path(args))
 
 
 def cmd_quality(args) -> int:
@@ -598,13 +627,13 @@ def cmd_finding(args) -> int:
         raise CLIError("更新 finding 需要 --status。")
     item = G.record_finding_status(
         path, args.id, args.status,
-        evidence_ids=args.evidence, note=args.note)
+        evidence_ids=_evidence_ids(args.evidence), note=args.note)
     print(f"Finding {item['finding_id']} → {item['status']}"
           f"（{item.get('severity')}）")
     if item["status"] == "fixed":
         print("下一步：运行定向测试/检查并登记证据，再标记 verified；"
               "不需要重新派发完整复核。")
-    return 0
+    return _print_continuation(path)
 
 
 def cmd_review_admission(args) -> int:
@@ -1219,7 +1248,7 @@ def cmd_reopen(args) -> int:
     G.reopen_task(_state_path(args), args.reason,
                   authorized_by=args.authorized_by)
     print("任务已重开；历史收口记录保留在 closure.reopen_history。")
-    return 0
+    return _print_continuation(_state_path(args))
 
 
 # ── 交付清单（只读） ──────────────────────────────────────────────────────
@@ -1491,12 +1520,14 @@ def cmd_contract(args) -> int:
                               contract_source=args.contract_file or "",
                               test_policy=_load_test_policy(args),
                               task_kind=args.task_kind or "",
-                              triggers=args.trigger or [])
+                              triggers=args.trigger or [],
+                              authorized_by=args.authorized_by or "",
+                              authorization_note=args.authorization_note or "")
     print(f"合同已修订：criteria_sha256={result['criteria_sha256'][:16]}…")
     for criterion in result["criteria"]:
         print(f"- {criterion['criterion_id']} [{criterion['status']}] "
               f"{criterion['description']}")
-    return 0
+    return _print_continuation(path)
 
 
 def cmd_authorize_review(args) -> int:
@@ -1899,6 +1930,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="修订任务类型（影响 SOL 默认认知路由）")
     p.add_argument("--trigger", action="append", default=[],
                    help="追加剧情的触发因素（可多次）")
+    p.add_argument("--authorized-by", default="",
+                   help="破坏性修订（删除条件/放松测试要求）必须写 user；"
+                        "该字段是调用方自报声明，不是可验证凭证")
+    p.add_argument("--authorization-note", default="",
+                   help="破坏性修订必填：用户原话或明确要求，写入合同历史供审计核对")
     p.set_defaults(func=cmd_contract)
 
     p = sub.add_parser("authorize-review", help="记录用户对正式 REVIEW 的明确授权")
@@ -1937,12 +1973,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    # 会话绑定：推进任务的命令表示“本会话正在负责这个任务”，Stop 守卫据此
-    # 判定归属（只写任务目录的 session.json，不改任务状态）；只读命令不写。
-    if args.command not in READ_ONLY_COMMANDS:
-        G.touch_session(str(getattr(args, "state", "") or ""))
     try:
-        return args.func(args) or 0
+        code = args.func(args) or 0
     except (G.GovernanceError, CLIError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
@@ -1951,6 +1983,15 @@ def main(argv: list[str] | None = None) -> int:
         # 不能把 traceback 或未脱敏详情抛给调用方。
         print(f"ERROR: [{exc.code}] {exc.detail}", file=sys.stderr)
         return exc.exit_code
+    # 会话绑定：只在实际推进成功（0/10）之后写。命令失败、参数错误或用户拒绝工具调用
+    # 时状态没有变化，不应把任务算到本会话名下，否则 Stop 会强制续跑一个没人推进的任务。
+    # 只读命令（含 --list/--show）不写绑定；绑定失败也不影响命令结果。
+    if code in (0, EXIT_CONTINUE) and not _is_read_only(args):
+        try:
+            G.touch_session(str(getattr(args, "state", "") or ""))
+        except Exception:  # noqa: BLE001 - 旁路绑定失败不能改变命令结论
+            pass
+    return code
 
 
 if __name__ == "__main__":

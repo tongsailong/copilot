@@ -62,8 +62,15 @@
 | 无 ready 且无可派生 | `none` | false |
 
 `evaluate`、`next`、`status`、`drive`、`record`、`rerun`、`criterion`、`report`、`block`、
-`unblock` 都使用同一判定。`EXIT_CONTINUE=10` 表示"还有下一步"，不能据此结束回合；
-`EXIT_WAIT=11` 只在 `required=false` 的真实等待时使用。
+`unblock`、`plan`、`finding`、`accept`、`reopen`、`contract --amend` 都使用同一判定。
+`EXIT_CONTINUE=10` 表示"还有下一步"，不能据此结束回合；`EXIT_WAIT=11` 只在
+`required=false` 的真实等待时使用。任何会推进状态并留下续跑要求的命令都以 10 结束：
+把它们当 0 会让调用方把一次回填或计划登记误读成任务终点。
+
+`reopen` 之后旧 PASS 不能直接复用：`evaluate` 在门禁全绿但**自最近一次重开后没有新证据、
+没有新的终态工作项、也没有条件重核销**时返回 PARTIAL（`任务重开后尚未产生新的实质进展`），
+`close_task` 用同一判定 fail-closed。进展基线在 reopen 时按计数采集（证据数、终态工作项、
+条件状态），不依赖时间戳，同秒内重开与推进也不会误判。
 
 ## 3. PARTIAL 派生规则
 
@@ -76,7 +83,7 @@
 | 条件未闭合 | `AUTO-C1`、`AUTO-C2`… | 执行工作、登记证据、`criterion met` |
 | 最新报告为 PWW、绑定当前且接受条件未闭合 | `AUTO-ACCEPT` | 把原始结论与全部 W/R 如实呈现给用户，取得用户明确接受后 `accept --by user`；执行方不得代接受。非 PWW 或绑定失效时改派 `AUTO-QUALITY` |
 | 质量报告替代/代码范围/工作区/接受门禁未过 | `AUTO-QUALITY` | 重新 verify、声明替代与解决、确认任务工作区并用当前代码快照重新接入 |
-| 停摆工作项 `A1` | `AUTO-R-A1` | 分析失败根因并重试/调整/记录真实阻塞 |
+| 停摆工作项 `A1` | `AUTO-R-A1` | 分析失败根因并重试/调整/记录真实阻塞；恢复项按根因家族归一，`AUTO-R-W1-R2` 的下一次恢复仍是 `AUTO-R-W1-R3`，不会套出 `AUTO-R-AUTO-R-…` |
 | Finding 台账有 `open`/`regressed` 的 blocking/major | `AUTO-FIX-<F>` | 修根因、登记修复证据并标记 fixed，不直接重跑完整复核 |
 | Finding 已 `fixed` 但未验证 | `AUTO-VERIFY-<F>` | 只跑对应定向测试/检查，登记证据并标记 verified |
 | `AUTO-C*` / `AUTO-R-*` 已派生 ≥3 次仍不闭合 | `AUTO-REPLAN` | 根因分析 + 实质不同的替代路线；替代路线执行中不派生同路径尝试，替代路线已结束而缺口仍在时派生新的 `AUTO-REPLAN` |
@@ -94,6 +101,10 @@
 - G4 退役后不再派生 `AUTO-G4*`；按生命周期主动建议的是 CONSULT / PLAN，REVIEW 只在用户明确要求
   时执行；两者都不是阻塞性工作项。
 - 失败/停摆的 `AUTO-C*` 项不再额外派生恢复项，避免同一缺口两份工作单。
+- **条件核销同步包装项**：`criterion --status met`（以及 reopen 把接受条件退回未闭合）会
+  同步它自动派生的 `AUTO-<cid>`。仍为 `pending`、无结果无证据的包装项标记 `dropped` 并写明
+  `随完成条件 C<n> 核销自动撤销`（不伪造 `done`）；条件重新未闭合时恢复为 `pending`。
+  已产出结果/证据的包装项、以及计划里人写的工作项（即使声明 `target_criteria`）不受影响。
 - 派生项带通用约束：不得越过原始授权范围、不得改目标/条件/业务规则、只做缺口需要的最小
   改动；若合同写有 `boundaries`，原样带入。
 - 派生项 `depends_on` 为空：它们是对缺口的直接行动，不阻塞其他工作。
@@ -126,6 +137,14 @@
 `stop_hook_active`），取 `cwd` 向上 4 层找 `.copilot-tasks`，对每个 state 求 `continuation`；
 任一 `required=true` 就向 stderr 写续跑理由并以退出码 2 阻止结束（ZCode 取 stderr 作为
 `decision=block` 的 reason，截断 4000 字符）。守卫只读，不写入 state 与绑定文件。
+
+会话绑定只在实际推进成功后写入（失败的命令、只读命令与 `--list`/`--show` 子动作都不写），
+并且先判归属再读 state：不属于本会话的任务即使 state 损坏也不会误拦当前会话。向上查找
+`.copilot-tasks` 到 Git 根即止，不继承父目录里别的项目的任务集。
+
+SessionStart（`resume|compact`）只注入绑定当前会话且 `continuation.required=true` 的任务；
+本会话任务自己的 state/绑定损坏时仍给出修复提示（不静默丢掉待续跑任务），其它任务的异常
+不进入本会话上下文。
 
 注入理由固定包含：3 次上限说明、归属、下一步动作、下一条命令、**可原样粘贴的续接命令**
 （`python3 -B <runtime>/scripts/copilot_auto.py drive --state <绝对路径>`）、一次拦截只做

@@ -51,12 +51,12 @@ python3 -B scripts/copilot_dispatch.py <子命令> --state <state.json> [参数]
 | `sol-think` | 历史别名：等同 `sol-consult`（`mode=CONSULT`），保留给既有调用方 | 参数同 `sol-consult` |
 | `sol-accept` | 回填主代理对 SOL 建议的采纳结论（事实记录，不改变阶段、G1–G3 或授权）。v2 记录含实际决策、理由、modified 差异、证据引用与 `advice_ref`；缺项只给非阻断提示 | `--call-id SC...`、`--status accepted\|modified\|rejected`、`--decision`、`--rationale`（省略回落 `--reason`）、`--delta`、`--evidence-ref E1,E3`（可重复/逗号分隔，指向本任务已登记证据）、`--source-ref`（报告章节/文件路径，只定位不核验）、`--evidence-note`、`--note`、`--reason`、`--decided-by`（默认 `zcode`）、`--json` |
 | `agent-policy` | Agent 调度建议：主代理默认，Explore/general-purpose 按需（只读、不派发）。判定顺序：子代理不可用 → 主代理；写入冲突 → 主代理；`--research-only` → Explore（绝不交给全工具代理）；独立交付物需并发且有收益才建议 general-purpose；其余 → 主代理 | `--needs-independent-context`、`--parallel`、`--independent-deliverable`、`--write-conflict`、`--saves-time`、`--research-only`、`--subagent-unavailable`、`--json` |
-| `finding` | 查看 / 更新 Finding 台账（不触发复核） | `--list`；`--id F1 --status open\|fixed\|verified\|closed\|regressed\|dropped --evidence E1 --note`；`fixed`/`verified` 必须有证据 |
+| `finding` | 查看 / 更新 Finding 台账（不触发复核） | `--list`；`--id F1 --status open\|fixed\|verified\|closed\|regressed\|dropped --evidence E1[,E2] --note`；`fixed`/`verified` 必须有证据，多个证据可用逗号分隔；回填成功后按续跑判定返回 10 |
 | `review-metrics` | 统计统一 SOL 调用流（`sol.calls_total` / `sol.by_mode`）、准入门槛、停止标记与 Finding 计数 | `--state`；历史 G4 数据标记 `g4.retired` |
 | `closure` | 收口（必须 G1–G3 通过） | `--close`、`--by` |
-| `reopen` | 用户授权后重开 | `--reason`、`--authorized-by user`（必填） |
+| `reopen` | 用户授权后重开 | `--reason`（必填，写用户原话/要求）、`--authorized-by user`（必填；调用方自报声明，不是凭证）；`reopen_history` 标注 `authorization_source=caller-declared` |
 | `handoff` | 只读列出生效交付清单：分支/HEAD/上游、已暂存、未暂存、未跟踪分类 | `--state`（可选）、`--cwd`、`--limit`、`--json`；不提交、不删除、不改 `.gitignore` |
-| `contract` | 查看/修订合同与条件 | `--show`、`--amend --contract-file/--criteria-file`、`--test-policy`/`--test-policy-file`（省略则保留原策略）；BLOCKED 时也可修订；登记源文件摘要，文件被改动时 `status` 给出非阻断提醒 |
+| `contract` | 查看/修订合同与条件 | `--show`、`--amend --contract-file/--criteria-file`、`--test-policy`/`--test-policy-file`（省略则保留原策略）、`--authorized-by user` + `--authorization-note "用户要求"`（破坏性修订必需）；BLOCKED 时也可修订；登记源文件摘要，文件被改动时 `status` 给出非阻断提醒。**破坏性修订**指待核销条件净减少（删掉未满足条件）或放松 `test_policy`，没有用户授权或未写明用户要求时 fail-closed；改写措辞/拆分/合并但只要不减少待核销条数不需要授权。合同历史记录 `authorized_by`、`authorization_source=caller-declared`、授权说明、新增/删除的未核销条数与被删除条件及旧指纹。`--authorized-by` 是调用方自报声明，不是可验证凭证：审计时须以用户原话/授权说明为准 |
 | `authorize-review` | 记录用户对正式 REVIEW 的授权 | `--authorized-by user`（必填，调用方声明）、`--reason`、`--scope` |
 | `formal-review` | 登记正式 REVIEW 结论或修订 | 新结论：`--verdict`、`--summary`；非实质修订：`--amend <review_id> --reason`；实质变化：`--supersedes <review_id> --reason`；均支持 `--review-ref`/`--reviewer` |
 | `legacy-status` | 只读查看 v1/v2 SOL 历史状态与台账 | `--state`、`--audit-log`、`--ledger`、`--json` |

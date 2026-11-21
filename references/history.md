@@ -7,9 +7,54 @@
 > （2026-11-18）升级 `gpt-6.2-sol` 并恢复建议性 CONSULT / PLAN；v8.2.0（2026-11-18）
 > 把三模式融合为 Copilot 内部统一按需认知能力；v8.3.0（2026-11-18）把“什么时候调用
 > SOL”升级为确定性复杂度判断与主动介入；v8.4.0（2026-11-18）把 CONSULT / PLAN 并入
-> 改为强制续跑的连续执行状态，并把阻塞收窄到工作项范围；v9.0.0（2026-11-20）把 SOL
-> 恢复为按生命周期的默认认知引擎 CONSULT / PLAN，THINK 只作读取别名；v9.1.0
-> （2026-11-20）完善 SOL 采纳记录（实际决策/理由/证据关联/非阻断提示）与质量指标**。
+> THINK；v8.5.0（2026-11-19）把 PARTIAL 改为强制续跑的连续执行状态，并把阻塞收窄到
+> 工作项范围；v9.0.0（2026-11-20）把 SOL 恢复为按生命周期的默认认知引擎
+> CONSULT / PLAN，THINK 只作读取别名；v9.1.0（2026-11-20）完善 SOL 采纳记录
+> （实际决策/理由/证据关联/非阻断提示）与质量指标；v9.2.0（2026-11-20）接入
+> SessionStart 恢复注入并给 SKILL 上下文瘦身；v9.3.0（2026-11-21）加固合同修订、
+> 续跑绑定与条件包装项同步**。
+
+## v9.3.0（2026-11-21）治理一致性与续跑绑定加固
+
+- **背景**：v9.2.0 之后对治理主链路做了一次自审：合同可被“改写成更弱表述”绕过完成条件，
+  条件核销后包装项仍 pending 导致永不 PASS，重开后旧 PASS 可立即复用，多阻塞共用一个
+  `blocked_by` 字段，Hooks 在命令失败/只读命令后也绑定会话，SOL 单轮复用键对材料空白与
+  模板变化不敏感。
+- **合同修订授权门**：`amend_contract` 改为净未核销条件计数（不含 PWW 接受条件），净减少
+  或 `test_policy.required` 由真变假视为破坏性修订，必须 `authorized_by="user"`；历史记录
+  新增 `authorized_by`、`previous_criteria_sha256`、`removed_criteria`、
+  `test_policy_weakened`。改写措辞仍留审计痕迹但不要求授权。
+- **条件-包装项同步**：`_sync_criterion_work_items` 在条件 met 时把无可执行结果的
+  `AUTO-C<n>`（或 `targets` 含该条件的自动项）置为 `dropped` 并记 `auto_closed_for`；
+  条件回退时重开。计划内业务工作项与已开工包装项不受影响。
+- **重开进展基线**：`reopen` 记录 `_progress_snapshot`（证据数、终态工作项、条件状态）；
+  `_reopened_without_progress` 在 `evaluate` 与 `close_task` 两处 fail-closed，无实质进展
+  时返回 PARTIAL / 拒绝收口；旧记录无基线时退回严格时间戳比较。
+- **多阻塞与恢复家族**：`resolve_block` 只在没有其它未解除 block 引用该工作项时恢复，
+  否则更新 `blocked_by`；`derive_work` 对 `AUTO-R-*` 逐层剥前缀并归一到
+  `AUTO-R-<base>-R<n>`，避免重启后嵌套膨胀。
+- **Hooks 绑定加固**：`copilot_dispatch.py` / `copilot_auto.py` 只在命令成功（0/10）且非
+  只读后 `touch_session`；只读集合新增 `quality`，`evidence` 无 `--add/--drop`、`contract`
+  无 `--amend` 视为只读；`find_tasks_root` 遇 `.git` 停止，不再继承祖先工作区任务；
+  `session-start` 只处理 `bound` 与 `corrupt` 绑定，未绑定异常不注入；摘要按行截断；
+  `check` 捕获任何异常后按 fail-closed 退出 2 并记录 `internal-error`。
+- **SOL 与 CLI**：`review_subject_sha256` 对材料 `strip()` 后哈希并把
+  `prompt_template_sha256()` 纳入 subject；`--force` 优先于复用判定；`_is_local_cpa_url`
+  拒绝 query/fragment 与 `/v1` 之外路径；`plan`、`finding`、`accept`、`reopen`、
+  `contract --amend` 统一返回 `EXIT_CONTINUE`。
+- **不变量**：G1–G3、PARTIAL 强制续跑语义、SOL-first 生命周期与 advisory 边界、零工具
+  单轮、G4 退役状态与授权边界均未改变。
+
+## v9.2.0（2026-11-20）ZCode 原生恢复衔接与上下文瘦身
+
+- **SessionStart 恢复注入**：`copilot_stop_guard.py session-start` 只处理
+  `source=resume|compact`，对绑定本会话且 `continuation.required=true` 的任务注入一段只读
+  快照（阶段、未闭合条件、续接命令）；不写状态、不消费 Stop 次数，异常退出 0；`install` /
+  `uninstall` 同时维护 `Stop` 与 `SessionStart`。
+- **SKILL 瘦身**：版本沿革外移到本文件，SKILL.md 84,291 → 56,707 B（−32.7%），规则与命令面
+  未删减。
+- **宿主实测**：headless `--resume` 确认宿主拼接恢复快照并继续由 Stop 守卫续跑（共 44 次
+  请求、3.33M input tokens，不宜无预算复跑）；`compact` 与 GUI 新会话未单独复现。
 
 ## v9.1.0（2026-11-20）SOL 采纳记录与证据关联
 

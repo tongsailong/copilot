@@ -26,7 +26,7 @@ import secrets
 import sys
 import tempfile
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 
 import code_scope as CS
 import review_policy as RP
@@ -886,12 +886,27 @@ def amend_contract(path: str, *, contract: str = "",
                    criteria: object = None,
                    contract_source: str = "",
                    test_policy: dict | None = None,
-                   task_kind: str = "", triggers: object = None) -> dict:
+                   task_kind: str = "", triggers: object = None,
+                   authorized_by: str = "",
+                   authorization_note: str = "") -> dict:
     """用户/任务范围内修订合同与完成条件；保留同描述条件的既有核销记录。
 
     BLOCKED 时允许修订：阻塞常常正是因为合同条款不可执行，禁止修订只会逼出
     “先假装解除、改完再重新登记”的无效往返。修订不会解除阻塞，任务仍在
     BLOCKED 直到阻塞被真实解决。
+
+    破坏性修订（待核销条件净减少或放松 test_policy）必须由用户明确授权
+    （`authorized_by="user"`）：否则执行方可以删掉未满足的条件并重算合同指纹，
+    让 G2 从“条件未满足”直接变成“指纹一致”。判定看净减少而不是看描述变化：
+    改写措辞、拆分或合并条件只要没有减少仍需核销的条数就放行，只有真正减少
+    待完成工作量时才要求授权。PWW 接受条件是系统登记的，不参与这个计数。
+    被删除的条件连同旧指纹写入合同历史，审计仍可追溯。
+
+    授权说明（`authorization_note`）在破坏性修订时必填：`authorized_by` 只是
+    调用方对用户要求的自报声明，不是可验证凭证；写入说明至少让事后审计能核对
+    “用户到底要求了什么”，而不是只看到一个 `user` 字样。历史同时记录
+    `authorization_source="caller-declared"` 与新增/删除的未核销条数，避免把
+    自报字段当作用户授权证据。
     """
     state = load_state(path)
     _assert_open(state, "修订合同", allow_blocked=True)
@@ -901,8 +916,42 @@ def amend_contract(path: str, *, contract: str = "",
     items = _normalize_criteria(raw)
     if not items:
         raise GovernanceError("修订后完成条件为空；PASS 需要至少一条可核销条件。")
-    old = {str(c.get("description") or ""): c
-           for c in current.get("criteria") or []}
+    base_before = [c for c in current.get("criteria") or []
+                   if not isinstance(c.get("acceptance"), dict)]
+    old = {str(c.get("description") or ""): c for c in base_before}
+    new_descriptions = {str(item.get("description") or "") for item in items}
+    removed = [c for key, c in old.items() if key not in new_descriptions]
+    outstanding_before = sum(
+        1 for c in base_before if str(c.get("status") or "") != "met")
+    outstanding_after = sum(
+        1 for item in items if str(item.get("status") or "") != "met")
+    destructive = outstanding_after < outstanding_before
+    previous_policy = current.get("test_policy") or _default_test_policy()
+    policy = (_normalize_test_policy(test_policy) if test_policy is not None
+              else previous_policy)
+    weakened = (bool(previous_policy.get("required"))
+                and not bool(policy.get("required")))
+    note_text = str(authorization_note or "").strip()
+    if destructive or weakened:
+        detail = []
+        if destructive:
+            detail.append(
+                f"待核销条件净减少（{outstanding_before} → {outstanding_after}"
+                + ("，删除 " + "、".join(str(c.get("criterion_id") or "?")
+                                        for c in removed)
+                   if removed else "") + "）")
+        if weakened:
+            detail.append("放松 test_policy（required → 未要求）")
+        if str(authorized_by or "").strip().lower() != "user":
+            raise GovernanceError(
+                "合同修订会" + "；".join(detail) + "。这是破坏性修订，必须由用户明确授权："
+                "显式传入 authorized_by=\"user\"（CLI：--authorized-by user）并说明原因；"
+                "执行方不得自行改写完成条件或合同指纹来通过门禁。")
+        if not note_text:
+            raise GovernanceError(
+                "合同修订会" + "；".join(detail) + "。破坏性修订必须写明用户授权说明"
+                "（CLI：--authorization-note \"用户原话/要求\"）；只写 user 而不记录"
+                "用户到底要求了什么，事后无法核对授权范围。")
     for item in items:
         item.pop("_initial_refs", None)
         previous = old.get(item["description"])
@@ -912,8 +961,6 @@ def amend_contract(path: str, *, contract: str = "",
             item["updated_at"] = previous.get("updated_at")
             item["updated_iteration"] = previous.get("updated_iteration")
             item["history"] = previous.get("history") or []
-    policy = (_normalize_test_policy(test_policy) if test_policy is not None
-              else (current.get("test_policy") or _default_test_policy()))
     if str(state.get("risk") or "").lower() == "high" and not policy.get("captured"):
         raise GovernanceError(
             "risk=high 修订合同时不能移除 test_policy；测试要求必须保留在合同中。")
@@ -966,8 +1013,24 @@ def amend_contract(path: str, *, contract: str = "",
     })
     state["contract"].setdefault("history", []).append({
         "event": "contract_amended", "at": now_iso(), "by": "zcode",
+        "authorized_by": str(authorized_by or "").strip().lower(),
+        # 自报声明不是凭证：显式标注来源，避免把 authorized_by 当作用户授权证据。
+        "authorization_source": "caller-declared" if authorized_by else "",
+        "authorization_note": note_text[:500],
+        "destructive": bool(destructive or weakened),
+        "outstanding_before": outstanding_before,
+        "outstanding_after": outstanding_after,
+        "removed_unmet": sum(1 for c in removed
+                             if str(c.get("status") or "") != "met"),
+        "added_unmet": sum(1 for item in items
+                           if item["description"] not in old),
         "criteria_sha256": sha,
+        "previous_criteria_sha256": current.get("criteria_sha256"),
         "criteria": [c["criterion_id"] for c in items],
+        "removed_criteria": [
+            {"criterion_id": c.get("criterion_id"), "status": c.get("status"),
+             "description": c.get("description")} for c in removed],
+        "test_policy_weakened": weakened,
     })
     state["contract_sha256"] = _contract_fingerprint(
         state.get("goal") or "", body, items, policy)
@@ -1506,6 +1569,60 @@ def rerun_action(path: str, aid: str, *, reason: str = "") -> dict:
     return action
 
 
+def _criterion_work_items(state: dict, cid: str) -> list[dict]:
+    """该完成条件自动派生的包装工作项（AUTO-<cid> 或 AUTO-* 声明了 target_criteria）。
+
+    只收自动派生项：计划里人写的工作项即使声明了 target_criteria，也可能是
+    有独立价值的任务，不能因为条件被别的证据核销就自动撤销。
+    """
+    out: list[dict] = []
+    for item in state.get("actions") or []:
+        if not isinstance(item, dict):
+            continue
+        aid = str(item.get("id") or "")
+        targets = item.get("target_criteria")
+        if aid == f"AUTO-{cid}" or (
+                aid.startswith("AUTO-") and isinstance(targets, list)
+                and cid in targets):
+            out.append(item)
+    return out
+
+
+def _sync_criterion_work_items(state: dict, cid: str) -> list[str]:
+    """条件核销/撤销时同步它自动派生的包装工作项。
+
+    `AUTO-<cid>` 的含义就是“去闭合这个条件”：条件 met 后再要求 record 这条工作项
+    只是重复劳动，还会让 PARTIAL 永远差一条。只自动收口仍然 pending、没有结果与
+    证据的包装项，并用 dropped（不是 done）记录，表示“随条件闭合而撤销”，不虚构
+    执行结果；条件重新变成未闭合时（reopen / criterion 回退）恢复为 pending。
+    """
+    criterion = _criterion(state, cid)
+    met = str(criterion.get("status") or "") == "met"
+    changed: list[str] = []
+    for item in _criterion_work_items(state, cid):
+        aid = str(item.get("id") or "")
+        status = str(item.get("status") or "")
+        if met:
+            if status != "pending" or item.get("result") or item.get("evidence_ids"):
+                continue
+            item["status"] = "dropped"
+            item["result"] = f"随完成条件 {cid} 核销自动撤销：条件已 met，无独立工作"
+            item["auto_closed_for"] = cid
+            item["updated"] = now_iso()
+            changed.append(aid)
+            _history(state, "work_auto_closed", {"id": aid, "criterion_id": cid})
+        else:
+            if status != "dropped" or str(item.get("auto_closed_for") or "") != cid:
+                continue
+            item["status"] = "pending"
+            item["result"] = ""
+            item["auto_closed_for"] = ""
+            item["updated"] = now_iso()
+            changed.append(aid)
+            _history(state, "work_auto_reopened", {"id": aid, "criterion_id": cid})
+    return changed
+
+
 def record_criterion(path: str, cid: str, status: str, *,
                      evidence_ids: list[str] | None = None) -> dict:
     state = load_state(path)
@@ -1533,6 +1650,7 @@ def record_criterion(path: str, cid: str, status: str, *,
     })
     _history(state, "criterion_recorded", {"criterion_id": cid, "status": status,
                                            "evidence_ids": [r["id"] for r in refs]})
+    _sync_criterion_work_items(state, cid)
     save_state(path, state)
     return criterion
 
@@ -1702,7 +1820,16 @@ def resolve_block(path: str, reason: str, block_id: str = "") -> dict:
                 continue
             if str(action.get("status") or "") != "blocked":
                 continue
-            if str(action.get("blocked_by") or "") != str(block.get("block_id") or ""):
+            # 同一工作项可能叠加多条真实阻塞：只有全部解除才恢复可执行。
+            # 只按 blocked_by 单值判定会在解除第一条时把它错误放行。
+            remaining = [b for b in state.get("blocks") or []
+                         if not b.get("resolved_at")
+                         and aid in (b.get("work_items") or [])]
+            if remaining:
+                action["blocked_by"] = remaining[0].get("block_id")
+                action["blocked_reason"] = remaining[0].get("reason") or ""
+                action["blocked_needs"] = remaining[0].get("needs") or ""
+                action["updated"] = now
                 continue
             action["status"] = "pending"
             action["blocked_by"] = None
@@ -4773,6 +4900,12 @@ def close_task(path: str, *, by: str = "zcode-native",
     if not check["passed"]:
         summary = "; ".join(f"{r.get('gate')}:{r.get('code')}" for r in check["reasons"])
         raise GovernanceError(f"G1–G3 未通过，不能收口：{summary}")
+    if _reopened_without_progress(state):
+        # 重开后的 PASS 必须由重开之后的新进展支撑：否则直接 close 会绕过
+        # evaluate 的同一判定，让“用户认为旧结论不成立”变成一句空话。
+        raise GovernanceError(
+            "任务重开后尚未产生新的实质进展（新证据、工作项结果或条件重核销）："
+            "旧 PASS 不能直接复用；先完成重开要求的工作再收口。")
     quality = quality_summary(state, cache=cache)
     # 原始质量结论与任务关闭状态分离：用户接受 PWW 不把 verdict 改写为 PASS。
     verdict = PWW if quality.get("verdict") == PWW else "pass"
@@ -4835,6 +4968,9 @@ def reopen_task(path: str, reason: str, *, authorized_by: str = "") -> dict:
     })
     state["closure"].setdefault("reopen_history", []).append({
         "reason": reason, "at": now_iso(), "authorized_by": authorized_by,
+        # 与合同修订同一口径：authorized_by 是调用方自报，不是可验证凭证；
+        # reason 记录用户原话/要求，供事后审计核对授权范围。
+        "authorization_source": "caller-declared",
         "previous": old,
     })
     # 重开意味着还会有新的工作/证据/代码；旧质量结论（含普通 PASS）不能直接
@@ -4861,9 +4997,16 @@ def reopen_task(path: str, reason: str, *, authorized_by: str = "") -> dict:
                      {"criterion_id": criterion.get("criterion_id")})
         if isinstance(criterion.get("acceptance"), dict):
             criterion["acceptance"]["status"] = "pending"
+        # 接受条件回到未闭合：它自动派生的包装工作项也要恢复，否则重开后
+        # 没有任何可执行项却永远差一条。
+        _sync_criterion_work_items(state, str(criterion.get("criterion_id") or ""))
     # 重开后任务重新进入活动状态：上一轮已随收口标为 CLOSED，不能改回 RUNNING
     # （会出现“同一轮既已收口又在进行”）。开一条新迭代承接后续工作。
     begin_iteration(state, note=f"重开：{reason[:80]}")
+    # 基线在重开的全部状态改写之后采集：重开本身（迭代、接受条件回退）不算进展，
+    # 之后的证据、工作项结果或条件重核销才算。
+    history_entry = state["closure"]["reopen_history"][-1]
+    history_entry["baseline"] = _progress_snapshot(state)
     _history(state, "task_reopened", {"reason": reason[:200],
                                       "authorized_by": authorized_by})
     save_state(path, state)
@@ -5065,7 +5208,13 @@ def derive_work(state: dict, *, reason: str = "partial",
         # 同一缺口出现两份工作单。
         if aid.startswith(("AUTO-C", "AUTO-FIX-", "AUTO-VERIFY-")):
             continue
-        add(f"AUTO-R-{aid}", f"处理停摆工作项 {aid}",
+        # 恢复项按根因家族归一：AUTO-R-W1-R2（甚至旧的 AUTO-R-AUTO-R-W1）都属于
+        # 同一个缺口。不归一就会层层套出 AUTO-R-AUTO-R-…，3 次上限永远不触发。
+        base_id = aid
+        while base_id.startswith("AUTO-R-"):
+            base_id = base_id[len("AUTO-R-"):]
+        base_id = re.sub(r"-R[0-9]+$", "", base_id) or aid
+        add(f"AUTO-R-{base_id}", f"处理停摆工作项 {aid}",
             f"处理工作项 {aid}（{why}）：分析失败根因，重试、调整方案或说明真实阻塞；"
             "不得机械重复同一失败路径。",
             "失败原因分析 + 新的执行结果/证据；若确属外部阻塞，用 block 记录原因与所需条件",
@@ -5185,9 +5334,77 @@ def _all_remaining_blocked(state: dict) -> bool:
                                 for a in active)
 
 
+def _epoch(value: object) -> float | None:
+    """ISO 时间戳 → epoch；无时区的历史值按 UTC 处理，保证可比较。"""
+    stamp = _parse_time(value)
+    if stamp is None:
+        return None
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=timezone.utc)
+    return stamp.timestamp()
+
+
+def _progress_snapshot(state: dict) -> dict:
+    """重开时的进展基线：用计数而不是时间戳，避免同秒内重开/推进被判成“有进展”。"""
+    return {
+        "evidence": len([item for item in state.get("evidence") or []
+                         if isinstance(item, dict)]),
+        "terminal_actions": sorted(
+            str(item.get("id") or "") for item in _tracked_actions(state)
+            if str(item.get("status") or "") in TERMINAL),
+        "criteria": {str(item.get("criterion_id") or ""):
+                     str(item.get("status") or "")
+                     for item in ((state.get("contract") or {}).get("criteria") or [])
+                     if isinstance(item, dict)},
+    }
+
+
+def _reopened_without_progress(state: dict) -> bool:
+    """最近一次 reopen 之后是否产生了新的实质进展。
+
+    重开表示用户认为旧结论已不成立；如果之后既没有新证据、没有新的工作项结果，
+    也没有条件重新核销，那么“条件与门禁仍全部通过”只能用旧结论解释，不能据此
+    再次 PASS（否则 reopen → 立即 PASS，等于绕过重开）。任一进展即放行。
+    """
+    history = (state.get("closure") or {}).get("reopen_history") or []
+    if not history:
+        return False
+    entry = history[-1] if isinstance(history[-1], dict) else {}
+    baseline = entry.get("baseline")
+    if isinstance(baseline, dict):
+        current = _progress_snapshot(state)
+        if current["evidence"] > int(baseline.get("evidence") or 0):
+            return False
+        if set(current["terminal_actions"]) - set(
+                baseline.get("terminal_actions") or []):
+            return False
+        if current["criteria"] != (baseline.get("criteria") or {}):
+            return False
+        return True
+    # 旧状态没有基线：退回时间戳比较，但要求严格晚于重开时刻。
+    since = _epoch(entry.get("at"))
+    if since is None:
+        return False
+    stamps: list[object] = []
+    for item in state.get("evidence") or []:
+        if isinstance(item, dict):
+            stamps.append(item.get("captured_at"))
+    for item in _tracked_actions(state):
+        if str(item.get("status") or "") in TERMINAL:
+            stamps.append(item.get("updated"))
+    for item in ((state.get("contract") or {}).get("criteria") or []):
+        if isinstance(item, dict):
+            stamps.append(item.get("updated_at"))
+    for value in stamps:
+        when = _epoch(value)
+        if when is not None and when > since:
+            return False
+    return True
+
+
 def _evaluate_core(state: dict, *, cache: dict | None = None) -> dict:
     """本地阶段求值；返回 phase、work、gate、next_commands 与说明。"""
-    if bool((state.get("closure") or {}).get("closed")):
+    if (state.get("closure") or {}).get("closed") is True:
         return {
             "phase": "CLOSED", "reason": "任务已收口", "actions": [],
             "stalled": [], "gate": (state.get("closure") or {}).get("gate"),
@@ -5299,7 +5516,7 @@ def _evaluate_core(state: dict, *, cache: dict | None = None) -> dict:
             "next_commands": ["copilot_auto.py drive --state <state>（本地派生恢复工作项）"],
         }
     check = closure_check(state, cache=cache)
-    if check["passed"]:
+    if check["passed"] and not _reopened_without_progress(state):
         quality = quality_summary(state, cache=cache)
         reason = "完成条件与 G1–G3 全部通过"
         if quality.get("verdict") == PWW:
@@ -5312,6 +5529,16 @@ def _evaluate_core(state: dict, *, cache: dict | None = None) -> dict:
             "actions": [], "stalled": [], "blocked_items": blocked_items,
             "gate": check, "criteria": criteria,
             "next_commands": commands,
+        }
+    if check["passed"]:
+        # 重开后条件与门禁仍全部通过，但还没有任何新进展：旧 PASS 属于重开前的
+        # 结论，不能原样复用。要求先产生新的证据/工作项结果/条件重核销再收口。
+        return {
+            "phase": "PARTIAL", "reason": "任务重开后尚未产生新的实质进展：旧 PASS 不能直接复用",
+            "actions": [], "stalled": [], "blocked_items": blocked_items,
+            "gate": check, "criteria": criteria,
+            "next_commands": ["copilot_auto.py drive --state <state>（先完成重开要求的工作，"
+                              "再重新核对条件并收口）"],
         }
     return {
         "phase": "PARTIAL", "reason": "G1–G3 未通过",

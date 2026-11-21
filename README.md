@@ -5,6 +5,12 @@ Copilot 是运行于 ZCode 内的**轻量协作治理 Skill**：用户侧 ChatGP
 调试、测试与验证；Copilot 负责任务合同、完成条件、状态、证据、审计与收口门禁，并用 PARTIAL
 派生持续推进任务；SOL 作为默认认知引擎按需提供判断，用户明确要求时可执行一次独立复核。
 
+**v9.3.0 治理一致性与续跑绑定加固**：合同修订不再能通过删条件或改弱措辞绕过 G2
+（破坏性修订须 `--authorized-by user` 留痕）；条件核销自动撤销其空包装项；任务重开后没有
+新证据不得复用旧 PASS；多阻塞按项解除、恢复项家族不嵌套；Hooks 只在命令成功后绑定会话、
+任务根查找止于 `.git`、守卫异常 fail-closed；`knowledge_handoff` 改为惰性导入，仓库只保留
+跟踪文件时 CLI 仍可用。详见 `docs/STATUS.md` 与 `docs/DECISIONS.md` 第 68 条。
+
 **v9.0.0 SOL-first 默认认知引擎**：SOL 恢复为 `CONSULT` / `PLAN` / `REVIEW` 三模式，
 CONSULT 与 PLAN 成为非简单任务的默认认知活动（`THINK` 只作读取别名）。生命周期：
 `start` 声明任务类型 → 起点 CONSULT（理解目标/本质/风险/调查方向）→ 调查后 PLAN
