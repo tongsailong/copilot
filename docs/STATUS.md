@@ -42,8 +42,10 @@
   后 Squash 合并为 `8f51037`（`mergedAt=2026-11-22T01:03:55Z`，未绕过 Ruleset：其
   `updated_at` 早于本次交付、`bypass_actors=[]`）→ 合并后 `main` push CI run `44969658309`
   再次两版本 855 OK + baseline 通过 → 删除 feature 分支。`git diff 326b81c 8f51037` 为空，
-  即 Squash 结果与已验证的分支头内容一致；本地 / `origin/main` / GitHub `refs/heads/main`
-  三方同为 `8f51037`、ahead/behind 0/0、工作区 clean。
+  即 Squash 结果与已验证的分支头内容一致；当时本地 / `origin/main` / GitHub
+  `refs/heads/main` 三方同为 `8f51037`、ahead/behind 0/0、工作区 clean。
+  其后仅有记录性文档提交（PR #3 `3e222a3` 只改本文件，代码树不变）；最新 tip 以
+  `git log -1 main` 为准，不在本文内固化。
 - **运行时（合并后核实）**：以最终 `main` 执行 `--check` 为缺失 0 / 不同 0（分发 24 文件，
   未受管理 `hm.txt` 保留），24 个受管文件逐个 SHA-256 与源码一致，`--verify-baseline` 通过；
   合并只改变提交身份、不改变受管内容，故未重复 `--apply`；源码与运行时 `--version` 均为
