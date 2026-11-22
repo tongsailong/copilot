@@ -72,16 +72,41 @@ python3 -B scripts/context_engine.py capture --state <state.json> \
 
 ## 4. 接线
 
+- **UserPromptSubmit（工程任务首轮自动召回）**：`copilot_stop_guard.py user-prompt` 在任务提示之外
+  调用 `prompt_recall.maybe_inject`。分类是确定性的：闲聊、短指令、斜杠命令、纯问答不触发；
+  需要至少一个工程信号（领域词/代码路径/命令）且当前目录在 Git 仓库内。命中后按
+  Memory 3 条 + Vault 2 条、总长 ≤1,400 字符注入 `path:line`、核验时间、`source_commit`
+  与片段；`budget_exhausted`/`partial` 显式标注「结果不完整」，不伪装成完整结论。
+  每次调用最多 40 命中 / 1,200 文件 / 8 MB / 1.2 s，缓存 600 s；同会话同项目按强词哈希
+  去重，换主题才允许增量召回，单会话最多 4 次。失败、零命中、冷却都返回 `exit 0` 且不阻断
+  用户回合；事件写入 `~/.zcode/copilot-runs/context-recall/events.jsonl`。
 - **SessionStart(startup|resume|compact)**：`copilot_stop_guard.py` 在任务状态快照后追加项目现场
   （根/分支/HEAD/工作区）、原生 Memory 与 Vault 可用性，以及 `recall` / `pack` 命令；
-  只读、失败即省略、总长仍受 `SESSION_START_LIMIT` 约束，任何异常都不阻断会话启动。
+  `resume`/`compact` 还把本会话已召回的前 2 条结论放进 `<copilot-recall-state>`，恢复后直接复用、
+  不重新检索。只读、失败即省略、总长仍受 `SESSION_START_LIMIT` 约束，任何异常都不阻断会话启动。
   该路径的单次 git 调用收紧到 1 s（钩子总超时 10 s），`git status` 失败时显示「未知」
   而不是 clean。
+- **Stop（收口/阻塞后的 Capture 提示）**：本会话绑定任务进入 `CLOSED` 或真实 `BLOCKED` 且
+  当前终止版本没有回执时，守卫以退出码 2 要求一次 Capture 评估（不是继续开发，也不改任务
+  状态）。完成评估后用 `copilot_stop_guard.py capture-ack --task-dir <dir> --status
+  done|skipped|failed` 写 `.capture.json`，幂等键为 `closed:<closed_at>` 或
+  `blocked:<updated>`；同一版本重复 Stop 不再提示。绑定前就已终止的旧任务不提示，避免把
+  别人的成果算到本会话。回执只记录评估结果，不放行未评估任务，也不产生 PASS。
 - **status**：`copilot_dispatch.py status` 在人工输出末尾附一行上下文提示；JSON 契约不变。
 - **子 Agent 交接**：`pack --target subagent` 输出 ≤5,000 字符的上下文包（项目身份、工程
   基线、任务条件、历史线索、可信度提示、验收要求），可与 `knowledge_handoff.py` 的
   `--target subagent` 交接块组合（`--handoff-file`）后放入 prompt。子 Agent 不继承
   Memory/AGENTS 注入（本仓库 2026-11-21 探针实测），所以交接必须显式给正文。
+
+### 自动召回的状态与隔离
+
+- 状态目录默认 `~/.zcode/copilot-runs/context-recall/`，可用 `COPILOT_RECALL_STATE_DIR` 覆盖；
+  测试可用 `COPILOT_RECALL_MEMORY_ROOT` / `COPILOT_RECALL_VAULT_ROOT` 指向临时知识根。
+- 只持久化强词哈希、已交付路径/行号/片段哈希与前 2 条短摘要；不保存原始 prompt、完整卡片或
+  疑似凭据。长十六进制串不进入检索词。
+- 项目键是 Git 根的 `sha256[:16]`，与会话哈希共同组成状态文件；不同项目不共享去重与召回内容。
+- 同会话冷却 60 s；明显换主题（≥2 个新强词且与上次重合 <50%）可立即增量召回。
+
 
 ## 5. 边界
 

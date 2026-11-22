@@ -264,7 +264,23 @@ Hook。`ZCODE_USER_CONFIG` 可覆盖目标路径（测试用）。新会话生�
 只注入“存在未闭合任务”的只读指针（阶段、阻塞原因/所需条件、归属会话），不注入任务正文、
 不自动绑定、不强制续跑；由当前会话 `status --json` 核实后自行决定是否 `drive` 接管。
 `clear` 与普通用户消息不注入。所有路径都不写状态、不消费 Stop 次数；任何异常一律静默
-退出 0，不阻断会话启动。
+退出 0，不阻断会话启动。`resume`/`compact` 还会重放本会话已召回的前 2 条历史结论
+（`<copilot-recall-state>`），恢复后直接复用，不重新检索。
+
+**自动召回（`UserPromptSubmit`，工程任务首轮）**：与任务指针同一次注入，零模型调用、
+确定性分类。闲聊、短指令、纯问答、斜杠命令不触发；需要工程信号且在 Git 仓库内才检索当前
+项目 Memory 与 Vault 正式区。注入上限 Memory 3 条 + Vault 2 条、总长 1,400 字符，带
+`path:line`、核验时间、`source_commit` 与片段；截断/部分失败显式标注。同会话同项目按强词
+哈希去重，换主题才增量召回（单会话最多 4 次、冷却 60 s）；失败/零命中只写事件、不阻断
+回合。状态在 `~/.zcode/copilot-runs/context-recall/`，不保存原始 prompt 或疑似凭据。
+
+**收口后 Capture 提示（`Stop`）**：本会话绑定任务进入 `CLOSED` 或真实 `BLOCKED` 且当前
+终止版本无回执时，守卫以退出码 2 要求一次 Capture 评估——只要求判断与落盘，不继续开发、
+不改任务状态、不伪造 PASS。评估后用
+`copilot_stop_guard.py capture-ack --task-dir <任务目录> --status done|skipped|failed
+--reason "<一句话>"` 写 `.capture.json`；同一 `closed_at`/`updated` 版本只提示一次。
+绑定前已终止的旧任务不提示。候选写入沿用 knowledge-manager 授权，正式卡仍需用户授权。
+
 
 **放行路径**：`COPILOT_STOP_GUARD=0`、工作区 `.copilot-tasks/.stop-guard-off`、任务目录
 `.stop-guard-off`、任务 state 的 `stop_guard=false`，或 `disable --state <state> --reason "<原因>"`
@@ -667,9 +683,11 @@ REVIEW 输出契约：总体结论 `verdict=pass|partial|blocked`；`findings` �
 - `capture`：读任务状态与证据，生成带任务/证据溯源、去重前置、住所待判定的候选草稿到任务
   目录，并打印 `candidate_write.py` 命令；工具本身不写 Vault 与原生 Memory。
 
-接线：SessionStart(startup|resume|compact) 快照/指针追加项目现场/Memory 可用性与上述命令（失败即省略，
-不阻断启动）；`status` 人工输出附一行提示，JSON 契约不变。历史线索与现场冲突时以现场为准，
-并在报告中写出卡路径、差异与核验时间。详见 `docs/CONTEXT-ENGINE.md`。
+接线：UserPromptSubmit 对工程任务首轮自动召回（Memory 3 + Vault 2 条、≤1,400 字符、
+会话内去重与 60 s 冷却，失败不阻断）；SessionStart(startup|resume|compact) 快照/指针追加
+项目现场/Memory 可用性与上述命令，resume/compact 重放已召回摘要；Stop 在任务收口或真实
+阻塞后要求一次 Capture 评估并写幂等回执（`capture-ack`），不改任务状态。历史线索与现场
+冲突时以现场为准，并在报告中写出卡路径、差异与核验时间。详见 `docs/CONTEXT-ENGINE.md`。
 
 CONSULT / PLAN 输出契约（`copilot-sol-think/v2`）：`judgment`、`goal_understanding`、
 `essence`、`strategy` 为字符串；`alternatives`、`tradeoffs`、`risks`、`priority`、

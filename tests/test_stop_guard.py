@@ -26,6 +26,7 @@ if SCRIPTS not in sys.path:
     sys.path.insert(0, SCRIPTS)
 
 import governance as G  # noqa: E402
+import context_engine as CE  # noqa: E402
 
 GUARD = os.path.join(SCRIPTS, "copilot_stop_guard.py")
 DISPATCH = os.path.join(SCRIPTS, "copilot_dispatch.py")
@@ -102,6 +103,32 @@ class StopGuardBase(unittest.TestCase):
     def save(self, state: dict) -> None:
         G.save_state(self.state_path, state)
 
+    def recall_fixture(self) -> dict:
+        """临时知识根 + 临时召回状态，避免测试读写真实 Memory/Vault。"""
+        subprocess.run(["git", "init", "-q"], cwd=self.workspace, check=True,
+                       capture_output=True)
+        base = os.path.join(self.workspace, "recall-fixture")
+        memory_root = os.path.join(base, "memories")
+        vault_root = os.path.join(base, "vault")
+        state_root = os.path.join(base, "state")
+        _, hash16 = CE.project_slug(os.path.realpath(self.workspace))
+        memory_dir = os.path.join(memory_root, "demo-" + hash16, "memory")
+        os.makedirs(memory_dir, exist_ok=True)
+        with open(os.path.join(memory_dir, "MEMORY.md"), "w", encoding="utf-8") as fh:
+            fh.write("- [Hook 续跑](hook-note.md) — stop hook 续跑与 session 绑定\n")
+        with open(os.path.join(memory_dir, "hook-note.md"), "w", encoding="utf-8") as fh:
+            fh.write("---\nname: hook-note\nmetadata:\n  type: project\n---\n"
+                     "- stop hook 续跑必须绑定 session；已验证 exit 2 生效。\n")
+        vault_dir = os.path.join(vault_root, "15-Engineering-Memory", "demo")
+        os.makedirs(vault_dir, exist_ok=True)
+        with open(os.path.join(vault_dir, "hook-session.md"), "w", encoding="utf-8") as fh:
+            fh.write("---\ntype: engineering-memory\nstatus: active\n"
+                     "last_verified: 2026-11-20\n---\n# stop hook 与 session 绑定\n"
+                     "stop hook 续跑：session 绑定后 exit 2 生效，已验证。\n")
+        return {"COPILOT_RECALL_MEMORY_ROOT": memory_root,
+                "COPILOT_RECALL_VAULT_ROOT": vault_root,
+                "COPILOT_RECALL_STATE_DIR": state_root}
+
 
 class ContinuationGateTests(StopGuardBase):
     def test_bound_partial_blocks_stop(self):
@@ -145,23 +172,61 @@ class ContinuationGateTests(StopGuardBase):
         self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
         self.assertIn("A1", proc.stderr, "单项阻塞不能冻结其余可执行工作")
 
-    def test_closed_task_allows_stop(self):
+    def capture_ack(self, *, task_dir: str | None = None, status: str = "done"):
+        return self.run_guard(args=["capture-ack", "--task-dir", task_dir or self.task_dir,
+                                    "--status", status, "--reason", "test"])
+
+    def test_closed_task_requires_one_capture_then_allows(self):
         state = self.state()
         state["closure"] = dict(state.get("closure") or {})
         state["closure"]["closed"] = True
         state["closure"]["closed_at"] = "2026-11-20T00:00:00+00:00"
         self.save(state)
+        before = read_bytes(self.state_path)
+        proc = self.run_guard()
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("copilot-capture-required", proc.stderr)
+        self.assertIn("Capture", proc.stderr)
+        self.assertEqual(read_bytes(self.state_path), before, "Capture 提示不得改写任务状态")
+        ack = self.capture_ack()
+        self.assertEqual(ack.returncode, 0, ack.stdout + ack.stderr)
+        self.assertIn("copilot-capture-ack/v1", ack.stdout)
+        self.assertEqual(read_bytes(self.state_path), before)
         proc = self.run_guard()
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertEqual(proc.stderr.strip(), "")
+        # 重复回执幂等：同一终止版本不会再次要求 Capture。
+        self.capture_ack()
+        proc = self.run_guard()
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
 
-    def test_fully_blocked_task_allows_stop(self):
+    def test_fully_blocked_task_requires_capture_then_allows(self):
         G.add_block(self.state_path, "缺少真机通道授权", "用户启用设备工具",
                     work_items=["A1", "A2"], criteria=["C1", "C2"])
         self.assertEqual(G.evaluate(self.state())["phase"], "BLOCKED")
         proc = self.run_guard()
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("真实阻塞", proc.stderr)
+        self.assertIn("可复用教训", proc.stderr)
+        ack = self.capture_ack(status="skipped")
+        self.assertEqual(ack.returncode, 0, ack.stdout + ack.stderr)
+        proc = self.run_guard()
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertEqual(proc.stderr.strip(), "")
+
+    def test_capture_gate_ignores_closure_before_binding(self):
+        state = self.state()
+        state["closure"] = dict(state.get("closure") or {})
+        state["closure"]["closed"] = True
+        state["closure"]["closed_at"] = "2026-11-19T00:00:00+00:00"
+        self.save(state)
+        # 本会话在收口之后才绑定该任务：不是本会话的成果，不要求补 Capture。
+        payload = {"sessions": [{"session_id": SESSION, "at": "2026-11-20T00:00:00+00:00"}],
+                   "updated": "2026-11-20T00:00:00+00:00"}
+        with open(os.path.join(self.task_dir, "session.json"), "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, ensure_ascii=False)
+        proc = self.run_guard()
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
 
     def test_other_session_task_does_not_block(self):
         # 旧任务/其它窗口的任务：不是靠时间过期，而是本会话没有负责它。
@@ -608,6 +673,19 @@ class SessionStartRecoveryTests(StopGuardBase):
             self.assertIn("不重做", text)
             self.assertLessEqual(len(text), 1600)
 
+    def test_resume_replays_prior_recall_without_search(self):
+        env = self.recall_fixture()
+        proc = self.run_guard(
+            args=["user-prompt"],
+            payload={"cwd": self.workspace, "session_id": SESSION,
+                     "prompt": "帮我修复 stop hook 的 session 绑定问题"},
+            env=env)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        text = self.injected(self.run_session_start(source="resume", env=env))
+        self.assertIn("<copilot-recall-state>", text)
+        self.assertIn("Memory/hook-note.md", text)
+        self.assertIn("不重复检索", text)
+
     def test_startup_and_clear_do_not_inject(self):
         for source in ("startup", "clear"):
             proc = self.run_session_start(source=source)
@@ -757,6 +835,52 @@ class UserPromptHookTests(StopGuardBase):
         state["closure"] = {"closed": True}
         self.save(state)
         proc = self.run_prompt()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "")
+
+    def test_recall_works_without_tasks_dir(self):
+        env = self.recall_fixture()
+        outside = tempfile.TemporaryDirectory()
+        self.addCleanup(outside.cleanup)
+        subprocess.run(["git", "init", "-q"], cwd=outside.name, check=True,
+                       capture_output=True)
+        text = self.injected(self.run_prompt(
+            payload={"cwd": outside.name, "session_id": SESSION,
+                     "prompt": "帮我修复 stop hook 的 session 绑定问题"},
+            env=env))
+        self.assertNotIn("<copilot-task-pointer>", text)
+        self.assertIn("<copilot-recall>", text)
+        self.assertIn("Vault/15-Engineering-Memory/demo/hook-session.md", text)
+        self.assertIn("核验 2026-11-20", text)
+
+    def test_social_prompt_keeps_task_pointer_without_recall(self):
+        env = self.recall_fixture()
+        text = self.injected(self.run_prompt(
+            payload={"cwd": self.workspace, "session_id": SESSION, "prompt": "你好"},
+            env=env))
+        self.assertIn("<copilot-task-pointer>", text)
+        self.assertNotIn("<copilot-recall>", text)
+
+    def test_recall_failure_does_not_break_user_prompt(self):
+        env = self.recall_fixture()
+        env["COPILOT_RECALL_MEMORY_ROOT"] = os.path.join(self.workspace, "missing-mem")
+        env["COPILOT_RECALL_VAULT_ROOT"] = os.path.join(self.workspace, "missing-vault")
+        text = self.injected(self.run_prompt(
+            payload={"cwd": self.workspace, "session_id": SESSION,
+                     "prompt": "帮我修复 stop hook 的 session 绑定问题"},
+            env=env))
+        self.assertIn("<copilot-task-pointer>", text)
+        self.assertNotIn("<copilot-recall>", text)
+
+    def test_marker_off_disables_recall_too(self):
+        env = self.recall_fixture()
+        marker = os.path.join(self.workspace, ".copilot-tasks", ".stop-guard-off")
+        with open(marker, "w", encoding="utf-8") as fh:
+            fh.write("off\n")
+        proc = self.run_prompt(
+            payload={"cwd": self.workspace, "session_id": SESSION,
+                     "prompt": "帮我修复 stop hook 的 session 绑定问题"},
+            env=env)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(proc.stdout.strip(), "")
 

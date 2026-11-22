@@ -93,6 +93,13 @@ POINTER_CLOSE = "</copilot-task-pointer>"
 USER_PROMPT_EVENT = "UserPromptSubmit"
 USER_PROMPT_LIMIT = 1800
 USER_PROMPT_MAX_TASKS = 3
+# 收口/阻塞后的 Capture 提示：只在任务真实终止后要求一次评估，不改变任务状态，
+# 也不把“已提示”当成“已沉淀”。回执按终止版本幂等，重复 Stop 不再重复要求。
+CAPTURE_ACK_FILE = ".capture.json"
+CAPTURE_ACK_SCHEMA = "copilot-capture-ack/v1"
+CAPTURE_PROMPT_LIMIT = 1700
+CAPTURE_STATUSES = ("done", "skipped", "failed")
+CAPTURE_MAX_TARGETS = 2
 
 
 def _env_off() -> bool:
@@ -212,6 +219,189 @@ def _recorded_sessions(task_dir: str) -> tuple[set[str], str]:
     if single:
         ids.add(single)
     return ids, ""
+
+
+def _session_bound_at(task_dir: str, session: str) -> float:
+    """本会话在该任务目录的绑定时间；用于排除“绑定前就已收口”的旧任务。"""
+    path = os.path.join(task_dir, SESSION_FILE)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return 0.0
+    if not isinstance(data, dict):
+        return 0.0
+    stamps: list[float] = []
+    for item in data.get("sessions") or []:
+        if isinstance(item, dict) and str(item.get("session_id") or "") == session:
+            stamps.append(_parse_time(str(item.get("at") or "")))
+    if not stamps and str(data.get("session_id") or "") == session:
+        stamps.append(_parse_time(str(data.get("updated") or "")))
+    return max(stamps or [0.0])
+
+
+def _read_capture_ack(task_dir: str) -> dict:
+    path = os.path.join(task_dir, CAPTURE_ACK_FILE)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _capture_fingerprint(state: dict, phase: str) -> str:
+    closure = state.get("closure") or {}
+    if phase == "CLOSED":
+        return "closed:" + str(closure.get("closed_at") or state.get("updated") or "")
+    return "blocked:" + str(state.get("updated") or "")
+
+
+def _capture_targets(root: str, session: str) -> list[dict]:
+    """本会话负责、已真实终止（收口或阻塞）且尚未写 Capture 回执的任务。"""
+    base = os.path.join(root, TASKS_DIR)
+    try:
+        names = sorted(os.listdir(base))
+    except OSError:
+        return []
+    targets: list[dict] = []
+    for name in names:
+        task_dir = os.path.join(base, name)
+        if not os.path.isdir(task_dir):
+            continue
+        if os.path.exists(os.path.join(task_dir, OFF_MARKER)):
+            continue
+        ids, _ = _recorded_sessions(task_dir)
+        if session not in ids:
+            continue
+        path = os.path.join(task_dir, "state.json")
+        if not os.path.isfile(path):
+            continue
+        try:
+            state = G.load_state(path)
+        except (G.GovernanceError, OSError, ValueError, TypeError):
+            continue
+        if _task_disabled(state):
+            continue
+        closure = state.get("closure") or {}
+        if closure.get("closed"):
+            phase = "CLOSED"
+            terminal_at = _parse_time(str(closure.get("closed_at") or ""))
+            reason = ""
+        else:
+            try:
+                cont = G.continuation(state)
+            except Exception:  # noqa: BLE001 - Capture 提示不是状态权威，异常时跳过
+                continue
+            if str(cont.get("phase") or "") != "BLOCKED":
+                continue
+            phase = "BLOCKED"
+            terminal_at = _parse_time(str(state.get("updated") or ""))
+            reason = str(cont.get("reason") or "")
+        bound_at = _session_bound_at(task_dir, session)
+        # 绑定前就已终止的任务不属于本会话的成果，不要求它补 Capture。
+        if bound_at and terminal_at and terminal_at < bound_at - 60:
+            continue
+        fingerprint = _capture_fingerprint(state, phase)
+        ack = _read_capture_ack(task_dir)
+        if (str(ack.get("schema") or "") == CAPTURE_ACK_SCHEMA
+                and str(ack.get("fingerprint") or "") == fingerprint
+                and str(ack.get("status") or "") in CAPTURE_STATUSES):
+            continue
+        targets.append({
+            "task_id": str(state.get("task_id") or name),
+            "task_dir": task_dir,
+            "state_path": path,
+            "phase": phase,
+            "verdict": str(closure.get("verdict") or ""),
+            "reason": reason,
+            "fingerprint": fingerprint,
+            "updated": str(state.get("updated") or ""),
+        })
+    targets.sort(key=lambda row: _parse_time(row["updated"]), reverse=True)
+    return targets
+
+
+def _capture_text(row: dict, *, root: str, total: int = 1) -> str:
+    """Stop 阶段的一次性 Capture 提示：只提出评估与回执要求，不伪造结论。"""
+    engine = os.path.join(HERE, "context_engine.py")
+    guard = os.path.join(HERE, "copilot_stop_guard.py")
+    state = shlex.quote(row["state_path"])
+    task_dir = shlex.quote(row["task_dir"])
+    phase_text = ("任务已收口" if row["phase"] == "CLOSED"
+                  else "任务处于真实阻塞（不是完成）")
+    verdict = f" · verdict {row['verdict']}" if row["verdict"] else ""
+    lines = [
+        "<copilot-capture-required>",
+        f"{phase_text}（本地状态只读判定，不是新的完成证明）：{row['task_id']}"
+        f"{verdict} · 回执键 {row['fingerprint']}",
+        "本轮 Stop 不结束，因为还欠一次【Capture 评估】；不是继续开发，也不改变任务状态。",
+        "1) 只沉淀已验证、可复用、跨会话有价值的内容；过程日志、未验证推测、"
+        "一次性状态不写。",
+        "2) 项目 Memory：仅当结论会影响后续会话时，更新 `MEMORY.md` 指针 + 同目录"
+        "卡片（一事实一卡，简短）。",
+        "3) Vault：先生成候选草稿（只写任务目录，不写正式区）：",
+        f"   python3 -B {shlex.quote(engine)} capture --workspace {shlex.quote(root)}"
+        f" --state {state} --keywords '<词1|词2>' --title '<标题>'",
+        "   再按 knowledge-manager 的 Evaluate/Capture 处理候选；正式卡写入需用户授权，"
+        "不得自行正式化。",
+        "4) 去重：先查同主题既有卡，优先更新/纠错；冲突标注现场证据；敏感信息不写入。",
+        "5) 完成后写回执（幂等键见上）：",
+        f"   python3 -B {shlex.quote(guard)} capture-ack --task-dir {task_dir}"
+        " --status done|skipped|failed --artifact '<路径>' --reason '<一句话>'",
+        "   无沉淀价值 → status=skipped 并说明；评估失败 → failed，不得伪造 done。",
+    ]
+    if row["phase"] == "BLOCKED":
+        lines.insert(3, "   阻塞任务只沉淀原因、解除条件与可复用教训；不声称已完成。")
+    if total > 1:
+        lines.append(f"- 另有 {total - 1} 个本会话终止任务待评估；本次先处理这一个。")
+    lines.append("</copilot-capture-required>")
+    text = "\n".join(lines)
+    if len(text) <= CAPTURE_PROMPT_LIMIT:
+        return text
+    return text[:CAPTURE_PROMPT_LIMIT - 16] + "\n...（已截断）"
+
+
+def cmd_capture_ack(args) -> int:
+    """写 Capture 回执：幂等键绑定任务当前终止版本；不改任务状态。"""
+    task_dir = os.path.abspath(args.task_dir)
+    state_path = os.path.join(task_dir, "state.json")
+    try:
+        state = G.load_state(state_path)
+    except (G.GovernanceError, OSError, ValueError, TypeError) as exc:
+        print(json.dumps({"ok": False, "error": f"{type(exc).__name__}: {exc}"},
+                         ensure_ascii=False))
+        return 2
+    closure = state.get("closure") or {}
+    phase = "CLOSED" if closure.get("closed") else "BLOCKED"
+    status = str(args.status or "").strip().lower()
+    if status not in CAPTURE_STATUSES:
+        print(json.dumps({"ok": False,
+                          "error": "status 必须是 done|skipped|failed"},
+                         ensure_ascii=False))
+        return 2
+    payload = {
+        "schema": CAPTURE_ACK_SCHEMA,
+        "task_id": str(state.get("task_id") or os.path.basename(task_dir)),
+        "trigger": phase,
+        "fingerprint": _capture_fingerprint(state, phase),
+        "status": status,
+        "artifact": str(args.artifact or ""),
+        "reason": str(args.reason or ""),
+        "at": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
+    }
+    path = os.path.join(task_dir, CAPTURE_ACK_FILE)
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(payload, ensure_ascii=False, indent=1) + "\n")
+        os.replace(tmp, path)
+    except OSError as exc:
+        print(json.dumps({"ok": False, "error": f"{type(exc).__name__}: {exc}"},
+                         ensure_ascii=False))
+        return 2
+    print(json.dumps({"ok": True, **payload}, ensure_ascii=False))
+    return 0
 
 
 def _unmet_criteria(state: dict) -> list[str]:
@@ -513,6 +703,12 @@ def _check() -> int:
             if anomalies:
                 _log(2, root, note="anomaly", session=session)
                 return _block(_anomaly_reason(anomalies))
+            targets = _capture_targets(root, session)
+            if targets:
+                _log(2, root, task_id=targets[0]["task_id"], session=session,
+                     note=f"capture-required:{targets[0]['phase']}:{len(targets)}")
+                return _block(_capture_text(targets[0], root=root,
+                                            total=len(targets)))
             _log(0, root, note=f"out-of-scope:{len(rows)}", session=session)
             return 0
     else:
@@ -737,6 +933,27 @@ def _session_start_text(rows: list[dict], anomalies: list[dict] | None = None,
     return "\n".join(kept + ["...（已截断）", SESSION_START_CLOSE])
 
 
+def _recall_snapshot(session: str, root: str) -> str:
+    """resume/compact 时重放本会话已召回的精简结论，不重新检索。"""
+    try:
+        import prompt_recall as PR
+    except Exception:  # noqa: BLE001 - 可选能力
+        return ""
+    try:
+        lines = PR.session_recall_lines(session, root, limit=2)
+    except Exception:  # noqa: BLE001 - 恢复注入优先
+        return ""
+    if not lines:
+        return ""
+    text = "\n".join([
+        "<copilot-recall-state>",
+        "本会话已进入过上下文的历史召回（恢复后直接复用，不重复检索）：",
+        *lines,
+        "</copilot-recall-state>",
+    ])
+    return text[:700]
+
+
 def cmd_session_start() -> int:
     """SessionStart 钩子模式：只读恢复快照；任何异常都放行且不注入。
 
@@ -783,6 +1000,10 @@ def cmd_session_start() -> int:
                      session=session)
                 return 0
             text = _session_start_text(bound, bound_anomalies, root=root)
+            if source in SESSION_START_SOURCES:
+                snapshot = _recall_snapshot(session, root)
+                if snapshot:
+                    text = text + "\n" + snapshot
             _log(0, root, task_id=bound[0]["task_id"] if bound else "",
                  session=session, note=f"session-start-inject:{source}")
             print(json.dumps({"hookSpecificOutput": {
@@ -798,6 +1019,10 @@ def cmd_session_start() -> int:
             _log(0, root, note="session-start-no-open-task", session=session)
             return 0
         text = _pointer_text(all_rows, all_anomalies, session=session)
+        if source in SESSION_START_SOURCES:
+            snapshot = _recall_snapshot(session, root)
+            if snapshot:
+                text = text + "\n" + snapshot
         _log(0, root, task_id=all_rows[0]["task_id"], session=session,
              note=f"session-start-pointer:{source}:{len(all_rows)}")
         print(json.dumps({"hookSpecificOutput": {
@@ -810,8 +1035,24 @@ def cmd_session_start() -> int:
         return 0
 
 
+def _recall_block(payload: dict) -> tuple[str, str]:
+    """工程任务首轮的有界召回。可选能力：缺失/失败都只返回空块。"""
+    try:
+        import prompt_recall as PR
+    except Exception:  # noqa: BLE001 - 召回不是守卫的必需依赖
+        return "", "module-missing"
+    try:
+        outcome = PR.maybe_inject(payload)
+    except Exception as exc:  # noqa: BLE001 - 召回失败不得影响用户回合
+        return "", f"error:{type(exc).__name__}"
+    return str(outcome.get("text") or ""), str(outcome.get("reason") or "")
+
+
 def cmd_user_prompt() -> int:
-    """UserPromptSubmit 钩子模式：逐回合提示未闭合任务；任何异常都放行。"""
+    """UserPromptSubmit 钩子模式：逐回合提示未闭合任务 + 工程任务首轮召回。
+
+    任何异常都放行；`.stop-guard-off`/环境变量关闭时两部分都不注入。
+    """
     try:
         if _env_off():
             _log(0, "", note="user-prompt-env-off")
@@ -820,20 +1061,27 @@ def cmd_user_prompt() -> int:
         if payload_error:
             _log(0, "", note="user-prompt-payload-error")
             return 0
+        session = _session_from(payload)
         start = _cwd_from_payload(payload)
         root = find_tasks_root(start)
-        if not root:
-            _log(0, start, note="user-prompt-no-tasks-dir")
+        if root and os.path.exists(os.path.join(root, TASKS_DIR, OFF_MARKER)):
+            _log(0, root, note="user-prompt-marker-off", session=session)
             return 0
-        if os.path.exists(os.path.join(root, TASKS_DIR, OFF_MARKER)):
-            _log(0, root, note="user-prompt-marker-off")
+        recall_text, recall_note = _recall_block(payload)
+        task_text = ""
+        tasks_n = 0
+        if root:
+            rows, anomalies = collect(root, session="", include_open=True)
+            if rows:
+                task_text = _user_prompt_text(rows, anomalies, session=session)
+                tasks_n = len(rows)
+        if not task_text and not recall_text:
+            _log(0, root or start, session=session,
+                 note=f"user-prompt-skip:tasks={tasks_n}:recall={recall_note}")
             return 0
-        rows, anomalies = collect(root, session="", include_open=True)
-        if not rows:
-            _log(0, root, note="user-prompt-no-open-task")
-            return 0
-        text = _user_prompt_text(rows, anomalies, session=_session_from(payload))
-        _log(0, root, task_id=rows[0]["task_id"], note=f"user-prompt-inject:{len(rows)}")
+        text = "\n".join(part for part in (task_text, recall_text) if part)
+        _log(0, root or start, task_id="", session=session,
+             note=f"user-prompt-inject:tasks={tasks_n}:recall={recall_note}")
         print(json.dumps({"hookSpecificOutput": {
             "hookEventName": USER_PROMPT_EVENT,
             "additionalContext": text,
@@ -1123,7 +1371,13 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("session-start",
                    help="SessionStart 恢复注入（resume|compact 快照；startup 只给指针）")
     sub.add_parser("user-prompt",
-                   help="UserPromptSubmit 逐回合提示未闭合任务（只读、失败放行）")
+                   help="UserPromptSubmit 逐回合提示未闭合任务并注入有界召回（只读、失败放行）")
+    p_ack = sub.add_parser("capture-ack",
+                           help="写入收口/阻塞后的 Capture 回执（幂等，不改任务状态）")
+    p_ack.add_argument("--task-dir", required=True)
+    p_ack.add_argument("--status", required=True, choices=CAPTURE_STATUSES)
+    p_ack.add_argument("--artifact", default="")
+    p_ack.add_argument("--reason", default="")
     p_config = sub.add_parser("config", help="打印 Stop/SessionStart/UserPromptSubmit 钩子配置片段")
     p_config.add_argument("--workspace", default="")
     p_install = sub.add_parser("install", help="把守卫写入工作区/用户级配置")
@@ -1151,6 +1405,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_session_start()
     if args.command == "user-prompt":
         return cmd_user_prompt()
+    if args.command == "capture-ack":
+        return cmd_capture_ack(args)
     if args.command == "status":
         return cmd_status(args)
     if args.command == "config":
