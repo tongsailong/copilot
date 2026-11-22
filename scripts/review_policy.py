@@ -968,8 +968,8 @@ def sol_event_snapshot(state: dict) -> dict:
     """事件判据的确定性快照，用于与上次认知调用比较是否出现新的认知对象。
 
     只使用状态里已有的可归因事实：台账中复现的 finding、曾经 met 又被回退的
-    条件、重规划工作项、显式登记的决策（新增即为新的决策窗口）、合同指纹、风险
-    等级、重开次数。它不读 history、不解析自由文本，也不把证据数量当作认知价值。
+    条件、重规划工作项、显式登记的决策、阻塞状态与重复失败阶段、合同指纹、风险
+    等级、重开次数。它不读 history，也不把普通步骤或证据数量当作认知价值。
     """
     ledger = state.get("finding_ledger") or {}
     regressed = sorted(
@@ -990,6 +990,43 @@ def sol_event_snapshot(state: dict) -> dict:
         str(item.get("decision_id") or f"D{index + 1}")
         for index, item in enumerate(state.get("decisions") or [])
         if isinstance(item, dict))
+    # Block facts are normalized and keyed by stable block ID. Status transitions
+    # (active, changed reason/needs, resolved) are compared to the last SOL snapshot.
+    blocks = []
+    for item in state.get("blocks") or []:
+        if not isinstance(item, dict):
+            continue
+        block_id = _text(item.get("block_id"))
+        if not block_id:
+            continue
+        blocks.append({
+            "block_id": block_id,
+            "scope": _text(item.get("scope")),
+            "work_items": sorted(set(_text(value) for value in
+                                      item.get("work_items") or [] if _text(value))),
+            "criteria": sorted(set(_text(value) for value in
+                                   item.get("criteria") or [] if _text(value))),
+            "reason": " ".join(_text(item.get("reason")).split()),
+            "needs": " ".join(_text(item.get("needs")).split()),
+            "active": not bool(item.get("resolved_at")),
+        })
+    blocks.sort(key=lambda item: item["block_id"])
+    # Failures are bucketed by episode, not raw retry count, to avoid firing on
+    # every retry. Rerun starts a new episode; the 2nd and 3rd+ failures matter.
+    failures = []
+    for item in state.get("actions") or []:
+        if not isinstance(item, dict):
+            continue
+        streak = max(0, int(item.get("fail_streak") or 0))
+        if streak < 2:
+            continue
+        failures.append({
+            "id": _text(item.get("id")),
+            "episode": max(0, int(item.get("rerun_count") or 0)),
+            "bucket": "2" if streak == 2 else "3+",
+            "status": _text(item.get("status")),
+        })
+    failures.sort(key=lambda item: (item["id"], item["episode"]))
     reopen_seq = len((state.get("closure") or {}).get("reopen_history") or [])
     risk = _text(state.get("risk")).lower()
     return {
@@ -997,6 +1034,8 @@ def sol_event_snapshot(state: dict) -> dict:
         "met": met,
         "replans": replans,
         "decisions": decisions,
+        "blocks": blocks,
+        "failures": failures,
         "contract_sha256": _text(state.get("contract_sha256")),
         "risk": "medium" if risk == "normal" else risk,
         "reopen_seq": reopen_seq,
@@ -1048,6 +1087,39 @@ def sol_events(state: dict, snapshot: dict, last: dict | None) -> list[dict]:
             "detail": "；".join(parts),
             "facts": {"regressed": new_regressed,
                       "invalidated": sorted(invalidated)},
+        })
+    previous_blocks = {str(item.get("block_id")): item
+                       for item in previous.get("blocks") or []
+                       if isinstance(item, dict) and item.get("block_id")}
+    block_changes = []
+    for current in snapshot.get("blocks") or []:
+        block_id = str(current.get("block_id") or "")
+        old = previous_blocks.get(block_id)
+        if old is None or old != current:
+            block_changes.append(current)
+    if block_changes:
+        rows.append({
+            "code": "blockage-change",
+            "instance": sha256_text(canonical_json(block_changes))[:16],
+            "detail": "阻塞状态发生实质变化：" + "、".join(
+                item["block_id"] for item in block_changes),
+            "facts": {"blocks": block_changes},
+        })
+    previous_failures = {str(item.get("id")) + ":" +
+                         str(item.get("episode")): item
+                         for item in previous.get("failures") or []
+                         if isinstance(item, dict)}
+    new_failures = [item for item in snapshot.get("failures") or []
+                    if previous_failures.get(
+                        str(item.get("id")) + ":" +
+                        str(item.get("episode"))) != item]
+    if new_failures:
+        rows.append({
+            "code": "repeated-work-failure",
+            "instance": sha256_text(canonical_json(new_failures))[:16],
+            "detail": "工作项进入重复失败阶段：" + "、".join(
+                item["id"] for item in new_failures),
+            "facts": {"failures": new_failures},
         })
     new_decisions = _new_items(snapshot["decisions"],
                                list(previous.get("decisions") or []))
@@ -1454,7 +1526,11 @@ def sol_advice(state: dict, *, calls: list[dict] | None = None,
             "action": "consult", "recommended_action": "recommended",
             "mode": "CONSULT", "phase": "stage", "stage": "stage",
             "family": "D", "event": "milestone", "level": "recommended",
-            "instance": progress_key[:16],
+            # A stage window is stable for one contract/reopen cycle. Routine
+            # action, evidence, or criterion updates must not mint a new D.
+            "instance": sha256_text(canonical_json([
+                snapshot["contract_sha256"], snapshot["reopen_seq"],
+                "milestone"]))[:16],
             "question": question_for("milestone", base),
             "reason": (f"{level} 复杂任务已完成 {done} 个工作项：在阶段边界做一次"
                        "成果复盘（是否偏离目标、未解决问题与下一阶段方向）；"

@@ -1039,7 +1039,9 @@ def _invoke_sol_once(*, state_path: str, task_dir: str, prompt: str,
                 state_path, mode=mode, error_code=exc.code, detail=exc.detail,
                 materials_sha256=digest, model=SR.MODEL,
                 obligation_id=str(getattr(args, "obligation_id", "") or ""),
-                stage=stage)
+                stage=stage,
+                request_attempted=bool(getattr(exc, "request_attempted", True)),
+                send_observed=str(getattr(exc, "send_observed", "unknown")))
             print(f"SOL {mode} 失败 [{exc.code}]：{exc.detail or ''}",
                   file=sys.stderr)
             if mode == "REVIEW":
@@ -1368,6 +1370,8 @@ def _run_sol_channel(args, mode: str) -> int:
             "reasoning_mode": result.get("reasoning_mode"),
             "reasoning_resolved": result.get("reasoning_resolved"),
             "reasoning_verified": result.get("reasoning_verified"),
+            "request_attempted": result.get("request_attempted"),
+            "send_observed": result.get("send_observed", "unknown"),
             # 只保留路由摘要：不回显 userinfo、查询参数或凭据。
             "endpoint": SR.resolve_base_url() + SR.ENDPOINT,
             "materials_sha256": result["materials_sha256"],
@@ -1511,6 +1515,7 @@ def cmd_sol_accept(args) -> int:
         delta=args.delta or "",
         evidence_refs=args.evidence_ref or [],
         source_refs=args.source_ref or [],
+        work_item_refs=getattr(args, "work_item_ref", None) or [],
         evidence_note=args.evidence_note or "",
         decided_by=args.decided_by or "zcode")
     if args.json:
@@ -1533,6 +1538,10 @@ def cmd_sol_accept(args) -> int:
             print("提示（非阻断，不影响登记与任务推进）：")
             for hint in result["hints"]:
                 print(f"- {hint}")
+        work_items = entry.get("work_item_resolution") or {}
+        print("工作项交叉引用（非因果/非完成证明）：" + "，".join([
+            "已登记 " + ("、".join(work_items.get("linked") or []) or "无"),
+            "待核 " + ("、".join(work_items.get("unresolved") or []) or "无")]))
         print("说明：这是主代理对建议的事实判断记录；不是用户授权，也不改变 G1–G3。")
     return 0
 
@@ -2391,6 +2400,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="关联本任务已登记证据编号；可重复或逗号分隔（E1,E3）")
     p.add_argument("--source-ref", action="append", default=[],
                    help="报告章节/文件路径等来源定位（只记录，不做证据核验）")
+    p.add_argument("--work-item-ref", action="append", default=[],
+                   help="可选工作项交叉引用（不代表因果或完成证明）")
     p.add_argument("--evidence-note", default="", help="证据补充说明")
     p.add_argument("--decided-by", default="zcode")
     p.add_argument("--json", action="store_true")

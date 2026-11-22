@@ -697,6 +697,15 @@ def _usage(record: dict) -> dict:
         return {"tokens": 0, "input_tokens": 0, "output_tokens": 0}
 
 
+def _percentile(values: list[int], fraction: float) -> int | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    index = max(0, min(len(ordered) - 1,
+                       int((len(ordered) - 1) * fraction + 0.5)))
+    return ordered[index]
+
+
 def _window_covered(rows: dict) -> int:
     """任务级窗口的覆盖计数：每个任务/窗口最多计 1 次（满足＝执行或复用）。
 
@@ -719,6 +728,15 @@ def task_stats(state: dict) -> dict:
              if isinstance(item, dict)]
     completed = [item for item in calls if item.get("status") == "completed"]
     failed_calls = [item for item in calls if item.get("status") == "failed"]
+    request_attempted = [item for item in calls
+                         if item.get("request_attempted") is True]
+    response_received = [item for item in calls
+                         if item.get("send_observed") == "response_received"]
+    send_unknown = [item for item in calls
+                    if item.get("request_attempted") is True
+                    and item.get("send_observed") == "unknown"]
+    send_not_attempted = [item for item in calls
+                          if item.get("request_attempted") is False]
     admission = RP.plan_admission(
         state, triggers=[_text(t.get("name"))
                          for t in state.get("admission_triggers") or []
@@ -812,8 +830,9 @@ def task_stats(state: dict) -> dict:
         else:
             acceptance["unrecorded"] += 1
     tokens = sum(_usage(item)["tokens"] for item in completed)
-    latency = [float((item.get("acceptance") or {}).get("latency_s") or 0)
-               for item in completed]
+    latency = [float(item.get("latency_ms") or 0)
+               for item in completed if item.get("latency_ms")]
+    ordered_latency = sorted(latency)
     return {
         "task_id": _text(state.get("task_id")),
         "eligible": bool(non_simple),
@@ -828,12 +847,22 @@ def task_stats(state: dict) -> dict:
         "by_event": by_event,
         "coverage": coverage,
         "calls": {"completed": len(completed), "failed": len(failed_calls),
-                  "total": len(calls)},
+                  "total": len(calls),
+                  "request_attempted": len(request_attempted),
+                  "response_received": len(response_received),
+                  "send_unknown": len(send_unknown),
+                  "not_attempted": len(send_not_attempted),
+                  "transport_observation_missing": len(calls) - len(
+                      request_attempted) - len(send_not_attempted)},
         "acceptance": acceptance,
         "usage": {"total_tokens": tokens,
                   "recorded_calls": len([i for i in completed
                                          if _usage(i)["tokens"]]),
-                  "latency_ms_recorded": len([v for v in latency if v])},
+                  "latency_ms_recorded": len(ordered_latency),
+                  "latency_ms_p50": _percentile(
+                      [int(value) for value in ordered_latency], 0.50),
+                  "latency_ms_p95": _percentile(
+                      [int(value) for value in ordered_latency], 0.95)},
     }
 
 
@@ -870,6 +899,9 @@ def stats(states: list[dict], *, scope: str = "") -> dict:
     for detail in details:
         for code, count in detail["by_event"].items():
             by_event[code] = by_event.get(code, 0) + count
+    call_keys = ("completed", "failed", "total", "request_attempted",
+                 "response_received", "send_unknown", "not_attempted",
+                 "transport_observation_missing")
     return {
         "schema": STATS_SCHEMA,
         "scope": scope,
@@ -877,9 +909,7 @@ def stats(states: list[dict], *, scope: str = "") -> dict:
         "coverage": coverage,
         "by_event": dict(sorted(by_event.items())),
         "calls": {
-            "completed": sum(d["calls"]["completed"] for d in details),
-            "failed": sum(d["calls"]["failed"] for d in details),
-            "total": sum(d["calls"]["total"] for d in details),
+            key: sum(d["calls"][key] for d in details) for key in call_keys
         },
         "acceptance": {
             key: sum(d["acceptance"][key] for d in details)
@@ -889,6 +919,20 @@ def stats(states: list[dict], *, scope: str = "") -> dict:
             "total_tokens": sum(d["usage"]["total_tokens"] for d in details),
             "recorded_calls": sum(d["usage"]["recorded_calls"]
                                   for d in details),
+            "latency_ms_recorded": sum(d["usage"]["latency_ms_recorded"]
+                                       for d in details),
+            "latency_ms_p50": _percentile([
+                int(item.get("latency_ms") or 0)
+                for state in states
+                for item in state.get("sol_calls") or []
+                if isinstance(item, dict) and item.get("status") == "completed"
+                and item.get("latency_ms")], 0.50),
+            "latency_ms_p95": _percentile([
+                int(item.get("latency_ms") or 0)
+                for state in states
+                for item in state.get("sol_calls") or []
+                if isinstance(item, dict) and item.get("status") == "completed"
+                and item.get("latency_ms")], 0.95),
         },
         "tasks": details,
         "notes": [
@@ -901,5 +945,8 @@ def stats(states: list[dict], *, scope: str = "") -> dict:
             "执行/复用/跳过的分项仍完整保留在 by_family，用于解释“覆盖了几次”。",
             "漏调（missed）＝窗口关闭时仍未执行且无有效复用；in_flight 单列为未决。",
             "not_registered 表示“应当登记却没有义务记录”，与“已登记未执行”不同。",
+            "calls 是状态台账记录数，不等价于 HTTP 请求数；request_attempted 只表示进入 transport，"
+            "response_received 表示收到了 HTTP 响应，send_unknown 不推断请求字节是否出站；"
+            "历史记录缺观测字段单列，不从成功/失败补造。",
         ],
     }

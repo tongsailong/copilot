@@ -323,6 +323,23 @@ class HandoffTests(SolFirstBase):
                           "pending": 0})
         self.assertEqual(metrics["adopted"], 2)
 
+    def test_acceptance_allows_optional_work_item_cross_references(self):
+        self.start(kind="feature")
+        self.plan(1)
+        call = self.record("CONSULT")
+        result = G.record_sol_acceptance(
+            self.state_path, G.sol_call_id(call), status="accepted",
+            decision="先实现 A1", rationale="与调查结论一致",
+            work_item_refs=["A1", "A-missing"])
+        entry = result["acceptance"]
+        self.assertEqual(entry["work_item_refs"], ["A1"])
+        self.assertEqual(entry["work_item_resolution"], {
+            "linked": ["A1"], "unresolved": ["A-missing"]})
+        self.assertNotEqual(G.evaluate(G.load_state(self.state_path))["phase"],
+                            "BLOCKED")
+        self.assertEqual(G.review_metrics(G.load_state(self.state_path))
+                         ["sol_cognitive"]["acceptance"]["accepted"], 1)
+
     def test_acceptance_requires_completed_call(self):
         self.start(kind="feature")
         failed = G.record_sol_call_failure(
@@ -484,6 +501,20 @@ class AcceptanceEvidenceTests(SolFirstBase):
         quality = self.quality()
         self.assertEqual(quality["archived_records"], 1)
         self.assertEqual(quality["evidence_linked"], 0)
+
+    def test_work_item_refs_are_optional_and_unresolved_is_nonblocking(self):
+        self.start(kind="feature")
+        self.plan(1)
+        call = self.record("CONSULT")
+        result = self.accept(
+            call, status="accepted", decision="沿计划推进",
+            rationale="当前证据支持", work_item_refs=["A1", "A9"])
+        resolution = result["acceptance"]["work_item_resolution"]
+        self.assertEqual(resolution,
+                         {"linked": ["A1"], "unresolved": ["A9"]})
+        self.assertEqual(self.quality()["records"], 1)
+        self.assertNotEqual(G.evaluate(G.load_state(self.state_path))["phase"],
+                            "BLOCKED")
 
     def test_invalid_evidence_id_is_rejected(self):
         self.start(kind="feature")
@@ -650,10 +681,11 @@ class BoundaryTests(SolFirstBase):
         self.record("CONSULT")
         self.plan(2)
         self.evidence()
+        self.record("PLAN")
         G.add_block(self.state_path, "缺少发布授权", "用户授权",
                     work_items=["A2"])
         advice = self.advice()
-        self.assertEqual(advice["action"], "plan")
+        self.assertIn(advice["action"], ("reuse", "consult"))
         self.assertNotIn("BLOCKED", advice["reason"])
 
     def test_task_level_block_stops_new_sol_calls(self):
@@ -701,6 +733,23 @@ class BoundaryTests(SolFirstBase):
         self.assertEqual(requested["mode"], "REVIEW")
         self.assertIn("sol-review", requested["command"])
         self.assertIn("用户明确要求", requested["reason"])
+
+    def test_run_sol_marks_received_response_but_does_not_claim_wire_bytes(self):
+        reply = {
+            "id": "resp-test", "status": "completed", "model": SR.MODEL,
+            "reasoning": {"effort": "high", "mode": "standard"},
+            "usage": {"total_tokens": 3},
+            "output": [{"type": "message", "content": [
+                {"type": "output_text", "text": json.dumps({
+                    "schema": SR.THINK_SCHEMA, "judgment": "保留最小改动",
+                    "goal_understanding": "完成调用闭环"}, ensure_ascii=False)}]}],
+        }
+        result = SR.run_sol(
+            "材料", mode="CONSULT", api_key="dummy",
+            base_url="http://127.0.0.1:8317/v1",
+            transport=lambda *_args: dict(reply))
+        self.assertTrue(result["request_attempted"])
+        self.assertEqual(result["send_observed"], "response_received")
 
     def test_g1_g3_are_unaffected_by_cognitive_calls(self):
         self.start(risk="medium", kind="standard")
