@@ -389,9 +389,12 @@ BLOCKED 表示**不能正常收口或继续受阻动作**，不表示无法记�
   `sol-consult/<call_id>.raw.txt`、`sol-plans/<call_id>.raw.txt` 或
   `sol-reviews/<call_id>.raw.txt`；审计统一写 `sol-audit.jsonl`（三模式共用，只记脱敏元数据：
   材料/请求/回复摘要、模型、推理强度回显、请求/追踪 ID、usage、耗时、错误码），不记正文与
-  凭据。三模式共用同一把 `.sol.lock`。采纳结论由 `sol-accept` 回填，属于主代理的事实判断，
-  不是用户授权，也不改变门禁；v9.1 起记录含 `decision`/`rationale`/`delta`/
-  `evidence_resolution`（linked/unresolved/archived）与 `advice_ref`，缺项只给非阻断提示。
+  凭据。状态 `calls` 计数是台账记录，不等价 HTTP 请求数；`request_attempted` 表示进入 transport，
+  `response_received` 表示收到 HTTP 响应，异常时 `send_observed=unknown`，不推断字节已出站；
+  历史缺失字段明确单列。三模式共用同一把 `.sol.lock`。采纳结论由 `sol-accept` 回填，属于主代理的事实判断，
+  不是用户授权，也不改变门禁；记录含 `decision`/`rationale`/`delta`/`evidence_resolution` /
+  `advice_ref`，可选 `work_item_refs` 与解析状态仅供交叉追踪，不表示因果或完成证明，不作为门禁；
+  缺项只给非阻断提示。
   历史任务状态里的 `sol_reviews` / `sol_advisories` 继续
   **只读兼容**：`--list`、`review-metrics`、`review-admission` 与单轮复用都会合并读取，
   历史 CONSULT / PLAN / THINK 记录按 CONSULT 计入覆盖，不迁移、不改写、不重复计数。
@@ -506,7 +509,7 @@ verify 的结构化质量报告（`copilot-verify-result/v1`）走报告接入�
 | A 任务启动 | 非简单任务默认一次 CONSULT：目标与隐含需求、问题本质、关键矛盾、初步策略、主要风险、调查方向 | `sol-consult --stage understanding` |
 | B 调查之后 | 已形成现场事实且存在实质方案决策（方案类任务类型 / 声明触发 / 中高复杂 / ≥2 工作项任一）建议一次 PLAN：方案比较、取舍、优先级、阶段目标。单工作项任务只要命中任一条件同样适用 | `sol-plan --stage planning` |
 | C 执行期动态 | 出现六类可归因事件之一时追加 CONSULT：实质证据变化（finding 复现、条件回退）、决策点（新登记决策）、风险升级、重规划、合同实质修订（scope-changed）、任务重开；普通证据追加、备注变化、常规步骤推进不触发 | `sol-consult --stage development --force --trigger ...` |
-| D 阶段复盘 | medium/high 任务完成 ≥2 个工作项（或 ≥1 项且已核销条件）后做一次成果复盘：是否偏离目标、未解决问题、下一阶段方向（`recommended`，同一进度只一次） | `sol-consult --stage stage` |
+| D 阶段复盘 | medium/high 任务完成 ≥2 个工作项（或 ≥1 项且已核销条件）后做阶段成果复盘；同一合同与重开周期共用一个稳定窗口，普通工作项/证据/条件进展不反复制造新 D 义务（`recommended`） | `sol-consult --stage stage` |
 | E 收口判断 | 有实质进展的非简单任务在最终工程验证完成后（工作项终态、条件核销、证据与合同必要测试齐备）、G1–G3 收口之前做一次综合判断：目标达成、重要遗漏与剩余风险；工程验收仍由 ZCode 完成 | `sol-consult --stage closure` |
 
 - **没有硬性调用次数或 Token 上限**：重大新证据、实质策略变化、方案失败、新风险都可以
@@ -576,7 +579,9 @@ verify 的结构化质量报告（`copilot-verify-result/v1`）走报告接入�
 合同修订后旧合同下未执行的义务显式记为 `skipped/contract-amended`（不进入新分母，但仍披露）。
 
 **覆盖率（观测，不是门禁）**：`sol-stats --state S` 或 `sol-stats --workspace W` 输出
-`copilot-sol-stats/v1`，分母显式且只含适用窗口：启动（非简单任务）、PLAN（按
+`copilot-sol-stats/v1`，calls 明确拆出台账 completed/failed/total、进入 transport 的尝试、收到响应、
+发送状态未知、未尝试与历史缺观测；Token 与 latency_ms P50/P95 只基于实际记录，缺样本为 null/0 并披露记录数。
+分母显式且只含适用窗口：启动（非简单任务）、PLAN（按
 `plan_admission` 判定适用）、收口（有实质进展且中/高复杂或高风险的非简单任务）、事件（每出现一次
 构成一个窗口）。统计区分建议 / 执行 / 复用 / 跳过 / 失败 / 漏调 / 未登记
 （`not_registered`），以及采纳 `accepted|modified|rejected`、tokens 与延迟（缺失标

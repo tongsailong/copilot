@@ -4622,11 +4622,35 @@ def _acceptance_warnings(entry: dict, resolution: dict,
     return codes
 
 
+def _normalize_acceptance_work_item_refs(state: dict, refs) -> dict:
+    """Resolve optional work-item cross-references without implying causality."""
+    known = {str(item.get("id") or ""): item
+             for item in state.get("actions") or [] if isinstance(item, dict)}
+    linked: list[str] = []
+    unresolved: list[str] = []
+    for raw in refs or []:
+        if raw is None:
+            continue
+        for piece in str(raw).split(","):
+            aid = piece.strip()
+            if not aid:
+                continue
+            if len(aid) > 100 or any(ord(char) < 32 for char in aid):
+                raise GovernanceError("工作项引用格式非法。")
+            target = linked if aid in known else unresolved
+            if aid not in target:
+                target.append(aid)
+    if len(linked) + len(unresolved) > 50:
+        raise GovernanceError("工作项引用过多（最多 50 条）。")
+    return {"linked": linked, "unresolved": unresolved}
+
+
 def record_sol_acceptance(path: str, call_id: str, *, status: str,
                           note: str = "", reason: str = "",
                           decision: str = "", rationale: str = "",
                           delta: str = "", evidence_refs: list | None = None,
                           source_refs: list | None = None,
+                          work_item_refs: list | None = None,
                           evidence_note: str = "",
                           decided_by: str = "zcode") -> dict:
     """回填主代理对 SOL 建议的采纳结论（accepted / modified / rejected）。
@@ -4650,6 +4674,7 @@ def record_sol_acceptance(path: str, call_id: str, *, status: str,
         raise GovernanceError("只能对已完成的 SOL 调用登记采纳结论。")
     refs = _normalize_acceptance_evidence_refs(evidence_refs)
     sources = _normalize_acceptance_source_refs(source_refs)
+    work_items = _normalize_acceptance_work_item_refs(state, work_item_refs)
     resolution = resolve_acceptance_evidence(state, refs)
     previous = record.get("acceptance")
     if not isinstance(previous, dict):
@@ -4666,6 +4691,8 @@ def record_sol_acceptance(path: str, call_id: str, *, status: str,
         "evidence_refs": refs,
         "evidence_resolution": resolution,
         "source_refs": sources,
+        "work_item_refs": work_items["linked"],
+        "work_item_resolution": work_items,
         "evidence_note": str(evidence_note or "").strip()[:2000],
         "advice_ref": _acceptance_advice_ref(record),
         "decided_by": str(decided_by or "zcode")[:40],
@@ -4687,6 +4714,8 @@ def record_sol_acceptance(path: str, call_id: str, *, status: str,
         "decision_recorded": bool(entry["decision"]),
         "rationale_recorded": bool(entry["rationale"]),
         "evidence_refs": list(refs),
+        "work_item_refs": list(work_items["linked"]),
+        "work_item_resolution": dict(work_items),
         "evidence_status": acceptance_evidence_status(entry),
         "warnings": list(entry["warnings"]),
         "acceptance": dict(entry),
@@ -4761,7 +4790,8 @@ def record_sol_call_failure(path: str, *, mode: str = "CONSULT",
                             error_code: str = "", detail: str = "",
                             materials_sha256: str = "",
                             model: str = "", obligation_id: str = "",
-                            stage: str = "") -> dict:
+                            stage: str = "", request_attempted: bool = True,
+                            send_observed: str = "unknown") -> dict:
     """登记一次失败的 SOL 调用；失败不改变任务阶段，也不阻断主代理继续。"""
     state = load_state(path)
     resolved = str(mode or "CONSULT").upper()
@@ -4778,6 +4808,10 @@ def record_sol_call_failure(path: str, *, mode: str = "CONSULT",
         "error": str(error_code or "sol_error"),
         "detail": str(detail or "")[:2000],
         "materials_sha256": str(materials_sha256 or ""),
+        "request_attempted": bool(request_attempted),
+        "send_observed": (str(send_observed)
+                          if send_observed in ("unknown", "response_received",
+                                               "not_attempted") else "unknown"),
         "model": model,
         "created_at": now_iso(),
     }
@@ -4798,6 +4832,8 @@ def record_sol_call_failure(path: str, *, mode: str = "CONSULT",
         "mode": resolved,
         "error": record["error"],
         "materials_sha256": record["materials_sha256"],
+        "request_attempted": record["request_attempted"],
+        "send_observed": record["send_observed"],
     })
     save_state(path, state)
     return record

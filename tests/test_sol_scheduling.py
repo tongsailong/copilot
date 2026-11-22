@@ -454,6 +454,44 @@ class DynamicEventTests(SchedulingBase):
         self.assertEqual(advice["family"], "C")
         self.assertEqual(advice["event"], "reopened")
 
+    def test_block_creation_and_resolution_are_events(self):
+        self._covered()
+        state = self.state()
+        state["actions"][0]["status"] = "running"
+        self.save(state)
+        block = G.add_block(self.state_path, "等待必要资源", "恢复后继续",
+                            work_items=[state["actions"][0]["id"]])
+        advice = self.advice()
+        self.assertEqual(advice["event"], "blockage-change")
+        state = self.state()
+        snapshot = RP.sol_event_snapshot(state)
+        state["sol_calls"][-1]["sol_event_snapshot"] = snapshot
+        self.save(state)
+        G.resolve_block(self.state_path, "资源已到位", block["block_id"])
+        advice = self.advice()
+        self.assertEqual(advice["event"], "blockage-change")
+
+    def test_repeat_failure_threshold_is_one_event_per_episode(self):
+        self._covered()
+        state = self.state()
+        action = state["actions"][0]
+        action.update(status="failed", fail_streak=1)
+        self.save(state)
+        self.assertNotEqual(self.advice().get("event"), "repeated-work-failure")
+        state = self.state()
+        state["actions"][0]["fail_streak"] = 2
+        self.save(state)
+        advice = self.advice()
+        self.assertEqual(advice["event"], "repeated-work-failure")
+        snapshot = RP.sol_event_snapshot(self.state())
+        state = self.state()
+        state["sol_calls"][-1]["sol_event_snapshot"] = snapshot
+        self.save(state)
+        state = self.state()
+        state["actions"][0]["fail_streak"] = 3
+        self.save(state)
+        self.assertEqual(self.advice().get("event"), "repeated-work-failure")
+
 
 # ── D/E：里程碑与收口 ─────────────────────────────────────────────────────
 class MilestoneAndClosureTests(SchedulingBase):
@@ -537,23 +575,35 @@ class MilestoneAndClosureTests(SchedulingBase):
                          digest)
         self.assertNotEqual(self.advice()["family"], "D")
 
-    def test_newer_milestone_supersedes_unexecuted_older_one(self):
-        """进展推进只保留一个里程碑窗口：旧窗口记 skipped，不堆积成漏调。"""
+    def test_routine_progress_does_not_create_new_milestone_window(self):
+        """工作项继续推进不会因 progress digest 改变反复新开 D 窗口。"""
         self._medium_with_milestone()
         self.sync()
         first = self.obligations("D")
         self.assertEqual(len(first), 1)
-        # 再完成一项：进度变化 → 产生新的里程碑建议
         self.done(1)
         state, _ = self.sync()
-        rows = [item for item in self.obligations("D")]
-        due = [item for item in rows if item["status"] == "due"]
-        skipped = [item for item in rows if item["status"] == "skipped"]
-        self.assertEqual(len(due), 1, rows)
-        self.assertEqual(len(skipped), 1, rows)
-        self.assertEqual(skipped[0]["skip_by"], "superseded-by-newer")
-        self.assertEqual(due[0]["level"], "recommended")
+        rows = self.obligations("D")
+        self.assertEqual(len(rows), 1, rows)
+        self.assertEqual(rows[0]["obligation_id"], first[0]["obligation_id"])
+        self.assertEqual(rows[0]["status"], "due")
         self.assertEqual(SS.task_stats(state)["by_family"]["D"]["missed"], 0)
+
+    def test_reopen_starts_a_new_milestone_cycle(self):
+        self._medium_with_milestone()
+        self.sync()
+        first = self.obligations("D")[0]
+        state = self.state()
+        state["closure"]["reopen_history"].append({"at": "now"})
+        # The reopen event (C) has priority; record it as the new judgment
+        # baseline, then ensure D gets a distinct identity for this cycle.
+        baseline = RP.sol_event_snapshot(state)
+        for call in state["sol_calls"]:
+            call["sol_event_snapshot"] = baseline
+        self.save(state)
+        advice = self.advice()
+        self.assertEqual(advice["family"], "D")
+        self.assertNotEqual(advice["instance"], first["instance"])
 
     def test_legacy_duplicate_milestone_windows_are_collapsed(self):
         """历史状态里已堆积的多条打开窗口在下一次同步时收成一条。"""
@@ -742,6 +792,24 @@ class DeduplicationTests(SchedulingBase):
         stats = SS.task_stats(state)
         self.assertEqual(stats["by_family"]["A"]["skipped"], 1)
         self.assertEqual(stats["by_family"]["A"]["missed"], 0)
+
+    def test_stats_distinguish_call_records_from_transport_observations(self):
+        self.start()
+        self.sync()
+        failed = G.record_sol_call_failure(
+            self.state_path, mode="CONSULT", error_code="sol_timeout",
+            request_attempted=True, send_observed="unknown")
+        state = self.state()
+        state["sol_calls"].append({
+            "call_id": "SClegacy", "mode": "CONSULT", "status": "failed",
+            "error": "legacy", "created_at": G.now_iso()})
+        G.save_state(self.state_path, state)
+        stats = SS.task_stats(self.state())
+        self.assertEqual(stats["calls"]["total"], 2)
+        self.assertEqual(stats["calls"]["request_attempted"], 1)
+        self.assertEqual(stats["calls"]["send_unknown"], 1)
+        self.assertEqual(stats["calls"]["transport_observation_missing"], 1)
+        self.assertEqual(failed["send_observed"], "unknown")
 
     def test_failure_records_real_reason_and_keeps_task_running(self):
         self.start()
@@ -998,8 +1066,11 @@ class GateAndStatsTests(SchedulingBase):
         self.assertEqual(stats["by_family"]["C"]["skipped"], 1)
         self.assertEqual(stats["by_family"]["B"]["failed"], 1)
         self.assertEqual(stats["by_family"]["C"]["missed"], 1)
-        self.assertEqual(stats["calls"], {"completed": 1, "failed": 1,
-                                          "total": 2})
+        self.assertEqual(stats["calls"], {
+            "completed": 1, "failed": 1, "total": 2,
+            "request_attempted": 0, "response_received": 0,
+            "send_unknown": 0, "not_attempted": 0,
+            "transport_observation_missing": 2})
         self.assertEqual(stats["acceptance"]["accepted"], 1)
         self.assertEqual(stats["acceptance"]["unrecorded"], 0)
         self.assertEqual(stats["usage"]["total_tokens"], 100)

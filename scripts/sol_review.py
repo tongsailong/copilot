@@ -143,6 +143,10 @@ class SolError(Exception):
         super().__init__(detail or code)
         self.code = code
         self.detail = detail
+        # True only after the transport callable is entered; urllib cannot prove
+        # that any request bytes reached the socket, so wire-level send stays unknown.
+        self.request_attempted = False
+        self.send_observed = "not_attempted"
 
 
 class SolUsageError(SolError):
@@ -1036,16 +1040,31 @@ def run_sol(materials: str, *, mode: str = "CONSULT", audit_log: str = "",
         "tools_sent": False,
         "tool_choice": "none",
         "attempts": 1,
+        "request_attempted": False,
+        "send_observed": "not_attempted",
     }
+    transport_entered = False
     try:
+        transport_entered = True
         response = (transport or _post_once)(url, key, payload, timeout)
+        if isinstance(response, dict):
+            response.setdefault("_request_attempted", True)
+            response.setdefault("_send_observed", "response_received")
     except SolError as exc:
+        attempted = transport_entered
+        observed = "unknown" if transport_entered else "not_attempted"
+        exc.request_attempted = attempted
+        exc.send_observed = observed
         _audit_safe(audit_log, {**audit_base, "ok": False,
+                           "request_attempted": attempted,
+                           "send_observed": observed,
                            "error": exc.code, "detail": exc.detail,
                            "elapsed_ms": int((time.monotonic() - started) * 1000)})
         raise
     elapsed_ms = int((time.monotonic() - started) * 1000)
     status = response.pop("_http_status", 0)
+    request_attempted = bool(response.pop("_request_attempted", True))
+    send_observed = str(response.pop("_send_observed", "response_received"))
     request_id = str(response.pop("_request_id", "") or "")
     trace_id = str(response.pop("_trace_id", "") or "")
     quota = _quota_signal(int(status or 0), response)
@@ -1081,7 +1100,9 @@ def run_sol(materials: str, *, mode: str = "CONSULT", audit_log: str = "",
     # 出现工具定义或非零用量才按安全事件拒绝。
     unexpected.extend(find_tool_activity(response))
     result_id = str(response.get("id") or "")
-    common_audit = {"http_status": status, "model_resolved": model_resolved,
+    common_audit = {"http_status": status,
+                    "request_attempted": request_attempted,
+                    "send_observed": send_observed,
                     "reasoning_resolved": reasoning_resolved,
                     "reasoning_verified": reasoning_verified,
                     "request_id": request_id, "trace_id": trace_id,
@@ -1139,6 +1160,8 @@ def run_sol(materials: str, *, mode: str = "CONSULT", audit_log: str = "",
     result = {
         "schema": (REVIEW_SCHEMA if resolved_mode == "REVIEW"
                    else THINK_SCHEMA),
+        "request_attempted": request_attempted,
+        "send_observed": send_observed,
         "mode": resolved_mode,
         "model": model,
         "model_resolved": model_resolved,
