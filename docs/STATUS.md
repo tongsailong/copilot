@@ -1,9 +1,10 @@
 # STATUS
 
 更新：2026-11-22 CST。本文件只记录现场可核实的事实；规划与未完成事项单独标注。
-当前版本：v9.6.2（源码级；统计口径修正、SOL 锁等待有界、文档与死代码收敛，未提交未发布）。
+当前版本：v9.6.2（已合并到 `main`：PR #2 Squash `8f51037`；统计口径修正、SOL 锁等待有界、
+文档与死代码收敛；未发布新 Release，`v9.6.1` Tag/Release 未移动）。
 
-## v9.6.2 全面评审与针对性优化（2026-11-22，源码级未提交）
+## v9.6.2 全面评审与针对性优化（2026-11-22，已交付 `main`）
 
 - **P1 缺陷（已修）**：`sol-stats` 任务级窗口分子/分母单位不一致——真实任务
   `closure-timing-2026-11-21` 曾输出 `coverage.closure.rate=3.0（3/1）`（多轮 reopen 的 3 次
@@ -34,9 +35,26 @@
   `accepted`，随后 G1–G3 收口 `verdict=pass iteration=I0 by=zcode-native`。
   调度义务 3 个、未闭合 0、漏调 0；`sol-stats` 的 startup/plan/closure 覆盖率为 1.0/1.0/1.0，
   事件窗口分母为 0 时 `rate=null`（不再伪造 100%）。REVIEW 未发起（用户授权为可选）。
-- **边界**：本轮未 commit/push/PR/Release/Tag，未改 Ruleset、Provider、模型或账户配置；
-  已发布 `v9.6.1` Tag/Release 未移动。运行时已按同步脚本下发，`--check` 与 `--verify-baseline`
-  结果见收口报告。
+- **交付（2026-11-22，已完成）**：分支 `fix/copilot-v9.6.2-review-optimization` 提交
+  `326b81c`（17 文件，+460/−229）→ push → PR #2 → PR CI run `44969511767` 的
+  `Python 3.10` / `Python 3.12` 各 `Ran 855 tests ... OK`（`skipped=1`：runner 未安装
+  knowledge-manager 的环境跳过）且 `Verify manifest baseline` 通过 → `mergeStateStatus=CLEAN`
+  后 Squash 合并为 `8f51037`（`mergedAt=2026-11-22T01:03:55Z`，未绕过 Ruleset：其
+  `updated_at` 早于本次交付、`bypass_actors=[]`）→ 合并后 `main` push CI run `44969658309`
+  再次两版本 855 OK + baseline 通过 → 删除 feature 分支。`git diff 326b81c 8f51037` 为空，
+  即 Squash 结果与已验证的分支头内容一致；本地 / `origin/main` / GitHub `refs/heads/main`
+  三方同为 `8f51037`、ahead/behind 0/0、工作区 clean。
+- **运行时（合并后核实）**：以最终 `main` 执行 `--check` 为缺失 0 / 不同 0（分发 24 文件，
+  未受管理 `hm.txt` 保留），24 个受管文件逐个 SHA-256 与源码一致，`--verify-baseline` 通过；
+  合并只改变提交身份、不改变受管内容，故未重复 `--apply`；源码与运行时 `--version` 均为
+  `9.6.2`。
+- **边界**：未新建 Release、未移动 `v9.6.1` Tag/Release（annotated tag 对象仍
+  `bf3eaa90…` → commit `c5a3e1c6…`，`publishedAt=2026-11-21T15:00:56Z`），未改 Ruleset、
+  Provider、模型或账户配置。评审轮的真实 SOL 调用见上（A/B/E 三次）；交付轮另有 A
+  `SC37688f023c0e656b45e48cc1`、B `SCbb3fc84bccca0e38126f0ccc`、E
+  `SCca0f42037e01ccca9667c364`（摘要 `e9f0c2a92f1ea4e7`）与一次 D 阶段复盘；任务
+  `v962-delivery` 收口为 `verdict=pass iteration=I0 by=zcode-native`（C1–C14 14/14 met，
+  证据 E1–E8）。
 
 ## 收口、main 分支保护与 v9.6.1 Release（2026-11-21）
 
