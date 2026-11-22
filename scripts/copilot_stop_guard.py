@@ -1020,8 +1020,8 @@ def cmd_install(args) -> int:
         with open(path, "rb") as src, open(backup, "wb") as dst:
             dst.write(src.read())
     _write_config(path, data)
-    print(f"已安装 Stop 续跑守卫与 SessionStart 恢复注入"
-          f"（{SESSION_START_MATCHER}）：{path}（{_scope_note(path)}）")
+    print(f"已安装 Stop 续跑守卫、SessionStart 恢复注入（{SESSION_START_MATCHER}）"
+          f"与 UserPromptSubmit 回合提示：{path}（{_scope_note(path)}）")
     if removed:
         print(f"已收敛 {removed} 条重复/过期记录为每事件 1 条")
     if backup:

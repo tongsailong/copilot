@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
-"""Copilot v8 持续推进器：本地阶段机 + 工作单 + 原生执行信封回填。
+"""Copilot 持续推进器：本地阶段机 + 工作单 + 原生执行信封回填。
 
-它**不调用任何模型**，也不等待外部判断：
+它不做远程判断，也不等待外部裁决；唯一可能发起模型调用的是 SOL 生命周期
+调度：默认 `--sol auto` 下每条命令最多消费 1 条 recommended 义务（1 次请求，
+失败只记录、不阻断），`--sol off|advise` 或测试进程不调用。
 
 * `drive`：读取状态 → 本地求值 → 命中 PASS 就收口；命中 BLOCKED/CLOSED 就停下
   报告；有可领取工作项就输出工作单并以 EXIT_EXECUTE 退出；PARTIAL 则本地派生
@@ -494,7 +496,7 @@ def ingest(args) -> int:
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         prog="copilot_auto.py",
-        description="Copilot 持续推进器（不调用任何模型）")
+        description="Copilot 持续推进器（--sol auto 时每条命令最多 1 次建议性调用）")
     sub = ap.add_subparsers(dest="command", required=True)
     p = sub.add_parser("drive", help="推进任务：收口 / 输出工作单 / 派生下一步")
     p.add_argument("--state", required=True)

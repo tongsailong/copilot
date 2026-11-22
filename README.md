@@ -35,8 +35,9 @@ Copilot 是运行在 ZCode 内的**轻量协作治理 Skill**。它把多步骤�
   完成前不执行收口判断；验证完成 → SOL 收口 CONSULT → 主 Agent 用 `sol-accept` 登记独立判断 →
   G1–G3 收口。同一验证摘要复用结论，摘要变化即旧结论失效。
 - **工作项领取**：`drive` 为选中工作项写入短租约（owner / TTL / handoff），避免并发重复执行。
-- **恢复与续跑**：`SessionStart` / `UserPromptSubmit` / `Stop` 钩子只读提示未闭合任务与续接命令
-  （钩子不写状态、异常退出码 0）。
+- **恢复与续跑**：`SessionStart` / `UserPromptSubmit` / `Stop` 钩子只读提示未闭合任务与续接命令。
+  钩子不写状态；`SessionStart` / `UserPromptSubmit` 内部异常 exit 0（不阻断会话），`Stop`
+  守卫保持 0/2 契约、内部异常返 2（不放行，宁可多跑一轮）。
 - **项目上下文（只读）**：`context_engine.py` 的 `resolve` / `recall` / `pack` / `capture`，全程
   零模型调用，不新建记忆库、不写知识库。
 
@@ -69,9 +70,10 @@ python3 -B scripts-sync/sync_runtime.py --check    # 期望：缺失 0、不同 
 
 新开的 ZCode 会话才会加载新版本（Skill 元数据在会话启动时缓存）。
 
-**恢复钩子**（可选，默认不装）：`scripts/copilot_stop_guard.py install` 会写用户级 hook 配置，
-属于修改全局配置，需你自行确认后执行；`uninstall` 可回退。钩子只读任务状态，不写状态、
-不消费续跑次数。
+**恢复钩子**（可选，默认不装）：`scripts/copilot_stop_guard.py install --workspace DIR` 写
+工作区级 hook 配置，`--user` 写用户级、`--config PATH` 写到指定文件（裸 `install` 会报错）。
+属于修改全局/工作区配置，需你自行确认后执行；`uninstall` 可回退。钩子只读任务状态、
+不写状态、不消费续跑次数。
 
 ## 持续集成（CI）
 
@@ -192,7 +194,8 @@ python3 -B scripts-sync/sync_runtime.py --baseline --verify-baseline
 
 | 版本 | 要点 |
 |---|---|
-| **v9.6.1** | 收口时序：最终工程验证完成才执行收口 CONSULT；验证摘要纳入材料口径；`sol-accept` 成为收口前的强制步骤 |
+| **v9.6.2** | 覆盖率口径修正（任务级窗口按任务计 1 次，不再出现 `rate=3.0`）；事件分母排除合理跳过；自动调度 SOL 锁等待有界（`AUTO_LOCK_WAIT_S`，`COPILOT_SOL_LOCK_TIMEOUT`）；SOL 网络栈惰性导入（命令冷启动约 −15~20 ms）；文档/帮助与实现对齐、死代码收敛 |
+| v9.6.1 | 收口时序：最终工程验证完成才执行收口 CONSULT；验证摘要纳入材料口径；`sol-accept` 成为收口前的强制步骤 |
 | v9.6.0 | SOL A–E 五阶段义务化调度、`--sol auto\|advise\|off`、覆盖率统计 |
 | v9.5.x | 工作项领取与短租约、阻塞按项成立、SessionStart/UserPromptSubmit 恢复提示 |
 | v9.4.0 | 只读 Context Engine（resolve/recall/pack/capture） |

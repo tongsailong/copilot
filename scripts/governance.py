@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Copilot v6 本地协作治理核心（ZCode Autonomous Development Edition）。
+"""Copilot 本地协作治理核心（ZCode Autonomous Development Edition）。
 
 定位
 ----
@@ -36,15 +36,14 @@ import sol_schedule as SS
 SCHEMA = "copilot-governance/v1"
 VERSION = 1
 
-# 风险层级与复核策略一致：low/medium 默认不派 Reviewer；high 建议一次
-# SOL 零工具单轮复核（advisory，不是收口门禁）。
+# 风险层级只影响认知复杂度与 CONSULT 建议：high 在启动/规划窗口给出更明确的
+# 认知准入；REVIEW 只在用户明确要求时执行（advisory，不是收口门禁）。
 # `normal` 是历史标签，start 时归一化为 medium；读取旧状态时按 non-high 处理。
 RISKS = ("low", "medium", "high", "normal")
 BACKENDS = ("legacy", "native")
 # 新计划只允许 zcode（主代理直接执行）与 deepseek（主代理派发原生子代理）。
 # reasonix 仅用于读取历史状态，不再接受为新工作项执行方。
 ASSIGNEES = ("zcode", "deepseek")
-LEGACY_ASSIGNEES = ("zcode", "deepseek", "reasonix")
 STATUSES = ("pending", "running", "done", "failed", "blocked", "dropped")
 TERMINAL = {"done", "dropped"}
 CRITERION_STATUSES = ("pending", "met", "not_met")
@@ -65,16 +64,12 @@ QUALITY_FIELDS = frozenset({
     "acceptance_status", "checks", "subject", "supersedes_report_id",
     "resolved_warning_ids", "resolved_residual_risk_ids",
 })
-QUALITY_ACCEPTANCE_STATUSES = ("pending", "partial", "accepted",
-                               "superseded", "stale")
 CRITERION_ID_RE = re.compile(r"^C[1-9][0-9]{0,2}$")
 EVIDENCE_ID_RE = re.compile(r"^E[1-9][0-9]{0,3}$")
 TASK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 ACTION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
-REVIEW_ATTEMPT_RE = re.compile(r"^RA[0-9a-f]{24}$")
 
-TERMINAL_PHASES = ("CLOSED", "BLOCKED", "PASS")
 PHASES = ("CLOSED", "BLOCKED", "PASS", "RUNNING", "PARTIAL")
 MAX_ACTIONS = 64
 MAX_DERIVED_PER_CALL = 12
@@ -128,12 +123,6 @@ def _text(value: object, name: str, *, allow_empty: bool = False,
 def _list(value: object, name: str) -> list:
     if not isinstance(value, list):
         raise GovernanceError(f"{name} 必须是数组。")
-    return value
-
-
-def _bool(value: object, name: str) -> bool:
-    if not isinstance(value, bool):
-        raise GovernanceError(f"{name} 必须是布尔值。")
     return value
 
 
@@ -757,21 +746,6 @@ def _add_triggers(state: dict, triggers: object) -> list[dict]:
         state.setdefault("admission_triggers", []).append(item)
         added.append(item)
     return added
-
-
-def add_admission_triggers(path: str, triggers: object, *, source: str = "zcode") -> dict:
-    """登记新的触发因素（新证据/新风险/范围变化等）；不改变任务状态与门禁。"""
-    state = load_state(path)
-    _assert_open(state, "登记 SOL 触发因素", allow_blocked=True)
-    added = _add_triggers(state, triggers)
-    for item in added:
-        item["source"] = str(source or "zcode")[:40]
-    if added:
-        _history(state, "admission_triggers_added",
-                 {"triggers": [t["name"] for t in added]})
-        save_state(path, state)
-    return {"added": [t["name"] for t in added],
-            "triggers": [t["name"] for t in state.get("admission_triggers") or []]}
 
 
 def _task_workspace_info(state: dict, state_path: str = "") -> tuple[str, list[str]]:
@@ -4382,11 +4356,6 @@ def list_sol_plan_calls(state: dict) -> list[dict]:
     return list_sol_calls(state, mode="PLAN")
 
 
-def list_sol_think_calls(state: dict) -> list[dict]:
-    """历史名称：v9 起等同 `list_sol_consult_calls`，保留给既有调用方。"""
-    return list_sol_consult_calls(state)
-
-
 def record_sol_call(path: str, call: dict, *, mode: str = "",
                     materials_sha256: str = "", trigger: str = "",
                     reason: str = "", obligation_id: str = "") -> dict:
@@ -4496,9 +4465,6 @@ ACCEPTANCE_STATUSES = ("accepted", "modified", "rejected", "pending")
 # v1（无 schema 字段）与 v2 都可读取；质量指标只以 v2 已决记录为分母，
 # 并把排除的旧记录单独披露。
 ACCEPTANCE_SCHEMA = "copilot-sol-acceptance/v2"
-ACCEPTANCE_EVIDENCE_STATES = ("linked", "partial", "unresolved",
-                              "archived_only", "source_only", "none",
-                              "unrecorded")
 ACCEPTANCE_HINTS = {
     "actual_decision_missing":
         "缺少实际决策说明：建议用 --decision 记录 ZCode 最终采取的做法"
@@ -4846,16 +4812,6 @@ def record_sol_review(path: str, review: dict, *,
                            trigger=trigger, reason=reason)
 
 
-def record_sol_advisory(path: str, advisory: dict, *,
-                        materials_sha256: str = "",
-                        trigger: str = "", reason: str = "") -> dict:
-    """历史名称：等同 `record_sol_call(mode=CONSULT|历史模式)`，保留给既有调用方。"""
-    return record_sol_call(path, advisory,
-                           mode=str(advisory.get("mode") or "CONSULT"),
-                           materials_sha256=materials_sha256,
-                           trigger=trigger, reason=reason)
-
-
 def record_sol_review_failure(path: str, *, error_code: str, detail: str = "",
                               materials_sha256: str = "",
                               model: str = "") -> dict:
@@ -4863,17 +4819,6 @@ def record_sol_review_failure(path: str, *, error_code: str, detail: str = "",
     return record_sol_call_failure(path, mode="REVIEW", error_code=error_code,
                                    detail=detail,
                                    materials_sha256=materials_sha256, model=model)
-
-
-def record_sol_advisory_failure(path: str, *, mode: str = "CONSULT",
-                                error_code: str = "", detail: str = "",
-                                materials_sha256: str = "",
-                                model: str = "") -> dict:
-    """历史名称：等同 `record_sol_call_failure(mode=CONSULT|历史模式)`。"""
-    return record_sol_call_failure(path, mode=mode, error_code=error_code,
-                                   detail=detail,
-                                   materials_sha256=materials_sha256, model=model)
-
 
 
 def list_findings(state: dict) -> dict:
@@ -6350,7 +6295,8 @@ def resolve_sol_obligation(state: dict, obligation_id: str, *, status: str,
     """把一次真实调用/失败/跳过结算到对应义务（只改内存状态）。
 
     结算不是完成证明：它只记录调度事实（谁执行、何时、结果引用）。义务必须属于
-    当前任务且仍处于打开窗口；重复结算幂等返回同一义务。
+    当前任务（跨任务结算直接失败）；同一义务重复结算返回同一条记录、以最后一次
+    结算为准并追加失败次数——是否该再次付费由调用前的复用判定决定，不由这里兜底。
     """
     target = str(obligation_id or "").strip()
     if not target:

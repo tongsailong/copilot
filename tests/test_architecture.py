@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -121,6 +122,24 @@ class RemoteReviewBoundaryTests(unittest.TestCase):
         text = source("governance.py")
         for needle in ("subprocess", "urlopen", "request(", "socket"):
             self.assertNotIn(needle, text)
+
+    def test_sol_review_import_stays_off_the_network_stack(self):
+        """SOL 网络栈只在请求路径内导入：不调 SOL 的命令不付 urllib/ssl 成本。
+
+        实测 `import urllib.request` 连带 `ssl`/`http.client`/`email` 约 40–45 ms，
+        而生命周期命令与钩子每次都会启动进程。这里用独立解释器断言模块级导入
+        不触发这些模块；`_NoRedirect` 仍可延迟取得（历史调用方直接构造它）。
+        """
+        code = (
+            "import sys; sys.path.insert(0, %r); import sol_review;"
+            "loaded = [m for m in ('http.client', 'ssl', 'urllib.request',"
+            " 'urllib.error') if m in sys.modules];"
+            "assert sol_review._NoRedirect.__name__ == '_NoRedirect';"
+            "print(loaded)" % SCRIPTS)
+        proc = subprocess.run([sys.executable, "-B", "-c", code],
+                              capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "[]")
 
 
 class StateMachineTests(unittest.TestCase):
