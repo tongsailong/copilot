@@ -13,8 +13,8 @@
   根因换一种说法仍是同一条，已关闭问题没有新证据不得重复登记为新问题。
 * 停止条件是状态事实：PASS 的目标/代码范围与当前一致时，不因 Reviewer 还能
   提出建议而重开；minor/info 不阻断，也不触发复核。
-* 纯文档/格式调整不需要独立复核；高风险任务建议一次 SOL 零工具单轮复核
-  （advisory，不是收口门禁）。
+* 纯文档/格式调整不需要独立复核；高风险任务在 CONSULT 建议里体现，REVIEW 只在
+  用户明确要求时执行（两者都是 advisory，不是收口门禁）。
 """
 from __future__ import annotations
 
@@ -30,7 +30,6 @@ SOL_ADVICE_SCHEMA = "copilot-sol-advice/v4"
 
 # 任务认知复杂度只使用状态里已有的确定性事实：不引入第二个模型，也不引入
 # 评分模型。每个信号都对应一条可复核的现场证据；0 个信号即低复杂度。
-COMPLEXITY_LEVELS = ("low", "medium", "high")
 COMPLEXITY_SIGNALS = {
     "risk-high": "高风险或不可逆影响",
     "declared-trigger": "声明了架构/安全/数据链路类风险",
@@ -68,17 +67,8 @@ SOL_EVENTS = {
     "milestone": "medium/high 任务的重要阶段里程碑",
     "closure": "最终收口综合判断",
 }
-SOL_EVENT_ORDER = ("startup", "plan-needed", "material-evidence-change",
-                   "decision-point", "risk-escalation", "replan-history",
-                   "scope-changed", "reopened", "milestone", "closure")
-# 六类动态事件：只在执行期按新增事实追加，不与启动/规划/里程碑/收口重复计数。
-SOL_DYNAMIC_EVENTS = ("material-evidence-change", "decision-point",
-                      "risk-escalation", "replan-history", "scope-changed",
-                      "reopened")
-SOL_EVENT_FAMILY = {
-    "startup": "A", "plan-needed": "B", "milestone": "D", "closure": "E",
-}
-SOL_DYNAMIC_FAMILY = "C"
+# 事件到生命周期窗口的归属由生命周期判断自身给出（义务里带 family）；
+# 六类动态事件在执行期按新增事实追加，不与启动/规划/里程碑/收口重复计数。
 SOL_FAMILIES = ("A", "B", "C", "D", "E")
 # 事件 → 追加调用时使用的 --trigger（与 single_round 的触发口径一致）。
 SOL_EVENT_TRIGGERS = {
@@ -138,8 +128,6 @@ TASK_KINDS = {
     "multi-option": "多方案比较与选型",
 }
 SIMPLE_TASK_KINDS = ("trivial", "mechanical", "docs", "format")
-NON_SIMPLE_TASK_KINDS = tuple(kind for kind in TASK_KINDS
-                              if kind not in SIMPLE_TASK_KINDS)
 DEFAULT_TASK_KIND = "standard"
 # 这些任务类型天然需要“调查后规划”，但 PLAN 仍要求已出现现场事实。
 PLAN_KINDS = ("architecture", "data-infra", "governance", "product-design",
@@ -916,11 +904,6 @@ def _retry_trigger(new_codes: list[str]) -> str:
     if "reopened" in new_codes:
         return "scope-changed"
     return "new-evidence"
-
-
-def event_family(code: str) -> str:
-    """事件所属生命周期窗口：A 启动 / B 规划 / C 执行期动态 / D 里程碑 / E 收口。"""
-    return SOL_EVENT_FAMILY.get(_text(code), SOL_DYNAMIC_FAMILY)
 
 
 def has_substantive_progress(state: dict) -> bool:

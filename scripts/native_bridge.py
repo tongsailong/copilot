@@ -31,7 +31,6 @@ from datetime import datetime
 DISPATCH_SCHEMA = "copilot-native-dispatch/v2"
 RESULT_SCHEMA = "copilot-native-result/v2"
 REVIEW_SCHEMA = "copilot-native-review/v2"
-SCHEMAS = (DISPATCH_SCHEMA, RESULT_SCHEMA, REVIEW_SCHEMA)
 LEGACY_SCHEMAS = ("copilot-native-dispatch/v1", "copilot-native-result/v1",
                   "copilot-native-review/v1")
 
@@ -507,15 +506,6 @@ def _validate_evidence(raw: object, state: dict, *, check_files: bool) -> list[d
     return out
 
 
-def _optional_text(obj: dict, key: str, name: str) -> str:
-    value = obj.get(key)
-    if value is None:
-        return ""
-    if not isinstance(value, str):
-        _fail("schema_invalid", f"{name}.{key} 必须是字符串。")
-    return value.strip()
-
-
 def validate_execution_result(envelope: object, dispatch: dict | None, state: dict, *,
                               check_files: bool = True) -> dict:
     """校验执行结果：计划绑定、结果摘要、证据文件、执行方元数据。"""
@@ -835,12 +825,3 @@ def _validate_execution_binding(raw: object, state: dict, *, work_item_id: str,
             "contract_test_policy": stored.get("contract_test_policy") or {},
             "contract_report": str(stored.get("contract_report") or ""),
             "contract_artifacts": list(stored.get("contract_artifacts") or [])}
-
-
-def _action_fingerprint(action: dict) -> str:
-    """工作项覆盖指纹：与 final_evidence_digest 的动作项口径保持一致。"""
-    return sha256_text(canonical_json([
-        action.get("status"),
-        sha256_text(str(action.get("result") or "")),
-        sorted(action.get("evidence_ids") or []),
-    ]))

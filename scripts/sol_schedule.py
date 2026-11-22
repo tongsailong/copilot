@@ -35,19 +35,20 @@ STATS_SCHEMA = "copilot-sol-stats/v1"
 # 正文缺失时显式标注“（未登记）”。该版本参与 `closure_verification_digest`，所以
 # 材料内容变化会让旧收口判断停止覆盖新结果，而不是靠“代码改过了”想当然。
 MATERIALS_SCHEMA = "copilot-sol-schedule-materials/v2"
-EVENT_SCHEMA = "copilot-sol-event/v1"
 
 # 义务状态：due 未执行 / claimed 已被本进程领取 / in_flight 已发出请求未落盘 /
 # satisfied 已满足（含复用）/ failed 真实失败 / skipped 显式跳过（须有理由）。
 OBLIGATION_STATUSES = ("due", "claimed", "in_flight", "satisfied", "failed",
                        "skipped")
-TERMINAL_OBLIGATION_STATUSES = ("satisfied", "failed", "skipped")
 # 窗口关闭时这些状态构成漏调：领取过但从未发出请求与“一直没动”等价。
 MISSED_STATUSES = ("due", "claimed")
 FAMILY_INDEX = {name: index for index, name in enumerate(RP.SOL_FAMILIES)}
 DEFAULT_MATERIALS_CHARS = 24_000
-# 自动执行默认硬预算（秒）：覆盖锁等待、材料生成与一次传输；不含重试。
-DEFAULT_BUDGET_S = 180.0
+# 自动调度路径等待任务 SOL 锁的上限（秒）：拿不到锁说明另一个进程正在调用，
+# 本次放弃执行、义务保持 due，而不是无限阻塞工程命令。手动调用不设默认上限；
+# `COPILOT_SOL_LOCK_TIMEOUT` 可覆盖。自动路径的“有界”是双重的：1 条义务、
+# 1 次请求，以及这条锁等待上限（不是请求本身的时长上限）。
+AUTO_LOCK_WAIT_S = 120.0
 
 
 def _text(value: object) -> str:
@@ -189,15 +190,6 @@ def _refresh(obligation: dict, advice: dict, *, now: str) -> bool:
     if changed:
         obligation["refreshed_at"] = now
     return changed
-
-
-def open_obligations(state: dict, *, family: str = "") -> list[dict]:
-    rows = [item for item in obligations(state)
-            if isinstance(item, dict) and item.get("window") == "open"
-            and _text(item.get("status")) not in ("skipped", "satisfied")]
-    if family:
-        rows = [item for item in rows if _text(item.get("family")) == family]
-    return rows
 
 
 def due_obligations(state: dict, *, recommended_only: bool = True) -> list[dict]:
@@ -705,8 +697,23 @@ def _usage(record: dict) -> dict:
         return {"tokens": 0, "input_tokens": 0, "output_tokens": 0}
 
 
+def _window_covered(rows: dict) -> int:
+    """任务级窗口的覆盖计数：每个任务/窗口最多计 1 次（满足＝执行或复用）。
+
+    分子必须与分母同单位。任务级窗口（A 启动 / B 规划 / E 收口）的分母是
+    “该窗口对本任务是否适用”（0/1），因此分子也只能是 0/1；直接取满足义务的
+    条数会把多轮 reopen 的多次收口判断算成 `rate=3.0`（3 次收口 ÷ 1 个任务）。
+    义务条数仍完整保留在 `by_family[...]["satisfied"]`，用于解释“覆盖了几次”。
+    """
+    return 1 if rows["satisfied"] else 0
+
+
 def task_stats(state: dict) -> dict:
-    """单个任务的调度覆盖率与口径；分母显式，跳过与漏调分开统计。"""
+    """单个任务的调度覆盖率与口径；分母显式，跳过与漏调分开统计。
+
+    两个口径必须一致：任务级窗口（A/B/E）的分母是“是否适用”（0/1），分子也是
+    0/1；事件窗口（C）的分母是适用义务条数，合理跳过的窗口不进入分母。
+    """
     rows = [item for item in obligations(state) if isinstance(item, dict)]
     calls = [item for item in state.get("sol_calls") or []
              if isinstance(item, dict)]
@@ -758,30 +765,35 @@ def task_stats(state: dict) -> dict:
     coverage = {
         "startup": {
             "denominator": 1 if non_simple else 0,
-            "reason": "非简单任务（启动 CONSULT 适用）",
-            "numerator": by_family["A"]["satisfied"],
+            "reason": "非简单任务（启动 CONSULT 适用；按任务计 1 次）",
+            "numerator": _window_covered(by_family["A"]),
             "skipped": by_family["A"]["skipped"],
             "missed": by_family["A"]["missed"],
         },
         "plan": {
             "denominator": 1 if admission["required"] else 0,
-            "reason": (f"PLAN 适用：{admission['reason']}"
+            "reason": (f"PLAN 适用：{admission['reason']}（按任务计 1 次）"
                        if admission["required"]
                        else f"PLAN 不适用：{admission['reason']}"),
-            "numerator": by_family["B"]["satisfied"],
+            "numerator": _window_covered(by_family["B"]),
             "skipped": by_family["B"]["skipped"],
             "missed": by_family["B"]["missed"],
         },
         "closure": {
             "denominator": 1 if closure_eligible else 0,
-            "reason": "有实质进展的非简单任务（收口 CONSULT 适用）",
-            "numerator": by_family["E"]["satisfied"],
+            "reason": "有实质进展的非简单任务（收口 CONSULT 适用；按任务计 1 次）",
+            "numerator": _window_covered(by_family["E"]),
             "skipped": by_family["E"]["skipped"],
             "missed": by_family["E"]["missed"],
         },
         "events": {
-            "denominator": by_family["C"]["obligations"],
-            "reason": "已识别的重大事件（每出现一次构成一个适用窗口）",
+            # 每个事件窗口都是一条义务；合理跳过（合同修订、被更新窗口取代、
+            # 非必需、已被收口覆盖）的窗口不进入分母，与 _expire_superseded /
+            # sync 的口径一致，避免用“已失效窗口”拉低覆盖率。
+            "denominator": max(0, by_family["C"]["obligations"]
+                               - by_family["C"]["skipped"]),
+            "reason": "已识别的重大事件（每出现一次构成一个适用窗口；"
+                      "合理跳过的窗口不进入分母）",
             "numerator": by_family["C"]["satisfied"],
             "skipped": by_family["C"]["skipped"],
             "missed": by_family["C"]["missed"],
@@ -832,6 +844,8 @@ def stats(states: list[dict], *, scope: str = "") -> dict:
         "tasks": len(details),
         "eligible_tasks": sum(1 for d in details if d["eligible"]),
         "plan_eligible_tasks": sum(1 for d in details if d["plan_eligible"]),
+        "closure_eligible_tasks": sum(1 for d in details
+                                      if d["closure_eligible"]),
         "progressed_tasks": sum(1 for d in details
                                 if d["eligible"] and d["progressed"]),
         "not_registered_tasks": sum(1 for d in details if d["not_registered"]),
@@ -880,23 +894,12 @@ def stats(states: list[dict], *, scope: str = "") -> dict:
         "notes": [
             "覆盖率分母只含适用任务/窗口：简单任务、无实质方案决策的 PLAN、"
             "未发生的事件、无合格里程碑、尚无实质进展的收口都不进入分母。",
-            "跳过（skipped）需有可审计理由并单列：它不进入分子，也不从分母消失。",
+            "跳过（skipped）需有可审计理由并单列：任务级窗口（A/B/E）的跳过不进入"
+            "分子、仍计入该窗口的分母（任务只有 0/1 次机会）；事件窗口（C）每出现一次"
+            "事件才构成一个适用窗口，因此合理跳过不进入分母，漏调仍单列。",
+            "任务级窗口的分子按任务计 1 次（满足＝真实执行或复用）；义务条数与"
+            "执行/复用/跳过的分项仍完整保留在 by_family，用于解释“覆盖了几次”。",
             "漏调（missed）＝窗口关闭时仍未执行且无有效复用；in_flight 单列为未决。",
             "not_registered 表示“应当登记却没有义务记录”，与“已登记未执行”不同。",
         ],
     }
-
-
-def describe(state: dict) -> str:
-    """单行调度摘要，用于回填命令输出（不改变任何状态）。"""
-    info = summary(state)
-    if not info["total"]:
-        return "SOL 调度：无调度义务"
-    parts = [f"SOL 调度：未闭合 {info['pending']} 项"]
-    if info["missed"]:
-        parts.append(f"漏调 {info['missed']} 项")
-    if info["next"]:
-        row = info["next"]
-        parts.append(f"下一项 {row['obligation_id']} "
-                     f"({row['family']}/{row['event']}，{row['mode']})")
-    return "；".join(parts)

@@ -33,15 +33,11 @@ Copilot 的 SOL 通道只承担**认知**，不承担决策或执行：
 from __future__ import annotations
 
 import hashlib
-import http.client
 import json
 import os
 import re
-import socket
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
 
 from lib_common import redact as _redact_text
 
@@ -49,7 +45,6 @@ REVIEW_SCHEMA = "copilot-sol-review/v1"
 # v9 认知输出是单一超集结构：同时覆盖启动理解、方案规划、执行期动态咨询、
 # 阶段复盘与收口判断；v1 记录继续只读兼容。
 THINK_SCHEMA = "copilot-sol-think/v2"
-LEGACY_THINK_SCHEMAS = ("copilot-sol-think/v1",)
 ADMISSION_SCHEMA = "copilot-sol-admission/v1"
 MODEL = "gpt-6.2-sol"
 BASE_URL = "http://127.0.0.1:8317/v1"
@@ -442,8 +437,9 @@ def validate_effort(effort: str) -> str:
 def validate_materials(materials: object, mode: str = "CONSULT") -> str:
     """材料前置校验：非空、字符上限；dry-run 与真实调用共用同一口径。
 
-    THINK 的上限更紧：它只接收主代理整理过的认知材料，完整仓库、冗长日志与
-    重复报告应在本地消化，超限直接拒绝而不是静默截断。
+    认知模式（CONSULT / PLAN）的上限比 REVIEW 更紧：它们只接收主代理整理过的
+    认知材料，完整仓库、冗长日志与重复报告应在本地消化，超限直接拒绝而不是
+    静默截断。
     """
     resolved = normalize_mode(mode)
     limit = MATERIALS_LIMITS[resolved]
@@ -876,31 +872,65 @@ def parse_think_output(text: str) -> dict:
 
 
 # ── 发送（一次，不重试） ───────────────────────────────────────────────────
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    """3xx 一律失败：避免把 Authorization 转发到重定向目标、保证严格一次请求。"""
+def _network():
+    """惰性导入网络栈：只有真正发请求时才付出 urllib/ssl/email 的导入成本。
 
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None
+    `urllib.request` 会连带 `ssl`、`http.client`、`email`（实测约 40–45 ms）。
+    生命周期命令（`start`/`drive`/`record`/`closure` 等）和 Stop/SessionStart
+    钩子每次都要启动进程，但绝大多数不调用 SOL；把这些导入放在请求路径内，
+    只读/回填命令少付一次网络栈开销，而 SOL 调用本身的行为与异常语义不变。
+    """
+    import http.client
+    import socket
+    import urllib.error
+    import urllib.request
+    return http.client, socket, urllib.error, urllib.request
+
+
+_NO_REDIRECT: type | None = None
+
+
+def _no_redirect_class():
+    """3xx 一律失败的 opener handler；类按需构建，避免模块级导入网络栈。"""
+    global _NO_REDIRECT
+    if _NO_REDIRECT is None:
+        _, _, _, request_module = _network()
+
+        class _NoRedirect(request_module.HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, headers, newurl):
+                return None
+
+        _NO_REDIRECT = _NoRedirect
+    return _NO_REDIRECT
+
+
+def __getattr__(name: str):
+    # `_NoRedirect` 对外仍是可取的模块属性（历史测试与外部调用直接构造它），
+    # 只是延迟到首次访问时才真正导入 urllib.request。
+    if name == "_NoRedirect":
+        return _no_redirect_class()
+    raise AttributeError(name)
 
 
 def _post_once(url: str, key: str, body: dict, timeout: float) -> dict:
+    http_client, socket, urllib_error, urllib_request = _network()
     data = json.dumps(body, ensure_ascii=False).encode("utf-8")
-    request = urllib.request.Request(
+    request = urllib_request.Request(
         url, data=data, method="POST",
         headers={"Authorization": "Bearer " + key,
                  "Content-Type": "application/json"})
     # 显式空 ProxyHandler：本机 CPA 请求不经过环境代理，避免凭据转发到第三方。
-    opener = urllib.request.build_opener(
-        urllib.request.ProxyHandler({}), _NoRedirect())
+    opener = urllib_request.build_opener(
+        urllib_request.ProxyHandler({}), _no_redirect_class())
     try:
         with opener.open(request, timeout=timeout) as response:
             raw = response.read()
             status = response.status
             headers = getattr(response, "headers", None)
-    except urllib.error.HTTPError as exc:
+    except urllib_error.HTTPError as exc:
         try:
             raw = exc.read()
-        except (OSError, http.client.HTTPException):
+        except (OSError, http_client.HTTPException):
             raw = b""
         payload = None
         try:
@@ -921,7 +951,7 @@ def _post_once(url: str, key: str, body: dict, timeout: float) -> dict:
         raise SolTimeoutError(
             "sol_timeout",
             f"请求在 {timeout:g}s 内未完成；结果未知，未自动重试。") from None
-    except urllib.error.URLError as exc:
+    except urllib_error.URLError as exc:
         reason = getattr(exc, "reason", exc)
         if isinstance(reason, (socket.timeout, TimeoutError)):
             raise SolTimeoutError(
@@ -929,7 +959,7 @@ def _post_once(url: str, key: str, body: dict, timeout: float) -> dict:
                 f"请求在 {timeout:g}s 内未完成；结果未知，未自动重试。") from None
         raise SolUpstreamError("sol_transport_error",
                                _safe_detail(reason)) from None
-    except (http.client.HTTPException, OSError) as exc:
+    except (http_client.HTTPException, OSError) as exc:
         # 响应读到一半中断、连接重置、Content-Length 不足等：请求已发出，
         # 结果未知。显式映射为 SolError，确保进入失败审计与状态登记。
         raise SolUpstreamError(

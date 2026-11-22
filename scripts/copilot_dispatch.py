@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """Copilot 任务治理 CLI（ZCode Autonomous Development Edition）。
 
-Copilot 做轻量协作治理：任务合同、工作项、证据、审计与本地 G1–G3。
-除 `sol-think`（默认认知引擎，一次性零工具判断）与 `sol-review`（用户明确
-要求时的一次零工具独立复核）外，所有命令只读写任务状态，不调用模型；
-SOL 的结论只是认知输入，工程执行与技术决策始终由 ZCode 主代理完成。
+Copilot 做轻量协作治理：任务合同、工作项、证据、审计、本地 G1–G3，以及 SOL
+生命周期调度（A 启动 / B 规划 / C 事件 / D 里程碑 / E 收口）。
+`sol-consult` / `sol-plan` / `sol-review` 是显式模型调用入口；其余生命周期命令
+（`start` / `plan` / `record` / `criterion` / `closure` 等）和 `drive` 在默认
+`--sol auto` 下会顺带执行**至多 1 条** recommended 调度义务（1 次请求，失败只
+记录、不阻断），因此“不调用模型”只对 `--sol off` / `advise`、读命令与测试进程
+成立。SOL 的结论只是认知输入，工程执行与技术决策始终由 ZCode 主代理完成。
 
 常用命令::
 
@@ -14,13 +17,18 @@ SOL 的结论只是认知输入，工程执行与技术决策始终由 ZCode 主
     copilot_dispatch.py evidence --state S --add --id E1 --text "..."
     copilot_dispatch.py record --state S --id W1 --status done --result "..." --evidence E1
     copilot_dispatch.py criterion --state S --id C1 --status met --evidence E1
+    copilot_dispatch.py sol-schedule --state S
+    copilot_dispatch.py sol-consult --state S --materials M.md --question "..."
+    copilot_dispatch.py sol-plan --state S --materials M.md --question "..."
+    copilot_dispatch.py sol-review --state S --materials M.md   # 仅用户明确要求
+    copilot_dispatch.py sol-accept --state S --call-id SC... --status accepted
+    copilot_dispatch.py sol-stats --state S
     copilot_dispatch.py closure-check --state S
     copilot_dispatch.py closure --state S --close
-    copilot_dispatch.py sol-think --state S --materials M.md --question "..."
-    copilot_dispatch.py sol-review --state S --materials M.md
     copilot_dispatch.py legacy-status --state old.json --audit-log old.jsonl --ledger ledger.json
 
-历史 v1/v2 SOL 状态与审计只能通过 `legacy-status` 只读查看，v6+ 不会驱动它们。
+历史 v1/v2 SOL 状态与审计只能通过 `legacy-status` 只读查看，v6+ 不会驱动它们；
+`sol-think` 是 v8.4–v8.5 的只读别名，读取时归一为 CONSULT。
 """
 from __future__ import annotations
 
@@ -44,7 +52,7 @@ import review_policy as RP  # noqa: E402
 import sol_review as SR  # noqa: E402
 import sol_schedule as SS  # noqa: E402
 
-__version__ = "9.6.1"
+__version__ = "9.6.2"
 
 
 class CLIError(Exception):
@@ -167,12 +175,6 @@ def _print(obj) -> None:
         print(json.dumps(obj, ensure_ascii=False, indent=2, sort_keys=True))
 
 
-def _brief(state: dict) -> str:
-    cache: dict = {}
-    ev = G.evaluate(state, cache=cache)
-    return G.render_status(state, ev, cache=cache)
-
-
 EXIT_CONTINUE = 10
 
 # 只读命令不写任何文件（含 session.json 会话绑定）：它们的契约是“只看不改”。
@@ -247,12 +249,28 @@ def _obligation_round_two(state: dict, obligation: dict) -> bool:
                for item in G.iter_sol_calls(state))
 
 
+def _auto_lock_wait() -> float:
+    """自动调度路径等待任务 SOL 锁的上限（秒）。
+
+    `COPILOT_SOL_LOCK_TIMEOUT` 可覆盖；非法/非正值回落到 `SS.AUTO_LOCK_WAIT_S`。
+    拿不到锁时 `_execute_obligation` 把义务保持 `due` 并退出 0（不付费、不阻断），
+    而不是让工程命令无限等待另一个进程的请求。
+    """
+    raw = str(os.environ.get("COPILOT_SOL_LOCK_TIMEOUT") or "").strip()
+    try:
+        value = float(raw) if raw else SS.AUTO_LOCK_WAIT_S
+    except ValueError:
+        value = SS.AUTO_LOCK_WAIT_S
+    return value if value > 0 else SS.AUTO_LOCK_WAIT_S
+
+
 def _obligation_argv(path: str, obligation: dict, *,
                      round_two: bool) -> list[str]:
     mode = str(obligation.get("mode") or "CONSULT").upper()
     sub = {"PLAN": "sol-plan", "REVIEW": "sol-review"}.get(mode, "sol-consult")
     argv = [sub, "--state", path,
-            "--obligation", str(obligation.get("obligation_id") or "")]
+            "--obligation", str(obligation.get("obligation_id") or ""),
+            "--lock-timeout", f"{_auto_lock_wait():g}"]
     if round_two:
         trigger = RP.SOL_EVENT_TRIGGERS.get(
             str(obligation.get("event")), "new-evidence")
@@ -993,9 +1011,10 @@ def _invoke_sol_once(*, state_path: str, task_dir: str, prompt: str,
 
     返回 `(result, exit_code)`；result 为 None 表示失败且已打印真实原因。
 
-    THINK 是默认认知引擎：失败时只记录并降级（返回 0），主代理按已有信息继续，
-    SOL 不可用不构成工程阻断。REVIEW 是用户明确要求的独立结论：失败仍返回真实
-    非零退出码，不伪造 PASS。
+    CONSULT / PLAN 是默认认知引擎（`THINK` 只是归一为 CONSULT 的历史别名）：
+    失败时只记录并降级（返回 0），主代理按已有信息继续，SOL 不可用不构成工程
+    阻断。REVIEW 是用户明确要求的独立结论：失败仍返回真实非零退出码，不伪造
+    PASS。
     """
     recovered = False
     result = _load_pending_result(task_dir, digest, audit_subdir, prompt)
@@ -1189,7 +1208,7 @@ def _run_sol_channel(args, mode: str) -> int:
                                       question=question, stage=stage)
         subject = SR.review_subject_sha256(
             current, materials, mode=mode, question=question, stage=stage)
-        # 上限口径与真实调用一致（THINK 更紧）：超限会拒绝而不是静默截断。
+        # 上限口径与真实调用一致（认知模式比 REVIEW 更紧）：超限拒绝而非截断。
         limit = SR.MATERIALS_LIMITS[mode]
         if len(prompt_text) > SR.MATERIALS_WARN[mode]:
             print(f"提示：材料 {len(prompt_text)} 字符，较大；"
@@ -2068,7 +2087,7 @@ def cmd_legacy_status(args) -> int:
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         prog="copilot_dispatch.py",
-        description="Copilot 本地任务治理（不调用任何模型）")
+        description="Copilot 本地任务治理（SOL 调度默认 auto：每条命令最多 1 次建议性调用）")
     ap.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     sub = ap.add_subparsers(dest="command", required=True)
 
@@ -2088,8 +2107,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--test-policy-file", default="",
                    help="合同测试策略 JSON 文件")
     p.add_argument("--risk", default="medium", choices=G.RISKS,
-                   help="low/medium 默认不派 Reviewer；high 建议一次 SOL 单轮复核"
-                        "（advisory，不阻塞收口）")
+                   help="low/medium/high 决定认知复杂度：high 在启动/规划窗口给出"
+                        "CONSULT 准入建议（advisory）；REVIEW 只在用户明确要求时执行")
     p.add_argument("--backend", default="legacy", choices=G.BACKENDS)
     p.add_argument("--task-id", default="")
     p.add_argument("--task-kind", default="",
@@ -2250,7 +2269,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="实质风险触发因素（如 security/core-logic/data-integrity）")
     p.add_argument("--reason", default="", help="准入原因")
     p.add_argument("--user-request", action="store_true",
-                   help="用户明确要求 SOL 判断：直接建议一次 THINK 调用")
+                   help="用户明确要求 SOL 判断：建议一次 CONSULT 调用")
     p.add_argument("--review-request", action="store_true",
                    help="用户明确要求独立复核：建议一次 REVIEW（不由阶段或风险自动派生）")
     p.add_argument("--json", action="store_true")
@@ -2274,6 +2293,12 @@ def build_parser() -> argparse.ArgumentParser:
                    help="只构建并校验请求（零工具/材料大小），不发请求、不写状态")
     p.add_argument("--list", action="store_true", help="只读列出生效的 SOL 复核记录")
     p.add_argument("--json", action="store_true")
+    # 与认知命令同一把锁、同一等待口径：显式调用默认一直等待，调度路径带上限。
+    p.add_argument("--lock-timeout", type=float, default=None,
+                   help="等待任务 SOL 锁的秒数；省略则一直等待（手动调用）。"
+                        "调度路径固定带上限（默认 "
+                        f"{SS.AUTO_LOCK_WAIT_S:g}s，COPILOT_SOL_LOCK_TIMEOUT 覆盖），"
+                        "拿不到锁时义务保持待执行、不付费")
     p.add_argument("--timeout", type=float, default=SR.DEFAULT_TIMEOUT,
                    help="单次请求超时秒数（不重试）")
     p.add_argument("--max-output-tokens", type=int,
@@ -2293,8 +2318,11 @@ def build_parser() -> argparse.ArgumentParser:
                             help="按调度义务执行（sol-schedule 给出编号）：材料/问题/"
                                  "阶段缺省时从义务补齐，并把结果结算到该义务")
         parser.add_argument("--lock-timeout", type=float, default=None,
-                            help="等待任务 SOL 锁的秒数；省略则一直等待（手动调用），"
-                                 "生命周期调度使用有界等待")
+                            help="等待任务 SOL 锁的秒数；省略则一直等待（手动调用）。"
+                                 "生命周期调度的自动路径固定带上限"
+                                 f"（默认 {SS.AUTO_LOCK_WAIT_S:g}s，"
+                                 "COPILOT_SOL_LOCK_TIMEOUT 覆盖），拿不到锁时"
+                                 "义务保持待执行、不付费")
         parser.add_argument("--knowledge-file", default="",
                             help="知识交接 JSON（由 knowledge_handoff.py 校验）；"
                                  "摘录追加到 materials")
@@ -2477,7 +2505,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--summary", default="",
                    help="新结论必填；amendment 可只改引用或写修订说明")
     p.add_argument("--review-ref", default="")
-    p.add_argument("--reviewer", default="native")
+    # G4 native 复核已退役：默认标签只标注“由 ZCode 在用户要求下登记”，
+    # 不再暗示存在原生 Reviewer 通道。
+    p.add_argument("--reviewer", default="zcode")
     p.add_argument("--amend", default="",
                    help="对既有 review_id 追加非实质修订（目标摘要必须未变）")
     p.add_argument("--supersedes", default="",

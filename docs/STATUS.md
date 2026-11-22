@@ -1,7 +1,42 @@
 # STATUS
 
-更新：2026-11-21 CST。本文件只记录现场可核实的事实；规划与未完成事项单独标注。
-当前版本：v9.6.1（收口时序：最终工程验证完成才执行收口 CONSULT）。
+更新：2026-11-22 CST。本文件只记录现场可核实的事实；规划与未完成事项单独标注。
+当前版本：v9.6.2（源码级；统计口径修正、SOL 锁等待有界、文档与死代码收敛，未提交未发布）。
+
+## v9.6.2 全面评审与针对性优化（2026-11-22，源码级未提交）
+
+- **P1 缺陷（已修）**：`sol-stats` 任务级窗口分子/分母单位不一致——真实任务
+  `closure-timing-2026-11-21` 曾输出 `coverage.closure.rate=3.0（3/1）`（多轮 reopen 的 3 次
+  收口判断 ÷ 1 个任务）。现按任务计 1 次（满足＝执行或复用），义务条数与执行/复用/跳过/
+  漏调分项保留在 `by_family`；工作区聚合复查 `closure 2/9=0.2222`、所有 rate ≤ 1，
+  `totals.closure_eligible_tasks` 新增且可复算。
+- **P1 缺陷（已修）**：事件（C）分母包含合理跳过窗口，与 `_expire_superseded` / `sync`
+  的跳过口径不一致；现分母＝识别事件数 − 合理跳过数，漏调仍单列。
+- **P1 缺陷（已修）**：文档承诺自动调度“有界执行”，但 `_obligation_argv` 从不传
+  `--lock-timeout`，`task_lock(timeout=None)` 会无限等待另一进程的 SOL 请求。现自动路径固定
+  `AUTO_LOCK_WAIT_S`（120 s，`COPILOT_SOL_LOCK_TIMEOUT` 覆盖），拿不到锁时义务保持 `due`、
+  不付费、退出码 0；`sol-review` 同步接受该参数。
+- **P1 性能（已改）**：`sol_review` 的网络栈改为请求路径内惰性导入；同机交替 A/B 中位数
+  （先 `compileall`，每条命令 `-B`）：`import copilot_dispatch` 98.2→80.0 ms，`status`
+  155→127 ms、`closure-check` 133→110 ms、`sol-stats` 129→112 ms、`handoff` 149→132 ms
+  （明细 `evidence/notes/perf-ab.txt`，E3）。
+- **P2 已处理**：CLI 文档/帮助、SKILL、`references/*`、README 与实现对齐（生命周期命令在
+  `--sol auto` 下会执行 1 条义务；收口顺序＝最终验证 → E → `sol-accept` → G1–G3；D 为
+  `recommended`；风险不再派生 REVIEW；钩子 0/2 与 exit 0 分开描述；`--reviewer` 默认
+  `zcode`）；清理 25 个零引用且无动态访问的符号（明细见 `SKILL.md` v9.6.2）。
+- **测试**：新增 5 项回归（任务级窗口不超过 100%、事件分母排除跳过、全跳过为 N/A、
+  自动路径锁等待有界 + 三个 SOL 子命令都接受该参数、新验证摘要不被旧收口判断/旧验收覆盖）
+  与 1 项架构约束（SOL 网络栈惰性导入）；最终口径 `tests/test_sol_scheduling.py` 72 项，
+  双版本全量 `Ran 855 tests ... OK`（3.12 / 3.10）。
+- **SOL 调度闭环（真实调用）**：A 启动 CONSULT `SC6a8b166b0f9bd72f71c5843e`（SO1）、
+  B 调查后 PLAN `SC61f1831bf3725c04609e0031`（SO2）、E 收口 CONSULT
+  `SC5a509ce03aace685da7a07c4`（SO3，摘要 `7357716c5786ce3a`）；ZCode 验收
+  `accepted`，随后 G1–G3 收口 `verdict=pass iteration=I0 by=zcode-native`。
+  调度义务 3 个、未闭合 0、漏调 0；`sol-stats` 的 startup/plan/closure 覆盖率为 1.0/1.0/1.0，
+  事件窗口分母为 0 时 `rate=null`（不再伪造 100%）。REVIEW 未发起（用户授权为可选）。
+- **边界**：本轮未 commit/push/PR/Release/Tag，未改 Ruleset、Provider、模型或账户配置；
+  已发布 `v9.6.1` Tag/Release 未移动。运行时已按同步脚本下发，`--check` 与 `--verify-baseline`
+  结果见收口报告。
 
 ## 收口、main 分支保护与 v9.6.1 Release（2026-11-21）
 

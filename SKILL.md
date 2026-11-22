@@ -9,7 +9,7 @@ when_to_use: >
   直接由 ZCode 原生完成，不进入本 Skill。
 ---
 
-# copilot：轻量协作治理（v9.6.1）
+# copilot：轻量协作治理（v9.6.2）
 
 Copilot 是运行在 ZCode 内的**协作治理层**，不是决策模型，也不是执行体。它负责把任务变成可
 追踪的合同、状态、证据与收口条件，并在任务没有真正完成时继续推进。
@@ -79,9 +79,12 @@ start（合同 + 完成条件 + 风险 + 任务类型 + 后端）
   → [仅用户明确要求] sol-review 一次（REVIEW 独立复核）
 ```
 
-除 `sol-consult` / `sol-plan` / `sol-review` 外，所有命令不发起网络或模型调用，只读写任务
-状态与本地证据/派发文件；其中 `evidence --capture-cmd` 会执行调用方给出的本地命令，`handoff`
-会做只读 Git 查询。三个 SOL 命令都是一次调用只发一次请求，不自动重试、不自动二审；
+`sol-consult` / `sol-plan` / `sol-review` 是显式模型调用入口；其余生命周期命令
+（`start` / `plan` / `record` / `criterion` / `closure` …）和 `drive` 在默认 `--sol auto` 下
+会顺带执行**至多 1 条** recommended 调度义务（1 次请求，失败只记录、不阻断）——所以
+“不调用模型”只对 `--sol off|advise`、读命令和测试进程成立。所有命令其余工作只读写任务
+状态与本地证据/派发文件；其中 `evidence --capture-cmd` 会执行调用方给出的本地命令，
+`handoff` 会做只读 Git 查询。每次 SOL 调用只发一次请求，不自动重试、不自动二审；
 CONSULT / PLAN 失败只记录并降级，不阻断工程推进。完整命令矩阵见 `references/workflow.md`；
 阶段机与驱动语义见 `references/runtime.md`。
 
@@ -541,8 +544,9 @@ verify 的结构化质量报告（`copilot-verify-result/v1`）走报告接入�
 - 已覆盖且没有升级型新信号 → `reuse`：直接复用已有认知结论；
 - 只有升级型信号（`risk-high` / `replan-history` / `reopened`）新出现，或合同被修订
   （合同指纹变化＝新范围），才允许追加；证据目录增加、工作项增减等结构变化不算新的认知对象。
-- 收口前建议通过 `status` / `review-admission` / `evaluate` 获得；`drive` 命中 PASS 会立即
-  收口，顺序是：最终验证 → 收口 CONSULT（如建议）→ `drive` 收口。
+- 收口前建议通过 `status` / `review-admission` / `evaluate` 获得；`drive` 命中 PASS 时按
+  固定顺序推进：最终验证 → 收口 CONSULT（如建议）→ ZCode `sol-accept` 独立验收 →
+  G1–G3 收口。验证有缺口时 `drive` 直接返回 `EXIT_EXECUTE`，不执行 SOL、不收口。
 
 ### 生命周期主动调度（v9.6）
 
@@ -766,7 +770,38 @@ CONSULT / PLAN 输出契约（`copilot-sol-think/v2`）：`judgment`、`goal_und
 
 ## 版本
 
-当前 **v9.6.1（收口时序：最终验证完成才执行收口 CONSULT）**：
+当前 **v9.6.2（统计口径修正、SOL 锁等待有界、文档与死代码收敛）**：
+
+- **覆盖率口径修正（P1 缺陷）**：任务级窗口（A 启动 / B 规划 / E 收口）的分母是“本任务是否
+  适用”（0/1），分子过去却取满足义务的条数——多轮 reopen 的多次收口判断会得出
+  `rate=3.0`（3 次收口 ÷ 1 个任务）。现按任务计 1 次（满足＝真实执行或复用），义务条数与
+  执行/复用/跳过/漏调的分项仍完整保留在 `by_family`；`totals` 新增 `closure_eligible_tasks`。
+- **事件分母**：C 事件窗口按“每出现一次事件 → 一个适用窗口”计数，合理跳过（合同修订、
+  被新窗口取代、任务已关闭）不再进入分母，与 `_expire_superseded` / `sync` 的口径一致。
+- **自动调度锁等待有界**：此前文档承诺“有界执行”，但自动路径从不传 `--lock-timeout`，
+  实际会无限等待另一进程的 SOL 请求。现在自动路径固定带上限
+  （`AUTO_LOCK_WAIT_S` 默认 120 s，`COPILOT_SOL_LOCK_TIMEOUT` 覆盖）；拿不到锁时义务保持
+  `due`、不付费、不阻断工程命令。`sol-review` 也接受同一参数。
+- **文档/帮助与实现对齐**：生命周期命令在 `--sol auto` 下会顺带执行 1 条义务，不再宣称
+  “所有命令都不调用模型”；收口顺序统一写成 最终验证 → E → `sol-accept` → G1–G3；D 里程碑
+  级别为 `recommended`（不是 `optional`）；风险只影响认知准入、REVIEW 仅用户明确要求；
+  钩子的 `0/2`（Stop，fail-closed）与 `exit 0`（SessionStart/UserPromptSubmit）分开描述。
+- **死代码收敛**：删除零引用且无动态访问的常量/别名/助手（`DEFAULT_BUDGET_S`、
+  `TERMINAL_OBLIGATION_STATUSES`、`EVENT_SCHEMA`、`open_obligations`、`describe`、
+  `SOL_EVENT_ORDER`、`SOL_DYNAMIC_EVENTS`、`SOL_EVENT_FAMILY`/`event_family`、
+  `COMPLEXITY_LEVELS`、`NON_SIMPLE_TASK_KINDS`、`LEGACY_ASSIGNEES`、
+  `QUALITY_ACCEPTANCE_STATUSES`、`REVIEW_ATTEMPT_RE`、`TERMINAL_PHASES`、`_bool`、
+  `add_admission_triggers`、`list_sol_think_calls`、`ACCEPTANCE_EVIDENCE_STATES`、
+  `record_sol_advisory*`、`SCHEMAS`、`_optional_text`、`_action_fingerprint`、
+  `LEGACY_THINK_SCHEMAS`、`_brief`）；`legacy/` 与历史审计/状态读取兼容不动。
+- **性能**：SOL 网络栈（`urllib.request`/`ssl`/`http.client`/`email`）改为请求路径内惰性导入；
+  同机交替 A/B 中位数（先 `compileall`，每条命令 `-B`）：`import copilot_dispatch`
+  98.2 → 80.0 ms，`status` 155 → 127 ms、`closure-check` 133 → 110 ms、`sol-stats`
+  129 → 112 ms、`handoff` 149 → 132 ms。
+- **不变量**：G1–G3、收口顺序与 `closure_readiness` 准入、PARTIAL 续跑、SOL advisory、
+  REVIEW 仅用户明确要求、G4 退役、Provider/模型/账户配置全部不变。
+
+**v9.6.1（收口时序：最终验证完成才执行收口 CONSULT）**：
 
 - **为什么改**：v9.6.0 的 E 准入只看“工作项是否耗尽”（`all_done`），`_sol_schedule_step`
   又固定传 `gates_passed=False`，于是最后一个工作项一关闭就可能立刻执行收口 CONSULT——
@@ -802,8 +837,10 @@ CONSULT / PLAN 输出契约（`copilot-sol-think/v2`）：`judgment`、`goal_und
   `state.sol_schedule`；窗口只按已持久化事实关闭，漏调由关闭时的事实派生。
 - **有界自动执行**：`start`/`plan`/`record`/`rerun`/`criterion`/`judgment`/`evidence`/
   `report`/`accept`/`decide`/`block`/`unblock`/`finding`/`contract`/`reopen`/`closure` 与
-  `drive` 在回填后做一次有界调度步：最多 1 条义务、1 次请求、硬预算；`--sol
-  auto|advise|off` 控制策略，`optional` 只提示，读命令永不执行。
+  `drive` 在回填后做一次有界调度步：最多 1 条义务、1 次请求，并由
+  `AUTO_LOCK_WAIT_S`（默认 120 s，`COPILOT_SOL_LOCK_TIMEOUT` 覆盖）限制锁等待；拿不到
+  锁时义务保持 `due`、不付费、不阻断。`--sol auto|advise|off` 控制策略，非 recommended
+  义务只提示，读命令永不执行。
 - **PLAN 准入唯一口径**：`plan_admission()` 不再由工作项数量单独决定（方案类类型、声明
   触发、中/高复杂、≥2 工作项任一），并默认读取任务自己声明的触发因素。
 - **六类动态事件可归因**：`material-evidence-change`（finding 复现 / 条件回退）、
@@ -812,7 +849,8 @@ CONSULT / PLAN 输出契约（`copilot-sol-think/v2`）：`judgment`、`goal_und
   调用记录持久化 `sol_event_snapshot` 与 `closure_key`，事件比较与收口周期去重以真实
   记录为基线（合同修订后仍与旧基线比较，才能判为 scope-changed）。
 - **里程碑与收口接线**：D 从“仅 high”扩到 medium/high（完成后 ≥2 项或 ≥1 项且条件已核销），
-  级别 `optional`；`drive` 的 PASS 分支与 `closure --close` 先消费 E 窗口再收口
+  级别 `recommended`（`auto` 下自动执行 1 次）；`drive` 的 PASS 分支与 `closure --close`
+  先消费 E 窗口、再要求 `sol-accept`，然后收口
   （`closure.sol_entry` 区分 `drive` / `closure-command` / `zcode-native`）。
 - **去重、并发与降级**：同一 (合同, family, event, instance) 只有一个义务；同一 subject
   复用不重复付费；`task_lock(timeout)` 拿不到锁即放弃本次执行（义务保持待执行）；失败记录

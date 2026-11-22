@@ -799,6 +799,41 @@ class DeduplicationTests(SchedulingBase):
                 with G.task_lock(self.dir, ".sol.lock", timeout=0.1):
                     self.fail("不应取得已被占用的锁")
 
+    def test_auto_obligation_argv_carries_bounded_lock_wait(self):
+        """自动路径的“有界执行”必须真的带上锁等待上限，而不是无限等待。
+
+        调度路径靠 `_obligation_argv` 构造子命令参数；缺这个参数时
+        `task_lock(timeout=None)` 会一直等另一个进程的请求，工程命令被无限期
+        挂住，文档里的“有界执行”也就不成立。
+        """
+        argv = CD._obligation_argv(self.state_path,
+                                   {"obligation_id": "SO1", "mode": "CONSULT"},
+                                   round_two=False)
+        self.assertIn("--lock-timeout", argv)
+        bound = float(argv[argv.index("--lock-timeout") + 1])
+        self.assertEqual(bound, SS.AUTO_LOCK_WAIT_S)
+        self.assertGreater(bound, 0)
+        with mock.patch.dict(os.environ,
+                             {"COPILOT_SOL_LOCK_TIMEOUT": "7.5"}):
+            argv = CD._obligation_argv(self.state_path,
+                                       {"obligation_id": "SO1", "mode": "PLAN"},
+                                       round_two=False)
+            self.assertEqual(float(argv[argv.index("--lock-timeout") + 1]), 7.5)
+        # 非法/非正值回落到默认上限：环境变量不能把等待变成“永不放弃”。
+        for raw in ("nope", "0", "-3"):
+            with mock.patch.dict(os.environ,
+                                 {"COPILOT_SOL_LOCK_TIMEOUT": raw}):
+                argv = CD._obligation_argv(self.state_path,
+                                           {"obligation_id": "SO1"},
+                                           round_two=False)
+                self.assertEqual(float(argv[argv.index("--lock-timeout") + 1]),
+                                 SS.AUTO_LOCK_WAIT_S, raw)
+        # 三个 SOL 子命令都必须接受这个参数；否则调度会因“参数不合法”永久待执行。
+        for sub in ("sol-consult", "sol-plan", "sol-review"):
+            ns = CD.build_parser().parse_args(
+                [sub, "--state", self.state_path, "--lock-timeout", "5"])
+            self.assertEqual(ns.lock_timeout, 5.0, sub)
+
 
 # ── 门禁与统计口径 ────────────────────────────────────────────────────────
 class GateAndStatsTests(SchedulingBase):
@@ -834,6 +869,92 @@ class GateAndStatsTests(SchedulingBase):
         self.assertFalse(SS.is_missed(rows["SO2"]))
         stats = SS.task_stats(state)
         self.assertEqual(stats["by_family"]["A"]["missed"], 1)
+
+    def test_reopen_closure_windows_never_exceed_full_coverage(self):
+        """多轮 reopen 的多次收口判断按任务计 1 次：覆盖率不得 > 100%。
+
+        回归 `coverage.closure.rate=3.0`：分子取满足义务条数（3 次收口）而分母是
+        任务级适用（1），单位不一致会把覆盖率算成 300%。义务条数仍保留在
+        `by_family` 里解释“实际覆盖了几次”。
+        """
+        state = {
+            "task_id": "t-reopen", "goal": "g", "risk": "high",
+            "task_kind": "governance", "contract_sha256": "c3",
+            "contract": {"criteria": [{"criterion_id": "C1", "status": "met",
+                                      "description": "x"}]},
+            "actions": [{"id": "A1", "status": "done", "title": "x"}],
+            "evidence": [{"id": "E1"}],
+            "sol_calls": [],
+            "sol_schedule": {"schema": SS.SCHEDULE_SCHEMA, "next_id": 9,
+                             "obligations": [
+                {"obligation_id": "SO1", "family": "E", "event": "closure",
+                 "mode": "CONSULT", "status": "satisfied", "window": "closed",
+                 "source": "executed", "level": "recommended"},
+                {"obligation_id": "SO2", "family": "E", "event": "closure",
+                 "mode": "CONSULT", "status": "skipped", "window": "closed",
+                 "skip_by": "superseded-by-newer", "level": "recommended"},
+                {"obligation_id": "SO3", "family": "E", "event": "closure",
+                 "mode": "CONSULT", "status": "satisfied", "window": "closed",
+                 "source": "executed", "level": "recommended"},
+                {"obligation_id": "SO4", "family": "E", "event": "closure",
+                 "mode": "CONSULT", "status": "satisfied", "window": "closed",
+                 "source": "executed", "level": "recommended"},
+            ]}}
+        stats = SS.task_stats(state)
+        coverage = stats["coverage"]["closure"]
+        self.assertTrue(stats["closure_eligible"])
+        self.assertEqual((coverage["numerator"], coverage["denominator"]),
+                         (1, 1))
+        self.assertEqual(coverage["rate"], 1.0)
+        self.assertEqual(coverage["skipped"], 1)
+        # 义务条数仍可解释：这一任务实际做过 3 次收口判断。
+        self.assertEqual(stats["by_family"]["E"]["satisfied"], 3)
+
+    def test_events_denominator_excludes_legitimately_skipped_windows(self):
+        """事件分母只含适用窗口：合同修订/被取代的窗口不进入分母。"""
+        state = {
+            "task_id": "t-events", "goal": "g", "risk": "medium",
+            "task_kind": "standard", "contract_sha256": "c4",
+            "actions": [{"id": "A1", "status": "done", "title": "x"}],
+            "sol_calls": [],
+            "sol_schedule": {"schema": SS.SCHEDULE_SCHEMA, "next_id": 5,
+                             "obligations": [
+                {"obligation_id": "SO1", "family": "C",
+                 "event": "decision-point", "mode": "CONSULT",
+                 "status": "satisfied", "window": "closed",
+                 "source": "executed", "level": "recommended"},
+                {"obligation_id": "SO2", "family": "C",
+                 "event": "scope-changed", "mode": "CONSULT",
+                 "status": "skipped", "window": "closed",
+                 "skip_by": "contract-amended", "level": "recommended"},
+                {"obligation_id": "SO3", "family": "C",
+                 "event": "reopened", "mode": "CONSULT", "status": "due",
+                 "window": "closed", "level": "recommended"},
+            ]}}
+        coverage = SS.task_stats(state)["coverage"]["events"]
+        self.assertEqual(coverage["skipped"], 1)
+        self.assertEqual(coverage["missed"], 1)
+        self.assertEqual((coverage["numerator"], coverage["denominator"]),
+                         (1, 2))
+        self.assertEqual(coverage["rate"], 0.5)
+
+    def test_all_windows_skipped_reports_not_applicable(self):
+        """全部合理跳过时事件覆盖率是“不适用”，不是伪造的 0% 或 100%。"""
+        state = {
+            "task_id": "t-skip", "goal": "g", "risk": "medium",
+            "task_kind": "standard", "contract_sha256": "c5",
+            "actions": [{"id": "A1", "status": "done", "title": "x"}],
+            "sol_calls": [],
+            "sol_schedule": {"schema": SS.SCHEDULE_SCHEMA, "next_id": 3,
+                             "obligations": [
+                {"obligation_id": "SO1", "family": "C",
+                 "event": "scope-changed", "mode": "CONSULT",
+                 "status": "skipped", "window": "closed",
+                 "skip_by": "contract-amended", "level": "recommended"},
+            ]}}
+        coverage = SS.task_stats(state)["coverage"]["events"]
+        self.assertEqual(coverage["denominator"], 0)
+        self.assertIsNone(coverage["rate"])
 
     def test_stats_separate_suggestion_execution_reuse_skip_failure(self):
         state = {
@@ -1386,6 +1507,37 @@ class ClosureAdmissionTests(SchedulingBase):
                     self._consult_args(obligation["obligation_id"]))
         self.assertIn("最终验证摘要已变化", str(ctx.exception))
         self.assertEqual(calls["count"], 0)
+
+    def test_newer_digest_is_not_covered_by_earlier_acceptance(self):
+        """旧摘要的判断与验收都不覆盖新摘要：E 未新跑时收口只能如实记漏调。
+
+        收口前又产生了新验证事实（新摘要）时，旧 E 结论与旧验收都只属于旧摘要；
+        这里确认系统不会把它们当成新摘要的覆盖（否则顺序执行的 E2E 也排除不了
+        误收口），而是把没执行的 E 实例记成漏调。
+        """
+        self.verified()
+        with self.sol_channel():
+            self.step("auto")
+        first = self.closure_calls()[0]
+        self.accept()
+        self.register_tests_evidence(name="tests-rerun.log",
+                                     content="Ran 9 tests\nOK\n")
+        digest = G.closure_readiness(self.state())["digest"]
+        self.assertNotEqual(digest, first["final_verification_digest"])
+        self.assertIsNone(G.closure_acceptance_pending(self.state()))
+        self.assertEqual(self.advice()["action"], "consult")
+        self.assertEqual(self.advice()["instance"], digest)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(CD.cmd_closure(argparse.Namespace(
+                state=self.state_path, close=True, by="zcode-native",
+                sol="off")), 0)
+        closure = self.state()["closure"]
+        self.assertEqual(closure["final_verification_digest"], digest)
+        self.assertEqual(
+            closure["sol_schedule"]["at_close"]["pending_before_close"], 1)
+        self.assertEqual(closure["sol_schedule"]["missed"], 1)
+        self.assertEqual(self.closure_calls()[0]["final_verification_digest"],
+                         first["final_verification_digest"])
 
     def test_materials_carry_contract_body_instead_of_none(self):
         """材料必须带合同正文：`body` 不是状态键，读错会印出 “None”。"""
