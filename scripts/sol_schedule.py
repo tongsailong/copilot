@@ -30,11 +30,11 @@ import review_policy as RP
 
 OBLIGATION_SCHEMA = "copilot-sol-obligation/v1"
 SCHEDULE_SCHEMA = "copilot-sol-schedule/v1"
-STATS_SCHEMA = "copilot-sol-stats/v1"
+STATS_SCHEMA = "copilot-sol-stats/v2"
 # 材料口径版本。v2：合同正文改读 `contract["done_criteria_text"]`（`body` 兼容回退），
 # 正文缺失时显式标注“（未登记）”。该版本参与 `closure_verification_digest`，所以
 # 材料内容变化会让旧收口判断停止覆盖新结果，而不是靠“代码改过了”想当然。
-MATERIALS_SCHEMA = "copilot-sol-schedule-materials/v2"
+MATERIALS_SCHEMA = "copilot-sol-schedule-materials/v3"
 
 # 义务状态：due 未执行 / claimed 已被本进程领取 / in_flight 已发出请求未落盘 /
 # satisfied 已满足（含复用）/ failed 真实失败 / skipped 显式跳过（须有理由）。
@@ -42,6 +42,11 @@ OBLIGATION_STATUSES = ("due", "claimed", "in_flight", "satisfied", "failed",
                        "skipped")
 # 窗口关闭时这些状态构成漏调：领取过但从未发出请求与“一直没动”等价。
 MISSED_STATUSES = ("due", "claimed")
+# 终态处置：窗口关闭后每个义务都必须落到一个可复核的结果。处置是**派生的观察
+# 事实**，不是完成证明、不是门禁：completed 只说“窗口有结论”，covered/skipped
+# 只说“不需要独立调用”并带可查理由，not-executed 只说“关闭时仍未执行”。
+DISPOSITION_KINDS = ("completed", "covered", "skipped", "failed",
+                     "not-executed", "unsettled")
 FAMILY_INDEX = {name: index for index, name in enumerate(RP.SOL_FAMILIES)}
 DEFAULT_MATERIALS_CHARS = 24_000
 # 自动调度路径等待任务 SOL 锁的上限（秒）：拿不到锁说明另一个进程正在调用，
@@ -105,6 +110,12 @@ def obligations(state: dict) -> list[dict]:
     return items if isinstance(items, list) else []
 
 
+def schedule_view(state: dict) -> dict | None:
+    """只读调度结构（不创建）：用于读取策略快照等旁证。"""
+    raw = state.get("sol_schedule")
+    return raw if isinstance(raw, dict) else None
+
+
 def obligation_key(state: dict, family: str, event: str, instance: str) -> str:
     """义务键：任务 + 合同指纹 + family + 事件 + 发生实例。
 
@@ -143,6 +154,8 @@ def _new_obligation(state: dict, advice: dict, *, now: str) -> dict:
         "level": _text(advice.get("level")) or "recommended",
         "question": _text(advice.get("question")),
         "reason": _text(advice.get("reason")),
+        # 收口周期：重开后新建的义务属于新周期，旧义务保持原周期与原始事实。
+        "cycle": current_cycle(state),
         "opened_at": now,
         "window": "open",
         "closed_at": "",
@@ -218,18 +231,172 @@ def is_unresolved_in_flight(obligation: dict) -> bool:
             and _text(obligation.get("status")) == "in_flight")
 
 
-def settle(obligation: dict, *, status: str, now: str, reason: str = "") -> None:
+# ── 收口周期与终态处置 ────────────────────────────────────────────────────
+def current_cycle(state: dict) -> int:
+    """收口周期编号：1 + 已授权重开次数。
+
+    重开产生新周期；旧周期的义务保持原样（不改写、不重算、不删除），新周期的
+    义务带新编号，避免把“重开前的漏调”与“重开后的进展”混成一个统计。
+    """
+    closure = state.get("closure")
+    history = closure.get("reopen_history") if isinstance(closure, dict) else None
+    return 1 + (len(history) if isinstance(history, list) else 0)
+
+
+def obligation_cycle(obligation: dict) -> int:
+    """义务所属周期；历史义务没有该字段时按第 1 个周期处理（不落盘改写）。"""
+    try:
+        value = int(obligation.get("cycle") or 1)
+    except (TypeError, ValueError):
+        value = 1
+    return max(1, value)
+
+
+def policy_snapshot(schedule: dict | None, cycle: int) -> dict:
+    """读取该周期的调度策略快照（`off` / `advise` / `auto`）。
+
+    历史上没有快照的义务返回空：不能拿“现在的配置”倒推“当时为什么没调用”。
+    """
+    if not isinstance(schedule, dict):
+        return {}
+    store = schedule.get("policy_snapshots")
+    if not isinstance(store, dict):
+        return {}
+    entry = store.get(str(int(cycle)))
+    return dict(entry) if isinstance(entry, dict) else {}
+
+
+def note_policy(schedule: dict, *, policy: str, auto_execution: bool | None,
+                now: str, cycle: int) -> bool:
+    """记录本周期的实际调度策略，供事后解释“为什么没有调用”。
+
+    只记录事实（策略、自动执行是否允许），不据此推断历史，也不改变任何义务状态。
+    """
+    value = _text(policy).lower()
+    if not value:
+        return False
+    store = schedule.get("policy_snapshots")
+    if not isinstance(store, dict):
+        store = {}
+        schedule["policy_snapshots"] = store
+    key = str(int(cycle))
+    entry = dict(store.get(key) or {})
+    auto = None if auto_execution is None else bool(auto_execution)
+    if _text(entry.get("value")) == value and entry.get("auto_execution") == auto:
+        return False
+    entry["first_seen_at"] = _text(entry.get("first_seen_at")) or now
+    entry["value"] = value
+    entry["auto_execution"] = auto
+    entry["at"] = now
+    store[key] = entry
+    return True
+
+
+def note_deferral(obligation: dict, *, now: str, reason: str) -> None:
+    """记录“条件成立但本次未能调度”（例如 SOL 锁被占用、参数前置不成立）。
+
+    只计数并留因：义务仍保持 due（调度失败不等于不该调用），也不结算成失败；
+    窗口关闭时这条事实会写进终态处置，不会被静默清除。
+    """
+    if not isinstance(obligation, dict):
+        return
+    obligation["deferrals"] = int(obligation.get("deferrals") or 0) + 1
+    obligation["last_deferral_reason"] = str(reason or "")[:500]
+    obligation["last_deferred_at"] = now
+
+
+def _disposition_facts(obligation: dict, schedule: dict | None) -> tuple[str, str]:
+    """按已持久化的事实推导（终态, 理由）；没有终态时返回 ("", "")。"""
+    status = _text(obligation.get("status"))
+    closed_reason = _text(obligation.get("closed_reason")) or status
+    if status == "satisfied":
+        if _text(obligation.get("source")) == "reuse":
+            return "completed", ("同一认知对象的既有结论复用满足（"
+                                 + (_text(obligation.get("reuse_of"))
+                                    or "subject-reuse") + "）")
+        mode = _text(obligation.get("mode")) or "SOL"
+        call_id = _text(obligation.get("call_id"))
+        return "completed", (f"已执行 {mode} 调用"
+                             + (f"（{call_id}）" if call_id else "（未记 call_id）"))
+    if status == "failed":
+        detail = _text(obligation.get("failure")) or _text(obligation.get("result_note"))
+        return "failed", (f"执行失败：{detail}" if detail
+                          else f"执行失败（{closed_reason}）")
+    if status == "skipped":
+        reason = _text(obligation.get("skip_reason"))
+        if _text(obligation.get("skip_by")) == "closure-covered":
+            return "covered", reason or "收口综合判断已覆盖该窗口的认知对象"
+        return "skipped", reason or f"显式跳过（{closed_reason}）"
+    if status in MISSED_STATUSES:
+        parts = [f"窗口关闭（{closed_reason}）时仍未执行"]
+        snapshot = policy_snapshot(schedule, obligation_cycle(obligation))
+        if _text(snapshot.get("value")):
+            parts.append(f"当时调度策略={_text(snapshot.get('value'))}"
+                         + ("（允许自动执行）"
+                            if snapshot.get("auto_execution") else ""))
+        else:
+            parts.append("当时调度策略未记录（unknown）")
+        deferrals = int(obligation.get("deferrals") or 0)
+        if deferrals:
+            parts.append(f"周期内 {deferrals} 次未能调度，最后一次："
+                         f"{_text(obligation.get('last_deferral_reason')) or '未记原因'}")
+        return "not-executed", "；".join(parts)
+    if status == "in_flight":
+        return "unsettled", "已发出请求但未落盘：结果未决（既不算完成也不算漏调）"
+    return "", ""
+
+
+def obligation_disposition(obligation: dict, schedule: dict | None = None) -> dict:
+    """只读视图：优先用持久化处置；历史义务按窗口事实现算，不改状态。
+
+    历史任务没有 `disposition` 字段也可以得到终态：推导只读当前义务与策略快照，
+    不需要回写历史状态，也不需要重跑任何命令。
+    """
+    stored = _text(obligation.get("disposition"))
+    if stored in DISPOSITION_KINDS:
+        return {"kind": stored,
+                "reason": _text(obligation.get("disposition_reason")),
+                "at": _text(obligation.get("disposition_at")),
+                "stored": True}
+    if obligation.get("window") != "closed":
+        return {"kind": "", "reason": "", "at": "", "stored": False}
+    kind, reason = _disposition_facts(obligation, schedule)
+    return {"kind": kind, "reason": reason,
+            "at": _text(obligation.get("closed_at")), "stored": False}
+
+
+def _stamp_disposition(obligation: dict, *, now: str,
+                       schedule: dict | None = None) -> bool:
+    """窗口关闭时落一次终态处置；已写过的不覆盖（只增不改）。"""
+    if _text(obligation.get("disposition")) in DISPOSITION_KINDS:
+        return False
+    if obligation.get("window") != "closed":
+        return False
+    kind, reason = _disposition_facts(obligation, schedule)
+    if not kind:
+        return False
+    obligation["disposition"] = kind
+    obligation["disposition_reason"] = reason[:500]
+    obligation["disposition_at"] = now
+    return True
+
+
+def settle(obligation: dict, *, status: str, now: str, reason: str = "",
+           schedule: dict | None = None) -> None:
     """结算义务：状态一旦落定（成功/失败/跳过/复用），窗口随即关闭。
 
     结算不是完成证明，只是“这个认知窗口已经有结果”。不关闭窗口会让已执行义务
     永远停在 open，收口时被误算成“关闭前仍未执行”，也会掩盖后续漏调的窗口边界。
+    结算同时写一次终态处置（`schedule` 只用于读取当时策略快照）。
     """
     obligation["status"] = status
     if obligation.get("window") == "closed":
+        _stamp_disposition(obligation, now=now, schedule=schedule)
         return
     obligation["window"] = "closed"
     obligation["closed_at"] = now
     obligation["closed_reason"] = str(reason or status)
+    _stamp_disposition(obligation, now=now, schedule=schedule)
 
 
 # ── 同步：把生命周期建议物化为义务、按事实关闭窗口 ────────────────────────
@@ -239,35 +406,49 @@ def _close(schedule: dict, obligation: dict, *, now: str, reason: str) -> None:
     obligation["window"] = "closed"
     obligation["closed_at"] = now
     obligation["closed_reason"] = reason
+    _stamp_disposition(obligation, now=now, schedule=schedule)
 
 
 def _advance_windows(schedule: dict, *, now: str) -> None:
     """更晚窗口已经“满足”时，关闭更早仍未满足的窗口（漏调因此可见）。
 
     只在确实有更晚窗口成功执行/复用后才关闭：刚创建、被提示但未执行、预算耗尽
-    都不关闭窗口，避免把“还没来得及做”误判成漏调。
+    都不关闭窗口，避免把“还没来得及做”误判成漏调。比较只在同一收口周期内进行：
+    重开后的收口判断覆盖的是重开后的认知对象，不能追溯性地宣布上一周期的窗口
+    已被覆盖。
     """
     satisfied = [item for item in schedule["obligations"]
                  if isinstance(item, dict) and item.get("window") == "closed"
                  and _text(item.get("status")) == "satisfied"]
     if not satisfied:
         return
-    frontier = min(family_index(_text(item.get("family"))) for item in satisfied)
+    # 收口综合判断覆盖了规划比较（B）与里程碑复盘（D）的认知对象：目标达成、
+    # 方案是否仍成立、遗漏与下一阶段方向都已在收口判断里综合。**只要同周期的
+    # E 窗口已满足就成立**，不能用“最早已满足窗口”的门槛去判断——启动 CONSULT
+    # （A）几乎总在该周期内先满足，用 min() 会让这条覆盖永远不触发，最后一批
+    # 进展刚打开 B/D 就收口时会白跑一次调用。
+    closure_cycles = {obligation_cycle(item) for item in satisfied
+                      if family_index(_text(item.get("family")))
+                      == family_index("E")}
+    frontiers: dict[int, int] = {}
+    for item in satisfied:
+        cycle = obligation_cycle(item)
+        index = family_index(_text(item.get("family")))
+        frontiers[cycle] = min(index, frontiers.get(cycle, index))
     for item in schedule["obligations"]:
         if not isinstance(item, dict) or item.get("window") != "open":
             continue
+        cycle = obligation_cycle(item)
         family = family_index(_text(item.get("family")))
-        if family >= frontier:
-            continue
-        if frontier == family_index("E") and _text(item.get("family")) == "D":
-            # 收口综合判断覆盖了里程碑复盘的认知对象（目标达成/遗漏/下一阶段）。
-            # 最后一批进展刚打开 D 窗口就收口时，记“合理跳过”而不是漏调：漏调只
-            # 统计确实应当独立执行而未执行的窗口。
+        if cycle in closure_cycles and _text(item.get("family")) in ("B", "D"):
             item["status"] = "skipped"
             item["skip_by"] = "closure-covered"
-            item["skip_reason"] = "收口综合判断已覆盖该里程碑复盘的认知对象"
+            item["skip_reason"] = "收口综合判断已覆盖该窗口的认知对象"
             item["finished_at"] = now
             _close(schedule, item, now=now, reason="closure-covered")
+            continue
+        frontier = frontiers.get(cycle)
+        if frontier is None or family >= frontier:
             continue
         _close(schedule, item, now=now, reason="superseded")
 
@@ -366,14 +547,25 @@ def _collapse_duplicate_windows(schedule: dict, *, now: str) -> list[str]:
 
 
 def sync(schedule: dict, state: dict, advice: dict, *, now: str,
-         closed: bool = False) -> list[str]:
+         closed: bool = False, policy: str = "",
+         auto_execution: bool | None = None) -> list[str]:
     """把当前建议物化为调度义务，并按已发生的事实关闭窗口。
 
     返回人类可读的变更说明（供状态历史/输出使用）。函数只改动传入的 schedule。
+    `policy` / `auto_execution` 只用于记录**当时的**调度策略事实：有了它，事后
+    才能区分“策略关闭所以没调用”与“应当调用但漏了”；没有它就记 unknown，绝不
+    用当前配置倒推。
     """
     changes: list[str] = []
     if not isinstance(schedule.get("obligations"), list):
         schedule["obligations"] = []
+    cycle = current_cycle(state)
+    if note_policy(schedule, policy=policy, auto_execution=auto_execution,
+                   now=now, cycle=cycle):
+        changes.append(f"SOL 调度策略（周期 {cycle}）："
+                       f"{_text(policy).lower()}"
+                       + ("，允许自动执行" if auto_execution else
+                          "，不自动执行" if auto_execution is False else ""))
     changes.extend(_expire_superseded(schedule, state, now=now))
     changes.extend(_collapse_duplicate_windows(schedule, now=now))
     action = _text(advice.get("action"))
@@ -444,21 +636,48 @@ def sync(schedule: dict, state: dict, advice: dict, *, now: str,
 def summary(state: dict) -> dict:
     """给 evaluate/status 的只读摘要：未闭合义务与下一条可执行项。"""
     rows = obligations(state)
+    raw = state.get("sol_schedule") if isinstance(state.get("sol_schedule"), dict) else None
     pending = [item for item in rows
                if isinstance(item, dict) and item.get("window") == "open"
                and _text(item.get("status")) in ("due", "claimed", "in_flight")]
     missed = [item for item in rows if isinstance(item, dict) and is_missed(item)]
     next_item = due_obligations(state)
+    # 终态处置与周期分布只是可观测值：它们不进入 total/pending/missed，也不参与
+    # 覆盖率分母；历史义务没有持久化处置时按窗口事实现算，不改历史状态。
+    dispositions = {kind: 0 for kind in DISPOSITION_KINDS}
+    by_cycle: dict[int, dict] = {}
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        cycle = obligation_cycle(item)
+        row = by_cycle.setdefault(cycle, {
+            "cycle": cycle, "obligations": 0, "open": 0, "missed": 0,
+            "dispositions": {kind: 0 for kind in DISPOSITION_KINDS}})
+        row["obligations"] += 1
+        if item.get("window") == "open":
+            row["open"] += 1
+        if is_missed(item):
+            row["missed"] += 1
+        disposition = obligation_disposition(item, raw)
+        if disposition["kind"]:
+            dispositions[disposition["kind"]] += 1
+            row["dispositions"][disposition["kind"]] += 1
+    current = current_cycle(state)
     return {
         "schema": SCHEDULE_SCHEMA,
         "total": len(rows),
         "pending": len(pending),
         "missed": len(missed),
+        "cycle": current,
+        "policy": policy_snapshot(raw, current),
+        "dispositions": dispositions,
+        "by_cycle": [by_cycle[key] for key in sorted(by_cycle)],
         "pending_obligations": [
             {"obligation_id": item.get("obligation_id"),
              "family": item.get("family"), "event": item.get("event"),
              "stage": item.get("stage"), "level": item.get("level"),
-             "status": item.get("status")}
+             "status": item.get("status"),
+             "cycle": obligation_cycle(item)}
             for item in pending],
         "next": ({"obligation_id": next_item[0].get("obligation_id"),
                   "family": next_item[0].get("family"),
@@ -552,6 +771,19 @@ def _delta_rows(state: dict, obligation: dict) -> list[str]:
             rows.append("- 回退为未核销的完成条件：" + "、".join(sorted(invalidated)))
         if new_replans:
             rows.append("- 新增重规划工作项：" + "、".join(new_replans))
+        new_decisions = [x for x in current["decisions"]
+                         if x not in set(previous.get("decisions") or [])]
+        if new_decisions:
+            rows.append("- 新增未决决策：" + "、".join(new_decisions))
+        previous_blocks = {str(item.get("block_id")): item
+                           for item in previous.get("blocks") or []
+                           if isinstance(item, dict)}
+        changed_blocks = [item for item in current.get("blocks") or []
+                          if item.get("active")
+                          and previous_blocks.get(str(item.get("block_id"))) != item]
+        if changed_blocks:
+            rows.append("- 未解除阻塞发生变化：" + "、".join(
+                str(item.get("block_id")) for item in changed_blocks))
         if previous.get("contract_sha256") and \
                 previous["contract_sha256"] != current["contract_sha256"]:
             rows.append("- 合同指纹已变化：旧结论不覆盖当前合同。")
@@ -580,6 +812,26 @@ def build_materials(state: dict, obligation: dict, *,
     """
     event = _text(obligation.get("event")) or "startup"
     family = _text(obligation.get("family")) or "C"
+    # 历史判断与未处理议程：让 SOL 做增量判断，而不是从零重问同一问题。只取
+    # 最近三次判断的核心结论与采纳状态，不注入完整回复。
+    prior = RP.prior_cognition(state.get("sol_calls"), limit=3)
+    agenda = RP.open_agenda(state.get("sol_calls"))
+    prior_lines: list[str] = []
+    if prior:
+        prior_lines = ["", "## 上次 SOL 判断与采纳", ""]
+        for item in prior:
+            line = (f"- {item['call_id']}（{item['mode']}/{item['stage']}，采纳："
+                    f"{item['acceptance']}"
+                    + (f"，决策：{item['decision']}" if item["decision"] else "")
+                    + f"）：{item['judgment'] or '（无判断文本）'}")
+            if item["delta"]:
+                line += f"；实际差异：{item['delta']}"
+            prior_lines.append(line)
+    agenda_lines: list[str] = []
+    if agenda:
+        agenda_lines = ["", "## 未处理议程（上次 SOL 提出，仍相关才继续判断）", ""]
+        agenda_lines += [f"- [{entry['kind']}] {entry['text']}"
+                         for entry in agenda]
     lines = [
         f"# SOL {family} 阶段材料（{_text(obligation.get('mode'))} / "
         f"{_text(obligation.get('stage'))}）",
@@ -595,6 +847,8 @@ def build_materials(state: dict, obligation: dict, *,
         f"- 生命周期窗口：{family}（{event}）",
         f"- 触发原因：{_text(obligation.get('reason')) or RP.SOL_EVENTS.get(event, '-')}",
         *_delta_rows(state, obligation),
+        *prior_lines,
+        *agenda_lines,
         "",
         "## 任务目标与合同约束",
         "",
@@ -778,6 +1032,23 @@ def task_stats(state: dict) -> dict:
         code = _text(item.get("event")) or "-"
         by_event[code] = by_event.get(code, 0) + 1
 
+    # 终态处置与周期分布：只做观测，不进入 coverage 的分子分母，也不改变 missed
+    # 口径。历史义务没有持久化处置时按窗口事实现算（只读，不回写历史状态）。
+    raw_schedule = state.get("sol_schedule") if isinstance(
+        state.get("sol_schedule"), dict) else None
+    dispositions = {kind: 0 for kind in DISPOSITION_KINDS}
+    by_cycle: dict[int, dict] = {}
+    for item in rows:
+        cycle = obligation_cycle(item)
+        row = by_cycle.setdefault(cycle, {
+            "cycle": cycle, "obligations": 0,
+            "dispositions": {kind: 0 for kind in DISPOSITION_KINDS}})
+        row["obligations"] += 1
+        kind = obligation_disposition(item, raw_schedule)["kind"]
+        if kind:
+            dispositions[kind] += 1
+            row["dispositions"][kind] += 1
+
     # 分母：只统计“适用”的任务/窗口，并显式给出理由；跳过不进入分子，但仍保留
     # 原始义务计数，避免通过缩小分母制造覆盖率。
     coverage = {
@@ -833,6 +1104,36 @@ def task_stats(state: dict) -> dict:
     latency = [float(item.get("latency_ms") or 0)
                for item in completed if item.get("latency_ms")]
     ordered_latency = sorted(latency)
+    # 议程/采纳/收口后调用是可观测值，不是价值证明：议程条数多不代表判断有效，
+    # 采纳率高也不代表结论正确；它们用于发现“判断沉睡”和“收口后重复付费”。
+    agenda_calls = [item for item in completed
+                    if RP.normalize_agenda(item.get("agenda"))]
+    agenda_items = sum(len(RP.normalize_agenda(item.get("agenda")))
+                       for item in completed)
+    closure_calls = [item for item in completed
+                     if _text(item.get("stage")) == "closure"]
+    # 收口后调用只在“收口判断之后、下一次授权 reopen 之前”的区间内计数。重开会
+    # 合法地重新打开认知窗口，把重开后的 C/D 调用算成“收口后重复付费”会制造
+    # 假阳性，让这个观察值失去意义。
+    closure_times = sorted(_text(item.get("created_at")) for item in closure_calls)
+    reopen_times = sorted(
+        _text(entry.get("at"))
+        for entry in (state.get("closure") or {}).get("reopen_history") or []
+        if isinstance(entry, dict) and _text(entry.get("at")))
+    post_closure_calls = []
+    for item in completed:
+        created = _text(item.get("created_at"))
+        if not created or _text(item.get("stage")) == "closure":
+            continue
+        if _text(item.get("mode")).upper() not in ("CONSULT", "PLAN"):
+            continue
+        prior = [value for value in closure_times if value < created]
+        if not prior:
+            continue
+        last_closure = prior[-1]
+        if any(last_closure < value <= created for value in reopen_times):
+            continue
+        post_closure_calls.append(item)
     return {
         "task_id": _text(state.get("task_id")),
         "eligible": bool(non_simple),
@@ -845,6 +1146,9 @@ def task_stats(state: dict) -> dict:
         "not_registered": bool(non_simple and not by_family["A"]["obligations"]),
         "by_family": by_family,
         "by_event": by_event,
+        "cycle": current_cycle(state),
+        "dispositions": dispositions,
+        "by_cycle": [by_cycle[key] for key in sorted(by_cycle)],
         "coverage": coverage,
         "calls": {"completed": len(completed), "failed": len(failed_calls),
                   "total": len(calls),
@@ -855,6 +1159,11 @@ def task_stats(state: dict) -> dict:
                   "transport_observation_missing": len(calls) - len(
                       request_attempted) - len(send_not_attempted)},
         "acceptance": acceptance,
+        "agenda": {"calls": len(agenda_calls),
+                   "items": agenda_items,
+                   "open": len(RP.open_agenda(calls))},
+        "pending_acceptance": len(RP.pending_acceptance(completed, limit=10000)),
+        "post_closure_calls": len(post_closure_calls),
         "usage": {"total_tokens": tokens,
                   "recorded_calls": len([i for i in completed
                                          if _usage(i)["tokens"]]),
@@ -879,6 +1188,11 @@ def stats(states: list[dict], *, scope: str = "") -> dict:
                                 if d["eligible"] and d["progressed"]),
         "not_registered_tasks": sum(1 for d in details if d["not_registered"]),
         "obligations": sum(d["obligations"] for d in details),
+        "dispositions": {
+            kind: sum(d["dispositions"][kind] for d in details)
+            for kind in DISPOSITION_KINDS
+        },
+        "reopened_tasks": sum(1 for d in details if d["cycle"] > 1),
     }
     coverage = {}
     for key in ("startup", "plan", "closure", "events"):
@@ -915,6 +1229,13 @@ def stats(states: list[dict], *, scope: str = "") -> dict:
             key: sum(d["acceptance"][key] for d in details)
             for key in ("accepted", "modified", "rejected", "unrecorded")
         },
+        "agenda": {
+            "calls": sum(d["agenda"]["calls"] for d in details),
+            "items": sum(d["agenda"]["items"] for d in details),
+            "open": sum(d["agenda"]["open"] for d in details),
+        },
+        "pending_acceptance": sum(d["pending_acceptance"] for d in details),
+        "post_closure_calls": sum(d["post_closure_calls"] for d in details),
         "usage": {
             "total_tokens": sum(d["usage"]["total_tokens"] for d in details),
             "recorded_calls": sum(d["usage"]["recorded_calls"]
@@ -948,5 +1269,14 @@ def stats(states: list[dict], *, scope: str = "") -> dict:
             "calls 是状态台账记录数，不等价于 HTTP 请求数；request_attempted 只表示进入 transport，"
             "response_received 表示收到了 HTTP 响应，send_unknown 不推断请求字节是否出站；"
             "历史记录缺观测字段单列，不从成功/失败补造。",
+            "agenda / pending_acceptance / post_closure_calls 是可观测值而非价值证明："
+            "议程条数与采纳率都不说明判断正确；post_closure_calls 是调度缺陷信号"
+            "（收口判断之后仍追加非收口认知调用），应为 0。",
+            "acceptance.unrecorded 只表示调用已完成但未回填采纳，不等于“被忽略”，"
+            "也不影响 G1–G3；E 收口的采纳门由 closure_acceptance_pending 单独判定。",
+            "dispositions / by_cycle 是观察值而非门禁：completed/covered/skipped/"
+            "failed/not-executed/unsettled 只描述窗口关闭时的实际结果，不改 coverage "
+            "分子分母、不改 missed、不阻止收口；not-executed 的理由里若没有当时的"
+            "策略快照，一律记 unknown，不用当前配置倒推。",
         ],
     }

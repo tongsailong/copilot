@@ -1,6 +1,6 @@
 ---
 name: copilot
-description: "Copilot v9.6 轻量协作治理：任务承接、合同与完成条件、状态与证据登记、PARTIAL 强制续跑与调度领取、SOL（gpt-6.2-sol，high，零工具）默认认知引擎 CONSULT / PLAN 与生命周期主动调度（义务化、有界自动执行、覆盖率统计）。PARTIAL 是连续执行状态而不是终点：只要仍有原始授权内的可执行工作，就必须派生、领取并继续；阻塞按工作项成立，单项缺授权不冻结整个任务。drive 把工作项领取落盘（短租约）避免并发重复，回填/阻塞自动释放；SessionStart 与 UserPromptSubmit 只读提示未闭合任务，用户补齐授权后立即恢复执行。SOL-first 生命周期：简单/机械任务 0 调用；非简单任务启动默认 CONSULT，调查后按需 PLAN（不依赖工作项数量），执行期按六类可归因事件追加 CONSULT，medium/high 任务可做阶段复盘，有实质进展的非简单任务在最终工程验证完成后、收口前做综合判断；生命周期命令把“应调用”物化为调度义务并可直接执行（每条命令最多 1 次，`--sol auto|advise|off`），`sol-stats` 以显式分母统计覆盖率。REVIEW 仅在用户明确要求时执行。SOL 只提供认知输入，ZCode 是唯一技术决策与工程执行主体；G4 原生只读复核已退役，历史台账只读保留。"
+description: "Copilot v9.7.1 轻量协作治理：任务承接、合同与完成条件、状态与证据登记、PARTIAL 强制续跑与调度领取、SOL（gpt-6.2-sol，high，零工具）默认认知引擎 CONSULT / PLAN 与生命周期主动调度（义务化、有界自动执行、覆盖率统计）。PARTIAL 是连续执行状态而不是终点：只要仍有原始授权内的可执行工作，就必须派生、领取并继续；阻塞按工作项成立，单项缺授权不冻结整个任务。drive 把工作项领取落盘（短租约）避免并发重复，回填/阻塞自动释放；SessionStart 与 UserPromptSubmit 只读提示未闭合任务，用户补齐授权后立即恢复执行。SOL-first 生命周期：简单/机械任务 0 调用；非简单任务启动默认 CONSULT，调查后按需 PLAN（不依赖工作项数量），执行期按可归因事件追加 CONSULT，medium/high 任务可做阶段复盘，有实质进展的非简单任务在最终工程验证完成后、收口前做综合判断；CONSULT/PLAN 可输出可选议程（核心问题/错误前提/遗漏风险/完成条件补充/验证/反例），材料带上次判断与采纳结果，收口周期后不再追加规划或里程碑窗口；生命周期命令把“应调用”物化为调度义务并可直接执行（每条命令最多 1 次，`--sol auto|advise|off`），`sol-stats` 以显式分母统计覆盖率。REVIEW 仅在用户明确要求时执行。调度义务在窗口关闭时写终态处置（完成/覆盖/跳过/失败/未执行/未决）与当时策略快照，`sol-accept --historical` 只为已收口任务补记可证明的采纳或带原因的 pending。SOL 只提供认知输入，ZCode 是唯一技术决策与工程执行主体；G4 原生只读复核已退役，历史台账只读保留。"
 when_to_use: >
   需要把多步骤工程任务纳入可追踪治理时：任务合同/完成条件需要固定、证据与审计需要绑定、
   长任务需要 PARTIAL 持续推进与上下文恢复、非简单任务需要 SOL 默认认知（启动 CONSULT、
@@ -9,7 +9,7 @@ when_to_use: >
   直接由 ZCode 原生完成，不进入本 Skill。
 ---
 
-# copilot：轻量协作治理（v9.6.2）
+# copilot：轻量协作治理（v9.7.1）
 
 Copilot 是运行在 ZCode 内的**协作治理层**，不是决策模型，也不是执行体。它负责把任务变成可
 追踪的合同、状态、证据与收口条件，并在任务没有真正完成时继续推进。
@@ -793,7 +793,65 @@ CONSULT / PLAN 输出契约（`copilot-sol-think/v2`）：`judgment`、`goal_und
 
 ## 版本
 
-当前 **v9.6.2（统计口径修正、SOL 锁等待有界、文档与死代码收敛）**：
+当前 **v9.7.1（认知记录与义务处置的终态闭环）**：
+
+- **历史采纳只补可证明的结论**：`sol-accept --historical` 只为**已收口**任务开放，`pending`
+  必须写明原因（`--reason` + 可选 `--reason-code`：`no-attribution` /
+  `superseded-within-cycle` / `later-cycle-superseded` / `insufficient-record`），
+  `accepted/modified/rejected` 也必须有任务内依据。重复执行完全相同的登记判 `duplicate`
+  幂等返回（不追加历史、不改登记次数）；既有已决结论不被覆盖、不被降级为 `pending`；
+  正常入口对 CLOSED 任务的拒绝不变。**不因代码已改、测试通过或任务 PASS 推断采纳**——
+  无法归因的一律保留 `pending` 并写明理由，不以 pending 数量下降为目标。
+- **义务终态处置**：窗口关闭时写 `disposition`（`completed` / `covered` / `skipped` /
+  `failed` / `not-executed` / `unsettled`）+ `disposition_reason` + `disposition_at`，
+  已有处置不覆盖。`not-executed` 的理由引用该周期的策略快照
+  （`schedule.policy_snapshots[<cycle>]`，来自 `--sol` / `COPILOT_SOL_AUTO`）；**没有快照
+  的历史义务记 `unknown`**，不用当前配置倒推。`due` 不等于强制调用：策略 `off`/`advise`
+  下义务保持 due，但快照让事后能分清“策略关闭”与“漏调”。
+- **未能调度留痕**：条件成立但本次没执行（SOL 锁被占用等）只累加 `deferrals` 与
+  `last_deferral_reason`，义务仍 `due`，窗口关闭时进入处置理由；不静默清除、不冒充失败。
+- **收口周期隔离**：义务带 `cycle`（1 + `reopen_history` 条数），窗口比较只在同周期内；
+  授权重开后的收口判断不追溯覆盖上一周期的窗口，旧周期义务保持原周期与原事实。
+- **不阻断**：处置与周期只进 `summary`（`dispositions` / `by_cycle` / `policy` /
+  `cycle`）与 `sol-stats`（`dispositions`、`by_cycle`、`reopened_tasks`）观测值，不改
+  `pending` / `missed`、不改 coverage 分母、不影响 G1–G3 与收口。历史义务可只读推导处置，
+  不回写历史状态。
+- **不变量**：G1–G3、`closure_readiness` 收口准入、E 前 `sol-accept`、PARTIAL 续跑、
+  SOL advisory、REVIEW 仅用户明确要求、G4 退役、零工具单轮、Provider/模型/凭据与授权
+  边界全部不变；本轮未获推送、发布或系统配置修改授权。
+
+**v9.7.0（SOL 主动认知与实战决策闭环）**：
+
+- **复盘依据**：对 2026-11-22–11-23 的 40 个任务、68 次 SOL 调用（447k tokens、累计 4,618.6 s）
+  做了逐条核对。问题不是“SOL 判断质量差”，而是四个确定性缺陷：材料不带历史判断（同一问题
+  重复付费）、收口后仍追加 B/D 窗口（7 次非收口调用发生在收口判断之后）、
+  `blockage-change`/`repeated-work-failure` 没有事件身份与专属问题、34 次已完成调用
+  的采纳结果不可见。
+- **可选议程**：CONSULT / PLAN 的输出契约新增可选 `agenda`（1–6 条，固定类型：核心问题、
+  错误前提、遗漏风险、完成条件补充、取舍、最值得验证的事实、关键反例），SOL 只给一句话级
+  认知提示；`governance.evaluate` / `status` 只读呈现 `sol_agenda`，不派生工作项、不进计划
+  SHA、不影响 G1–G3。议程缺失时输出契约与旧调用方完全兼容。
+- **认知连续性**：调度材料新增“上次 SOL 判断与采纳”（最近三次的判断、采纳状态、决策与
+  实际差异）与“未处理议程”；`build_prompt` 也注入同样的事实段。差异行补充新增决策与
+  未解除阻塞变化，避免同一事实被反复提问。材料口径升为
+  `copilot-sol-schedule-materials/v3`（参与收口验证摘要，旧 E 结论按既有规则失效）。
+- **收口顺序**：同一收口周期（合同 + 重开次数）已有收口判断后，不再推荐 B 规划或 D 里程碑；
+  被收口覆盖而仍未执行的 B/D 义务按 `skipped/closure-covered` 结算，不再误记为漏调。升级型
+  事件（重规划、风险升级、合同修订、重开等）仍可打开新的 C 窗口。
+- **事件质量**：`blockage-change` 只由“新的或实质变化的未解除阻塞”触发，单纯解除阻塞不再
+  制造事件；`repeated-work-failure` 保持每阶段一次（第 2、3+ 次失败），两者都有专属问题，
+  普通测试失败与常规进展不触发。
+- **采纳可见**：`evaluate` 输出 `sol_pending_acceptance`，`status` 提示未回填的已完成认知
+  调用并给出 `sol-accept` 入口（只提示、不阻断）；E 收口的采纳门语义不变。
+- **可观测值**：`sol-stats` 新增 `agenda`（有议程的调用数/条数/未处理条数）、
+  `pending_acceptance`、`post_closure_calls`（收口后仍发生的非收口认知调用，应为 0）；
+  schema 升为 `copilot-sol-stats/v2`，明确这些观察值不证明判断价值。
+- **经验闭环**：`context_engine.py capture` 的候选草稿包含任务内 SOL 判断与采纳痕迹
+  （含议程与证据溯源），并注明“任务内事实，不是可复用结论”；不写 Vault、不替代知识写入授权。
+- **不变量**：G1–G3、`closure_readiness` 收口准入、PARTIAL 续跑、SOL advisory、REVIEW 仅用户
+  明确要求、G4 退役、零工具单轮、Provider/模型/凭据配置与授权边界全部不变。
+
+**v9.6.2（统计口径修正、SOL 锁等待有界、文档与死代码收敛）**：
 
 - **覆盖率口径修正（P1 缺陷）**：任务级窗口（A 启动 / B 规划 / E 收口）的分母是“本任务是否
   适用”（0/1），分子过去却取满足义务的条数——多轮 reopen 的多次收口判断会得出

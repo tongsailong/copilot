@@ -454,7 +454,7 @@ class DynamicEventTests(SchedulingBase):
         self.assertEqual(advice["family"], "C")
         self.assertEqual(advice["event"], "reopened")
 
-    def test_block_creation_and_resolution_are_events(self):
+    def test_block_creation_is_event_but_resolution_is_not(self):
         self._covered()
         state = self.state()
         state["actions"][0]["status"] = "running"
@@ -467,9 +467,15 @@ class DynamicEventTests(SchedulingBase):
         snapshot = RP.sol_event_snapshot(state)
         state["sol_calls"][-1]["sol_event_snapshot"] = snapshot
         self.save(state)
+        # 解除阻塞只表示被冻结的工作恢复推进：它不是新的认知对象，不再触发一次
+        # 重复付费的认知判断（C5）。
         G.resolve_block(self.state_path, "资源已到位", block["block_id"])
         advice = self.advice()
-        self.assertEqual(advice["event"], "blockage-change")
+        self.assertNotEqual(advice.get("event"), "blockage-change")
+        # 新的未解除阻塞改变了可推进边界，仍构成事件。
+        G.add_block(self.state_path, "等待用户授权", "用户确认后继续",
+                    work_items=[state["actions"][0]["id"]])
+        self.assertEqual(self.advice()["event"], "blockage-change")
 
     def test_repeat_failure_threshold_is_one_event_per_episode(self):
         self._covered()
@@ -1632,6 +1638,197 @@ class ClosureAdmissionTests(SchedulingBase):
                       "stage": "understanding", "event": "startup"}
         text = SS.build_materials(state, obligation)
         self.assertIn("合同正文摘要：（未登记）", text)
+
+
+class ProactiveCognitionTests(SchedulingBase):
+    """主动议程、认知连续性、收口顺序与采纳可见性（v9.7）。"""
+
+    def test_normalize_agenda_is_typed_deduped_and_bounded(self):
+        items = RP.normalize_agenda([
+            {"kind": "verify", "text": "  先验证并发写入  "},
+            {"kind": "verify", "text": "先验证并发写入"},
+            {"type": "risk_escalation", "text": "风险来源未查清"},
+            {"kind": "counterexample", "text": "x" * 400},
+            "字符串条目",
+        ])
+        self.assertEqual(len(items), 4)
+        self.assertEqual(items[0]["kind"], "verify")
+        self.assertEqual(items[0]["text"], "先验证并发写入")
+        self.assertEqual(items[0]["label"], RP.AGENDA_KINDS["verify"])
+        self.assertEqual(items[1]["kind"], "core-question")
+        self.assertEqual(len(items[2]["text"]), RP.AGENDA_TEXT_LIMIT)
+        self.assertEqual(items[3]["kind"], "core-question")
+        self.assertEqual(RP.normalize_agenda("不是数组"), [])
+
+    def _attach(self, call_id: str, **fields) -> None:
+        state = self.state()
+        for item in state.get("sol_calls") or []:
+            if item.get("call_id") == call_id:
+                item.update(fields)
+        self.save(state)
+
+    def test_prior_cognition_tracks_adoption_and_open_agenda(self):
+        self.start()
+        self.plan(1)
+        self.evidence()
+        record = self.record("CONSULT")
+        self._attach(record["call_id"], judgment="先补测试再改状态机",
+                     agenda=[{"kind": "missing-risk",
+                              "text": "并发写入未验证"}])
+        calls = self.state().get("sol_calls")
+        prior = RP.prior_cognition(calls)
+        self.assertEqual(len(prior), 1)
+        self.assertEqual(prior[0]["acceptance"], "pending")
+        self.assertEqual(prior[0]["judgment"], "先补测试再改状态机")
+        self.assertEqual(RP.open_agenda(calls)[0]["kind"], "missing-risk")
+        self.assertEqual(len(RP.pending_acceptance(calls)), 1)
+        G.record_sol_acceptance(self.state_path, record["call_id"],
+                                status="modified", rationale="先补测试再改",
+                                delta="追加了并发用例")
+        calls = self.state().get("sol_calls")
+        prior = RP.prior_cognition(calls)
+        self.assertEqual(prior[0]["acceptance"], "modified")
+        self.assertEqual(prior[0]["delta"], "追加了并发用例")
+        self.assertEqual(RP.pending_acceptance(calls), [])
+
+    def test_materials_carry_prior_judgment_and_open_agenda(self):
+        self.start()
+        self.plan(1)
+        self.evidence()
+        record = self.record("CONSULT")
+        self._attach(record["call_id"], judgment="先补测试再改状态机",
+                     agenda=[{"kind": "wrong-premise",
+                              "text": "单进程写入假设可能不成立"}])
+        text = SS.build_materials(self.state(), {
+            "family": "C", "mode": "CONSULT", "stage": "development",
+            "event": "decision-point", "question": "要不要改状态机？"})
+        self.assertIn(SS.MATERIALS_SCHEMA, text)
+        self.assertIn("上次 SOL 判断与采纳", text)
+        self.assertIn("先补测试再改状态机", text)
+        self.assertIn("未处理议程", text)
+        self.assertIn("单进程写入假设可能不成立", text)
+
+    def test_status_shows_agenda_and_pending_acceptance_without_gating(self):
+        self.start()
+        self.plan(1)
+        self.evidence()
+        record = self.record("CONSULT")
+        self._attach(record["call_id"], judgment="先验证",
+                     agenda=[{"kind": "verify",
+                              "text": "先验证并发写入"}])
+        evaluation = G.evaluate(self.state())
+        self.assertEqual(evaluation["sol_agenda"][0]["text"], "先验证并发写入")
+        self.assertEqual(len(evaluation["sol_pending_acceptance"]), 1)
+        rendered = G.render_status(self.state(), evaluation)
+        self.assertIn("SOL 议程（advisory", rendered)
+        self.assertIn("先验证并发写入", rendered)
+        self.assertIn("采纳待回填", rendered)
+        # 议程与采纳提示都不派生工作项，也不改变阶段。
+        self.assertEqual(len(self.state().get("actions") or []), 1)
+
+    def test_closure_cycle_suppresses_plan_and_milestone_windows(self):
+        self.start(kind="feature", triggers=["architecture"])
+        self.record("CONSULT")
+        self.plan(3)
+        self.evidence()
+        self.done(2)
+        before = self.advice()
+        self.assertIn(before["family"], ("B", "D"))
+        # 收口判断已覆盖本周期（合同 + 重开次数）：不再补规划或里程碑。
+        self.record("CONSULT", stage="closure")
+        after = self.advice()
+        self.assertEqual(after["family"], "")
+        self.assertEqual(after["action"], "reuse")
+        self.assertIn("收口", after["reason"])
+        # 升级型事件仍可打开新窗口：重规划不是被收口覆盖的认知对象。
+        state = self.state()
+        state["actions"].append({"id": "AUTO-REPLAN-1", "title": "换路线",
+                                 "status": "pending", "origin": "replan"})
+        self.save(state)
+        escalated = self.advice()
+        self.assertEqual(escalated["family"], "C")
+        self.assertEqual(escalated["event"], "replan-history")
+
+    def test_closure_covers_open_plan_window_as_reasoned_skip(self):
+        self.start(kind="feature", triggers=["architecture"])
+        self.record("CONSULT")
+        self.plan(3)
+        self.evidence()
+        state, _ = self.sync()
+        plan_rows = [item for item in SS.obligations(state)
+                     if item.get("family") == "B" and item.get("window") == "open"]
+        self.assertTrue(plan_rows)
+        state = self.state()
+        schedule = SS.ensure_schedule(state)
+        schedule["obligations"].append(
+            {"obligation_id": "SXB", "family": "E", "event": "closure",
+             "instance": "closure", "status": "satisfied", "window": "closed",
+             "level": "recommended", "opened_at": "2026-11-23T20:00:01+08:00"})
+        self.save(state)
+        state = self.state()
+        G.sync_sol_schedule(state, advice={"action": "none"}, closed=True)
+        self.save(state)
+        row = [item for item in SS.obligations(self.state())
+               if item.get("family") == "B"][0]
+        self.assertEqual(row["status"], "skipped")
+        self.assertEqual(row["skip_by"], "closure-covered")
+        self.assertFalse(SS.is_missed(row))
+
+    def test_stats_observe_agenda_pending_acceptance_and_post_closure_calls(self):
+        self.start()
+        self.plan(2)
+        self.evidence()
+        first = self.record("CONSULT")
+        self._attach(first["call_id"], judgment="先验证",
+                     agenda=[{"kind": "verify", "text": "先验证并发写入"}],
+                     created_at="2026-11-23T10:00:00+08:00",
+                     completed_at="2026-11-23T10:00:00+08:00")
+        closure = self.record("CONSULT", stage="closure")
+        self._attach(closure["call_id"],
+                     created_at="2026-11-23T11:00:00+08:00",
+                     completed_at="2026-11-23T11:00:00+08:00")
+        later = self.record("CONSULT", stage="development")
+        self._attach(later["call_id"],
+                     created_at="2026-11-23T12:00:00+08:00",
+                     completed_at="2026-11-23T12:00:00+08:00")
+        detail = SS.task_stats(self.state())
+        self.assertEqual(detail["agenda"]["calls"], 1)
+        self.assertEqual(detail["agenda"]["items"], 1)
+        # 最新一次调用没有议程：未处理议程为空（不跨调用累加旧议程）。
+        self.assertEqual(detail["agenda"]["open"], 0)
+        self.assertEqual(detail["pending_acceptance"], 3)
+        # 收口判断之后仍发生一次非收口调用：这是应被观测到的调度缺陷。
+        self.assertEqual(detail["post_closure_calls"], 1)
+
+    def test_post_closure_calls_exclude_authorized_reopen_interval(self):
+        self.start()
+        self.plan(2)
+        self.evidence()
+        first = self.record("CONSULT")
+        self._attach(first["call_id"],
+                     created_at="2026-11-23T10:00:00+08:00",
+                     completed_at="2026-11-23T10:00:00+08:00")
+        closure = self.record("CONSULT", stage="closure")
+        self._attach(closure["call_id"],
+                     created_at="2026-11-23T11:00:00+08:00",
+                     completed_at="2026-11-23T11:00:00+08:00")
+        later = self.record("CONSULT", stage="development")
+        self._attach(later["call_id"],
+                     created_at="2026-11-23T12:00:00+08:00",
+                     completed_at="2026-11-23T12:00:00+08:00")
+        state = self.state()
+        state.setdefault("closure", {})["reopen_history"] = [
+            {"at": "2026-11-23T11:30:00+08:00", "authorized_by": "user"}]
+        self.save(state)
+        detail = SS.task_stats(self.state())
+        # 重开是在收口与这次调用之间的显式授权事实：这段区间不是“收口后重复付费”。
+        self.assertEqual(detail["post_closure_calls"], 0)
+        # 收口前（重开前）的区间仍然计数：把重开时间挪到调用之后。
+        state = self.state()
+        state["closure"]["reopen_history"] = [
+            {"at": "2026-11-23T12:30:00+08:00", "authorized_by": "user"}]
+        self.save(state)
+        self.assertEqual(SS.task_stats(self.state())["post_closure_calls"], 1)
 
 
 if __name__ == "__main__":

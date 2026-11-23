@@ -264,6 +264,32 @@ instance、`contract_sha256`、`level`、`status`、`window`。`status` 取值 `
 - **合同修订**：旧合同下仍在 open 的义务显式记为 `skipped` + `skip_by=contract-amended`
   并关闭窗口——旧事实留在审计里，但不进入新合同的覆盖率分母。
 
+**终态处置与收口周期（v9.7.1）**
+
+- **每个义务都要有终态**：窗口关闭时写一次 `disposition`——`completed`（真实执行或复用）、
+  `covered`（`closure-covered`：收口判断已覆盖该认知对象）、`skipped`（合同修订、被更新
+  窗口取代、非必需等，必有 `skip_reason`）、`failed`（真实失败，带错误码）、
+  `not-executed`（关闭时仍未执行）、`unsettled`（`in_flight`：请求已发出但未落盘）。
+  附 `disposition_reason` 与 `disposition_at`；已有处置不覆盖（只增不改），也不改变
+  `status`、`window` 与 `missed` 口径。
+- **`due` 不等于强制调用**：`schedule.policy_snapshots[<cycle>]` 记录本周期实际生效的
+  `off` / `advise` / `auto` 与是否允许自动执行（由生命周期命令的 `--sol` /
+  `COPILOT_SOL_AUTO` 写入）。`not-executed` 的理由引用这份快照；**没有快照的历史义务一律
+  记 `unknown`**，不拿当前配置倒推“当时为什么没调用”。
+- **未能调度要留痕**：条件成立但本次没能执行（SOL 锁被占用等）只累加 `deferrals` 与
+  `last_deferral_reason`，义务仍保持 `due`；窗口关闭时这条事实现身在 `not-executed` 的
+  理由里，不被静默清除，也不冒充失败（真实请求失败仍由 `failed` 表示）。
+- **收口周期隔离**：新义务带 `cycle`（1 + `closure.reopen_history` 条数）。窗口比较
+  （`_advance_windows` 的“更晚窗口已满足”）只在同一周期内进行：重开后的收口判断覆盖的是
+  重开后的认知对象，不能追溯宣布上一周期的窗口已被覆盖。旧周期的义务保持原周期与原事实
+  （合同修订/被更新窗口取代的既有语义不变）；`summary.by_cycle` 与
+  `sol-stats.totals.reopened_tasks` 只是观测值。
+- **历史义务只读推导**：`obligation_disposition()` 对没有持久化处置的旧义务按窗口事实现算，
+  不写回历史状态；历史任务无需重跑命令也能看到终态与 `unknown` 理由。
+- **不阻断**：处置与周期分布只进 `summary.dispositions` / `by_cycle` 与 `sol-stats`，
+  不改 `pending` / `missed`、不改 coverage 分母、不阻止收口；`sol_schedule_warnings` 仍是
+  非阻断提醒。
+
 **有界执行**
 
 - 执行点：`start` / `plan` / `record` / `rerun` / `criterion` / `judgment` / `evidence` /

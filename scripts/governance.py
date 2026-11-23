@@ -4429,6 +4429,7 @@ def record_sol_call(path: str, call: dict, *, mode: str = "",
             "risks": len(record.get("risks") or []),
             "priority": len(record.get("priority") or []),
             "verify": len(record.get("verify") or []),
+            "agenda": len(record.get("agenda") or []),
         })
     # 调度结算：把真实调用结算到对应义务。义务编号过期只记录“未关联”，不丢
     # 已经付费得到的记录（台账事实优先于调度簿记）。
@@ -4461,6 +4462,8 @@ def _find_sol_call(state: dict, call_id: str) -> dict:
 
 
 ACCEPTANCE_STATUSES = ("accepted", "modified", "rejected", "pending")
+# 已决采纳结果：pending 只表示“复核过但没有结论”，本身不是结论。
+DECIDED_ACCEPTANCE_STATUSES = ("accepted", "modified", "rejected")
 # 采纳记录结构版本：显式标记区分新旧记录，不按日期或字段是否填满推断。
 # v1（无 schema 字段）与 v2 都可读取；质量指标只以 v2 已决记录为分母，
 # 并把排除的旧记录单独披露。
@@ -4645,6 +4648,54 @@ def _normalize_acceptance_work_item_refs(state: dict, refs) -> dict:
     return {"linked": linked, "unresolved": unresolved}
 
 
+def _acceptance_review_signature(entry: dict) -> tuple:
+    """历史回填的幂等比较键。
+
+    只比较可以重复生成的事实字段，不做语义比较、不猜“两次文字是否同义”：
+    内容有变化就按一次新登记追加历史，完全一致才算重复执行。`at`、
+    `registration_count`、证据解析结果等派生字段不参与比较。
+    """
+    def _ids(key: str) -> tuple:
+        values = entry.get(key) if isinstance(entry, dict) else None
+        return tuple(str(item) for item in values) \
+            if isinstance(values, list) else ()
+    return (
+        str((entry or {}).get("status") or ""),
+        str((entry or {}).get("decision") or ""),
+        str((entry or {}).get("rationale") or ""),
+        str((entry or {}).get("delta") or ""),
+        str((entry or {}).get("reason") or ""),
+        str((entry or {}).get("reason_code") or ""),
+        str((entry or {}).get("note") or ""),
+        _ids("evidence_refs"),
+        _ids("source_refs"),
+        _ids("work_item_refs"),
+    )
+
+
+def _acceptance_review_entry(record: dict, *, value: str, reason: str,
+                             reason_code: str, note: str,
+                             decided_by: str, stamp: str) -> dict:
+    """历史复核但未形成结论的 pending 记录：带原因，不带决策字段。
+
+    它不是“采纳结论”，也不能升级或降级既有结论；只为让历史调用留下可审计的
+    复核痕迹（为什么没填、依据是什么）。
+    """
+    return {
+        "schema": ACCEPTANCE_SCHEMA,
+        "status": "pending",
+        "origin": "historical-review",
+        "reason_code": str(reason_code or "")[:60],
+        "reason": str(reason or "")[:1000],
+        "note": str(note or "")[:4000],
+        "advice_ref": _acceptance_advice_ref(record),
+        "decided_by": str(decided_by or "zcode")[:40],
+        "at": stamp,
+        "reviewed_at": stamp,
+        "basis": "zcode-review-no-decision",
+    }
+
+
 def record_sol_acceptance(path: str, call_id: str, *, status: str,
                           note: str = "", reason: str = "",
                           decision: str = "", rationale: str = "",
@@ -4652,7 +4703,9 @@ def record_sol_acceptance(path: str, call_id: str, *, status: str,
                           source_refs: list | None = None,
                           work_item_refs: list | None = None,
                           evidence_note: str = "",
-                          decided_by: str = "zcode") -> dict:
+                          decided_by: str = "zcode",
+                          historical: bool = False,
+                          reason_code: str = "") -> dict:
     """回填主代理对 SOL 建议的采纳结论（accepted / modified / rejected）。
 
     采纳结论是事实记录：用于统计与恢复时复用已确认结论，不改变任务阶段、
@@ -4662,24 +4715,85 @@ def record_sol_acceptance(path: str, call_id: str, *, status: str,
     `delta`（modified 与原建议的差异）、`evidence_refs`（E 编号）、
     `source_refs`（报告章节/文件路径）与 `evidence_note`；原建议只存
     `advice_ref` 引用。缺项只产生非阻断提示，登记始终成功。
+
+    `historical=True` 是**已收口任务**的历史回填通道，三条硬边界：
+
+    - 只对 CLOSED 任务开放（未收口任务按正常登记走，不借历史通道绕过 OPEN 约束）；
+    - 不覆盖既有已决结论：完全相同的重复执行按幂等返回 `duplicate`，
+      内容不同则失败关闭，改由用户授权后单独处理；
+    - `status="pending"` 只在此通道可用，且必须写明 `reason`：用于记录
+      “复核过但无法用任务记录证明采纳”的调用，不为了消除 pending 而降低证据要求。
     """
     state = load_state(path)
-    _assert_open(state, "登记 SOL 采纳结论", allow_blocked=True)
+    closed = bool((state.get("closure") or {}).get("closed"))
+    if historical:
+        if not closed:
+            raise GovernanceError(
+                "历史回填（--historical）只用于已收口（CLOSED）任务；"
+                "未收口任务请按正常采纳登记。")
+    else:
+        _assert_open(state, "登记 SOL 采纳结论", allow_blocked=True)
     value = str(status or "").strip().lower()
-    if value not in ACCEPTANCE_STATUSES or value == "pending":
+    if value not in ACCEPTANCE_STATUSES:
         raise GovernanceError(
             "采纳结论必须是 accepted / modified / rejected 之一。")
+    if value == "pending":
+        if not historical:
+            raise GovernanceError(
+                "采纳结论必须是 accepted / modified / rejected 之一；pending "
+                "只用于已收口任务的历史复核时记录未解决原因。")
+        if not str(reason or "").strip():
+            raise GovernanceError("历史复核保留 pending 必须写明原因（--reason）。")
     record = _find_sol_call(state, call_id)
     if str(record.get("status") or "") != "completed":
         raise GovernanceError("只能对已完成的 SOL 调用登记采纳结论。")
+    previous = record.get("acceptance")
+    if not isinstance(previous, dict):
+        previous = {}
+    prior = str(previous.get("status") or "")
+    stamp = now_iso()
+    if value == "pending":
+        if prior in DECIDED_ACCEPTANCE_STATUSES:
+            raise GovernanceError(
+                f"该调用已有采纳结论（{prior}）；历史复核不把它改写成 pending。")
+        entry = _acceptance_review_entry(
+            record, value=value, reason=reason, reason_code=reason_code,
+            note=note, decided_by=decided_by, stamp=stamp)
+        if _acceptance_review_signature(previous) == \
+                _acceptance_review_signature(entry):
+            return {
+                "call_id": sol_call_id(record),
+                "acceptance": previous,
+                "evidence_status": acceptance_evidence_status(previous),
+                "warnings": [],
+                "hints": [],
+                "unchanged": True,
+                "duplicate": True,
+            }
+        record["acceptance"] = entry
+        _history(state, "sol_call_acceptance_review", {
+            "call_id": sol_call_id(record),
+            "mode": sol_call_mode(record),
+            "status": value,
+            "reason_code": entry["reason_code"],
+            "reason": entry["reason"],
+            "historical": True,
+            "acceptance": dict(entry),
+        })
+        save_state(path, state)
+        return {
+            "call_id": sol_call_id(record),
+            "acceptance": entry,
+            "evidence_status": acceptance_evidence_status(entry),
+            "warnings": [],
+            "hints": [],
+            "unchanged": False,
+            "duplicate": False,
+        }
     refs = _normalize_acceptance_evidence_refs(evidence_refs)
     sources = _normalize_acceptance_source_refs(source_refs)
     work_items = _normalize_acceptance_work_item_refs(state, work_item_refs)
     resolution = resolve_acceptance_evidence(state, refs)
-    previous = record.get("acceptance")
-    if not isinstance(previous, dict):
-        previous = {}
-    stamp = now_iso()
     entry = {
         "schema": ACCEPTANCE_SCHEMA,
         "status": value,
@@ -4703,6 +4817,28 @@ def record_sol_acceptance(path: str, call_id: str, *, status: str,
         "registration_count": int(previous.get("registration_count") or 0) + 1,
         "basis": "zcode-judgment",
     }
+    if reason_code:
+        entry["reason_code"] = str(reason_code)[:60]
+    if historical:
+        # 历史回填的结论同样按 v2 记录，但显式标明来源，便于把“当时登记”与
+        # “事后回填”分开统计；它不是第二次登记，也不改写原建议。
+        entry["origin"] = "historical-backfill"
+    if historical and prior in DECIDED_ACCEPTANCE_STATUSES:
+        # 回填不覆盖既有结论：内容完全一致按幂等返回，不同则失败关闭。
+        if _acceptance_review_signature(previous) == \
+                _acceptance_review_signature(entry):
+            return {
+                "call_id": sol_call_id(record),
+                "acceptance": previous,
+                "evidence_status": acceptance_evidence_status(previous),
+                "warnings": list(previous.get("warnings") or []),
+                "hints": [],
+                "unchanged": True,
+                "duplicate": True,
+            }
+        raise GovernanceError(
+            f"该调用已有采纳结论（{prior}）；历史回填不覆盖既有结论。"
+            "如需修正，请由用户授权后单独处理。")
     entry["warnings"] = _acceptance_warnings(entry, resolution, sources)
     # 当前记录以最近一次登记为准；每次登记在追加历史中保留完整快照，
     # 旧记录不被改写，也不隐式继承上一次的字段。
@@ -4718,6 +4854,7 @@ def record_sol_acceptance(path: str, call_id: str, *, status: str,
         "work_item_resolution": dict(work_items),
         "evidence_status": acceptance_evidence_status(entry),
         "warnings": list(entry["warnings"]),
+        **({"historical": True} if historical else {}),
         "acceptance": dict(entry),
     })
     save_state(path, state)
@@ -5425,7 +5562,8 @@ def closure_check(state: dict, *, task_dir: str = "",
 
 
 def close_task(path: str, *, by: str = "zcode-native", sol_entry: str = "",
-               cache: dict | None = None) -> dict:
+               cache: dict | None = None, sol_policy: str = "",
+               sol_auto: bool | None = None) -> dict:
     if cache is None:
         cache = {}
     state = load_state(path)
@@ -5477,7 +5615,8 @@ def close_task(path: str, *, by: str = "zcode-native", sol_entry: str = "",
     # 收口前把调度窗口按事实关闭，并快照进 closure：收口之后仍能核对“当时还有
     # 哪些义务未执行”。这不是门禁——closure_check 已在上方按 G1–G3 判定。
     schedule_before = SS.summary(state)
-    sync_sol_schedule(state, closed=True)
+    sync_sol_schedule(state, closed=True, policy=sol_policy,
+                      auto_execution=sol_auto)
     schedule_snapshot = SS.summary(state)
     schedule_snapshot["at_close"] = {
         "pending_before_close": schedule_before.get("pending", 0),
@@ -6305,18 +6444,21 @@ def sol_advice_summary(state: dict, *, gates_passed: bool = False,
 
 def sync_sol_schedule(state: dict, *, closed: bool = False,
                       advice: dict | None = None,
-                      now: str | None = None) -> dict:
+                      now: str | None = None, policy: str = "",
+                      auto_execution: bool | None = None) -> dict:
     """把当前生命周期建议物化为调度义务（只改内存状态，调用方负责保存）。
 
     这是调度层的唯一写入口：义务的创建、刷新、复用满足、窗口关闭都在这里发生，
     其它命令通过它读取「当前应当执行哪一次调用」。函数不调用模型、不读写其它
-    文件，也不改变阶段与 G1–G3。
+    文件，也不改变阶段与 G1–G3。`policy` / `auto_execution` 只记录当时的策略
+    事实（事后解释“为什么没有调用”），不推断历史、不影响任何状态。
     """
     moment = now or now_iso()
     advice = advice if isinstance(advice, dict) else sol_advice_summary(state)
     schedule = SS.ensure_schedule(state)
     is_closed = closed or bool((state.get("closure") or {}).get("closed"))
-    changes = SS.sync(schedule, state, advice, now=moment, closed=is_closed)
+    changes = SS.sync(schedule, state, advice, now=moment, closed=is_closed,
+                      policy=policy, auto_execution=auto_execution)
     if changes:
         _history(state, "sol_schedule_sync", {
             "changes": changes,
@@ -6357,7 +6499,8 @@ def resolve_sol_obligation(state: dict, obligation_id: str, *, status: str,
         if status == "failed":
             item["attempts"] = int(item.get("attempts") or 0) + 1
         # 结算即关闭窗口：已执行的义务不应在收口时被算成“仍未执行”。
-        SS.settle(item, status=status, now=finished, reason=source)
+        SS.settle(item, status=status, now=finished, reason=source,
+                  schedule=SS.schedule_view(state))
         return item
     raise GovernanceError(f"当前任务的调度义务中不存在：{target}")
 
@@ -6383,7 +6526,9 @@ def record_sol_obligation_error(state: dict, obligation_id: str, reason: str, *,
             item["failure"] = str(reason or "")[:1000]
             finished = now_iso()
             item["finished_at"] = finished
-            SS.settle(item, status="failed", now=finished, reason="attempts-exhausted")
+            SS.settle(item, status="failed", now=finished,
+                      reason="attempts-exhausted",
+                      schedule=SS.schedule_view(state))
         return item
     raise GovernanceError(f"当前任务的调度义务中不存在：{target}")
 
@@ -6419,6 +6564,20 @@ def evaluate(state: dict, *, cache: dict | None = None) -> dict:
                 f"调度：义务 {pending['obligation_id']}"
                 f"（{pending['family']}/{pending['event']}，{pending['mode']}）待执行；"
                 "`sol-schedule` 给出可直接执行的命令")
+        # 认知议程与未回填采纳（只读呈现）：议程不是工作项，采纳提示不是门禁。
+        calls = [item for item in iter_sol_calls(state) if isinstance(item, dict)]
+        agenda = RP.open_agenda(calls)
+        if agenda:
+            result["sol_agenda"] = agenda
+        pending_accepts = RP.pending_acceptance(calls, limit=10000)
+        if pending_accepts:
+            result["sol_pending_acceptance"] = pending_accepts[-3:]
+            latest = pending_accepts[-1]
+            result.setdefault("next_commands", []).append(
+                f"采纳回填：copilot_dispatch.py sol-accept --state <state> "
+                f"--call-id {latest['call_id']} "
+                "--status accepted|modified|rejected --note <实际做法与差异>"
+                f"（{len(pending_accepts)} 次已完成认知调用未回填，advisory 不阻断）")
     # 续跑判定：忽略它不会改变状态，但阶段报告与工作项回填必须据此继续。
     result["continuation"] = continuation(state, cache=cache, evaluation=result)
     return result
@@ -6484,6 +6643,17 @@ def render_status(state: dict, evaluation: dict | None = None, *,
         f"REVIEW {counts['REVIEW']} · 采纳 {accepted}"
         + (f" · 失败 {len([i for i in sol_calls if i.get('status') == 'failed'])}"
            if any(i.get("status") == "failed" for i in sol_calls) else ""))
+    agenda = ev.get("sol_agenda") or RP.open_agenda(sol_calls)
+    if agenda:
+        lines.append("SOL 议程（advisory，不是工作项、不影响门禁）：")
+        lines.extend(f"- [{item.get('kind')}] {item.get('text')}"
+                     for item in agenda)
+    pending_accepts = ev.get("sol_pending_acceptance")
+    if pending_accepts:
+        lines.append(
+            f"SOL 采纳待回填：最近 {len(pending_accepts)} 次已完成认知调用未登记"
+            "（`sol-accept --call-id ... --status accepted|modified|rejected`；"
+            "只提示，不阻断）")
     quality = quality_summary(state, cache=cache)
     if quality.get("verdict") == PWW:
         accepted = "、".join(quality.get("accepted_ids") or []) or "无"

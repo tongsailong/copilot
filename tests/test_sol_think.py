@@ -358,6 +358,57 @@ class InputBudgetTests(ThinkBase):
             SR.normalize_stage("bogus", mode="CONSULT")
 
 
+class ProactiveAgendaTests(ThinkBase):
+    """主动议程（可选 agenda）：只做认知提示，不是工作项、不影响契约与门禁。"""
+
+    def test_agenda_is_optional_and_normalized(self):
+        parsed = SR.parse_think_output(cognitive_reply())
+        self.assertEqual(parsed["agenda"], [])
+        parsed = SR.parse_think_output(cognitive_reply(agenda=[
+            {"kind": "wrong-premise", "text": "假设单进程写入可能不成立"},
+            "最该先验证并发写入",
+            {"kind": "missing-risk", "text": "假设单进程写入可能不成立"},
+            {"kind": "unknown-kind", "text": "未知类型归入核心问题"},
+        ]))
+        self.assertEqual([item["kind"] for item in parsed["agenda"]],
+                         ["wrong-premise", "core-question", "missing-risk",
+                          "core-question"])
+        self.assertEqual(parsed["agenda"][0]["label"],
+                         RP.AGENDA_KINDS["wrong-premise"])
+        with self.assertRaises(SR.SolResponseError):
+            SR.parse_think_output(cognitive_reply(agenda="不是数组"))
+
+    def test_agenda_is_bounded(self):
+        parsed = SR.parse_think_output(cognitive_reply(agenda=[
+            {"kind": "verify", "text": f"验证项 {index}"} for index in range(12)
+        ]))
+        self.assertEqual(len(parsed["agenda"]), RP.AGENDA_MAX_ITEMS)
+        long_text = SR.parse_think_output(cognitive_reply(
+            agenda=[{"kind": "verify", "text": "长" * 500}]))["agenda"][0]["text"]
+        self.assertEqual(len(long_text), RP.AGENDA_TEXT_LIMIT)
+
+    def test_prompt_carries_prior_judgment_and_open_agenda(self):
+        self.start()
+        self.plan(2)
+        state = G.load_state(self.state_path)
+        G.record_sol_call(self.state_path, {
+            "call_id": "SCprior", "mode": "CONSULT", "status": "completed",
+            "stage": "development", "judgment": "先验证并发写入再合并",
+            "agenda": [{"kind": "missing-risk", "text": "并发写入未验证"}],
+            "sol_event_snapshot": RP.sol_event_snapshot(state),
+            "completed_at": G.now_iso(),
+        }, mode="CONSULT")
+        state = G.load_state(self.state_path)
+        prompt = SR.build_prompt(state, "材料", mode="CONSULT",
+                                 question="下一步做什么？", stage="development")
+        self.assertIn("历史 SOL 认知", prompt)
+        self.assertIn("先验证并发写入再合并", prompt)
+        self.assertIn("并发写入未验证", prompt)
+        # 历史判断只是只读事实，不能伪装成本轮结论或改变输出契约。
+        self.assertIn("不是本轮结论", prompt)
+        self.assertIn("agenda", SR.CONSULT_INSTRUCTIONS)
+
+
 class GovernanceBoundaryTests(ThinkBase):
     def test_gates_are_still_g1_g2_g3(self):
         self.start(risk="high")

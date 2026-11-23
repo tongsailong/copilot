@@ -52,7 +52,7 @@ import review_policy as RP  # noqa: E402
 import sol_review as SR  # noqa: E402
 import sol_schedule as SS  # noqa: E402
 
-__version__ = "9.6.2"
+__version__ = "9.7.1"
 
 
 class CLIError(Exception):
@@ -299,6 +299,13 @@ def _execute_obligation(path: str, obligation: dict) -> int:
     try:
         return _run_sol_channel(ns, mode)
     except G.LockBusyError as exc:
+        # 条件成立但本次没能调度：只留痕（次数与真实原因），不结算、不改状态，
+        # 也不阻断工程命令；窗口关闭时这条事实会写进终态处置。
+        current = G.load_state(path)
+        row = SS.find_obligation(current, obligation_id=obligation_id)
+        if row is not None:
+            SS.note_deferral(row, now=G.now_iso(), reason=str(exc))
+            G.save_state(path, current)
         print(f"SOL 调度：{exc}；本次不执行，义务保持待执行。", file=sys.stderr)
         return 0
     except CLIError as exc:
@@ -334,7 +341,8 @@ def _sol_schedule_step(path: str, args, *, gates_passed: bool = False,
         else G.closure_readiness(state, cache=cache)
     advice = G.sol_advice_summary(state, gates_passed=gates_passed,
                                   closure_ready=readiness, cache=cache)
-    synced = G.sync_sol_schedule(state, advice=advice)
+    synced = G.sync_sol_schedule(state, advice=advice, policy=policy,
+                                auto_execution=_auto_execution_allowed())
     if synced["changes"]:
         G.save_state(path, state)
     due = SS.due_obligations(state)
@@ -1431,6 +1439,7 @@ def _run_sol_channel(args, mode: str) -> int:
                 "decisions": result.get("decisions") or [],
                 "verify": result.get("verify") or [],
                 "reconsult": result.get("reconsult") or [],
+                "agenda": result.get("agenda") or [],
             })
         record = G.record_sol_call(
             path, record, mode=mode, materials_sha256=digest,
@@ -1474,6 +1483,10 @@ def _run_sol_channel(args, mode: str) -> int:
                 f"priority={len(record.get('priority') or [])}",
                 f"omissions={len(record.get('omissions') or [])}",
                 f"verify={len(record.get('verify') or [])}"]))
+            if record.get("agenda"):
+                print("议程（advisory，不是工作项）：")
+                for item in record["agenda"]:
+                    print(f"- [{item.get('kind')}] {item.get('text')}")
             if record.get("unverified"):
                 print(f"未验证事项：{len(record['unverified'])} 条（见结果 JSON）")
             print(f"原始输出：{raw_path or '(写入失败，见结构化结果)'}")
@@ -1517,11 +1530,28 @@ def cmd_sol_accept(args) -> int:
         source_refs=args.source_ref or [],
         work_item_refs=getattr(args, "work_item_ref", None) or [],
         evidence_note=args.evidence_note or "",
-        decided_by=args.decided_by or "zcode")
+        decided_by=args.decided_by or "zcode",
+        historical=bool(getattr(args, "historical", False)),
+        reason_code=getattr(args, "reason_code", "") or "")
+    entry = result["acceptance"]
+    if result.get("duplicate"):
+        print(f"重复执行：{result['call_id']} 已有相同记录（{entry.get('status')}），"
+              "本次未写入、未追加历史。")
+        if args.json:
+            _print(result)
+        return 0
+    if entry.get("status") == "pending":
+        print(f"历史复核已登记：{result['call_id']} 保留 pending"
+              f"（原因码 {entry.get('reason_code') or '未分类'}）")
+        print(f"原因：{entry.get('reason')}")
+        print("说明：pending 只表示复核过、但任务记录无法证明采纳；"
+              "不改变任务状态、结论与 G1–G3。")
+        if args.json:
+            _print(result)
+        return 0
     if args.json:
         _print(result)
     else:
-        entry = result["acceptance"]
         print(f"SOL 采纳结论已登记：{result['call_id']} → {entry['status']}"
               + (f"（{entry['note']}）" if entry.get("note") else ""))
         print("记录：" + "，".join([
@@ -1553,6 +1583,7 @@ def _sol_schedule_view(state: dict, path: str) -> dict:
     for item in SS.obligations(state):
         if not isinstance(item, dict):
             continue
+        disposition = SS.obligation_disposition(item, SS.schedule_view(state))
         rows.append({
             "obligation_id": item.get("obligation_id"),
             "family": item.get("family"),
@@ -1562,13 +1593,18 @@ def _sol_schedule_view(state: dict, path: str) -> dict:
             "level": item.get("level"),
             "status": item.get("status"),
             "window": item.get("window"),
+            "cycle": SS.obligation_cycle(item),
             "missed": SS.is_missed(item),
+            "disposition": disposition["kind"],
+            "disposition_reason": disposition["reason"],
             "source": item.get("source"),
             "call_id": item.get("call_id"),
             "opened_at": item.get("opened_at"),
             "closed_reason": item.get("closed_reason"),
             "skip_reason": item.get("skip_reason"),
             "failure": item.get("failure"),
+            "deferrals": int(item.get("deferrals") or 0),
+            "last_deferral_reason": item.get("last_deferral_reason") or "",
         })
     command = ""
     if due:
@@ -1587,7 +1623,9 @@ def cmd_sol_schedule(args) -> int:
     path = _state_path(args)
     state = G.load_state(path)
     advice = G.sol_advice_summary(state)
-    synced = G.sync_sol_schedule(state, advice=advice)
+    synced = G.sync_sol_schedule(state, advice=advice,
+                                 policy=_sol_policy(args),
+                                 auto_execution=_auto_execution_allowed())
     if args.execute:
         # 显式执行：先落盘义务事实，再执行一个（有界），便于脚本按需推进。
         if synced["changes"]:
@@ -1604,18 +1642,24 @@ def cmd_sol_schedule(args) -> int:
         return 0
     summary = view["summary"]
     print(f"SOL 调度：义务 {summary['total']} 个"
-          f"（未闭合 {summary['pending']}，漏调 {summary['missed']}）")
+          f"（未闭合 {summary['pending']}，漏调 {summary['missed']}，"
+          f"周期 {summary['cycle']}）")
     for row in view["obligations"]:
-        mark = "漏调" if row["missed"] else row["status"]
+        mark = ("漏调" if row["missed"]
+                else row["status"] if row["window"] != "closed"
+                else (row["disposition"] or row["status"]))
         extra = ""
         if row.get("call_id"):
             extra = f" call={row['call_id']}"
-        elif row.get("skip_reason"):
-            extra = f"（{row['skip_reason']}）"
+        elif row.get("disposition_reason"):
+            extra = f"（{row['disposition_reason']}）"
         elif row.get("failure"):
             extra = f"（失败：{row['failure']}）"
+        if row.get("deferrals"):
+            extra += f" 未调度 {row['deferrals']} 次"
         print(f"- {row['obligation_id']} [{mark}] {row['family']}/{row['event']} "
-              f"{row['mode']} {row['level']} stage={row['stage'] or '-'}{extra}")
+              f"{row['mode']} {row['level']} stage={row['stage'] or '-'}"
+              f" cycle={row['cycle']}{extra}")
     if view["command"]:
         print("下一条可执行：" + str(view["next"]))
         print("可直接执行：" + view["command"])
@@ -1733,7 +1777,9 @@ def cmd_closure(args) -> int:
             print("登记判断后再执行 closure --close：此时才执行 G1–G3 收口。")
             return EXIT_CONTINUE
     closure = G.close_task(path, by=args.by, cache=cache,
-                           sol_entry="closure-command")
+                           sol_entry="closure-command",
+                           sol_policy=_sol_policy(args),
+                           sol_auto=_auto_execution_allowed())
     quality = closure.get("quality") or {}
     print(f"任务已收口：verdict={closure['verdict']} "
           f"iteration={closure['iteration_id']} by={closure['closed_by']}")
@@ -2386,7 +2432,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--state", required=True)
     p.add_argument("--call-id", required=True, help="SOL 记录的 call_id")
     p.add_argument("--status", required=True,
-                   choices=("accepted", "modified", "rejected"))
+                   choices=("accepted", "modified", "rejected", "pending"),
+                   help="采纳结论；pending 仅用于 --historical 记录未解决原因")
     p.add_argument("--note", default="", help="实际采用范围或补充说明")
     p.add_argument("--reason", default="",
                    help="拒绝或修改的理由（--rationale 省略时作为理由）")
@@ -2404,6 +2451,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="可选工作项交叉引用（不代表因果或完成证明）")
     p.add_argument("--evidence-note", default="", help="证据补充说明")
     p.add_argument("--decided-by", default="zcode")
+    p.add_argument("--historical", action="store_true",
+                   help="已收口任务的历史回填：只写采纳记录，不改阶段/结论/门禁；"
+                        "重复执行幂等，不覆盖既有结论")
+    p.add_argument("--reason-code", default="",
+                   help="历史复核的原因分类（如 no-attribution / superseded）")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_sol_accept)
 

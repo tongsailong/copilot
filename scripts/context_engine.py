@@ -690,6 +690,46 @@ def _phase_of(state: dict) -> str:
         return str(state.get("phase") or "未知")
 
 
+def _sol_cognition(state: dict, *, limit: int = 5) -> list[dict]:
+    """已完成的 SOL 认知判断与采纳结论（只读；供候选草稿溯源）。
+
+    这是“本次任务得出过哪些判断、主代理怎么采纳”的事实，不是知识结论：草稿仍
+    需要主 Agent 按现场核验、去重与判定住所后才能入库。REVIEW 记录不在此列
+    （复核发现走 finding 台账）。
+    """
+    rows: list[dict] = []
+    for item in state.get("sol_calls") or []:
+        if not isinstance(item, dict) or item.get("status") != "completed":
+            continue
+        mode = str(item.get("mode") or "").upper()
+        if mode not in ("CONSULT", "PLAN"):
+            continue
+        acceptance = item.get("acceptance") if isinstance(
+            item.get("acceptance"), dict) else {}
+        agenda = []
+        for entry in item.get("agenda") or []:
+            if isinstance(entry, dict):
+                kind = str(entry.get("kind") or "core-question")
+                text = str(entry.get("text") or "").strip()
+            elif isinstance(entry, str):
+                kind, text = "core-question", entry.strip()
+            else:
+                continue
+            if text:
+                agenda.append({"kind": kind, "text": text[:240]})
+        rows.append({
+            "call_id": str(item.get("call_id") or ""),
+            "mode": mode,
+            "stage": str(item.get("stage") or ""),
+            "judgment": str(item.get("judgment") or "")[:400],
+            "acceptance": str(acceptance.get("status") or "pending"),
+            "decision": str(acceptance.get("decision") or "")[:200],
+            "delta": str(acceptance.get("delta") or "")[:300],
+            "agenda": agenda[:6],
+        })
+    return rows[-max(1, limit):]
+
+
 def _state_snapshot(state_path: str) -> dict:
     try:
         with open(state_path, "r", encoding="utf-8") as fh:
@@ -715,6 +755,7 @@ def _state_snapshot(state_path: str) -> dict:
         "evidence": [e for e in state.get("evidence") or [] if isinstance(e, dict)],
         "reports": [r for r in state.get("reports") or [] if isinstance(r, dict)],
         "plans": [p for p in state.get("plans") or [] if isinstance(p, dict)],
+        "sol_cognition": _sol_cognition(state),
         "phase": _phase_of(state),
         "updated": str(state.get("updated") or ""),
     }
@@ -1037,6 +1078,21 @@ def build_capture(*, project: dict, snapshot: dict, state_path: str,
     if unmet:
         head.append("- 未闭合条件（不得写成已确认结论）："
                     + "、".join(c["id"] for c in unmet))
+    cognition = snapshot.get("sol_cognition") or []
+    if cognition:
+        head += ["", "## SOL 认知与采纳（任务内事实，不是可复用结论）", ""]
+        for item in cognition:
+            head.append(f"- {item['call_id']}（{item['mode']}/{item['stage']}，"
+                        f"采纳：{item['acceptance']}）："
+                        f"{C.redact(item['judgment']) or '(无判断文本)'}")
+            if item["decision"]:
+                head.append(f"  - 采纳决策：{C.redact(item['decision'])}")
+            if item["delta"]:
+                head.append(f"  - 实际差异：{C.redact(item['delta'])}")
+            for entry in item["agenda"]:
+                head.append(f"  - 议程[{entry['kind']}]：{C.redact(entry['text'])}")
+        head.append("  - 以上是任务内判断与采纳痕迹；只有当结论被现场验证、"
+                    "可脱离本次任务复用时，才考虑沉淀为正式知识。")
     head += ["", "## 证据", ""]
     if evidence:
         head += ["| 证据 | 类型 | 摘要/路径 |", "|---|---|---|"]
@@ -1106,6 +1162,7 @@ def build_capture(*, project: dict, snapshot: dict, state_path: str,
         "met_criteria": [c["id"] for c in met],
         "unmet_criteria": [c["id"] for c in unmet],
         "evidence": [str(e.get("id")) for e in evidence],
+        "sol_cognition_calls": len(cognition),
         "dedupe_hits": len((dedupe or {}).get("hits") or []),
         "file_name": name,
         "sha256": C.sha256_text(text),

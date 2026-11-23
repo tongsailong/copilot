@@ -12,6 +12,24 @@ Copilot 是运行于 ZCode 内的**轻量协作治理 Skill**：负责任务承�
 （CONSULT / PLAN）按生命周期提供整体判断，用户明确要求时执行一次独立复核（REVIEW），均由
 `gpt-6.2-sol` 零工具单轮调用完成。
 
+- **v9.7.1 起认知记录与义务处置都写可复核终态**：`sol-accept --historical` 只用于已收口任务
+  的历史复核——`pending` 必须写明原因（`--reason` + 可选 `--reason-code`），重复执行幂等、
+  不覆盖既有已决结论、也不把已决结论降级为 `pending`；`accepted/modified/rejected` 必须有
+  任务内依据，**不因代码已修改、测试通过或任务 PASS 推断采纳**。调度义务在窗口关闭时写
+  `disposition`（`completed`/`covered`/`skipped`/`failed`/`not-executed`/`unsettled`）与
+  理由：没有当时策略快照的记 `unknown`，不用当前配置倒推；条件成立但未能调度（锁等待失败
+  等）只留 `deferrals` 痕迹、不结算成失败。义务带 `cycle`（1 + 重开次数），比较只在同周期
+  内进行；处置与周期只进 `summary`/`sol-stats` 观测值，不改 `missed`、不改变 coverage 分母、
+  不阻止收口。
+- **v9.7.0 起 SOL 输出可选主动议程并保持认知连续**：CONSULT / PLAN 的 JSON 契约新增可选
+  `agenda`（1–6 条，固定类型：核心问题/错误前提/遗漏风险/完成条件补充/取舍/验证/反例），
+  `review_policy.normalize_agenda()` 做确定性归一，`evaluate`/`status` 只读呈现
+  `sol_agenda`，不派生工作项、不进计划 SHA、不影响 G1–G3。调度材料升为
+  `copilot-sol-schedule-materials/v3`，带“上次 SOL 判断与采纳”和“未处理议程”；同一收口
+  周期（合同 + 重开次数）已有收口判断后不再推荐 B/D，被覆盖窗口按
+  `skipped/closure-covered` 结算；`blockage-change` 只由新增或实质变化的未解除阻塞触发；
+  `evaluate` 输出 `sol_pending_acceptance`，`sol-stats` 增加 `agenda`、
+  `pending_acceptance`、`post_closure_calls` 观察值（不证明判断价值）。
 - **v9.6.1 起收口 CONSULT 的准入是“最终工程验证完成”**：`governance.closure_readiness()`
   是 E 窗口与收口的唯一准入（工作项终态、条件核销、证据登记、合同 `test_policy` 的执行
   痕迹、重开后无进展、finding 台账），并以 `closure_verification_digest()` 作为 E 义务的
