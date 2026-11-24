@@ -73,6 +73,14 @@ class DispositionBase(unittest.TestCase):
         row.update(fields)
         row["obligation_id"] = (row["obligation_id"]
                                or f"SO{len(schedule['obligations']) + 1}")
+        # 模拟生产路径：sync 物化义务时会把“打开这一刻生效的策略”固化到义务上。
+        policy = SS.policy_snapshot(schedule, SS.current_cycle(state))
+        if isinstance(policy.get("value"), str) and policy["value"]:
+            row["policy_at_open"] = {
+                "value": policy["value"],
+                "auto_execution": policy.get("auto_execution"),
+                "at": policy.get("at", ""),
+            }
         schedule["obligations"].append(row)
         self.save(state)
         return dict(row)
@@ -140,9 +148,10 @@ class NotExecutedTests(DispositionBase):
         self.assertEqual(summary["dispositions"]["not-executed"], 1)
 
     def test_policy_snapshot_explains_policy_off_without_calling(self):
-        self.add(family="B", mode="PLAN")
+        # 生产路径：先记录当时策略，再在同一/后续同步里物化义务。
         changes = self.sync(policy="off", auto_execution=False)
         self.assertTrue(any("off" in item for item in changes), changes)
+        self.add(family="B", mode="PLAN")
         # due 不等于强制调用：策略 off 时没有任何 SOL 调用记录。
         self.assertEqual(self.state().get("sol_calls") or [], [])
         self.assertEqual(self.row()["status"], "due")
@@ -153,6 +162,54 @@ class NotExecutedTests(DispositionBase):
         self.assertNotIn("unknown", row["disposition_reason"])
         self.assertEqual(SS.summary(self.state())["policy"]["value"], "off")
 
+    def test_policy_at_open_survives_mid_cycle_change(self):
+        advice = {"action": "plan", "family": "B", "event": "plan",
+                  "instance": "i1", "mode": "PLAN", "stage": "planning",
+                  "level": "recommended", "question": "方案是否成立",
+                  "reason": "方案类任务"}
+        self.sync(advice=advice, policy="advise", auto_execution=False)
+        # 窗口打开后策略改为 auto：不得把周期内最新策略当成“当时”策略。
+        self.sync(policy="auto", auto_execution=True)
+        self.sync(closed=True)
+        row = self.row()
+        self.assertEqual(row["disposition"], "not-executed")
+        self.assertIn("当时调度策略=advise", row["disposition_reason"])
+        self.assertIn("周期内调度策略后改为=auto", row["disposition_reason"])
+
+    def test_legacy_obligation_uses_snapshot_history_at_open(self):
+        """历史义务没有 policy_at_open 时，按快照变更历史回推打开时点策略。"""
+        state = self.state()
+        schedule = SS.ensure_schedule(state)
+        schedule["policy_snapshots"] = {"1": {
+            "first_seen_at": "2026-11-23T20:31:00+08:00",
+            "value": "auto", "auto_execution": True,
+            "at": "2026-11-23T21:16:00+08:00",
+            "history": [
+                {"value": "advise", "auto_execution": False,
+                 "at": "2026-11-23T20:31:00+08:00"},
+                {"value": "auto", "auto_execution": True,
+                 "at": "2026-11-23T21:16:00+08:00"},
+            ],
+        }}
+        self.save(state)
+        row = self.add(family="A", mode="CONSULT", stage="startup",
+                       event="startup", instance="s1",
+                       opened_at="2026-11-23T20:32:00+08:00")
+        state = self.state()
+        target = SS.find_obligation(state, obligation_id=row["obligation_id"])
+        # 模拟修复前的历史义务：没有 policy_at_open，窗口已关闭但未写处置。
+        target.pop("policy_at_open", None)
+        target["window"] = "closed"
+        target["closed_at"] = "2026-11-23T22:00:00+08:00"
+        target["closed_reason"] = "task-closed"
+        self.save(state)
+        # 只读推导：历史义务不被补写字段。
+        disposition = SS.obligation_disposition(
+            target, SS.schedule_view(self.state()))
+        self.assertFalse(disposition["stored"])
+        self.assertIn("当时调度策略=advise", disposition["reason"])
+        self.assertIn("周期内调度策略后改为=auto", disposition["reason"])
+
     def test_policy_change_is_recorded_per_cycle(self):
         self.sync(policy="advise", auto_execution=False)
         self.sync(policy="auto", auto_execution=True)
@@ -160,8 +217,14 @@ class NotExecutedTests(DispositionBase):
         snapshot = SS.policy_snapshot(SS.schedule_view(state), 1)
         self.assertEqual(snapshot["value"], "auto")
         self.assertTrue(snapshot["auto_execution"])
-        # 同一策略重复记录不产生新变更。
+        self.assertEqual([row["value"] for row in snapshot["history"]],
+                         ["advise", "auto"])
+        # 同一策略重复记录不产生新变更，也不追加历史。
+        before = len(snapshot["history"])
         self.assertEqual(self.sync(policy="auto", auto_execution=True), [])
+        self.assertEqual(
+            len(SS.policy_snapshot(SS.schedule_view(self.state()), 1)["history"]),
+            before)
 
 
 class CoveredAndSkippedTests(DispositionBase):
@@ -477,6 +540,8 @@ class ReadOnlyHistoryTests(DispositionBase):
 
 class ClosureNotBlockedTests(DispositionBase):
     def test_close_task_records_dispositions_without_gating(self):
+        # 生产路径：策略先于义务打开被记录，收口时同一策略不覆盖打开时点事实。
+        self.sync(policy="advise", auto_execution=False)
         self.add(family="D", mode="CONSULT", stage="stage",
                  event="milestone", instance="m1")
         self.close_all()

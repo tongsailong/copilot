@@ -13,7 +13,200 @@
 > （实际决策/理由/证据关联/非阻断提示）与质量指标；v9.2.0（2026-11-20）接入
 > SessionStart 恢复注入并给 SKILL 上下文瘦身；v9.3.0（2026-11-21）加固合同修订、
 > 续跑绑定与条件包装项同步；v9.4.0（2026-11-21）新增只读 Context Engine，衔接原生
-> Memory / Vault / Task Memory / 工程现场**。
+> Memory / Vault / Task Memory / 工程现场；v9.5.0–v9.7.1（调度领取、收口时序、有界执行、
+> 可选议程与义务终态处置）的完整记录于 2026-11-24 从 `SKILL.md` 版本段迁入本文件**。
+
+<!-- v9.5.0–v9.7.1 条目于 2026-11-24 从 SKILL.md 版本段迁入，正文未改写；SKILL.md 只保留当前版本与跨版本不变量。 -->
+
+## v9.7.1（认知记录与义务处置的终态闭环）
+
+- **历史采纳只补可证明的结论**：`sol-accept --historical` 只为**已收口**任务开放，`pending`
+  必须写明原因（`--reason` + 可选 `--reason-code`：`no-attribution` /
+  `superseded-within-cycle` / `later-cycle-superseded` / `insufficient-record`），
+  `accepted/modified/rejected` 也必须有任务内依据。重复执行完全相同的登记判 `duplicate`
+  幂等返回（不追加历史、不改登记次数）；既有已决结论不被覆盖、不被降级为 `pending`；
+  正常入口对 CLOSED 任务的拒绝不变。**不因代码已改、测试通过或任务 PASS 推断采纳**——
+  无法归因的一律保留 `pending` 并写明理由，不以 pending 数量下降为目标。
+- **义务终态处置**：窗口关闭时写 `disposition`（`completed` / `covered` / `skipped` /
+  `failed` / `not-executed` / `unsettled`）+ `disposition_reason` + `disposition_at`，
+  已有处置不覆盖。`not-executed` 的理由引用该周期的策略快照
+  （`schedule.policy_snapshots[<cycle>]`，来自 `--sol` / `COPILOT_SOL_AUTO`）；**没有快照
+  的历史义务记 `unknown`**，不用当前配置倒推。`due` 不等于强制调用：策略 `off`/`advise`
+  下义务保持 due，但快照让事后能分清“策略关闭”与“漏调”。
+- **未能调度留痕**：条件成立但本次没执行（SOL 锁被占用等）只累加 `deferrals` 与
+  `last_deferral_reason`，义务仍 `due`，窗口关闭时进入处置理由；不静默清除、不冒充失败。
+- **收口周期隔离**：义务带 `cycle`（1 + `reopen_history` 条数），窗口比较只在同周期内；
+  授权重开后的收口判断不追溯覆盖上一周期的窗口，旧周期义务保持原周期与原事实。
+- **不阻断**：处置与周期只进 `summary`（`dispositions` / `by_cycle` / `policy` /
+  `cycle`）与 `sol-stats`（`dispositions`、`by_cycle`、`reopened_tasks`）观测值，不改
+  `pending` / `missed`、不改 coverage 分母、不影响 G1–G3 与收口。历史义务可只读推导处置，
+  不回写历史状态。
+- **不变量**：G1–G3、`closure_readiness` 收口准入、E 前 `sol-accept`、PARTIAL 续跑、
+  SOL advisory、REVIEW 仅用户明确要求、G4 退役、零工具单轮、Provider/模型/凭据与授权
+  边界全部不变；本轮未获推送、发布或系统配置修改授权。
+
+## v9.7.0（SOL 主动认知与实战决策闭环）
+
+- **复盘依据**：对 2026-11-22–11-23 的 40 个任务、68 次 SOL 调用（447k tokens、累计 4,618.6 s）
+  做了逐条核对。问题不是“SOL 判断质量差”，而是四个确定性缺陷：材料不带历史判断（同一问题
+  重复付费）、收口后仍追加 B/D 窗口（7 次非收口调用发生在收口判断之后）、
+  `blockage-change`/`repeated-work-failure` 没有事件身份与专属问题、34 次已完成调用
+  的采纳结果不可见。
+- **可选议程**：CONSULT / PLAN 的输出契约新增可选 `agenda`（1–6 条，固定类型：核心问题、
+  错误前提、遗漏风险、完成条件补充、取舍、最值得验证的事实、关键反例），SOL 只给一句话级
+  认知提示；`governance.evaluate` / `status` 只读呈现 `sol_agenda`，不派生工作项、不进计划
+  SHA、不影响 G1–G3。议程缺失时输出契约与旧调用方完全兼容。
+- **认知连续性**：调度材料新增“上次 SOL 判断与采纳”（最近三次的判断、采纳状态、决策与
+  实际差异）与“未处理议程”；`build_prompt` 也注入同样的事实段。差异行补充新增决策与
+  未解除阻塞变化，避免同一事实被反复提问。材料口径升为
+  `copilot-sol-schedule-materials/v3`（参与收口验证摘要，旧 E 结论按既有规则失效）。
+- **收口顺序**：同一收口周期（合同 + 重开次数）已有收口判断后，不再推荐 B 规划或 D 里程碑；
+  被收口覆盖而仍未执行的 B/D 义务按 `skipped/closure-covered` 结算，不再误记为漏调。升级型
+  事件（重规划、风险升级、合同修订、重开等）仍可打开新的 C 窗口。
+- **事件质量**：`blockage-change` 只由“新的或实质变化的未解除阻塞”触发，单纯解除阻塞不再
+  制造事件；`repeated-work-failure` 保持每阶段一次（第 2、3+ 次失败），两者都有专属问题，
+  普通测试失败与常规进展不触发。
+- **采纳可见**：`evaluate` 输出 `sol_pending_acceptance`，`status` 提示未回填的已完成认知
+  调用并给出 `sol-accept` 入口（只提示、不阻断）；E 收口的采纳门语义不变。
+- **可观测值**：`sol-stats` 新增 `agenda`（有议程的调用数/条数/未处理条数）、
+  `pending_acceptance`、`post_closure_calls`（收口后仍发生的非收口认知调用，应为 0）；
+  schema 升为 `copilot-sol-stats/v2`，明确这些观察值不证明判断价值。
+- **经验闭环**：`context_engine.py capture` 的候选草稿包含任务内 SOL 判断与采纳痕迹
+  （含议程与证据溯源），并注明“任务内事实，不是可复用结论”；不写 Vault、不替代知识写入授权。
+- **不变量**：G1–G3、`closure_readiness` 收口准入、PARTIAL 续跑、SOL advisory、REVIEW 仅用户
+  明确要求、G4 退役、零工具单轮、Provider/模型/凭据配置与授权边界全部不变。
+
+## v9.6.2（统计口径修正、SOL 锁等待有界、文档与死代码收敛）
+
+- **覆盖率口径修正（P1 缺陷）**：任务级窗口（A 启动 / B 规划 / E 收口）的分母是“本任务是否
+  适用”（0/1），分子过去却取满足义务的条数——多轮 reopen 的多次收口判断会得出
+  `rate=3.0`（3 次收口 ÷ 1 个任务）。现按任务计 1 次（满足＝真实执行或复用），义务条数与
+  执行/复用/跳过/漏调的分项仍完整保留在 `by_family`；`totals` 新增 `closure_eligible_tasks`。
+- **事件分母**：C 事件窗口按“每出现一次事件 → 一个适用窗口”计数，合理跳过（合同修订、
+  被新窗口取代、任务已关闭）不再进入分母，与 `_expire_superseded` / `sync` 的口径一致。
+- **自动调度锁等待有界**：此前文档承诺“有界执行”，但自动路径从不传 `--lock-timeout`，
+  实际会无限等待另一进程的 SOL 请求。现在自动路径固定带上限
+  （`AUTO_LOCK_WAIT_S` 默认 120 s，`COPILOT_SOL_LOCK_TIMEOUT` 覆盖）；拿不到锁时义务保持
+  `due`、不付费、不阻断工程命令。`sol-review` 也接受同一参数。
+- **文档/帮助与实现对齐**：生命周期命令在 `--sol auto` 下会顺带执行 1 条义务，不再宣称
+  “所有命令都不调用模型”；收口顺序统一写成 最终验证 → E → `sol-accept` → G1–G3；D 里程碑
+  级别为 `recommended`（不是 `optional`）；风险只影响认知准入、REVIEW 仅用户明确要求；
+  钩子的 `0/2`（Stop，fail-closed）与 `exit 0`（SessionStart/UserPromptSubmit）分开描述。
+- **死代码收敛**：删除零引用且无动态访问的常量/别名/助手（`DEFAULT_BUDGET_S`、
+  `TERMINAL_OBLIGATION_STATUSES`、`EVENT_SCHEMA`、`open_obligations`、`describe`、
+  `SOL_EVENT_ORDER`、`SOL_DYNAMIC_EVENTS`、`SOL_EVENT_FAMILY`/`event_family`、
+  `COMPLEXITY_LEVELS`、`NON_SIMPLE_TASK_KINDS`、`LEGACY_ASSIGNEES`、
+  `QUALITY_ACCEPTANCE_STATUSES`、`REVIEW_ATTEMPT_RE`、`TERMINAL_PHASES`、`_bool`、
+  `add_admission_triggers`、`list_sol_think_calls`、`ACCEPTANCE_EVIDENCE_STATES`、
+  `record_sol_advisory*`、`SCHEMAS`、`_optional_text`、`_action_fingerprint`、
+  `LEGACY_THINK_SCHEMAS`、`_brief`）；`legacy/` 与历史审计/状态读取兼容不动。
+- **性能**：SOL 网络栈（`urllib.request`/`ssl`/`http.client`/`email`）改为请求路径内惰性导入；
+  同机交替 A/B 中位数（先 `compileall`，每条命令 `-B`）：`import copilot_dispatch`
+  98.2 → 80.0 ms，`status` 155 → 127 ms、`closure-check` 133 → 110 ms、`sol-stats`
+  129 → 112 ms、`handoff` 149 → 132 ms。
+- **不变量**：G1–G3、收口顺序与 `closure_readiness` 准入、PARTIAL 续跑、SOL advisory、
+  REVIEW 仅用户明确要求、G4 退役、Provider/模型/账户配置全部不变。
+
+## v9.6.1（收口时序：最终验证完成才执行收口 CONSULT）
+
+- **为什么改**：v9.6.0 的 E 准入只看“工作项是否耗尽”（`all_done`），`_sol_schedule_step`
+  又固定传 `gates_passed=False`，于是最后一个工作项一关闭就可能立刻执行收口 CONSULT——
+  而合同要求的测试、最终证据、条件核销甚至 G1–G3 还没完成，SOL 拿到的是不完整的收口材料。
+- **统一准入**：`governance.closure_readiness()` 是 E 与收口的唯一准入，先查便宜事实
+  （工作项终态、条件核销、证据、合同必要测试的执行痕迹、重开后无进展、开放 finding），
+  再算确定性门禁（不含质量报告的用户接受，它属于 ZCode 验收之后的用户一步）。
+- **验证摘要**：`closure_verification_digest()` 只取验证事实的 `sha256[:16]`，作为 E 义务的
+  instance。义务与当前摘要不符时拒绝付费；同一摘要再到达判 `reuse`；重跑测试或新增/修订
+  证据后摘要变化，旧 E 结论不再覆盖新结果。
+- **入口一致**：`drive` 在缺口时返回 `EXIT_EXECUTE` 且不执行 E；`closure --close`、手动
+  `sol-consult --stage closure`、`close_task` 都拒绝绕过；回填命令只更新义务。`evaluate`
+  的 `continuation` 在缺口时给出 `verify` 动作与阻塞原因。
+- **验收顺序强制**：E 执行后必须先有 ZCode 的 `sol-accept`（accepted/modified/rejected 任一）
+  才能收口——`closure_acceptance_pending()` 让 `close_task` 失败关闭、`drive` / `closure
+  --close` 停在 `EXIT_EXECUTE` / `EXIT_CONTINUE` 并打印命令。裁决不是 SOL 批准权，也不替代
+  用户对质量报告的接受。
+- **材料口径进摘要**：`MATERIALS_SCHEMA` 参与 `closure_verification_digest()`，材料生成口径
+  变化（例如合同正文来源修正）即可让旧 E 结论停止覆盖新结果；材料内自报口径版本。
+- **测试证据可核对**：`evidence --capture-cmd` 现在真的把命令写进证据记录（此前该字段是死的），
+  合同声明命令按词元顺序匹配（允许 `-B` 等运行器参数），自述“测试已通过”不算执行痕迹。
+- **不变量**：五阶段架构、G1–G3、PARTIAL 续跑、SOL advisory（E 不是门禁、不需 SOL PASS）、
+  REVIEW 仅用户明确要求、G4 退役、模型/Provider 配置全部不变。
+
+## v9.6.0（SOL 生命周期主动调度：义务化、有界执行、覆盖率统计）
+
+- **为什么改**：v9.0–v9.5 的 SOL 建议是纯函数输出，只在 `start`/`status`/`drive`/
+  `review-admission` 打印；建议命令带 3 处占位符，`_run_sol_channel` 又要求
+  `--materials`/`--question`，于是“应当调用”从未进入任何状态，事后也无法区分“没建议”
+  与“建议了没执行”。`drive` 在 PASS 分支直接收口，收口 CONSULT 结构上不可达。
+- **调度义务**：新增 `scripts/sol_schedule.py`（纯函数、零网络、零状态写入）。每次生命周期
+  判断物化为义务（family A–E / event / instance / 合同指纹 / level），写入
+  `state.sol_schedule`；窗口只按已持久化事实关闭，漏调由关闭时的事实派生。
+- **有界自动执行**：`start`/`plan`/`record`/`rerun`/`criterion`/`judgment`/`evidence`/
+  `report`/`accept`/`decide`/`block`/`unblock`/`finding`/`contract`/`reopen`/`closure` 与
+  `drive` 在回填后做一次有界调度步：最多 1 条义务、1 次请求，并由
+  `AUTO_LOCK_WAIT_S`（默认 120 s，`COPILOT_SOL_LOCK_TIMEOUT` 覆盖）限制锁等待；拿不到
+  锁时义务保持 `due`、不付费、不阻断。`--sol auto|advise|off` 控制策略，非 recommended
+  义务只提示，读命令永不执行。
+- **PLAN 准入唯一口径**：`plan_admission()` 不再由工作项数量单独决定（方案类类型、声明
+  触发、中/高复杂、≥2 工作项任一），并默认读取任务自己声明的触发因素。
+- **六类动态事件可归因**：`material-evidence-change`（finding 复现 / 条件回退）、
+  `decision-point`（新登记的显式决策，`add_decision` 写入 `decision_id`）、
+  `risk-escalation`、`replan-history`、`scope-changed`（合同指纹变化）、`reopened`。
+  调用记录持久化 `sol_event_snapshot` 与 `closure_key`，事件比较与收口周期去重以真实
+  记录为基线（合同修订后仍与旧基线比较，才能判为 scope-changed）。
+- **里程碑与收口接线**：D 从“仅 high”扩到 medium/high（完成后 ≥2 项或 ≥1 项且条件已核销），
+  级别 `recommended`（`auto` 下自动执行 1 次）；`drive` 的 PASS 分支与 `closure --close`
+  先消费 E 窗口、再要求 `sol-accept`，然后收口
+  （`closure.sol_entry` 区分 `drive` / `closure-command` / `zcode-native`）。
+- **去重、并发与降级**：同一 (合同, family, event, instance) 只有一个义务；同一 subject
+  复用不重复付费；`task_lock(timeout)` 拿不到锁即放弃本次执行（义务保持待执行）；失败记录
+  真实原因并继续，前置条件连续失败 3 次后终止该义务。
+- **统计**：`sol-stats` 输出显式分母的覆盖率、事件分布、采纳分布、tokens 与延迟；建议、
+  执行、复用、跳过、失败、漏调、未登记分开统计。覆盖率不是门禁。
+- **不变量**：SOL 零工具单轮、advisory、G1–G3、ZCode 唯一工程执行与技术决策主体、REVIEW
+  仅用户明确要求、授权边界、模型与 Provider 配置、G4 退役状态全部不变。
+
+## v9.5.1（宿主集成修正：startup 恢复、钩子可发现性、工作单条件归属）
+
+- **SessionStart matcher 含 startup**：宿主只在全新会话发 `source=startup`；匹配器为
+  `startup|resume|compact`。startup 只给只读指针（不注入任务正文、不自动绑定、不强制
+  续跑），resume/compact 且绑定本会话时仍给完整快照。
+- **状态文件位置是硬条件**：任务必须位于 `<workspace>/.copilot-tasks/<task>/state.json`，
+  三个钩子只扫描该目录；`start` 对目录外路径给出提示。
+- **工作单条件归属**：`work_order` 优先使用本工作项 `target_criteria`（`AUTO-C<n>` 次之），
+  多条件工作项提示“还对应 Cx、Cy”，不再一律写 C1。
+- **交办次数跨过期租约累计**：中断后被其它会话接管仍记第 2 次；主动释放/完成后重新领取
+  从 1 计数。
+- **不变量**：G1–G3、PARTIAL 强制续跑、SOL-first advisory、授权边界与 G4 退役状态不变。
+
+## v9.5.0（持续推进：调度领取、恢复提示与阻塞边界）
+
+- **调度领取（claims）**：`drive` 在 RUNNING 阶段把工作项领取落盘（`claims`：owner 会话、
+  `claim_id`、`expires_at`、`handoff_count`；默认 TTL 1800s，`COPILOT_CLAIM_TTL` 可调）。
+  同一工作项不会被两个会话同时领取；其它会话的有效租约不抢占，到期自动回收；`record` /
+  `rerun` / 条件 `met` / `block` 自动释放。**领取是交办事实，不是执行证明**，工作项终态
+  仍以 `status` / `result` / 证据为准。只剩通用 `AUTO-NEXT` 兜底且具体缺口已被其它会话
+  领取时，`continuation.action=wait`（`required=false`）且 `drive` 返回 11，不重复规划。
+- **计划目标条件**：`plan` 工作项可声明 `target_criteria`（必须真实存在于合同），用于领取
+  去重、阻塞自动归属；该字段不进入计划摘要，native dispatch 的计划指纹保持不变。
+- **UserPromptSubmit 逐回合提示**：`install` 写入 Stop / SessionStart / UserPromptSubmit
+  三个事件；`user-prompt` 只读列出**本会话负责**的未闭合任务（含 BLOCKED 的 reason/needs）
+  与授权判断规则；其它会话/未绑定的旧任务不逐回合展开、也不重复披露（现场与阻塞原因由
+  SessionStart 指针披露一次），本会话另有任务时它们只占一行计数。归属无法确认
+  （`session.json` 损坏，Stop 会 fail-closed 拦截）的任务仍逐回合提示；宿主未给会话标识时
+  只有**恰好一个**候选任务才当作本会话的展开，多个候选只报数量、让先 `status --json`
+  核对归属（与 Stop 同一口径：不按“最近更新”替会话选任务）。
+  用户本回合补齐授权/决策时，先用其原话登记 `unblock --by user --quote "<原话>"`，再
+  `drive` 继续；提示本身不是用户新指令，也不构成授权。没有本会话任务时不注入。
+- **恢复可发现性**：SessionStart(startup|resume|compact) 对本会话绑定任务注入完整快照，startup 只给指针；
+  或重启后会话标识变化时只注入只读指针（任务阶段、可执行项、阻塞原因/需要、归属标注），
+  不绑定、不接管、不强制续跑。快照与 status 均显示阻塞原因与所需条件。
+- **阻塞边界与解除来源**：仍有可执行工作项时，`block --scope task` 被拒绝，必须显式
+  `--force` 并记录 `ready_at_creation` / `forced_scope`；单项授权缺口走 `--work-item`。
+  `unblock --by user` 必须同时给出 `--quote`，状态记录 `resolved_by`、
+  `authorization_source=caller-declared` 与原话，供审计核对。
+- **不变量**：G1–G3、PARTIAL 强制续跑、SOL-first advisory、证据完整性、授权边界、ZCode
+  唯一工程执行主体与 G4 退役状态全部不变。
 
 ## v9.4.0（2026-11-21）项目上下文与长期记忆衔接
 
