@@ -1,15 +1,21 @@
 # STATUS
 
-更新：2026-11-24 CST。本文件只记录现场可核实的事实；规划与未完成事项单独标注。
-当前版本：工作区源码为 v9.8.0（多模态设计认知：真实图片输入、无图/有图双模式、设计协作
+更新：2026-11-25 CST。本文件只记录现场可核实的事实；规划与未完成事项单独标注。
+当前版本：v9.8.0（多模态设计认知：真实图片输入、无图/有图双模式、设计协作
 与知识复用）；v9.7.1 及更早的治理记录见下。基线以本次交付的最终提交与运行时核验为准。
 任务 `sol-cognition-governance-p1p3-2026-11-23` 经用户授权一次性 `reopen` 后，已于
 `2026-11-24T07:40:07` 在**最终代码**上重新收口 **CLOSED / PASS**（周期 2，G1–G3 全 PASS）。
 
-## 开发效能与自主交付闭环专项（2026-11-24，工作区改动，未提交）
+**正式交付（2026-11-25）**：开发效能专项已入库——提交 `24a2e31`（12 文件，+1411/−370）
+经 PR #9 合并为 `b83cf33`；CI Python 3.10 / 3.12 各 956 项 OK、`--verify-baseline` 通过；
+main 三方（本地 / `origin/main` / `ls-remote`）同为 `b83cf33`（0/0），工作区干净；
+运行时 `--check` 缺失 0 / 不同 0，27 个受管理文件源码与运行时 SHA-256 全部一致。
 
-任务 `dev-efficiency-2026-11-24`（`task-fd963b4e34918738`），授权范围不含 commit/push/PR/
-Tag/Release。现场基线、已修缺陷与保留边界如下。
+## 开发效能与自主交付闭环专项（2026-11-24 实施，2026-11-25 正式交付）
+
+任务 `dev-efficiency-2026-11-24`（`task-fd963b4e34918738`）实施时授权不含 commit/push，
+交付由后续任务 `delivery-2026-11-25`（`task-9066a221fd2fdeee`）在用户明确授权下完成；
+现场基线、已修缺陷与保留边界如下。
 
 - **调查基线（实测）**：26 个受管理分发文件、HEAD `b3ba3e7`（v9.8.0）；跨 5 个工作区
   （copilot / pedometer / rili / lele-pedometer-xin / designwise）共 104 个任务台账：91 收口
@@ -38,15 +44,14 @@ Tag/Release。现场基线、已修缺陷与保留边界如下。
 - **保留边界（未新增门禁）**：普通 capture 证据不绑定代码快照，代码变更后不会自动失效；
   只有质量/verify 报告绑定 `code_scope`。报告内 `unavailable` 项（催促次数、提前停止、
   重复测试、压缩次数）当前事实源没有数据，不估算。
-- **测试**：活动 955 项（含新增 6 项效能报告与 2 项处置保真回归）、legacy 853 项与 HEAD
+- **测试**：活动 956 项（含新增 7 项效能报告与 2 项处置保真回归）、legacy 853 项与 HEAD
   `b3ba3e7` 失败集合逐条一致（146 = 99 failures + 47 errors，历史 v5 行为测试，非本轮引入）。
-- **同步**：`--apply` 后 `--check` 缺失 0 / 不同 0；`--baseline` 重建为 26 个 Git
-  跟踪文件（`efficiency_report.py` 未跟踪、不进入 manifest），`--verify-baseline` 通过。
-- **未验证**：未做 commit / push / Tag / Release；`efficiency_report.py`
-  的宿主库工具耗时 P95 是近似口径；未做同构任务的开发周期、返工率、Token 节省与用户接受度
-  对照（见下节“最终验收补强”）。
+- **同步**：`--apply` 后 `--check` 缺失 0 / 不同 0；`--baseline` 为 27 个 Git 跟踪文件
+  （含 `scripts/efficiency_report.py`），`--verify-baseline` 通过。
+- **未验证**：`efficiency_report.py` 的宿主库工具耗时 P95 是近似口径；未做同构任务的
+  开发周期、返工率、Token 节省与用户接受度对照（见下节“最终验收补强”）。
 
-### 最终验收补强（2026-11-24，工作区改动，未提交）
+### 最终验收补强（2026-11-24 验收，2026-11-25 随正式交付入库）
 
 - **真实宿主验证（已做，最小充分）**：一次无头会话（`sess_7b8d02a1…`，`--mode yolo`，
   `copilot` Skill 调用 1 次），`SKILL.md` 注入 70,811 字节（不含 frontmatter）、
@@ -59,12 +64,11 @@ Tag/Release。现场基线、已修缺陷与保留边界如下。
   时 `skill_headroom = 100000 - None` 抛 `TypeError`（退出 1）。现缺文件即记 `unavailable`
   （`skill_bytes` / `skill_headroom` / `instruction_total_bytes` 一并），补 1 项回归；同一
   cwd 复核退出 0。另清理 `SKILL.md` 末尾重复的“## 版本”块（迁移残留，约 1.5 KB）。
-- **基线保护（待正式交付阶段完成）**：`--baseline` 只记录 Git 跟踪文件，`efficiency_report.py`
-  仍未跟踪，因此**当前不在 manifest 内**（26 个文件）。临时 worktree 演练已确认：显式
-  `git add` 后 `--baseline` 记录 27 个文件、`--verify-baseline` 通过、`--check` 0/0、
-  `test_sync_runtime.py` 20 项 OK（`a1-baseline-rehearsal.log`）。正式交付顺序固定为
-  **暂存新增文件 → `--baseline` → `--verify-baseline` → `--check` → 分发相关测试**，
-  待核销条件：manifest 出现 `scripts/efficiency_report.py` 且 `--verify-baseline` 通过。
+- **基线保护（2026-11-25 已核销）**：交付前 `--baseline` 只记录 Git 跟踪文件，
+  `efficiency_report.py` 曾不在 manifest（26 项）；交付阶段按固定顺序
+  **暂存新增文件 → `--baseline` → `--verify-baseline` → `--check` → 分发相关测试** 执行，
+  manifest 现为 **27 项**且含 `scripts/efficiency_report.py`，`--verify-baseline` 通过。
+  交付前的 worktree 演练记录见任务目录 `a1-baseline-rehearsal.log`（该 worktree 已删除）。
 - **验收口径**：可声明的是文件字节、注入字节（单次宿主实测）、台账/宿主库计数；
   **不可声明**的是“常驻注入下降 21.9%”“Token 节省”“开发周期/返工率改善”——无同构任务
   对照，保持未测量。宿主验证会话本身消耗 3.39M Token（含缓存读 3.28M），只作成本事实记录，
