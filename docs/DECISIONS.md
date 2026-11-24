@@ -2083,3 +2083,106 @@
     - **不变量**：不 force push、不改写历史、不删除既有 Release、不扩大工程范围；不修改
       SOL 调度、G1–G3、Provider/模型路由、ZCode 宿主程序与既有安全设置（Secret Scanning /
       Push Protection 保持启用）。
+
+80. **v9.7.0 SOL 主动认知与实战决策闭环（2026-11-23，用户任务）。**
+    - **复盘结论（可复核）**：按 11/22–11/23 的 40 个任务、68 次 SOL 调用逐条核对，问题不在
+      “SOL 推理差”，而在四个确定性缺陷：① 材料不含上次判断、采纳与未处理议程，同一问题在
+      不同窗口被重复付费（68 次里 34 次采纳未回填）；② 收口判断之后仍会推荐 B 规划/D 里程碑，
+      7 次非收口调用发生在同一任务的收口调用之后；③ `blockage-change` 产生 17 条义务却没有
+      事件身份与专属问题，且阻塞解除也触发；④ 采纳结果只在 `sol-stats` 内部计数，`status`
+      看不到，判断容易沉睡在台账里。高风险/架构任务“义务仍 due 却 0 调用”这一项因状态未记录
+      当时的自动策略，未单独归因于调度缺陷。
+    - **决策**：只在既有 `review_policy` / `sol_schedule` / `sol_review` / `governance` /
+      `context_engine` 上做最小改造，不新建认知 Agent、不扩模型或工具权限、不恢复评审门禁。
+    - **议程**：SOL 输出契约新增可选 `agenda`（固定 7 类、单条一句话、最多 6 条），
+      `normalize_agenda()` 负责类型归一、去重与限长；Copilot 只读展示，不派生工作项、不进
+      计划 SHA、不影响 G1–G3。议程缺失保持旧契约兼容。
+    - **连续性**：材料口径升为 `copilot-sol-schedule-materials/v3`，注入“上次判断与采纳”
+      （最近三次）与“未处理议程”；`build_prompt` 注入同样的只读事实段；差异行增加新增决策与
+      未解除阻塞变化。材料口径参与收口验证摘要，旧 E 结论按既有规则失效而不是被复用。
+    - **收口顺序**：同一收口周期（合同指纹 + 重开次数）已有收口判断后，`sol_advice` 不再推荐
+      B/D；`_advance_windows` 把被收口覆盖的 B/D 义务记为 `skipped/closure-covered`，不记漏调。
+      升级型事件（重规划、风险升级、合同修订、重开）仍可打开 C 窗口。
+    - **事件质量**：`blockage-change` 只由“新增 / 实质变化 / 重新生效的未解除阻塞”触发，单纯
+      解除不触发；`repeated-work-failure` 保持每失败阶段一次；两者补专属问题模板。普通测试
+      失败、常规进展仍不触发。
+    - **采纳与观测**：`evaluate` 增加 `sol_pending_acceptance`，`status` 给出 `sol-accept`
+      入口（只提示、不阻断）；`sol-stats` schema 升为 `copilot-sol-stats/v2`，新增 `agenda`、
+      `pending_acceptance`、`post_closure_calls`，并在 notes 中声明它们不是价值证明。
+      `capture` 草稿增加“SOL 认知与采纳”段与溯源，注明任务内事实不直接入库。
+    - **不变量**：G1–G3、`closure_readiness` 收口准入、E 前 `sol-accept`、PARTIAL 续跑、
+      SOL advisory、REVIEW 仅用户明确要求、G4 退役、零工具单轮、Provider/模型/凭据与授权
+      边界全部不变；本轮未获推送、发布或系统配置修改授权。
+
+81. **v9.7.1 认知记录闭环：历史采纳回填、义务终态处置与议程观察口径（2026-11-24，用户任务）。**
+    - **P1 基线（单一窗口，不与其它时段混合）**：以 2026-11-23T23:33:59 的全量扫描为基线——
+      48 个含认知调用的任务目录中 46 个（按目录计）有已完成 CONSULT/PLAN 调用，共 104 次，
+      其中 `pending` 44 条（`accepted` 40 / `modified` 20）。回填后同一口径为 109 次调用、
+      `accepted` 43 / `modified` 20 / `pending` 46，差额**逐条对账**：+5 次调用（本次补记历史
+      复核的 2 条收口 CONSULT、2 条新收口判断、本任务 1 条启动 CONSULT）；`accepted` +3 =
+      2 条新调用被采纳 + 1 条基线内已完成的调用在 23:42:05 才登记采纳；`pending` 44 − 1
+      （该次登记）+ 3（2 条历史复核 + 本任务 1 条）= 46。任务数在“目录名去重 46 / 按
+      `task_id` 去重 48”之间有 2 条差异（同一 `task_id` 出现在不同日期的目录），**如实保留为
+      未解决的口径差异，不调整分母、不合并目录**。
+    - **P1 证据门槛**：可回填的唯一依据是任务内**可归属的工程事实**——`sol-accept` 记录的
+      decision/delta、计划与工作项的实际执行结果、证据摘要、条件核销；调用时间之后没有对应
+      工程事实、或该事实无法与该次建议建立行为对应的，一律不回填为已决状态，记 `pending` +
+      原因码（`no-attribution` / `superseded-within-cycle` / `later-cycle-superseded` /
+      `insufficient-record`）。**代码已修改、测试通过、任务最终 PASS 都不构成“建议被采纳”**：
+      回填前后 `accepted`/`modified` 计数不变（新增的回填一律落在 `pending`），本轮不产生任何
+      推断性采纳。
+    - **P1 执行结果**：已收口的 38 条历史调用全部登记为 `pending`/`historical-review` + 原因码
+      （`no-attribution` 34、`superseded-within-cycle` 3、`later-cycle-superseded` 1）；未收口的
+      8 条（rili 5、本任务 1、step-content-growth 1、另一条同向）保持原状，走常规 `sol-accept`
+      通道，不用历史通道写未收口任务。重复执行两次均为 38 条重复、0 条新增判决、0 条覆盖，
+      幂等成立。`--historical` 只对已收口任务开放；`pending` 必须带原因；已决结论不得被降级。
+    - **P3 时间线还原（只读，不改历史状态）**：`interstitial-stability-2026-11-23`、
+      `commit-push-2026-11-23`、`zcode-memory-loop-2026-11-22` 三个任务各有 2 条 due 义务
+      （A 启动、E 收口），`attempts=0`、无 `failure`、无 `deferrals`、无任何 CONSULT/PLAN 调用。
+      可由时间戳直接证明的只有机制事实：E 窗口在 3 s / 5 s / 45 s 内被同一命令物化并关闭
+      （`same-command-close`），A 窗口跨多条命令保持 `due` 23–44 分钟
+      （`kept-due-across-commands`）。**原因无法确定**：状态里没有当时的调度策略快照，也没有
+      失败或延迟痕迹，无法区分“策略关闭”“未按建议执行”“调度未发生”；任务内没有任何认知
+      调用，也不构成“已有判断覆盖”或“义务被替代”。因此三条的处置记为
+      `not-executed`，理由写明“窗口关闭时仍未执行 + 当时调度策略 unknown”，**不按当前
+      `--sol auto` 配置倒推历史时点**。
+    - **P3 机制（最小实现）**：① 每个义务带 `cycle`（`1 + closure.reopen_history` 长度）；
+      ② 每个周期首次同步时写 `policy_snapshots[cycle]`（策略、是否允许自动执行、首次观察
+      时间），缺失即 `unknown`，永不回填；③ 窗口关闭时一次性写终态处置
+      `disposition` = `completed` / `covered` / `skipped` / `failed` / `not-executed` /
+      `unsettled` + 可复核理由，**只写一次、不覆盖**；④ 调度锁等待失败写 `deferrals` /
+      `last_deferral_reason` 并保持 `due`，不再静默清除；⑤ `_advance_windows` 的窗口前沿按
+      周期隔离，上一周期的满足不覆盖本周期的义务。历史义务的处置用**只读派生**（存储优先、
+      缺失则按状态推导），不回写 217 条历史状态：派生结果为 89 `completed` / 95 `skipped` /
+      28 `not-executed`（扫描时点 212 条终态、5 条仍开放；本任务其后自身产生的义务不计入
+      该快照）。
+    - **P3 口径核对**：已收口任务中**打开的 due 窗口为 0 条**；28 条历史 `due` 行
+      （`window=closed`、`closed_reason=task-closed`）全部带终态处置（`not-executed` +
+      `unknown`）；仍打开的 due 窗口全部位于未收口任务。`due` 与“窗口已关闭”在记录上可以
+      共存，判断依据是窗口是否关闭以及是否有终态处置，不是状态字面值。
+    - **P3 边界**：处置是观察事实，不是完成证明、不是门禁；`due` 不等于必须调用，
+      `covered`/`skipped` 只表示该窗口不需要独立调用且带可查理由；正常收口不因存在
+      `not-executed` 而受阻（`closure_readiness` 口径未变）；重开产生的义务进入新周期，前后
+      周期严格分离——**迟到的旧周期事件不抵扣新周期 due**（结算只作用于被结算的义务，统计按
+      周期归属），新旧周期使用同一义务键时也一样，两个反例都有定向测试覆盖；`closure-covered`、收口后调用计数与合法 reopen 语义保持不变。
+      `sol-stats` / `sol-schedule summary` 只新增 `cycle` / `dispositions` / `by_cycle` /
+      `deferrals` 观察值，`total` / `pending` / `missed` 与覆盖率分母口径不变。
+    - **P2 议程观察口径（只读，不实现状态机）**：`agenda` 的只读语义不变——不派生工作项、
+      不进计划 SHA、不改 G1–G3、不增强制调用。下一阶段的观察只对**真实任务**做，判定材料是
+      任务状态里已经存在的事实：`agenda` 原文、工作项与计划变化、证据与条件、`sol-accept`
+      的 decision/delta、后续真实运行结果。观察维度固定五类：① 改变了决策（有工作项/计划/
+      验收方式随之改变）；② 补充了验证项（新增证据或条件）；③ 已被既有覆盖（与任务内已有
+      判断或事实重复）；④ 被合理忽略（与目标无关、证据不足或代价不合理）；⑤ 被证伪（工程
+      事实与议程相反）。样本不足时只记录、不下结论；**不以议程条数、被采纳条数或 SOL 调用
+      次数作为成功标准**；只有反复观察到某类议程长期无价值时才另提调整，不预先实现完整
+      议程状态机。
+    - **实跑发现的缺陷与修复（本任务自身现场）**：`_advance_windows` 用“最早已满足窗口”
+      （`min()`）判断前沿，而同周期的启动 CONSULT（A）几乎总是先满足，于是“收口判断覆盖
+      B/D 窗口”（`closure-covered`）在真实任务里**永不触发**——本任务收口命令里就实际多跑
+      了一次 PLAN 调用（`SC41468606…`）。修法不改通用前沿语义：同周期只要存在已满足的 E
+      窗口，B/D 打开窗口一律记 `skipped/closure-covered`，并由
+      `test_closure_coverage_does_not_depend_on_earlier_satisfied_window` 固定该行为。
+      该缺陷属 v9.6/v9.7.0 既有实现，v9.7.0 文档中“被覆盖窗口按 `skipped/closure-covered`
+      结算”的说法在 A 已满足时并不成立，本版一并纠正。
+    - **不变量**：不新增 Agent、Provider、模型或工具权限；不恢复 G4、G1–G3 不变；不增加强制
+      Reviewer；SOL 保持 advisory；本轮不提交、不推送、不发布，也未做生产或系统配置变更。

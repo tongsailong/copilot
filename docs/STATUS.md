@@ -1,8 +1,147 @@
 # STATUS
 
-更新：2026-11-22 CST。本文件只记录现场可核实的事实；规划与未完成事项单独标注。
-当前版本：v9.6.2（已合并到 `main`：PR #2 Squash `8f51037`；统计口径修正、SOL 锁等待有界、
-文档与死代码收敛；未发布新 Release，`v9.6.1` Tag/Release 未移动）。
+更新：2026-11-24 CST。本文件只记录现场可核实的事实；规划与未完成事项单独标注。
+当前版本：工作区源码为 v9.7.1（认知记录闭环：历史采纳回填、义务终态处置、议程观察口径），
+已在本地提交 `feat(copilot): enhance SOL cognition and obligation governance`（含 v9.7.0
+主动认知，见下节）；**未推送、未发布**，`v9.6.1` Tag/Release 未移动。
+任务 `sol-cognition-governance-p1p3-2026-11-23` 经用户授权一次性 `reopen` 后，已于
+`2026-11-24T07:40:07` 在**最终代码**上重新收口 **CLOSED / PASS**（周期 2，G1–G3 全 PASS）。
+
+## v9.7.1 认知记录闭环：历史采纳回填、义务终态处置与议程观察口径（2026-11-24，已本地提交，未推送）
+
+- **P1 基线（单一窗口）**：以 2026-11-23T23:33:59 的全量扫描为基线，不与其它时段混合。
+  基线口径 104 次已完成 CONSULT/PLAN 调用、`pending` 44 条（`accepted` 40 / `modified` 20）；
+  回填后同口径 109 次、`accepted` 43 / `modified` 20 / `rejected` 0 / `pending` 46。
+- **P1 增量对账**：+5 次调用 = 本次补记历史复核的 2 条收口 CONSULT + 2 条新收口判断 +
+  本任务 1 条启动 CONSULT；`accepted` 40 → 43 = 2 条新调用被采纳 + 1 条基线内已完成的调用
+  （`SC010f0b43…`，23:31:53 完成）在 23:42:05 才登记采纳；`pending` 44 → 46 = −1（该次登记）
+  +3（2 条历史复核 + 本任务 1 条）。三次差额全部对上，无“凭空增加/消失”的记录。
+- **P1 回填结果**：已收口的 38 条历史 `pending` 全部登记为 `pending`/`historical-review` +
+  原因码（`no-attribution` 34、`superseded-within-cycle` 3、`later-cycle-superseded` 1）；
+  未收口的 8 条保持原状（rili 5、copilot 1、step-content-growth 1 及同项目 1 条），不写历史
+  通道。连跑两次均为 38 条 `duplicate`、0 新增判决、0 覆盖，幂等成立。
+- **P1 未解决**：46 条 `pending` 中 38 条带原因码但结论仍为待定（其中 34 条是“调用之后没有可
+  归属的工程事实”，按证据门槛不回填）；8 条属未收口任务，依赖各自任务后续收口时按常规通道
+  登记。任务计数口径存在 2 条差异（目录名去重 46 / `task_id` 去重 48），**如实保留、不调整
+  分母**。
+- **P3 时间线（只读还原，未改历史状态）**：`interstitial-stability-2026-11-23`、
+  `commit-push-2026-11-23`、`zcode-memory-loop-2026-11-22` 各有 2 条 due 义务（A 启动、
+  E 收口），`attempts=0`、无 `failure`、无 `deferrals`、任务内 0 次 CONSULT/PLAN 调用。
+  可证明的机制事实：E 窗口在 3 s / 5 s / 45 s 内被同一命令物化并关闭
+  （`same-command-close`）；A 窗口跨多条命令保持 `due` 2385 s / 29 s / 1395 s
+  （`kept-due-across-commands`）。**原因不可确定**：无当时策略快照、无失败或延迟痕迹，无法
+  区分策略关闭、未按建议执行或调度未发生；任务内无认知调用，也不构成“已被覆盖/被替代”。
+  三条处置记 `not-executed` + 理由“窗口关闭时仍未执行；当时调度策略 unknown”，**不按当前
+  `--sol auto` 倒推历史**。
+- **P3 机制（最小实现）**：`cycle`（1 + 重开次数）、每周期首次同步写 `policy_snapshots`、
+  窗口关闭时一次性写 `disposition` + 理由（只写不覆盖）、锁等待失败写 `deferrals` 并保持
+  `due`、`_advance_windows` 按周期隔离前沿。历史义务的处置为**只读派生**、不回写：217 条
+  义务中 212 条有终态（89 `completed` / 95 `skipped` / 28 `not-executed`），5 条仍开放（扫描
+  时点 2026-11-24T00:13 的全库快照，不含本任务其后自身产生的义务）；全库
+  `policy_snapshots` 为空，故所有历史 `not-executed` 理由均为 `unknown`。
+- **P3 边界**：处置不是完成证明、不是门禁；`due` 不等于必须调用；`not-executed` 不阻断收口
+  （`closure_readiness` 口径未变）；重开后的义务进入新周期，前后不互相覆盖；
+  `closure-covered` 与收口后调用计数语义不变；`total` / `pending` / `missed` 与覆盖率分母
+  口径不变。
+- **P2 口径**：`agenda` 保持只读（不派生工作项、不进计划 SHA、不改 G1–G3、不增强制调用）；
+  下一阶段只用真实任务已有事实做五类观察（改变决策 / 补充验证 / 已被覆盖 / 合理忽略 /
+  被证伪），样本不足只记录不下结论，不预先实现议程状态机，不以议程或采纳条数为成功标准。
+- **C6/C7 的精确口径**：已收口任务中**打开的 due 窗口为 0 条**；28 条历史 `due` 行
+  （`window=closed`、`closed_reason=task-closed`）全部带显式终态处置
+  （`not-executed` + `unknown`），无一条缺终态。6 条仍打开的 due 窗口全部位于**未收口**任务。
+- **实跑发现的缺陷与修复**：本任务收口命令里实际多跑了一次 PLAN 调用
+  （`SC41468606ea50f44053ffc70c`，其建议是“维持交付范围、不因规划窗口返工”）。根因是
+  `_advance_windows` 用 `min()` 判断“最早已满足窗口”：同周期启动 CONSULT（A）几乎总先满足，
+  于是同周期收口判断（E）对 B/D 的 `closure-covered` 覆盖**永不触发**。修复不改通用前沿
+  语义，只加“同周期 E 已满足即覆盖 B/D”的判定，并新增回归
+  `test_closure_coverage_does_not_depend_on_earlier_satisfied_window`。该缺陷属既有实现，
+  v9.7.0 文档中“被覆盖窗口按 `closure-covered` 结算”在 A 已满足时不成立。
+- **测试**：活动套件 `Ran 929 tests ... OK`（v9.7.0 的 894 + 35 项：历史回填 15、
+  义务处置 20）。定向复跑 `test_docs_v6` 17、`test_sol_obligation_disposition` 20、
+  `test_sol_acceptance_backfill` 15、`test_sol_scheduling` 84、`test_sol_think` 22、
+  `test_context_engine` 44 全通过。按 SOL 收口判断的优先验证项新增两项反例：
+  ① 授权重开后结算旧周期义务，不抵扣新周期 due、不追溯写处置，统计按周期归属；
+  ② 新旧周期使用**同一义务键**时，迟到的旧周期事件只结算旧周期那一行。
+  `legacy/tests` `Ran 853 tests`（99 F + 47 E + 32 skip），
+  失败/错误集合与 `dab91e8` 上的 `git worktree` 实跑逐条一致（146 条，diff 为空）。
+- **运行时与基线**：`sync_runtime.py --apply` 后 `--check` 受管理文件缺失 0 / 不同 0
+  （运行时另有 1 个未受管理文件 `hm.txt`，按默认保留、未触碰）；`--baseline` 重建 25 个
+  Git 跟踪文件的 `manifests/source-baseline.sha256`，`--verify-baseline` 通过。
+  `python3 -m compileall -q scripts scripts-sync tests` 通过。
+- **记录对齐（用户授权 reopen，已完成）**：周期 1 的收口（verdict=pass，
+  `2026-11-24T00:42:25`）发生在上述修复之前。用户随后明确授权一次限定范围
+  `reopen --authorized-by user`（`2026-11-24T07:29:06`，`authorization_source=caller-declared`，
+  原收口记录与 `reopen_history` 保留、不删不改），仅用于修复后证据对齐与重新验收。按既有
+  调度规则，`reopened` 事件触发一条动态 CONSULT（`SCc53a02c…`，义务 SO7 → `satisfied`），
+  属策略义务且材料不含重开原因，不是重复调用。周期 1 的 E8/E16/E17/E18 采集于修复前、文件已
+  被重写，按规则归档（文件保留不删），由最终代码证据取代：E20（活动套件 `Ran 929 tests` /
+  `OK`，命令采集）、E21（legacy 853，命令采集）、E22（定向 205 全通过）、E23（legacy 与
+  `dab91e8` worktree 双跑，146 条失败名逐条一致）、E24（套件结果行 + compileall + 同步 0/0 +
+  baseline 25 校验）、E25（交付报告，收口前冻结）。
+- **重新收口结果**：最终代码上的收口 CONSULT `SC6fcd6343f8aa308c46156df1`
+  （2026-11-24T07:38:59，digest `f69147c387482847`，9,067 tokens）结论为“可按原合同收口、
+  未见反例”；其保留项（重开授权依据、周期归属）已逐条核实并登记采纳。随后 `drive` 收口
+  **CLOSED / PASS**（`2026-11-24T07:40:07`，`by=zcode-native`，G1–G3 全 PASS）。采纳记录：
+  收口 E 与重开 C 为 `accepted`；两条周期 1 旧 E（`SC88e7d9d7…`、`SC914ca9f1…`）与缺陷触发的
+  PLAN（`SC41468606…`）记 `modified`（方向一致、证据基础被替换或调用源于缺陷），**不计作
+  accepted**。
+- **覆盖行为对照（真实状态最小形状副本）**：旧代码（`dab91e8`）在 A 已满足时对同周期打开的
+  B 一律保持 `due`（缺陷复现）；新代码只在**同周期 E 已满足**时写 `skipped`/`closure-covered`
+  + `covered`，无 E 或 E 在另一周期时保持 `due`（无误覆盖、无跨周期覆盖）。周期 2 实跑中没有
+  产生 B/D 窗口（无新的计划事件），故该分支的实证来自判定对照与回归测试，不冒充生产观测。
+- **未验证**：本版未做真实宿主端到端（无新增宿主绑定或信封行为）；P2 观察需要后续真实任务
+  样本，本轮无样本；8 条开放任务的 `pending` 只能由各自任务收口时处理；历史义务的处置是
+  派生值，历史状态文件里的 `disposition` 字段仍不存在（按设计不回写）。
+
+## v9.7.0 SOL 主动认知与实战决策闭环（2026-11-23，随同一次本地提交落库，未推送）
+
+- **复盘范围与可复算事实（2026-11-23 只读统计）**：`/media/vdb/projects` 下 46 个任务状态
+  文件、104 次已完成 SOL 调用（CONSULT/PLAN）；采纳登记 `accepted` 40、`modified` 20、
+  `pending` 44（42% 未回填）。7 个任务在首次收口判断之后仍追加了非收口 CONSULT（各 1 次），
+  即收口后补 B/D 的时序缺陷；`blockage-change` 在旧口径下由“阻塞解除”触发，属噪声事件；
+  同一任务重复问同一问题的根因是材料里没有上次判断、采纳与未处理议程。
+- **主动议程（CONSULT/PLAN 新输出）**：输出契约新增可选 `agenda`（1–6 条，固定类型
+  `core-question` / `wrong-premise` / `missing-risk` / `completion-gap` / `decision` /
+  `verify` / `counterexample`），`review_policy.normalize_agenda()` 做确定性归一（去空、
+  截断 240 字符、限 6 条、去重）。`evaluate` / `status` 只读呈现 `sol_agenda`，不派生工作项、
+  不进计划 SHA、不影响 G1–G3。
+- **认知连续性**：调度材料升为 `copilot-sol-schedule-materials/v3`，新增“上次 SOL 判断与
+  采纳”（最近 3 次判断的核心结论＋采纳状态）与“未处理议程”；提示词（`sol-prompt-v5`）
+  注入同一事实。SOL 因此做增量判断而不是从零重问。
+- **调度顺序修正**：同一收口周期（合同＋重开次数）已有收口判断后不再建议 B 规划或 D 阶段
+  复盘；最后一批进展打开 B/D 又立即收口时记 `skipped/closure-covered`（合理跳过，不算漏调）；
+  仍可由升级型事件（C）或新的最终验证摘要（E）打开新窗口。
+- **事件质量**：新增 `blockage-change`（只在“仍未解除的阻塞”新增或实质变化时触发，解除不
+  触发）与 `repeated-work-failure`（同一工作项连续失败），两者进入 `SOL_EVENT_TRIGGERS`
+  与 `question_for`；阻塞解除不再制造无认知价值的事件。
+- **采纳可见**：`evaluate` 输出 `sol_pending_acceptance` 并给出 `sol-accept` 回填命令，
+  `status` 打印待回填条数；`sol-stats` 新增 `agenda`（calls/items/open）、
+  `pending_acceptance`、`post_closure_calls` 观察值（不构成价值证明）；`post_closure_calls`
+  只统计“收口判断之后、下一次授权 reopen 之前”的区间，重开后的合法调用不计为缺陷。
+- **经验衔接**：`context_engine` 的 capture 草稿新增“SOL 认知与采纳”章节（判断、采纳、
+  决策/差异、议程，`sol_cognition_calls` 计数），标注“任务内事实，不是可复用结论”，
+  Capture 口径仍为 v1，不写 Vault 与原生 Memory。
+- **测试**：活动套件 `Ran 894 tests ... OK`（68.8 s，v9.6.2 的 855 + 39 项新增：议程归一、
+  材料历史/议程、状态只读呈现、收口后不开 B/D、`closure-covered` 合理跳过、事件质量、
+  stats 新字段、capture 溯源）。`legacy/tests` 失败/错误集合与 `HEAD` 基线一致（详见交付
+  报告；不含新增回归）。运行时 `--check` 缺失 0 / 不同 0（分发 25 文件），
+  `--baseline` 25 个 Git 跟踪文件、`--verify-baseline` 通过。
+- **真实宿主 E2E（两个临时工作区，真实 `gpt-6.2-sol`）**：
+  - `feature`/medium、实际复杂度 low：A 启动 CONSULT `SC395c19d1a87ba6ac8eee7a1c`
+    （33.7 s / 3,227 tokens，议程 3 条）；B 未准入（`plan_admission.required=false`），
+    0 次强制规划，符合“简单任务不强制 CONSULT/PLAN”。
+  - `multi-option`/medium：A `SCc131ae8195c34e003304c036`（37.4 s / 3,336 tokens，
+    议程 3 条）→ `sol-accept accepted` → 同一命令内自动执行 B
+    `SCf9978bad88b8bbd47915b121`（44.8 s / 3,976 tokens，议程 2 条），材料 2,242 字符，
+    实测含“上次 SOL 判断与采纳（accepted）”与“未处理议程”两节；`sol-stats` 输出
+    `agenda={calls:2, items:5, open:2}`、`pending_acceptance=1`、`post_closure_calls=0`；
+    capture 草稿带 SOL 认知章节（`sol_cognition_calls=2`）。全程每条命令最多 1 次请求。
+  - 本任务自身同样走真实生命周期：A `SC010f0b4379d4f18cca55c753`（48.7 s / 6,843 tokens）、
+    B `SCac1ecdb143195b177cb0ebdc`（67.5 s / 7,898 tokens）、E
+    `SC6380eac3a630f2652803f6fb`（38.9 s / 7,939 tokens，最终验证摘要 `56b2fc32e1895140`）。
+    E 明确区分“机制可验证”与“真实收益未证明”，并指出统计口径不可直接比较（已按 E9 取证）。
+- **边界**：本轮未 commit、未 push、未发布、未改 Provider/模型/安全配置、未新建 Agent 或
+  工具权限、未恢复 G4、未改 G1–G3；任务级 `.copilot-tasks/` 数据不入库。
 
 ## v9.6.2 全面评审与针对性优化（2026-11-22，已交付 `main`）
 

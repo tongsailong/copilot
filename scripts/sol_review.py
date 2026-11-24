@@ -40,6 +40,7 @@ import time
 import urllib.parse
 
 from lib_common import redact as _redact_text
+import review_policy as _RP
 
 REVIEW_SCHEMA = "copilot-sol-review/v1"
 # v9 认知输出是单一超集结构：同时覆盖启动理解、方案规划、执行期动态咨询、
@@ -338,8 +339,18 @@ JSON 结构（所有字段都必须出现；不适用的数组用空数组）：
   "decisions": ["需要用户决定的事项（产品方向/优先级/授权）"],
   "verify": ["需要重点关注的验证结果或信号"],
   "reconsult": ["出现哪些新事实时应重新咨询"],
-  "unverified": ["无法从材料确认的事项"]
+  "unverified": ["无法从材料确认的事项"],
+  "agenda": [
+    {"kind": "core-question|wrong-premise|missing-risk|completion-gap|decision|verify|counterexample",
+     "text": "一句话：ZCode 最该注意的认知事项"}
+  ]
 }
+
+议程（agenda，可选）不是计划也不是任务清单：只列 1–4 条真正影响判断的事项，
+每条一句话。kind 含义：core-question 最需要回答的问题、wrong-premise 可能的
+错误前提、missing-risk 易遗漏风险、completion-gap 完成条件缺项、decision 值得
+单独分析的取舍、verify 最值得优先验证的事实、counterexample 可能推翻结论的反例。
+没有新增内容时给空数组，不要复述材料。
 
 阶段重点：
 - understanding（任务启动）：先确认目标理解、问题判断、关键矛盾、初步策略、主要风险与调查方向；
@@ -369,8 +380,15 @@ JSON 结构（所有字段都必须出现；不适用的数组用空数组）：
   "decisions": ["需要用户决定的事项"],
   "verify": ["验收关注点与关键验证信号"],
   "reconsult": ["出现哪些新事实时应重新规划"],
-  "unverified": ["无法从材料确认的事项"]
-}"""
+  "unverified": ["无法从材料确认的事项"],
+  "agenda": [
+    {"kind": "core-question|wrong-premise|missing-risk|completion-gap|decision|verify|counterexample",
+     "text": "一句话：ZCode 最该注意的认知事项"}
+  ]
+}
+
+议程（agenda，可选）不是实施步骤：只列 1–4 条真正影响方案或验收的事项，每条
+一句话；kind 含义同 CONSULT。没有新增内容时给空数组，不要复述已知事实。"""
 
 MODE_INSTRUCTIONS = {
     "CONSULT": CONSULT_INSTRUCTIONS,
@@ -388,8 +406,10 @@ STAGE_FOCUS = {
                     "优先级或关键风险，并给出下一步策略调整。"),
     "stage": ("本次是阶段成果复盘：判断是否偏离最初目标、哪些问题仍未解决、"
               "下一阶段应优先做什么。"),
-    "closure": ("本次是收口前综合判断：评估目标达成情况、重要遗漏与剩余风险；"
-                "工程验收仍由 ZCode 依据真实证据完成。"),
+    "closure": ("本次是收口前综合判断：判断真实目标是否达成（测试与自检通过不等于"
+                "业务成功）、是否还有未解决的关键风险或能推翻结论的反例、证据是否"
+                "支持结论、此前的 SOL 判断哪些已不再成立；工程验收仍由 ZCode 依据"
+                "真实证据完成。"),
 }
 
 
@@ -862,6 +882,12 @@ def normalize_think(data: dict) -> dict:
                 "sol_think_field_invalid", f"{key} 必须是字符串")
     for key in THINK_LIST_FIELDS:
         result[key] = _string_list(data.get(key), key)
+    # 议程是可选增量：缺失视为空（旧调用方与旧材料继续有效），出现时只做确定性
+    # 归一（固定类型、短文本、去重、限长），不把自由格式带进状态。
+    agenda_raw = data.get("agenda")
+    if agenda_raw is not None and not isinstance(agenda_raw, list):
+        raise SolResponseError("sol_agenda_invalid", "agenda 必须是数组")
+    result["agenda"] = _RP.normalize_agenda(agenda_raw)
     if not result["judgment"] and not result["strategy"]:
         raise SolResponseError(
             "sol_think_empty", "judgment 与 strategy 均为空：回复没有认知内容。")
@@ -1217,12 +1243,14 @@ def run_sol(materials: str, *, mode: str = "CONSULT", audit_log: str = "",
             "verify": parsed["verify"],
             "reconsult": parsed["reconsult"],
             "unverified": parsed["unverified"],
+            "agenda": parsed["agenda"],
         })
         audit_extra = {
             key: len(parsed[key])
             for key in ("alternatives", "tradeoffs", "risks", "priority",
                         "investigation", "phase_goals", "assumptions",
-                        "omissions", "decisions", "verify", "reconsult")
+                        "omissions", "decisions", "verify", "reconsult",
+                        "agenda")
         }
     audit_error = _audit_safe(audit_log, {**audit_base, **common_audit,
                                           **audit_extra, "ok": True,
@@ -1288,7 +1316,7 @@ def _audit_safe(path: str, record: dict) -> str | None:
 # ── 材料、单轮判定与准入 ───────────────────────────────────────────────────
 # 提示词/策略版本：进入单轮判定键。提示词、共享上下文或判定规则实质变化时，
 # 旧结论不再被当成同一审查对象复用（缓存失效条件见 review_subject_sha256）。
-PROMPT_VERSION = "sol-prompt-v4"
+PROMPT_VERSION = "sol-prompt-v5"
 
 _EVIDENCE_LIMIT = 80
 _EVIDENCE_MAX_CHARS = 6000
@@ -1363,6 +1391,30 @@ def _action_lines(state: dict, *, limit: int = _ACTION_LIMIT) -> list[str]:
     return lines
 
 
+def _prior_lines(state: dict) -> list[str]:
+    """历史 SOL 判断与未处理议程：让新一轮判断做增量，而不是从零重问。
+
+    只注入最近两次判断的核心结论与采纳状态，以及最近一次仍有效的议程；不含完整
+    回复。旧结论失效条件（合同修订、重开、新事件）由生命周期与 `reconsult` 决定，
+    这里不替 SOL 判断“是否仍然成立”。
+    """
+    calls = state.get("sol_calls") or []
+    prior = _RP.prior_cognition(calls, limit=2)
+    agenda = _RP.open_agenda(calls)
+    if not prior and not agenda:
+        return []
+    lines = ["## 历史 SOL 认知（只读事实，不是本轮结论）", ""]
+    for item in prior:
+        lines.append(f"- {item['call_id']} {item['mode']}/{item['stage']} "
+                     f"采纳={item['acceptance']}："
+                     f"{item['judgment'] or '(无判断文本)'}")
+    if agenda:
+        lines.append("- 上次议程（仍相关的事项请在本轮继续判断，已处理的不必重复）：")
+        lines += [f"  - [{entry['kind']}] {entry['text']}" for entry in agenda]
+    lines.append("")
+    return lines
+
+
 def _context_lines(state: dict) -> list[str]:
     """CONSULT / PLAN / REVIEW 共用的任务上下文：一份合同、一套条件与证据。"""
     contract = state.get("contract") or {}
@@ -1390,6 +1442,7 @@ def _context_lines(state: dict) -> list[str]:
         str(contract.get("done_criteria_text") or "").strip() or "(未登记)",
         "",
         *(["## 合同边界", "", boundaries, ""] if boundaries else []),
+        *_prior_lines(state),
         "## 工作项（按任务状态自动注入）",
         "",
         *_action_lines(state),

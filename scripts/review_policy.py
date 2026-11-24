@@ -62,6 +62,8 @@ SOL_EVENTS = {
     "decision-point": "出现需要取舍的决策点",
     "risk-escalation": "风险等级实质上升",
     "replan-history": "方案失效并重新规划",
+    "blockage-change": "阻塞边界实质变化：出现新的未解除阻塞或阻塞条件被改写",
+    "repeated-work-failure": "同一工作项连续失败：原方案可能已失效",
     "scope-changed": "目标、范围或合同实质变化",
     "reopened": "任务重新打开",
     "milestone": "medium/high 任务的重要阶段里程碑",
@@ -76,6 +78,8 @@ SOL_EVENT_TRIGGERS = {
     "decision-point": "new-evidence",
     "risk-escalation": "new-risk",
     "replan-history": "new-risk",
+    "blockage-change": "new-risk",
+    "repeated-work-failure": "new-risk",
     "scope-changed": "scope-changed",
     "reopened": "scope-changed",
     "startup": "new-evidence",
@@ -1091,8 +1095,14 @@ def sol_events(state: dict, snapshot: dict, last: dict | None) -> list[dict]:
     previous_blocks = {str(item.get("block_id")): item
                        for item in previous.get("blocks") or []
                        if isinstance(item, dict) and item.get("block_id")}
+    # 只有“仍未解除的阻塞”构成认知事件：新增阻塞、阻塞条件被改写、已解除的阻塞
+    # 重新生效都会改变可推进边界。单纯解除不触发——它意味着被冻结的工作恢复，
+    # 由主代理按既有计划继续推进，不需要 SOL 再判断一次，否则每次解除阻塞都会
+    # 制造一次重复付费。
     block_changes = []
     for current in snapshot.get("blocks") or []:
+        if not current.get("active"):
+            continue
         block_id = str(current.get("block_id") or "")
         old = previous_blocks.get(block_id)
         if old is None or old != current:
@@ -1101,7 +1111,7 @@ def sol_events(state: dict, snapshot: dict, last: dict | None) -> list[dict]:
         rows.append({
             "code": "blockage-change",
             "instance": sha256_text(canonical_json(block_changes))[:16],
-            "detail": "阻塞状态发生实质变化：" + "、".join(
+            "detail": "未解除阻塞发生实质变化：" + "、".join(
                 item["block_id"] for item in block_changes),
             "facts": {"blocks": block_changes},
         })
@@ -1314,6 +1324,13 @@ def sol_advice(state: dict, *, calls: list[dict] | None = None,
             or (not _text(item.get("final_verification_digest"))
                 and _text(item.get("closure_key") or closure_cycle) == closure_cycle))
         for item in consult_calls)
+    # 本收口周期（合同 + 重开次数）是否已经有收口判断。收口判断已经综合了方案与
+    # 阶段成果，之后再补 B 规划或 D 里程碑属于对同一认知对象重复付费；只有升级型
+    # 事件（C）或新的最终验证摘要（E）可以打开新窗口。
+    closure_cycle_consulted = any(
+        _call_stage(item) == "closure"
+        and _text(item.get("closure_key") or closure_cycle) == closure_cycle
+        for item in consult_calls)
     stage_consulted_now = any(
         _call_stage(item) == "stage"
         and _text(item.get("progress_digest")) == progress_key
@@ -1492,7 +1509,7 @@ def sol_advice(state: dict, *, calls: list[dict] | None = None,
     # ── 阶段 B：调查后默认 PLAN（方案比较 / 重要取舍 / 实施优先级）──────
     # 已到收口或全部工作项完成时不再补规划：此时收口综合判断价值更高。
     if not covered["PLAN"] and plan_required and understood \
-            and not (gates_passed or all_done):
+            and not (gates_passed or all_done) and not closure_cycle_consulted:
         trigger = "scope-changed" if attempted["PLAN"] else ""
         base["second_round"] = attempted["PLAN"]
         base["trigger"] = trigger
@@ -1519,7 +1536,7 @@ def sol_advice(state: dict, *, calls: list[dict] | None = None,
         for item in (state.get("contract") or {}).get("criteria") or []
         if isinstance(item, dict)))
     if level in ("medium", "high") and milestone_done and not all_done \
-            and not stage_consulted_now:
+            and not stage_consulted_now and not closure_cycle_consulted:
         base["second_round"] = True
         base["trigger"] = "stage-result"
         base.update({
@@ -1541,7 +1558,10 @@ def sol_advice(state: dict, *, calls: list[dict] | None = None,
 
     base.update({
         "action": "reuse", "mode": "CONSULT",
-        "reason": ("同一合同已有有效 SOL 认知结论且没有新的升级型事件：直接复用，"
+        "reason": ("本收口周期已有收口综合判断且没有新的升级型事件：不再追加规划、"
+                   "里程碑或收口判断，直接复用既有结论。"
+                   if closure_cycle_consulted else
+                   "同一合同已有有效 SOL 认知结论且没有新的升级型事件：直接复用，"
                    "不重复调用。"),
     })
     return base
@@ -1569,15 +1589,139 @@ def question_for(event: str, advice: dict | None = None) -> str:
                             "以及是否应调整方案、验证强度或暂停某些动作。"),
         "replan-history": ("原方案已失效并进入重新规划。请判断失败的根因、必须放弃的"
                            "假设，以及实质不同的替代路线与验收方式。"),
+        "blockage-change": ("未解除的阻塞发生了实质变化（见材料中的阻塞与触发事实）。"
+                            "请判断：新的阻塞是否改变了可推进边界与优先顺序？哪些"
+                            "判断必须等用户补齐授权/决策/资源后才能做出？剩余工作"
+                            "应如何重排才不空转？"),
+        "repeated-work-failure": ("同一工作项连续失败，原方案可能已经失效。请判断："
+                                  "这些失败是否指向共同的更深根因？哪些假设已被证伪？"
+                                  "应当放弃还是修正原方案？下一步最有价值的一次验证"
+                                  "是什么？"),
         "scope-changed": ("目标、范围或合同发生实质变化。请判断旧结论哪些仍成立、哪些"
                           "已被推翻，以及新范围下的优先顺序与主要风险。"),
         "reopened": ("任务已重新打开。请判断重开的真实原因、旧结论的适用范围，"
                      "以及为避免再次返工应补充的验证。"),
         "milestone": ("重要阶段成果已完成。请复盘：是否偏离原目标？原方案是否仍成立？"
                       "是否有遗漏或新风险？下一阶段的重点与优先级是什么？"),
-        "closure": ("最终工程验证已完成，进入收口综合判断。请回答六点："
-                    "1) 目标是否真正达成？2) 是否有重要遗漏？"
-                    "3) 是否仍存在未解决的关键风险或限制？"
-                    "4) 证据与结论是否一致？5) 是否有必要补充验证？"
-                    "6) 与之前 SOL 的判断相比是否有实质变化或被推翻的部分？"),
+        "closure": ("最终工程验证已完成，进入收口综合判断。请只回答有判断价值的部分："
+                    "1) 用户的真实目标是否达成，而不只是测试与自检通过（测试通过不等于"
+                    "业务成功，请指出两者可能不一致的地方）？"
+                    "2) 是否仍存在未解决的关键风险、限制或关键反例，足以推翻“已完成”？"
+                    "3) 已有证据是否真正支持结论，哪些结论仍只是推断？"
+                    "4) 与之前 SOL 的判断相比，哪些已被证实、哪些已被推翻或不再适用？"
+                    "5) 若继续投入，最值得优先补充的一次验证是什么？"),
     }.get(code, SOL_EVENTS.get(code) or "请判断本次最需要澄清的事项。")
+
+
+# ── 主动议程：SOL 可选输出的“需要主代理注意的认知事项” ────────────────────
+# 议程不是工作项、不是门禁，也不进入计划 SHA：它只把 SOL 认为最该被注意的认知
+# 问题压缩成短短几条，避免长计划或工程指令挤占 ZCode 的工程上下文。类型固定
+# 是为了让 Copilot 能确定性去重与展示，而不是让 SOL 输出自由格式。
+AGENDA_KINDS = {
+    "core-question": "本次最需要回答的实质问题",
+    "wrong-premise": "可能的错误前提或隐藏假设",
+    "missing-risk": "容易遗漏的关键风险",
+    "completion-gap": "完成条件可能缺少的部分",
+    "decision": "值得单独分析的取舍",
+    "verify": "最值得优先验证的事实或证据",
+    "counterexample": "可能推翻当前结论的关键反例",
+}
+AGENDA_MAX_ITEMS = 6
+AGENDA_TEXT_LIMIT = 240
+
+
+def normalize_agenda(raw: object) -> list[dict]:
+    """把 SOL 的可选议程归一为稳定结构：固定类型、短文本、去重、限长。
+
+    未知类型归到 `core-question` 而不是丢弃内容；空条目与超长噪声被截断。这里
+    不做语义判断，也不把议程变成任务：调用方只读展示。
+    """
+    if not isinstance(raw, list):
+        return []
+    items: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    for entry in raw:
+        if isinstance(entry, str):
+            kind, text = "core-question", entry
+        elif isinstance(entry, dict):
+            kind = _text(entry.get("kind") or entry.get("type")).lower()
+            kind = kind.replace("_", "-").strip()
+            text = _text(entry.get("text") or entry.get("item")
+                         or entry.get("detail") or entry.get("summary"))
+        else:
+            continue
+        if kind not in AGENDA_KINDS:
+            kind = "core-question"
+        text = " ".join(text.split())[:AGENDA_TEXT_LIMIT]
+        if not text or (kind, text) in seen:
+            continue
+        seen.add((kind, text))
+        items.append({"kind": kind, "label": AGENDA_KINDS[kind], "text": text})
+        if len(items) >= AGENDA_MAX_ITEMS:
+            break
+    return items
+
+
+def _cognitive_calls(calls: list[dict] | None) -> list[dict]:
+    """已完成的 CONSULT / PLAN 记录，按创建时间升序；REVIEW 不参与认知连续性。"""
+    rows = [item for item in calls or []
+            if isinstance(item, dict) and item.get("status") == "completed"
+            and _record_mode(item) in ("CONSULT", "PLAN")]
+    rows.sort(key=lambda item: _text(item.get("created_at")))
+    return rows
+
+
+def prior_cognition(calls: list[dict] | None, *, limit: int = 3) -> list[dict]:
+    """最近几次 SOL 判断及其采纳结果：供后续材料做增量比较，避免重复付费。
+
+    只取判断、阶段、采纳状态与简短差异；不含完整回复，也不替主代理解释采纳。
+    `acceptance` 缺失时如实标 `pending`，不推断“已采纳”。
+    """
+    rows: list[dict] = []
+    for item in _cognitive_calls(calls)[-max(1, limit):]:
+        acceptance = item.get("acceptance") if isinstance(
+            item.get("acceptance"), dict) else {}
+        rows.append({
+            "call_id": _text(item.get("call_id")),
+            "mode": _record_mode(item),
+            "stage": _call_stage(item),
+            "created_at": _text(item.get("created_at")),
+            "judgment": " ".join(_text(item.get("judgment")).split())[:400],
+            "acceptance": _text(acceptance.get("status")) or "pending",
+            "decision": _text(acceptance.get("decision")),
+            "delta": " ".join(_text(acceptance.get("delta")).split())[:240],
+        })
+    return rows
+
+
+def open_agenda(calls: list[dict] | None) -> list[dict]:
+    """当前仍未处理的议程：取最近一次认知调用的议程（SOL 会重述仍相关的事项）。
+
+    不跨调用累加，避免旧议程无限滞留；采纳结论由 `prior_cognition` 单独呈现。
+    """
+    rows = _cognitive_calls(calls)
+    if not rows:
+        return []
+    return normalize_agenda(rows[-1].get("agenda"))
+
+
+def pending_acceptance(calls: list[dict] | None, *, limit: int = 5) -> list[dict]:
+    """已完成但尚未回填采纳结果的认知调用（只读提示，不构成门禁）。
+
+    这些调用已经产生过判断成本，主代理应明确采纳/调整/拒绝并说明实际落地，
+    避免结论沉睡在台账里；E 收口的采纳门仍由 `closure_acceptance_pending` 单独管。
+    """
+    rows: list[dict] = []
+    for item in _cognitive_calls(calls):
+        acceptance = item.get("acceptance") if isinstance(
+            item.get("acceptance"), dict) else {}
+        if _text(acceptance.get("status")) not in ("", "pending"):
+            continue
+        rows.append({
+            "call_id": _text(item.get("call_id")),
+            "mode": _record_mode(item),
+            "stage": _call_stage(item),
+            "created_at": _text(item.get("created_at")),
+            "judgment": " ".join(_text(item.get("judgment")).split())[:160],
+        })
+    return rows[-max(1, limit):]

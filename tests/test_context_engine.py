@@ -373,6 +373,32 @@ class CaptureTests(ContextEngineBase):
         self.assertRegex(summary["file_name"],
                          r"^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-[a-z0-9-]+-candidate\.md$")
 
+    def test_draft_carries_sol_cognition_and_adoption(self):
+        """候选草稿带 SOL 判断与采纳痕迹（只读事实），不把任务内判断当正式知识。"""
+        with open(self.state, "r", encoding="utf-8") as fh:
+            state = json.load(fh)
+        state["sol_calls"] = [{
+            "call_id": "SCconsult0", "mode": "CONSULT", "status": "completed",
+            "stage": "development", "judgment": "先验证迁移脚本幂等性",
+            "acceptance": {"status": "modified",
+                           "decision": "先跑一次空库迁移",
+                           "delta": "补了回滚验证"},
+            "agenda": [{"kind": "verify", "text": "迁移脚本重复执行"}],
+        }, {
+            "call_id": "SCreview0", "mode": "REVIEW", "status": "completed",
+            "verdict": "pass", "findings": [],
+        }]
+        with open(self.state, "w", encoding="utf-8") as fh:
+            json.dump(state, fh)
+        text, summary = self.build()
+        self.assertEqual(summary["sol_cognition_calls"], 1)
+        self.assertIn("SOL 认知与采纳", text)
+        self.assertIn("先验证迁移脚本幂等性", text)
+        self.assertIn("先跑一次空库迁移", text)
+        self.assertIn("补了回滚验证", text)
+        self.assertIn("迁移脚本重复执行", text)
+        self.assertNotIn("SCreview0", text)
+
     def test_draft_passes_candidate_write_validation(self):
         scripts = os.path.expanduser(
             "~/.zcode/skills/knowledge-manager/scripts")
