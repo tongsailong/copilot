@@ -49,6 +49,9 @@ DISPOSITION_KINDS = ("completed", "covered", "skipped", "failed",
                      "not-executed", "unsettled")
 FAMILY_INDEX = {name: index for index, name in enumerate(RP.SOL_FAMILIES)}
 DEFAULT_MATERIALS_CHARS = 24_000
+# 每周期保留的策略变更历史条数上限：只用于解释“窗口打开时是什么策略”，
+# 不参与调度判定，超出上限丢弃最旧记录（不是审计台账）。
+POLICY_HISTORY_LIMIT = 50
 # 自动调度路径等待任务 SOL 锁的上限（秒）：拿不到锁说明另一个进程正在调用，
 # 本次放弃执行、义务保持 due，而不是无限阻塞工程命令。手动调用不设默认上限；
 # `COPILOT_SOL_LOCK_TIMEOUT` 可覆盖。自动路径的“有界”是双重的：1 条义务、
@@ -288,6 +291,13 @@ def note_policy(schedule: dict, *, policy: str, auto_execution: bool | None,
     entry["value"] = value
     entry["auto_execution"] = auto
     entry["at"] = now
+    # 策略变更历史：只追加“当时生效了什么”，供义务窗口打开时点回溯。没有它，
+    # 事后只能用周期内最后一次策略解释更早打开的窗口（会把 advise 下的漏调
+    # 误标成 auto）。
+    history = entry.get("history")
+    history = list(history) if isinstance(history, list) else []
+    history.append({"value": value, "auto_execution": auto, "at": now})
+    entry["history"] = history[-POLICY_HISTORY_LIMIT:]
     store[key] = entry
     return True
 
@@ -303,6 +313,52 @@ def note_deferral(obligation: dict, *, now: str, reason: str) -> None:
     obligation["deferrals"] = int(obligation.get("deferrals") or 0) + 1
     obligation["last_deferral_reason"] = str(reason or "")[:500]
     obligation["last_deferred_at"] = now
+
+
+def _policy_at_open(obligation: dict, schedule: dict | None) -> dict:
+    """推导义务窗口打开时实际生效的调度策略（只读，不写状态）。
+
+    优先用义务自带的 `policy_at_open`（新义务在 `sync` 内记录）。历史义务回退到
+    周期策略快照的变更历史：取打开时刻及之前最后一次变更；快照本身不晚于打开
+    时刻时它就是打开时的策略。无法确定时返回空 dict（记 unknown），绝不用当前
+    配置倒推。
+    """
+    recorded = obligation.get("policy_at_open")
+    if isinstance(recorded, dict) and _text(recorded.get("value")):
+        return dict(recorded)
+    opened_at = _text(obligation.get("opened_at"))
+    snapshot = policy_snapshot(schedule, obligation_cycle(obligation))
+    if not _text(snapshot.get("value")):
+        return {}
+    history = snapshot.get("history")
+    best: dict = {}
+    if isinstance(history, list):
+        for item in sorted(
+                (row for row in history if isinstance(row, dict)),
+                key=lambda row: _text(row.get("at"))):
+            if not _text(item.get("value")):
+                continue
+            at = _text(item.get("at"))
+            if opened_at and at and at > opened_at:
+                continue
+            best = dict(item)
+    if best:
+        return best
+    at = _text(snapshot.get("at"))
+    if not opened_at or not at or at <= opened_at:
+        return {"value": _text(snapshot.get("value")),
+                "auto_execution": snapshot.get("auto_execution"),
+                "at": at}
+    return {}
+
+
+def _policy_suffix(policy: dict) -> str:
+    """策略值的可读后缀：明确写“允许/不自动执行”，避免只凭 auto 猜测。"""
+    if policy.get("auto_execution") is True:
+        return "（允许自动执行）"
+    if policy.get("auto_execution") is False:
+        return "（不自动执行）"
+    return ""
 
 
 def _disposition_facts(obligation: dict, schedule: dict | None) -> tuple[str, str]:
@@ -329,13 +385,26 @@ def _disposition_facts(obligation: dict, schedule: dict | None) -> tuple[str, st
         return "skipped", reason or f"显式跳过（{closed_reason}）"
     if status in MISSED_STATUSES:
         parts = [f"窗口关闭（{closed_reason}）时仍未执行"]
-        snapshot = policy_snapshot(schedule, obligation_cycle(obligation))
-        if _text(snapshot.get("value")):
-            parts.append(f"当时调度策略={_text(snapshot.get('value'))}"
-                         + ("（允许自动执行）"
-                            if snapshot.get("auto_execution") else ""))
+        opened = _policy_at_open(obligation, schedule)
+        opened_value = _text(opened.get("value"))
+        if opened_value:
+            parts.append(f"当时调度策略={opened_value}" + _policy_suffix(opened))
         else:
             parts.append("当时调度策略未记录（unknown）")
+        # 周期内策略后来变过：如实补记，不改变“打开时”的口径，也不让事后看到的
+        # 最新配置冒充窗口打开时的策略。
+        latest = policy_snapshot(schedule, obligation_cycle(obligation))
+        latest_value = _text(latest.get("value"))
+        if latest_value and latest_value != opened_value:
+            at = _text(latest.get("at"))
+            if opened_value:
+                parts.append(f"周期内调度策略后改为={latest_value}"
+                             + _policy_suffix(latest)
+                             + (f"（{at}）" if at else ""))
+            else:
+                parts.append(f"周期内记录的调度策略={latest_value}"
+                             + _policy_suffix(latest)
+                             + (f"（{at}）" if at else ""))
         deferrals = int(obligation.get("deferrals") or 0)
         if deferrals:
             parts.append(f"周期内 {deferrals} 次未能调度，最后一次："
@@ -579,6 +648,15 @@ def sync(schedule: dict, state: dict, advice: dict, *, now: str,
                 _text(state.get("contract_sha256")):
             obligation = _new_obligation(state, advice, now=now)
             obligation["obligation_id"] = _next_obligation_id(schedule)
+            # 打开时点策略：note_policy 已在本轮同步开头记录当前策略，这里把
+            # “打开这一刻生效什么”固化到义务上，后续策略变更不覆盖它。
+            current_policy = policy_snapshot(schedule, cycle)
+            if _text(current_policy.get("value")):
+                obligation["policy_at_open"] = {
+                    "value": _text(current_policy.get("value")),
+                    "auto_execution": current_policy.get("auto_execution"),
+                    "at": _text(current_policy.get("at")),
+                }
             changes.extend(_supersede_older(schedule, obligation, now=now))
             schedule["obligations"].append(obligation)
             changes.append(

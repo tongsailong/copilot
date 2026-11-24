@@ -313,7 +313,23 @@ python3 -B scripts/copilot_dispatch.py legacy-status --ledger review-ledger.json
 - v1/v2 状态不会被 v6 驱动；`legacy-status` 不写文件、不续跑、不改写历史。
 - 历史调用记录、REVIEW 裁决、证据与 SHA-256 原样保留，仅标注为历史。
 
-## 7. 退出码与常见错误
+## 7. 只读效能观测（`efficiency_report.py`）
+
+```bash
+python3 -B scripts/efficiency_report.py --workspace /path/to/ws [--workspace /path/to/ws2] \
+  --repo-root /media/vdb/projects/copilot \
+  --recall-events ~/.zcode/copilot-runs/context-recall/events.jsonl \
+  --host-db ~/.zcode/cli/db/db.sqlite --days 7 [--json]
+```
+
+- 数据来源全部是既有事实：`.copilot-tasks/*/state.json` 台账、`SKILL.md`/`AGENTS.md` 字节数、
+  召回事件 JSONL、可选宿主 `db.sqlite`（只读打开）。
+- 每个指标带 `basis`：`measured`（直接计数）、`proxy`（近似口径）、`unavailable`（事实源
+  没有该数据）。不补零、不推断；`unavailable` 不是 0。
+- 不写文件、不调用模型、不联网、不改任务状态；结果用于前后对照与排查，**不作为门禁**。
+- 退出码：0 正常；2 参数错误。缺工作区或缺库只降级为 `unavailable`，不失败。
+
+## 8. 退出码与常见错误
 
 | 场景 | 退出码 |
 |---|---|

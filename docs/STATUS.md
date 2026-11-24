@@ -6,6 +6,70 @@
 任务 `sol-cognition-governance-p1p3-2026-11-23` 经用户授权一次性 `reopen` 后，已于
 `2026-11-24T07:40:07` 在**最终代码**上重新收口 **CLOSED / PASS**（周期 2，G1–G3 全 PASS）。
 
+## 开发效能与自主交付闭环专项（2026-11-24，工作区改动，未提交）
+
+任务 `dev-efficiency-2026-11-24`（`task-fd963b4e34918738`），授权范围不含 commit/push/PR/
+Tag/Release。现场基线、已修缺陷与保留边界如下。
+
+- **调查基线（实测）**：26 个受管理分发文件、HEAD `b3ba3e7`（v9.8.0）；跨 5 个工作区
+  （copilot / pedometer / rili / lele-pedometer-xin / designwise）共 104 个任务台账：91 收口
+  且全 PASS、13 未收口（12 个超 24h 未更新）、条件 829/865、工作项 422（失败 0、重跑 24）、
+  证据 1,524（丢弃 197、引用 2,577、复用率 0.575 proxy）、SOL 137 次 / 913,698 tokens
+  （延迟 p50 55.2 s、p95 133.2 s；采纳已登记 83、待登记 52）、未闭合义务 4、未解除阻塞 18。
+  召回事件 75 次（注入 69、零命中 6，其中 5 次预算耗尽；p50 659 字符 / 78 ms）。宿主库
+  7 天：402 回合、40,028 次模型请求、44,181 次工具调用、工具错误 0、上下文超限 0。
+- **已修缺陷（审计保真）**：SOL 义务终态处置此前用“周期最新策略”标注“当时调度策略”，
+  与窗口打开时的真实策略不符（真实案例 `adfree-retire-2026-11-24` 在 `advise` 下打开却被
+  标成 auto）。现新增 `policy_at_open` 与每周期 `policy_snapshots[*].history`（上限 50 条），
+  历史义务按快照历史只读回推，无证据记 `unknown`；已存处置从不覆盖。回归见
+  `tests/test_sol_obligation_disposition.py`。
+- **指令面瘦身（实测字节，不等于注入量或 Token）**：`SKILL.md` 91,045 → 73,097（−19.7%，
+  宿主单文件上限 100,000，余量 8,955 → 26,903）；`AGENTS.md` 23,973 → 15,221（−36.5%）；
+  v9.7.1 及更早逐版本变更迁入 `references/history.md`（39,592 → 57,769，按需读取，不再进入
+  Skill 正文）。口径：`SKILL.md` 正文只在调用 Skill 时载入（常驻的只有 description），
+  `AGENTS.md` 按会话注入，两者不构成同一条“常驻注入”曲线；字节减少换算成的实际注入字符、
+  Token 消耗与开发效率收益均**未测量**（`unavailable`），不得由字节数推导。
+- **新增只读观测**：`scripts/efficiency_report.py`（`copilot-efficiency-report/v1`），只读
+  台账 / 召回事件 / 宿主 `db.sqlite`，指标强制标注 `measured` / `proxy` / `unavailable`，
+  不写文件、不调模型、不联网、不参与门禁。7 项单测覆盖口径与降级。
+- **核查后无需改动的既有能力**：证据 SHA 重读、丢弃/篡改/跨任务拒绝、质量报告代码范围
+  失效、`final_verification_digest`、PARTIAL 强制续跑与按项阻塞、证据哈希缓存、Hook 会话
+  隔离与启动开销、SOL 有界义务执行——均有现有测试与真实宿主记录支撑。
+- **保留边界（未新增门禁）**：普通 capture 证据不绑定代码快照，代码变更后不会自动失效；
+  只有质量/verify 报告绑定 `code_scope`。报告内 `unavailable` 项（催促次数、提前停止、
+  重复测试、压缩次数）当前事实源没有数据，不估算。
+- **测试**：活动 955 项（含新增 6 项效能报告与 2 项处置保真回归）、legacy 853 项与 HEAD
+  `b3ba3e7` 失败集合逐条一致（146 = 99 failures + 47 errors，历史 v5 行为测试，非本轮引入）。
+- **同步**：`--apply` 后 `--check` 缺失 0 / 不同 0；`--baseline` 重建为 26 个 Git
+  跟踪文件（`efficiency_report.py` 未跟踪、不进入 manifest），`--verify-baseline` 通过。
+- **未验证**：未做 commit / push / Tag / Release；`efficiency_report.py`
+  的宿主库工具耗时 P95 是近似口径；未做同构任务的开发周期、返工率、Token 节省与用户接受度
+  对照（见下节“最终验收补强”）。
+
+### 最终验收补强（2026-11-24，工作区改动，未提交）
+
+- **真实宿主验证（已做，最小充分）**：一次无头会话（`sess_7b8d02a1…`，`--mode yolo`，
+  `copilot` Skill 调用 1 次），`SKILL.md` 注入 70,811 字节（不含 frontmatter）、
+  `truncated=false`，注入内容同时包含开头/中段/结尾标志串（无静默截断头部）；会话未读取
+  `references/history.md`；在该工作区完成 start → evidence → criterion → drive →
+  closure-check → closure（`host-verify-2026-11-24`，CLOSED/pass/G1–G3 passed），中途 Stop
+  退出码 2 触发续跑、capture 后放行。细节与取证见任务目录 `a2-host-verify.md`。
+  本轮不覆盖业务任务与任务队列。
+- **宿主验证中发现的缺陷（已修）**：`efficiency_report.py` 在**无 `SKILL.md` 的目录**下运行
+  时 `skill_headroom = 100000 - None` 抛 `TypeError`（退出 1）。现缺文件即记 `unavailable`
+  （`skill_bytes` / `skill_headroom` / `instruction_total_bytes` 一并），补 1 项回归；同一
+  cwd 复核退出 0。另清理 `SKILL.md` 末尾重复的“## 版本”块（迁移残留，约 1.5 KB）。
+- **基线保护（待正式交付阶段完成）**：`--baseline` 只记录 Git 跟踪文件，`efficiency_report.py`
+  仍未跟踪，因此**当前不在 manifest 内**（26 个文件）。临时 worktree 演练已确认：显式
+  `git add` 后 `--baseline` 记录 27 个文件、`--verify-baseline` 通过、`--check` 0/0、
+  `test_sync_runtime.py` 20 项 OK（`a1-baseline-rehearsal.log`）。正式交付顺序固定为
+  **暂存新增文件 → `--baseline` → `--verify-baseline` → `--check` → 分发相关测试**，
+  待核销条件：manifest 出现 `scripts/efficiency_report.py` 且 `--verify-baseline` 通过。
+- **验收口径**：可声明的是文件字节、注入字节（单次宿主实测）、台账/宿主库计数；
+  **不可声明**的是“常驻注入下降 21.9%”“Token 节省”“开发周期/返工率改善”——无同构任务
+  对照，保持未测量。宿主验证会话本身消耗 3.39M Token（含缓存读 3.28M），只作成本事实记录，
+  不作效率结论。
+
 ## Hooks 必要性审计与性能优化（2026-11-24，工作区改动，未提交）
 
 - **生效清单（核实到配置源头）**：用户级 `~/.zcode/cli/config.json` 只有三条钩子，均指向

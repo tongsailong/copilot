@@ -68,7 +68,12 @@ class SkillEntryTests(unittest.TestCase):
     def test_version_and_sol_review_only(self):
         self.assertIn(f"v{current_version()}", self.doc)
         self.assertIn(f"# copilot：轻量协作治理（v{current_version()}）", self.doc)
-        self.assertIn("SOL 零工具单轮复核", self.doc)
+        # 单轮复核仍是入口规则；完整的版本沿革迁到 references/history.md，
+        # 入口只保留当前摘要、不变量与指针（见 v9.8.0 文档瘦身）。
+        self.assertIn("零工具单轮", self.doc)
+        self.assertIn("references/history.md", self.doc)
+        history = text(os.path.join(REFERENCES, "history.md"))
+        self.assertIn("SOL 零工具单轮复核", history)
         self.assertIn("legacy-status", self.doc)
         self.assertNotIn("唯一正式 GPT/SOL 入口", self.doc)
         # SOL 只是建议：不得恢复决策通道或 DECIDE。
@@ -84,7 +89,7 @@ class SkillEntryTests(unittest.TestCase):
         self.assertIn("sol-consult", self.doc)
         self.assertIn("sol-plan", self.doc)
         self.assertIn("THINK 保留为只读别名", self.doc)
-        self.assertIn("v9.0.0（SOL-first", self.doc)
+        self.assertIn("THINK 只作读取别名", history)
 
     def test_think_and_review_are_advisory_not_gates(self):
         self.assertIn("sol_advisories", self.doc)
