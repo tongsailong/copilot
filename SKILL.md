@@ -1,6 +1,6 @@
 ---
 name: copilot
-description: "Copilot v9.7.1 轻量协作治理：任务承接、合同与完成条件、状态与证据登记、PARTIAL 强制续跑与调度领取、SOL（gpt-6.2-sol，high，零工具）默认认知引擎 CONSULT / PLAN 与生命周期主动调度（义务化、有界自动执行、覆盖率统计）。PARTIAL 是连续执行状态而不是终点：只要仍有原始授权内的可执行工作，就必须派生、领取并继续；阻塞按工作项成立，单项缺授权不冻结整个任务。drive 把工作项领取落盘（短租约）避免并发重复，回填/阻塞自动释放；SessionStart 与 UserPromptSubmit 只读提示未闭合任务，用户补齐授权后立即恢复执行。SOL-first 生命周期：简单/机械任务 0 调用；非简单任务启动默认 CONSULT，调查后按需 PLAN（不依赖工作项数量），执行期按可归因事件追加 CONSULT，medium/high 任务可做阶段复盘，有实质进展的非简单任务在最终工程验证完成后、收口前做综合判断；CONSULT/PLAN 可输出可选议程（核心问题/错误前提/遗漏风险/完成条件补充/验证/反例），材料带上次判断与采纳结果，收口周期后不再追加规划或里程碑窗口；生命周期命令把“应调用”物化为调度义务并可直接执行（每条命令最多 1 次，`--sol auto|advise|off`），`sol-stats` 以显式分母统计覆盖率。REVIEW 仅在用户明确要求时执行。调度义务在窗口关闭时写终态处置（完成/覆盖/跳过/失败/未执行/未决）与当时策略快照，`sol-accept --historical` 只为已收口任务补记可证明的采纳或带原因的 pending。SOL 只提供认知输入，ZCode 是唯一技术决策与工程执行主体；G4 原生只读复核已退役，历史台账只读保留。"
+description: "Copilot v9.8.0 轻量协作治理：任务承接、合同与完成条件、状态与证据登记、PARTIAL 强制续跑与调度领取、SOL（gpt-6.2-sol，high，零工具）默认认知引擎 CONSULT / PLAN 与生命周期主动调度（义务化、有界自动执行、覆盖率统计）；支持真实图片输入的设计认知咨询与无图认知咨询两种模式。PARTIAL 是连续执行状态而不是终点：只要仍有原始授权内的可执行工作，就必须派生、领取并继续；阻塞按工作项成立，单项缺授权不冻结整个任务。drive 把工作项领取落盘（短租约）避免并发重复，回填/阻塞自动释放；SessionStart 与 UserPromptSubmit 只读提示未闭合任务，用户补齐授权后立即恢复执行。SOL-first 生命周期：简单/机械任务 0 调用；非简单任务启动默认 CONSULT，调查后按需 PLAN（不依赖工作项数量），执行期按可归因事件追加 CONSULT，medium/high 任务可做阶段复盘，有实质进展的非简单任务在最终工程验证完成后、收口前做综合判断；CONSULT/PLAN 可输出可选议程（核心问题/错误前提/遗漏风险/完成条件补充/验证/反例），材料带上次判断与采纳结果，收口周期后不再追加规划或里程碑窗口；生命周期命令把“应调用”物化为调度义务并可直接执行（每条命令最多 1 次，`--sol auto|advise|off`），`sol-stats` 以显式分母统计覆盖率。REVIEW 仅在用户明确要求时执行。调度义务在窗口关闭时写终态处置（完成/覆盖/跳过/失败/未执行/未决）与当时策略快照，`sol-accept --historical` 只为已收口任务补记可证明的采纳或带原因的 pending。SOL 只提供认知输入，ZCode 是唯一技术决策与工程执行主体；G4 原生只读复核已退役，历史台账只读保留。"
 when_to_use: >
   需要把多步骤工程任务纳入可追踪治理时：任务合同/完成条件需要固定、证据与审计需要绑定、
   长任务需要 PARTIAL 持续推进与上下文恢复、非简单任务需要 SOL 默认认知（启动 CONSULT、
@@ -9,7 +9,7 @@ when_to_use: >
   直接由 ZCode 原生完成，不进入本 Skill。
 ---
 
-# copilot：轻量协作治理（v9.7.1）
+# copilot：轻量协作治理（v9.8.0）
 
 Copilot 是运行在 ZCode 内的**协作治理层**，不是决策模型，也不是执行体。它负责把任务变成可
 追踪的合同、状态、证据与收口条件，并在任务没有真正完成时继续推进。
@@ -635,6 +635,32 @@ verify 的结构化质量报告（`copilot-verify-result/v1`）走报告接入�
   不自动重试、不切换 Provider、不派原生 Reviewer 顶替。CONSULT / PLAN 失败只记录并返回
   “可继续”，主代理按已有信息继续推进；REVIEW 失败如实报告，不伪造 PASS。
 
+### 设计审美咨询（可选，v9.8.0 多模态）
+
+设计类任务需要独立审美或设计认知意见时，用现有 CONSULT/PLAN/REVIEW 通道提交材料。
+**是否发起由调用方按价值自行判断，用户不必点名；普通工程任务与局部调整不触发，跳过是正常结果。**
+两种模式不能混：认知咨询（可无图）只讨论论证链、母题与取舍，SOL 没看画面，不得评价像素；
+视觉咨询（必须有图）才评构图与完成度。
+
+```bash
+python3 -B scripts/copilot_dispatch.py sol-consult --state S --materials M.md \
+  --question "这一版的视觉重心与构图是否成立" \
+  --image shots/p1-default.png --image-note "P1 待读默认 1.0，1000x2000"
+```
+
+- 视觉咨询必须提交**当前版本真实像素**；`--image` 可重复，最多 6 张，单张 ≤ 8 MB、合计 ≤ 24 MB，
+  PNG/JPEG/WebP；`--image-note` 与图片顺序一一对应。图片作为 `input_image` 内容块进入同一请求，
+  仍然是零工具、单轮。认知咨询只交文字材料并写明"无图"。
+- 审计与状态只存 `sha256/尺寸/说明`，不存 base64 与绝对路径；`images_sha256` 参与请求指纹，
+  换图即新材料，不复用旧的文本结论。
+- **禁止**用 OCR、文字描述、源码分析代替图片；看不清就写无法判断。无真实产物时不发起视觉结论，
+  如实标注"未做视觉评审"。
+- 结论仅为证据输入：不进 G1–G3、不改完成条件、不阻塞工程动作；采用/修改/拒绝由主代理决定，
+  用 `sol-accept` 登记。可同时问缺陷、值得保留与创造性选项（替代母题/构图），建议是候选，
+  不替代真实生图。
+- 细则见 `references/design-review.md`；设计判据与素材规范由调用方设计技能提供，Copilot 不复述；
+  单个项目的色板/风格/材质/布局不自动成为其他项目的默认审美。
+
 ### 审查材料（REVIEW 专用）
 
 用户明确要求独立复核时，材料必须包含：任务目标与完成条件、相关项目规则/关键决策、完整
@@ -784,6 +810,7 @@ CONSULT / PLAN 输出契约（`copilot-sol-think/v2`）：`judgment`、`goal_und
 | 命令矩阵、证据登记、收口操作、只读交付清单、历史只读 | `references/workflow.md` |
 | 阶段机、`drive`/`ingest`、PARTIAL 派生、退出码 | `references/runtime.md` |
 | SOL CONSULT/PLAN/REVIEW、单轮调用、正式 REVIEW、缺陷分级、台账与历史 G4 记录 | `references/review.md` |
+| 设计审美咨询（真实截图输入、采纳登记、与设计技能接口） | `references/design-review.md` |
 | 原生 Bridge v2 执行信封、错误码 | `references/agent-bridge.md` |
 | Agent 调度与内置 Explore/general-purpose 能力基线 | `copilot_dispatch.py agent-policy`；`references/agent-bridge.md` |
 | 项目上下文（resolve/recall/pack/capture）、四层信息与验收映射 | `docs/CONTEXT-ENGINE.md` |
@@ -793,7 +820,22 @@ CONSULT / PLAN 输出契约（`copilot-sol-think/v2`）：`judgment`、`goal_und
 
 ## 版本
 
-当前 **v9.7.1（认知记录与义务处置的终态闭环）**：
+当前 **v9.8.0（多模态设计认知：真实图片输入、无图/有图双模式与设计知识复用）**：
+
+- **真实图片输入**：`sol-consult` / `sol-plan` / `sol-review` 支持 `--image`（最多 6 张、
+  单张 ≤8 MB、合计 ≤24 MB，PNG/JPEG/WebP）与 `--image-note`；图片作为 Responses API
+  `input_image` 内容块与材料同轮进入，仍是零工具单轮。审计只留名称/类型/字节/尺寸/sha256/说明，
+  不写 base64 与绝对路径；图片指纹进入请求摘要，换图即新材料。
+- **两种咨询模式**：无图认知咨询只讨论论证链、母题与取舍，必须声明未看画面、不得评价像素；
+  有图视觉咨询才评构图与完成度，禁止用 OCR、文字描述或源码冒充像素。是否发起由调用方按
+  价值自主判断，普通工程任务与局部调整不触发，跳过是正常结果。
+- **设计协作协议**：设计判据与素材规范归调用方（如 DesignWise）；Copilot 只做认知调用、
+  审计与采纳台账。意见是证据输入，不进 G1–G3、不改阶段、不是审批；可同时问缺陷、值得保留
+  与创造性候选。
+- **知识复用边界**：沿用现有 `knowledge-manager` / Memory 通道，不新建审美记忆系统；单个项目
+  的色板、风格、材质与布局不自动成为其他项目的默认审美。
+
+**v9.7.1（认知记录与义务处置的终态闭环）**：
 
 - **历史采纳只补可证明的结论**：`sol-accept --historical` 只为**已收口**任务开放，`pending`
   必须写明原因（`--reason` + 可选 `--reason-code`：`no-attribution` /
