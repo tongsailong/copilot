@@ -1007,9 +1007,14 @@ CONSULT / PLAN 输出契约（`copilot-sol-think/v2`）：`judgment`、`goal_und
 - **计划目标条件**：`plan` 工作项可声明 `target_criteria`（必须真实存在于合同），用于领取
   去重、阻塞自动归属；该字段不进入计划摘要，native dispatch 的计划指纹保持不变。
 - **UserPromptSubmit 逐回合提示**：`install` 写入 Stop / SessionStart / UserPromptSubmit
-  三个事件；`user-prompt` 只读列出未闭合任务（含 BLOCKED 的 reason/needs）与判断规则。
+  三个事件；`user-prompt` 只读列出**本会话负责**的未闭合任务（含 BLOCKED 的 reason/needs）
+  与授权判断规则；其它会话/未绑定的旧任务不逐回合展开、也不重复披露（现场与阻塞原因由
+  SessionStart 指针披露一次），本会话另有任务时它们只占一行计数。归属无法确认
+  （`session.json` 损坏，Stop 会 fail-closed 拦截）的任务仍逐回合提示；宿主未给会话标识时
+  只有**恰好一个**候选任务才当作本会话的展开，多个候选只报数量、让先 `status --json`
+  核对归属（与 Stop 同一口径：不按“最近更新”替会话选任务）。
   用户本回合补齐授权/决策时，先用其原话登记 `unblock --by user --quote "<原话>"`，再
-  `drive` 继续；提示本身不是用户新指令，也不构成授权。没有未闭合任务时不注入。
+  `drive` 继续；提示本身不是用户新指令，也不构成授权。没有本会话任务时不注入。
 - **恢复可发现性**：SessionStart(startup|resume|compact) 对本会话绑定任务注入完整快照，startup 只给指针；
   或重启后会话标识变化时只注入只读指针（任务阶段、可执行项、阻塞原因/需要、归属标注），
   不绑定、不接管、不强制续跑。快照与 status 均显示阻塞原因与所需条件。

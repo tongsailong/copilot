@@ -6,6 +6,45 @@
 任务 `sol-cognition-governance-p1p3-2026-11-23` 经用户授权一次性 `reopen` 后，已于
 `2026-11-24T07:40:07` 在**最终代码**上重新收口 **CLOSED / PASS**（周期 2，G1–G3 全 PASS）。
 
+## Hooks 必要性审计与性能优化（2026-11-24，工作区改动，未提交）
+
+- **生效清单（核实到配置源头）**：用户级 `~/.zcode/cli/config.json` 只有三条钩子，均指向
+  `copilot_stop_guard.py`：`Stop`、`SessionStart`（matcher `startup|resume|compact`）、
+  `UserPromptSubmit`；无工作区级钩子，启用的 7 个插件都不贡献钩子。`PreToolUse: []` 是空
+  死配置，已从用户级配置删除（只删该行，其它配置与权限位未变）。
+- **必要性结论**：三项均保留——Stop 是宿主唯一“退出码 2 强制续跑”的机械衔接层；
+  SessionStart 是 compact/resume 后唯一的状态恢复入口；UserPromptSubmit 是 BLOCKED 任务
+  在“用户补齐授权当回合恢复执行”的唯一触发点。未注册的 `~/.zcode/hooks/design-gate` 与
+  `~/.zcode/hooks/knowledge-loop` 为历史残留（无任何配置/规则引用），未删除，交用户处置。
+- **性能修正（真实子进程 A/B，交错采样，中位数减解释器基线）**：`governance` 改为惰性导入
+  （约 33 ms）+ 钩子高频路径跳过 `argparse`（约 11 ms）：无任务工作区 Stop 75.5→30.6 ms
+  （-59.5%）、SessionStart 71.3→31.1 ms（-56.4%）、UserPromptSubmit 76.1→47.6 ms（-37.5%）；
+  需要读状态的路径 75.8→70.5 ms、81.3→69.3 ms。判定口径未变。
+- **上下文成本**：`user-prompt` 只展开本会话负责的任务，其它会话/未绑定任务收敛为一行计数
+  （无关消息 1,445→0 字节）；本会话任务提示 1,421→1,229 字节（原四步判断规则并为两条）；
+  Stop 续跑原因压缩但保留“领取工作项 / AUTO-REPLAN / disable / 强制续跑 / 3 次 / G1–G3 /
+  不得改写 PARTIAL”等硬约束。
+- **真实宿主验证**（`node /opt/ZCode/resources/glm/zcode.cjs -p|--resume` 配
+  `COPILOT_STOP_GUARD_LOG`，共 **6 个无头会话**：plain / foreign / bound / cap / final /
+  recall）：无任务工作区三事件均触发并放行；含其它会话任务的工作区
+  `session-start-pointer:startup:1` 注入指针、`user-prompt` 0 注入、Stop `out-of-scope`
+  放行；绑定任务的 `--resume` 会话 `session-start-inject:resume` →
+  `user-prompt-inject:tasks=1` → Stop 退出码 2（`capture-required:CLOSED`）→ 宿主续跑并
+  完成任务 → 第二次 Stop 放行，回合正常结束。
+- **会话识别边界（本轮收口修复）**：宿主 `zcode.cjs` 在 SessionStart / UserPromptSubmit / Stop
+  三处都由 `hookRunner.run` 注入 `session_id`（真实宿主 6 个无头会话共 31 次钩子调用，
+  31/31 带 `sess_*`，无空值），无标识只出现在手工调用。原实现“无标识时按最近更新取一个任务”会把别人的任务强制续跑到当前上下文，已改为：
+  有标识严格按绑定；无标识时**仅恰好一个候选任务**才回退；多个候选不选人（Stop 记
+  `ambiguous-no-session` 并放行，UserPromptSubmit 只报数量、要求先 `status --json` 核对），
+  但状态/绑定异常仍 fail-closed。新增 4 项回归（多任务不选、单任务仍续跑、异常不放行、
+  逐回合只报数量）。
+- **验证**：活动套件 `python3 -B -m unittest discover -s tests -p 'test_*.py'` **947 项 OK**
+  （最终代码上重跑）；运行时副本（与源码 sha256 相同）用真实 stdin 载荷复跑 10 个会话场景
+  矩阵（无任务 / 单任务·本会话 / 多会话并存 / 仅其它会话有任务 / 未绑定 / 绑定损坏 /
+  BLOCKED+可执行并存 / 无标识多任务 / 无标识单任务 / 无标识多任务含损坏）全部符合预期；
+  `sync_runtime.py --apply` 后 `--check` 缺失 0 / 不同 0，`--verify-baseline` 通过
+  （基线已按最终源码刷新）。
+
 ## v9.8.0 多模态设计认知（2026-11-24，正式交付）
 
 - **真实图片输入**：`sol-consult` / `sol-plan` / `sol-review` 的 `--image` 支持最多 6 张、
@@ -583,6 +622,8 @@
   （用户本轮给出授权 → `unblock --by user --quote` 后 `drive`；否则不要自行续跑；
   不是授权；不要重复派发），失败一律 exit 0。`install`/`uninstall` 同时维护 Stop、
   SessionStart（`startup|resume|compact`）与 UserPromptSubmit 三处。
+  （2026-11-24 起口径收敛：只展开本会话负责的任务、判断规则并为两条，其余任务不再逐轮
+  披露——见文首「Hooks 必要性审计与性能优化」。）
 - **测试**：新增 `tests/test_v95_scheduling.py`（20 项，覆盖 C1 自动续跑、C2 派生→调度→
   执行→核销闭环、C3 单项阻塞隔离、C4 授权变更恢复、C5 条件变更恢复、C6 重复调度防护与
   领取不永久丢失、C7 上下文重载续跑、C8 真实 BLOCKED 的原因与 needs、C9 PASS 只在全部

@@ -46,7 +46,6 @@ Copilot 的 `EXIT_CONTINUE=10` 只是命令退出码，模型可以忽略它并�
 """
 from __future__ import annotations
 
-import argparse
 import json
 import os
 import shlex
@@ -57,7 +56,21 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
-import governance as G  # noqa: E402
+_GOVERNANCE = None
+
+
+def _governance():
+    """惰性导入 governance（含 code_scope，约 33ms）。
+
+    三个钩子事件每回合都会调起本脚本，而“工作区没有需要续跑的任务”是最常见的
+    情况：这条路径只做目录检查就退出，不该为状态模块付导入成本。
+    """
+    global _GOVERNANCE
+    if _GOVERNANCE is None:
+        import governance as module  # noqa: PLC0415 - 钩子高频路径的惰性导入
+        _GOVERNANCE = module
+    return _GOVERNANCE
+
 
 TASKS_DIR = ".copilot-tasks"
 OFF_MARKER = ".stop-guard-off"
@@ -277,6 +290,7 @@ def _capture_targets(root: str, session: str) -> list[dict]:
         path = os.path.join(task_dir, "state.json")
         if not os.path.isfile(path):
             continue
+        G = _governance()
         try:
             state = G.load_state(path)
         except (G.GovernanceError, OSError, ValueError, TypeError):
@@ -366,6 +380,7 @@ def cmd_capture_ack(args) -> int:
     """写 Capture 回执：幂等键绑定任务当前终止版本；不改任务状态。"""
     task_dir = os.path.abspath(args.task_dir)
     state_path = os.path.join(task_dir, "state.json")
+    G = _governance()
     try:
         state = G.load_state(state_path)
     except (G.GovernanceError, OSError, ValueError, TypeError) as exc:
@@ -482,6 +497,7 @@ def collect(root: str, *, session: str = "",
             anomalies.append({"kind": "binding", "task_id": name,
                               "task_dir": task_dir, "state_path": path,
                               "binding": binding, "detail": bind_error})
+        G = _governance()
         try:
             state = G.load_state(path)
         except (G.GovernanceError, OSError, ValueError, TypeError) as exc:
@@ -533,7 +549,7 @@ def _binding_note(row: dict) -> str:
     if row["binding"] == "corrupt":
         return "绑定文件损坏，无法核对归属（fail-closed 拦截）；修好或 disable 后重试"
     if row["binding"] == "unknown-session":
-        return "会话标识不可用，按最近更新判定"
+        return "会话标识不可用，无法核对归属（仅唯一候选任务时按本会话处理）"
     return "未绑定"
 
 
@@ -549,10 +565,9 @@ def render(row: dict, *, total: int = 1, anomalies: list[dict] | None = None,
     lines = [
         f"[COPILOT 续跑守卫] 任务 {row['task_id']} 仍在 {row['phase']}："
         f"{row['reason'] or '仍有必须继续的工作'}",
-        f"- 归属：{_binding_note(row)}",
-        f"- 宿主限制：ZCode 每回合最多接受 {MAX_CONTINUATIONS} 次自动续跑（硬编码、"
-        "不可配置）；守卫拿不到已用次数与剩余次数，因此不声明“还剩几次”，也不断言"
-        "这是最后一次。",
+        f"- 归属：{_binding_note(row)} · 宿主每回合最多接受 {MAX_CONTINUATIONS} 次自动"
+        "续跑（硬编码、不可配置）；守卫拿不到已用/剩余次数，不声明“还剩几次”，也不"
+        "断言这是最后一次。",
     ]
     detail = []
     if row["executable"]:
@@ -590,18 +605,16 @@ def render(row: dict, *, total: int = 1, anomalies: list[dict] | None = None,
                  "完成条件）：领取 → 实施改动 → 跑定向测试 → 登记证据并 criterion met "
                  "→ 再跑 drive 重新求值。不要用只读核对、重复计划或长篇说明代替实际进展。")
     lines.append("- 每次续跑结束前必须落盘：进展与结论用 record/report 写入，证据先 "
-                 "evidence --add 再引用，未完成工作项保留 pending/blocked 并写明原因，"
-                 "使下一回合能凭状态文件与上面的续接命令继续。")
-    lines.append("- 不得为结束回合把 PARTIAL 改写成 BLOCKED 或 PASS 来规避续跑上限："
-                 "BLOCKED 只在真实外部阻塞（每条有 reason/needs）时登记，PASS 只在 G1–G3 "
-                 "全部通过后由收口产生；改状态规避等同于伪造结论。")
+                 "evidence --add 再引用，未完成工作项保留 pending/blocked 并写明原因；"
+                 "新回合先 status --json 核实，只继续真正未完成的部分，不重做已完成工作、"
+                 "不覆盖既有证据。")
     lines.append("- 阶段报告、计划、只给命令不执行、单个工具失败、子代理返回 PARTIAL "
-                 "都不是终点；工具失败先分析原因并换一条合法路径，不要原样重试；"
-                 "无进展按 AUTO-REPLAN 换路线，不得降低验收标准。")
-    lines.append("- 新回合续接：先 status --json 核实阶段、已完成工作项与证据，只继续真正"
-                 "未完成的部分，不重做已完成工作、不覆盖既有证据。")
-    lines.append("- 只有 PASS 收口，或所有剩余工作真实 BLOCKED（每条都有 reason/needs）"
-                 "才可停止；需要用户授权/决策时先 block 该工作项再 drive。")
+                 "都不是终点；工具失败先分析原因并换一条合法路径，无进展按 AUTO-REPLAN "
+                 "换路线，不得降低验收标准。")
+    lines.append("- 停下来的条件只有两个：PASS 收口，或剩余工作全部真实 BLOCKED（每条有 "
+                 "reason/needs）。不得为结束回合把 PARTIAL 改写成 BLOCKED 或 PASS 来规避"
+                 "续跑上限：改状态规避等同于伪造结论，PASS 只在 G1–G3 通过后由收口产生；"
+                 "需要用户授权/决策时先 block 该工作项再 drive。")
     if continued:
         lines.append("- 本回合 Stop 已被强制续跑过至少一次；剩余次数未知，不要假设还有"
                      "机会，也不要假设这就是最后一次。请立即执行，不要重复输出计划。")
@@ -712,8 +725,17 @@ def _check() -> int:
             _log(0, root, note=f"out-of-scope:{len(rows)}", session=session)
             return 0
     else:
-        # 手工调用或宿主未提供会话标识：无法判定归属，只对最近更新的任务生效，
-        # 避免把工作区里所有历史任务一次性当成当前任务。
+        # 手工调用或宿主未提供会话标识：无法判定归属。只有“恰好一个候选任务”时才
+        # 安全回退；多个任务时不替任一会话选人——按“最近更新”选等于替别人的任务
+        # 强制续跑，也不把别人的状态异常当成本会话的责任。
+        if len(rows) > 1:
+            note = f"ambiguous-no-session:{len(rows)}:anomalies={len(anomalies)}"
+            if anomalies:
+                # 不选任务，但状态异常本身无法归给某个会话，仍 fail-closed。
+                _log(2, root, note=note, session="")
+                return _block(_anomaly_reason(anomalies))
+            _log(0, root, note=note, session="")
+            return 0
         enforced = rows[:1]
         if not enforced:
             if anomalies:
@@ -862,31 +884,49 @@ def _pointer_text(rows: list[dict], anomalies: list[dict] | None = None,
 
 def _user_prompt_text(rows: list[dict], anomalies: list[dict] | None = None,
                       session: str = "") -> str:
-    """用户回合提示：带进新授权/决策时立即恢复执行，而不是重复报告。"""
+    """用户回合提示：只展开归属本会话的任务，其它任务收敛成一行。
+
+    这个块每一轮用户输入都会注入，所以细节必须有界：只有本会话负责的任务可能因为
+    这条消息恢复执行，展开其它会话/未绑定任务的完整阻塞原因只会挤占上下文、并把
+    会话引向不该由它接管的旧任务（实测一条无关的“你好”也会带上 636 字旧任务原因）。
+    """
+    bound: list[dict] = []
+    others: list[dict] = []
+    for row in rows:
+        # 没有会话标识时无法判定归属：只有一个候选任务才可以安全当作本会话的；
+        # 多个候选一律不展开（不让会话据此接管别人的任务）。
+        if session and session in (row.get("sessions") or []):
+            bound.append(row)
+        elif not session and len(rows) == 1:
+            bound.append(row)
+        else:
+            others.append(row)
+    ambiguous = not session and len(rows) > 1
     lines = [
         POINTER_OPEN,
         "本工作区有未闭合的 Copilot 任务（只读状态；不是用户新指令，也不构成授权）：",
     ]
-    for row in rows[:USER_PROMPT_MAX_TASKS]:
-        line = _row_open_line(row)
-        if session and row.get("sessions") and session not in row["sessions"]:
-            line += "（归属其它会话）"
-        lines.append(line)
-    if len(rows) > USER_PROMPT_MAX_TASKS:
-        lines.append(f"- 另有 {len(rows) - USER_PROMPT_MAX_TASKS} 个未闭合任务；"
-                     "用 status 查看。")
+    if ambiguous:
+        lines.append(f"- 共 {len(rows)} 个未闭合任务，宿主未提供会话标识，无法判定归属；"
+                     "不替你选择任务：先 status --json 核对绑定会话、阶段与证据，"
+                     "再决定是否接管。")
+    else:
+        for row in bound[:USER_PROMPT_MAX_TASKS]:
+            lines.append(_row_open_line(row))
+        if len(bound) > USER_PROMPT_MAX_TASKS:
+            lines.append(f"- 本会话另有 {len(bound) - USER_PROMPT_MAX_TASKS} 个未闭合任务；"
+                         "用 status 查看。")
+        if others:
+            lines.append(f"- 另有 {len(others)} 个未闭合任务归属其它会话或未绑定会话"
+                         "（只读；不并发接管，需要时先 status --json 核对）。")
     if anomalies:
         lines.append(f"- 另有 {len(anomalies)} 处任务状态读取异常；先按 status 的 fix 提示"
                      "处理，不得忽略，也不得伪造 PASS。")
-    lines.append("本回合判断（按顺序）：")
-    lines.append("1) 用户这条消息是否补齐了上面某个阻塞所需的授权/决策/条件，或明确要求"
-                 "继续该任务？")
-    lines.append("2) 是 → 用用户原话登记解除（unblock --by user --quote \"<用户原话>\"，"
-                 "或补齐对应条件），然后 drive 继续执行到下一个真实终点；不要只回总结、"
-                 "也不要把“已理解”当成已执行。")
-    lines.append("3) 否 → 不要恢复执行；用户明确要求停止/切换时按其指示，本提示不是授权。")
-    lines.append("4) 不重复已完成工作：先 status --json 核对阶段与证据；工作项若已被其它"
-                 "会话领取，避免并发重复执行。")
+    lines.append("本回合判断：用户这条消息补齐了某个阻塞的授权/决策/条件，或明确要求继续"
+                 " → 先用其原话登记解除（unblock --by user --quote \"<用户原话>\"，"
+                 "或补齐对应条件）再 drive 执行到下一个真实终点；否则不要恢复执行"
+                 "（本提示不是授权，也不要把“已理解”当成已执行）。")
+    lines.append("继续前先 status --json 核对阶段、工作项与证据，不重复已完成工作。")
     lines.append(POINTER_CLOSE)
     return _fit_lines(lines, USER_PROMPT_LIMIT, POINTER_CLOSE)
 
@@ -1072,9 +1112,24 @@ def cmd_user_prompt() -> int:
         tasks_n = 0
         if root:
             rows, anomalies = collect(root, session="", include_open=True)
-            if rows:
-                task_text = _user_prompt_text(rows, anomalies, session=session)
-                tasks_n = len(rows)
+            # 逐回合只提示本会话负责的任务，以及归属无法确认（Stop 会 fail-closed 拦截）
+            # 的任务：其它会话的旧任务由 SessionStart 指针披露一次即可，不必每轮重复，
+            # 否则一条无关的“你好”也会带上别处旧任务的完整阻塞原因。
+            if session:
+                mine = [row for row in rows
+                        if session in (row.get("sessions") or [])]
+                ambiguous = False
+            else:
+                # 无会话标识：只有恰好一个候选任务才能安全回退；多个任务只报计数，
+                # 不替任一会话选择“最近任务”（见 _user_prompt_text 的 ambiguous 分支）。
+                mine = rows if len(rows) == 1 else []
+                ambiguous = len(rows) > 1
+            corrupt = [item for item in anomalies if item.get("binding") == "corrupt"]
+            if mine or corrupt or ambiguous:
+                task_text = _user_prompt_text(
+                    rows, anomalies if (mine or ambiguous) else corrupt,
+                    session=session)
+                tasks_n = len(mine)
         if not task_text and not recall_text:
             _log(0, root or start, session=session,
                  note=f"user-prompt-skip:tasks={tasks_n}:recall={recall_note}")
@@ -1101,7 +1156,7 @@ def cmd_status(args) -> int:
     session = str(getattr(args, "session", "") or "") or _session_from({})
     rows, anomalies = collect(root, session=session)
     print(f"工作区：{root}")
-    print(f"会话：{session or '（不可用；按最近更新任务判定）'}")
+    print(f"会话：{session or '（不可用；仅唯一候选任务时判定归属，多个任务不选）'}")
     if not rows:
         print("没有要求续跑的任务。")
     for row in rows:
@@ -1362,6 +1417,17 @@ def cmd_enable(args) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    args_list = list(sys.argv[1:] if argv is None else argv)
+    # 钩子高频路径先分派：argparse 导入约 11ms，Stop/SessionStart/UserPromptSubmit
+    # 每回合都会调起，没必要为了三个固定子命令付这份成本。
+    if not args_list:
+        return cmd_check()
+    if len(args_list) == 1:
+        if args_list[0] == "session-start":
+            return cmd_session_start()
+        if args_list[0] == "user-prompt":
+            return cmd_user_prompt()
+    import argparse  # noqa: PLC0415 - 仅命令行子命令需要
     parser = argparse.ArgumentParser(description="Copilot Stop 续跑守卫")
     sub = parser.add_subparsers(dest="command")
     p_status = sub.add_parser("status", help="只读列出要求续跑的任务")
