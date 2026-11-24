@@ -174,6 +174,20 @@ class ReferenceTests(unittest.TestCase):
             self.assertIn("历史文档", doc, f"{name} 缺少退役横幅")
             self.assertIn("退役", doc, f"{name} 未说明退役")
 
+    def test_design_review_keeps_two_modes_and_knowledge_boundary(self):
+        # 设计咨询是可选证据输入：认知模式可无图但不得冒充看过画面。
+        doc = text(os.path.join(REFERENCES, "design-review.md"))
+        for phrase in ("认知咨询（可无图）", "视觉咨询（必须有图）",
+                       "未看画面", "不得评价像素", "跳过是正常结果",
+                       "创造性问题", "九问是视觉咨询的通用兜底",
+                       "项目视觉 DNA", "不自动成为其他项目的默认审美",
+                       "不重复付费"):
+            self.assertIn(phrase, doc)
+        self.assertIn("不是审批节点", doc)
+        self.assertIn("不改变决策主体", doc)
+        self.assertIn("references/design-review.md",
+                      text(SKILL))
+
     def test_history_records_v6_and_v8(self):
         doc = text(os.path.join(REFERENCES, "history.md"))
         self.assertIn("v6.0.0（2026-11-12）", doc)

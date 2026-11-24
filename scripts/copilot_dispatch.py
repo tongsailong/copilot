@@ -52,7 +52,7 @@ import review_policy as RP  # noqa: E402
 import sol_review as SR  # noqa: E402
 import sol_schedule as SS  # noqa: E402
 
-__version__ = "9.7.1"
+__version__ = "9.8.0"
 
 
 class CLIError(Exception):
@@ -102,6 +102,30 @@ def _compose_materials(materials: str, knowledge_file: str) -> tuple[str, dict]:
         "knowledge_entries": sum(1 for line in block.splitlines()
                                  if line.startswith("### ")),
     }
+
+
+def _compose_image_block(materials: str, images: list[dict]) -> str:
+    """把图片清单追加到材料：与请求中的 input_image 顺序一一对应。
+
+    只写文件名、尺寸、sha256 与调用方给出的说明，不写本地路径或 base64。
+    清单进入提示词后，材料摘要自然包含图片指纹：换图不会被当成“同一材料”复用。
+    """
+    if not images:
+        return materials
+    lines = [
+        "",
+        "## 图像材料（与请求中的 input_image 顺序一一对应）",
+        "只依据这些真实像素判断；不要从文件名、文字或代码推断画面。"
+        "看不清或被裁切的细节写“无法判断”，不要补全。",
+    ]
+    for index, item in enumerate(images, start=1):
+        width, height = item.get("width"), item.get("height")
+        dims = f"{width}x{height}" if width and height else "未知尺寸"
+        label = item.get("label") or "未标注"
+        lines.append(
+            f"图{index}：{item.get('name') or ''}；{dims}；"
+            f"sha256={item.get('sha256') or ''}；说明={label}")
+    return materials.rstrip() + "\n" + "\n".join(lines) + "\n"
 
 
 def _load_json_doc(text: str, name: str):
@@ -1014,7 +1038,8 @@ def _load_pending_result(task_dir: str, digest: str,
 def _invoke_sol_once(*, state_path: str, task_dir: str, prompt: str,
                      digest: str, mode: str, args, audit_log: str,
                      audit_subdir: str,
-                     stage: str = "") -> tuple[dict | None, int]:
+                     stage: str = "",
+                     images: list[dict] | None = None) -> tuple[dict | None, int]:
     """共享的一次调用路径：pending 恢复 → 一次请求 → 落可恢复结果。
 
     返回 `(result, exit_code)`；result 为 None 表示失败且已打印真实原因。
@@ -1041,7 +1066,7 @@ def _invoke_sol_once(*, state_path: str, task_dir: str, prompt: str,
             result = call(
                 prompt, audit_log=audit_log,
                 max_output_tokens=args.max_output_tokens,
-                timeout=args.timeout)
+                timeout=args.timeout, images=images or None)
         except SR.SolError as exc:
             G.record_sol_call_failure(
                 state_path, mode=mode, error_code=exc.code, detail=exc.detail,
@@ -1188,6 +1213,13 @@ def _run_sol_channel(args, mode: str) -> int:
         materials = _read_text(args.materials)
     materials, knowledge_meta = _compose_materials(
         materials, str(getattr(args, "knowledge_file", "") or ""))
+    image_paths = list(getattr(args, "image", None) or [])
+    image_labels = list(getattr(args, "image_note", None) or [])
+    try:
+        images = SR.load_images(image_paths, labels=image_labels or None)
+    except SR.SolUsageError as exc:
+        raise CLIError(f"[{exc.code}] {exc.detail}") from None
+    materials = _compose_image_block(materials, images)
     if not materials.strip():
         raise CLIError("材料为空。")
     question = str(getattr(args, "question", "") or "").strip()
@@ -1237,7 +1269,8 @@ def _run_sol_channel(args, mode: str) -> int:
         if outcome is not None:
             return outcome
         payload = SR.build_payload(
-            prompt, mode=mode, max_output_tokens=args.max_output_tokens)
+            prompt, mode=mode, max_output_tokens=args.max_output_tokens,
+            images=images)
         info = {
             "schema": cfg["dry_run_schema"],
             "mode": mode,
@@ -1246,6 +1279,10 @@ def _run_sol_channel(args, mode: str) -> int:
             "endpoint": SR.resolve_base_url() + SR.ENDPOINT,
             "materials_sha256": digest,
             "materials_chars": len(prompt),
+            "images": SR.image_public_metadata(images),
+            "image_count": len(images),
+            "images_sha256": SR.images_digest(images),
+            "input_type": "content_blocks" if images else "text",
             "question": question,
             "stage": stage,
             # 缓存/复用口径：这些成分变化即不再复用旧结论。
@@ -1275,6 +1312,10 @@ def _run_sol_channel(args, mode: str) -> int:
             print(f"SOL {mode} 预检：model={info['model']} "
                   f"effort={info['reasoning_effort']} "
                   f"materials={info['materials_chars']} 字符 sha={digest[:16]}…")
+            if info["image_count"]:
+                print(f"图像材料：{info['image_count']} 张 "
+                      f"（{info['input_type']}），"
+                      f"images_sha={info['images_sha256'][:16]}…")
             print(f"共享上下文：提示词 {info['prompt_version']}，"
                   f"证据 {info['evidence_entries']} 条，"
                   f"工作项 {info['action_entries']} 个")
@@ -1326,7 +1367,7 @@ def _run_sol_channel(args, mode: str) -> int:
         result, code = _invoke_sol_once(
             state_path=path, task_dir=task_dir, prompt=prompt,
             digest=digest, mode=mode, args=args, audit_log=audit_log,
-            audit_subdir=cfg["subdir"], stage=stage)
+            audit_subdir=cfg["subdir"], stage=stage, images=images)
         if result is None:
             return code
         reply_text = result.pop("reply_text", "")
@@ -1389,6 +1430,9 @@ def _run_sol_channel(args, mode: str) -> int:
             "knowledge_block_sha256": knowledge_meta.get(
                 "knowledge_block_sha256") or "",
             "knowledge_entries": knowledge_meta.get("knowledge_entries") or 0,
+            "images": result.get("images") or [],
+            "image_count": result.get("image_count") or 0,
+            "images_sha256": result.get("images_sha256") or "",
             "request_sha256": result.get("request_sha256"),
             "request_id": result.get("request_id") or "",
             "trace_id": result.get("trace_id") or "",
@@ -2338,6 +2382,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="主代理整理的审查材料文件（- 表示 stdin）；--list 时可省略")
     p.add_argument("--knowledge-file", default="",
                    help="知识交接 JSON（由 knowledge_handoff.py 校验）；摘录追加到 materials")
+    p.add_argument("--image", action="append", default=[],
+                   help="真实图片材料（PNG/JPEG/WebP，可重复，最多 6 张）：作为 "
+                        "Responses API input_image 提交；不做 OCR 或文字替代")
+    p.add_argument("--image-note", action="append", default=[],
+                   help="与 --image 一一对应的说明（页面/状态/档位/本次变化）")
     p.add_argument("--reason", default="", help="再次复核的具体原因")
     p.add_argument("--trigger", default="",
                    choices=("", *sorted(SR.RETRY_TRIGGERS)),
@@ -2381,6 +2430,12 @@ def build_parser() -> argparse.ArgumentParser:
         parser.add_argument("--knowledge-file", default="",
                             help="知识交接 JSON（由 knowledge_handoff.py 校验）；"
                                  "摘录追加到 materials")
+        parser.add_argument("--image", action="append", default=[],
+                            help="真实图片材料（PNG/JPEG/WebP，可重复，最多 6 张）："
+                                 "作为 Responses API input_image 提交；"
+                                 "不做 OCR 或文字替代")
+        parser.add_argument("--image-note", action="append", default=[],
+                            help="与 --image 一一对应的说明（页面/状态/档位/本次变化）")
         parser.add_argument("--question", default="",
                             help="本次真正需要 SOL 判断的事项（必填；越具体越好）")
         parser.add_argument("--stage", default="",

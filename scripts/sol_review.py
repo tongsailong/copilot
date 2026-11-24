@@ -82,6 +82,14 @@ MATERIALS_WARN = {"CONSULT": THINK_WARN_MATERIALS_CHARS,
                   "PLAN": THINK_WARN_MATERIALS_CHARS,
                   "REVIEW": WARN_MATERIALS_CHARS}
 
+# 图像材料：SOL 只能通过 Responses API 的 `input_image` 内容块看到真实像素。
+# 这里只做本地文件读取、编码与上限校验；不解码像素、不做 OCR、不把图片文字化。
+# 上限偏保守：一次设计审美咨询通常 2–6 张代表性截图，不需要整包截图。
+IMAGE_MAX_COUNT = 6
+IMAGE_MAX_BYTES = 8 * 1024 * 1024
+IMAGE_MAX_TOTAL_BYTES = 24 * 1024 * 1024
+IMAGE_MIMES = ("image/png", "image/jpeg", "image/webp")
+
 BENIGN_OUTPUT_TYPES = {"message", "reasoning"}
 TOOL_KEYS = ("tools", "functions", "parallel_tool_calls", "tool_resources",
              "tool_config")
@@ -479,19 +487,200 @@ def validate_materials(materials: object, mode: str = "CONSULT") -> str:
     return materials
 
 
+def probe_image_bytes(data: bytes) -> tuple[str, int | None, int | None]:
+    """按魔数识别 PNG / JPEG / WebP，并尽量读出显示尺寸；不解码像素。"""
+    if data.startswith(b"\x89PNG\r\n\x1a\n") and len(data) >= 24:
+        width = int.from_bytes(data[16:20], "big")
+        height = int.from_bytes(data[20:24], "big")
+        return "image/png", width or None, height or None
+    if data.startswith(b"\xff\xd8\xff"):
+        index = 2
+        while index + 9 < len(data):
+            if data[index] != 0xFF:
+                index += 1
+                continue
+            marker = data[index + 1]
+            if marker in (0xD8, 0xD9):
+                index += 2
+                continue
+            if index + 4 > len(data):
+                break
+            length = int.from_bytes(data[index + 2:index + 4], "big")
+            if length < 2 or index + 2 + length > len(data):
+                break
+            # SOF0..SOF15（跳过 DHT/JPG/DAC 等非 SOF 标记）
+            if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
+                height = int.from_bytes(data[index + 5:index + 7], "big")
+                width = int.from_bytes(data[index + 7:index + 9], "big")
+                return "image/jpeg", width or None, height or None
+            index += 2 + length
+        return "image/jpeg", None, None
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP" and len(data) >= 30:
+        fourcc = data[12:16]
+        if fourcc == b"VP8X":
+            width = int.from_bytes(data[24:27], "little") + 1
+            height = int.from_bytes(data[27:30], "little") + 1
+            return "image/webp", width, height
+        if fourcc == b"VP8 " and data[23:26] == b"\x9d\x01\x2a":
+            width = int.from_bytes(data[26:28], "little") & 0x3FFF
+            height = int.from_bytes(data[28:30], "little") & 0x3FFF
+            return "image/webp", width or None, height or None
+        if fourcc == b"VP8L" and len(data) >= 25 and data[20] == 0x2F:
+            bits = int.from_bytes(data[21:25], "little")
+            width = (bits & 0x3FFF) + 1
+            height = ((bits >> 14) & 0x3FFF) + 1
+            return "image/webp", width, height
+        return "image/webp", None, None
+    raise SolUsageError(
+        "sol_image_format_unsupported",
+        "只接受真实 PNG / JPEG / WebP 文件；不按扩展名猜测，也不用 OCR 或文字描述代替像素。")
+
+
+def load_images(paths: list[str], *, labels: list[str] | None = None) -> list[dict]:
+    """读取本地图片为 Responses API 的 input_image 内容块。
+
+    返回项含 `data_url`（仅用于请求体，绝不写审计）与可公开的元数据。
+    任何一张不可读、超限或格式不符都整体失败，不静默跳过。
+    """
+    if not paths:
+        return []
+    if len(paths) > IMAGE_MAX_COUNT:
+        raise SolUsageError(
+            "sol_image_count_exceeded",
+            f"一次最多 {IMAGE_MAX_COUNT} 张图片，收到 {len(paths)} 张；"
+            "请只给代表性页面/状态，不整包上传。")
+    if labels is not None and len(labels) != len(paths):
+        raise SolUsageError(
+            "sol_image_label_mismatch",
+            f"--image 有 {len(paths)} 个，--image-note 有 {len(labels)} 个；"
+            "两者必须一一对应。")
+    images = []
+    total = 0
+    for index, path in enumerate(paths, start=1):
+        resolved = os.path.abspath(os.path.expanduser(str(path)))
+        if not os.path.isfile(resolved):
+            raise SolUsageError(
+                "sol_image_missing",
+                f"第 {index} 张图片不存在：{resolved}")
+        size = os.path.getsize(resolved)
+        if size <= 0:
+            raise SolUsageError(
+                "sol_image_empty", f"第 {index} 张图片为空文件：{resolved}")
+        if size > IMAGE_MAX_BYTES:
+            raise SolUsageError(
+                "sol_image_too_large",
+                f"第 {index} 张图片 {size} 字节，超过单张上限 "
+                f"{IMAGE_MAX_BYTES}；请先导出适合评审的尺寸，不静默压缩。")
+        total += size
+        if total > IMAGE_MAX_TOTAL_BYTES:
+            raise SolUsageError(
+                "sol_image_total_too_large",
+                f"图片总量 {total} 字节超过上限 {IMAGE_MAX_TOTAL_BYTES}；"
+                "请减少数量或尺寸。")
+        with open(resolved, "rb") as fh:
+            data = fh.read()
+        mime, width, height = probe_image_bytes(data)
+        if mime not in IMAGE_MIMES:
+            raise SolUsageError(
+                "sol_image_format_unsupported",
+                f"第 {index} 张图片格式 {mime!r} 不在允许范围 {IMAGE_MIMES}。")
+        import base64
+        images.append({
+            "path": resolved,
+            "name": os.path.basename(resolved),
+            "mime": mime,
+            "bytes": size,
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "width": width,
+            "height": height,
+            "label": (labels[index - 1] if labels else "").strip(),
+            "data_url": "data:%s;base64,%s" % (
+                mime, base64.b64encode(data).decode("ascii")),
+        })
+    return images
+
+
+def validate_images(images: object) -> list[dict]:
+    """请求构造前的图像校验：结构、数量与内容块形状。"""
+    if images in (None, []):
+        return []
+    if not isinstance(images, list):
+        raise SolUsageError("sol_image_invalid", "images 必须是列表。")
+    if len(images) > IMAGE_MAX_COUNT:
+        raise SolUsageError(
+            "sol_image_count_exceeded",
+            f"一次最多 {IMAGE_MAX_COUNT} 张图片，收到 {len(images)} 张。")
+    checked = []
+    for index, item in enumerate(images, start=1):
+        if not isinstance(item, dict):
+            raise SolUsageError(
+                "sol_image_invalid", f"第 {index} 张图片元数据不是对象。")
+        data_url = item.get("data_url")
+        mime = str(item.get("mime") or "")
+        if not isinstance(data_url, str) or not data_url.startswith("data:"):
+            raise SolUsageError(
+                "sol_image_invalid", f"第 {index} 张图片缺少 data_url。")
+        if mime not in IMAGE_MIMES:
+            raise SolUsageError(
+                "sol_image_format_unsupported",
+                f"第 {index} 张图片格式 {mime!r} 不在允许范围。")
+        checked.append(item)
+    return checked
+
+
+def image_public_metadata(images: list[dict] | None) -> list[dict]:
+    """可写入状态/审计的图片元数据；不含 path 与 base64。"""
+    public = []
+    for item in images or []:
+        public.append({
+            "name": item.get("name") or "",
+            "mime": item.get("mime") or "",
+            "bytes": int(item.get("bytes") or 0),
+            "sha256": item.get("sha256") or "",
+            "width": item.get("width"),
+            "height": item.get("height"),
+            "label": item.get("label") or "",
+        })
+    return public
+
+
+def images_digest(images: list[dict] | None) -> str:
+    """图片集合摘要：用于判断“同一问题是否换了图”，不含像素本体。"""
+    payload = [
+        {"sha256": item.get("sha256") or "", "label": item.get("label") or ""}
+        for item in images or []
+    ]
+    return hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+
+def _payload_input(materials: str, images: list[dict] | None) -> object:
+    """文本时保持字符串；有图片时用 Responses API 的 content 块数组。"""
+    if not images:
+        return materials
+    content = [{"type": "input_text", "text": materials}]
+    for item in images:
+        content.append({"type": "input_image",
+                        "image_url": item["data_url"]})
+    return [{"role": "user", "content": content}]
+
+
 def build_payload(materials: str, *, mode: str = "CONSULT",
                   model: str = MODEL, effort: str = REASONING_EFFORT,
                   max_output_tokens: int | None = DEFAULT_MAX_OUTPUT_TOKENS,
-                  instructions: str = "") -> dict:
+                  instructions: str = "",
+                  images: list[dict] | None = None) -> dict:
     """构建 Responses API 请求体；工具字段一律不存在、推理强度固定 high。"""
     resolved_mode = normalize_mode(mode)
     validate_materials(materials, resolved_mode)
     resolved_effort = validate_effort(effort)
+    checked_images = validate_images(images)
     if not str(model or "").strip():
         raise SolUsageError("sol_model_missing", "模型 ID 为空。")
     payload = {
         "model": model,
-        "input": materials,
+        "input": _payload_input(materials, checked_images),
         "store": False,
         "stream": False,
         "tool_choice": "none",
@@ -1032,12 +1221,14 @@ def run_sol(materials: str, *, mode: str = "CONSULT", audit_log: str = "",
             max_output_tokens: int | None = DEFAULT_MAX_OUTPUT_TOKENS,
             timeout: float = DEFAULT_TIMEOUT,
             transport=None, api_key: str | None = None,
-            base_url: str | None = None, instructions: str = "") -> dict:
+            base_url: str | None = None, instructions: str = "",
+            images: list[dict] | None = None) -> dict:
     """发起一次 SOL 调用（CONSULT / PLAN / REVIEW）；任何异常都显式失败。"""
     resolved_mode = normalize_mode(mode)
     payload = build_payload(
         materials, mode=resolved_mode, model=model, effort=effort,
-        max_output_tokens=max_output_tokens, instructions=instructions)
+        max_output_tokens=max_output_tokens, instructions=instructions,
+        images=images)
     resolved_effort = str(payload["reasoning"]["effort"])
     # 无论 URL 来自环境还是显式参数，都在解析凭据与发送前做同一本机出口校验。
     base = (base_url or resolve_base_url()).rstrip("/")
@@ -1052,6 +1243,7 @@ def run_sol(materials: str, *, mode: str = "CONSULT", audit_log: str = "",
         json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
     ).hexdigest()
     started = time.monotonic()
+    public_images = image_public_metadata(images)
     audit_base = {
         "ts": _now_iso(),
         "mode": resolved_mode,
@@ -1061,6 +1253,11 @@ def run_sol(materials: str, *, mode: str = "CONSULT", audit_log: str = "",
         "materials_sha256": hashlib.sha256(
             materials.encode("utf-8")).hexdigest(),
         "materials_chars": len(materials),
+        # 只记录图片指纹与尺寸；不记录路径、base64 或像素。
+        "images": public_images,
+        "image_count": len(public_images),
+        "images_sha256": images_digest(images),
+        "input_type": "content_blocks" if public_images else "text",
         "request_sha256": body_sha,
         "zero_tool": True,
         "tools_sent": False,
@@ -1202,6 +1399,9 @@ def run_sol(materials: str, *, mode: str = "CONSULT", audit_log: str = "",
         "response_id": result_id,
         "materials_sha256": audit_base["materials_sha256"],
         "materials_chars": len(materials),
+        "images": public_images,
+        "image_count": len(public_images),
+        "images_sha256": audit_base["images_sha256"],
         "request_sha256": body_sha,
         "reply_text": text,
         "reply_sha256": text_sha,
