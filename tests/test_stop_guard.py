@@ -247,7 +247,9 @@ class ContinuationGateTests(StopGuardBase):
         proc = self.run_guard()
         self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
 
-    def test_no_session_identity_enforces_newest_task_only(self):
+    def test_no_session_identity_with_multiple_tasks_does_not_pick_one(self):
+        # 无会话标识且存在多个候选任务：不得按“最近更新”替某个会话做续跑决定，
+        # 否则会把别人的任务强制续跑到当前会话（跨会话错误绑定）。
         second = os.path.join(self.workspace, ".copilot-tasks", "t2")
         os.makedirs(second, exist_ok=True)
         state_path = os.path.join(second, "state.json")
@@ -256,9 +258,31 @@ class ContinuationGateTests(StopGuardBase):
         G.plan_state(state_path, PLAN)
         self.bind(OTHER_SESSION, second)
         proc = self.run_guard(session=None, payload={"cwd": self.workspace})
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(proc.stderr.strip(), "")
+        self.assertEqual(proc.stdout.strip(), "")
+
+    def test_no_session_identity_with_single_task_still_enforces(self):
+        # 只有一个候选任务时归属无歧义：保留强制续跑能力，不因缺标识放行。
+        proc = self.run_guard(session=None, payload={"cwd": self.workspace})
         self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
-        # 只对最近更新的任务生效，避免把工作区里所有任务一次性当成当前任务。
-        self.assertIn("1 个任务同时要求续跑", proc.stderr)
+        self.assertIn("COPILOT 续跑守卫", proc.stderr)
+        self.assertIn(self.state()["task_id"], proc.stderr)
+
+    def test_no_session_identity_with_anomaly_fails_closed(self):
+        # 多任务且无标识时虽不选任务，但状态异常仍 fail-closed（不静默放行）。
+        second = os.path.join(self.workspace, ".copilot-tasks", "t2")
+        os.makedirs(second, exist_ok=True)
+        state_path = os.path.join(second, "state.json")
+        G.start_state(state_path, goal="第二个任务", contract=CONTRACT,
+                      test_policy={"required": False}, workspace=self.workspace)
+        G.plan_state(state_path, PLAN)
+        with open(os.path.join(second, "session.json"), "w", encoding="utf-8") as fh:
+            fh.write("[]")
+        proc = self.run_guard(session=None, payload={"cwd": self.workspace})
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("fail-closed", proc.stderr)
+        self.assertIn("session.json", proc.stderr)
 
     def test_multi_workspace_isolation(self):
         other = tempfile.TemporaryDirectory()
@@ -802,9 +826,10 @@ class UserPromptHookTests(StopGuardBase):
     """UserPromptSubmit：用户每回合带进新授权时重新提示未闭合任务。"""
 
     def run_prompt(self, *, payload: dict | None = None,
-                   text: str | None = None, env: dict | None = None):
+                   text: str | None = None, env: dict | None = None,
+                   session: str | None = SESSION):
         return self.run_guard(args=["user-prompt"], payload=payload,
-                              text=text, env=env)
+                              text=text, env=env, session=session)
 
     def injected(self, proc) -> str:
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
@@ -829,6 +854,63 @@ class UserPromptHookTests(StopGuardBase):
         self.assertIn("等待官方答复", text)
         self.assertIn("官方工单回复", text)
         self.assertIn("A1", text)
+
+    def test_foreign_task_is_not_expanded_per_turn(self):
+        # 任务绑定 SESSION；当前会话是 OTHER_SESSION。逐回合提示不得展开（也不重复披露）
+        # 别的会话的旧任务——现场由 SessionStart 指针披露一次。
+        G.add_block(self.state_path, "等待官方答复", "官方工单回复",
+                    work_items=["A1"], criteria=["C1"])
+        proc = self.run_prompt(
+            payload={"cwd": self.workspace, "session_id": OTHER_SESSION,
+                     "prompt": "你好"},
+            session=OTHER_SESSION)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "")
+
+    def test_own_task_suppresses_foreign_detail(self):
+        # 本会话有任务时只展开本会话的，其它任务给一行计数，不展开原因。
+        other_task = os.path.join(self.workspace, ".copilot-tasks", "t2")
+        os.makedirs(other_task, exist_ok=True)
+        other_state = os.path.join(other_task, "state.json")
+        G.start_state(other_state, goal="别人的任务", contract=CONTRACT,
+                      test_policy={"required": False}, workspace=self.workspace)
+        G.plan_state(other_state, PLAN)
+        self.bind(OTHER_SESSION, task_dir=other_task)
+        G.add_block(other_state, "别人的阻塞原因", "别人的条件",
+                    work_items=["A1"], criteria=["C1"])
+        text = self.injected(self.run_prompt())
+        self.assertIn(self.state()["task_id"], text)
+        self.assertIn("归属其它会话或未绑定会话", text)
+        self.assertNotIn("别人的阻塞原因", text)
+
+    def test_missing_session_id_still_points_at_single_task(self):
+        # 宿主没给会话标识且只有一个候选任务：归属无歧义，不能整块静默。
+        text = self.injected(self.run_prompt(payload={"cwd": self.workspace},
+                                            session=None))
+        self.assertIn("<copilot-task-pointer>", text)
+        self.assertIn(self.state()["task_id"], text)
+
+    def test_missing_session_id_with_multiple_tasks_reports_ambiguity(self):
+        # 无会话标识 + 多个候选任务：只报数量，不展开任一个任务的细节（也不挑最近的），
+        # 避免把别的会话的任务当成本会话的来恢复。
+        other_task = os.path.join(self.workspace, ".copilot-tasks", "t2")
+        os.makedirs(other_task, exist_ok=True)
+        other_state = os.path.join(other_task, "state.json")
+        G.start_state(other_state, goal="别人的任务", contract=CONTRACT,
+                      test_policy={"required": False}, workspace=self.workspace)
+        G.plan_state(other_state, PLAN)
+        self.bind(OTHER_SESSION, task_dir=other_task)
+        G.add_block(other_state, "别人的阻塞原因", "别人的条件",
+                    work_items=["A1"], criteria=["C1"])
+        other_id = G.load_state(other_state)["task_id"]
+        text = self.injected(self.run_prompt(payload={"cwd": self.workspace},
+                                            session=None))
+        self.assertIn("<copilot-task-pointer>", text)
+        self.assertIn("无法判定归属", text)
+        self.assertIn("2 个未闭合任务", text)
+        self.assertNotIn(self.state()["task_id"], text)
+        self.assertNotIn(other_id, text)
+        self.assertNotIn("别人的阻塞原因", text)
 
     def test_no_open_task_does_not_inject(self):
         state = self.state()

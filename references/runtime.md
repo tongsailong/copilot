@@ -187,7 +187,8 @@ BLOCKED/PASS 规避上限、以及新回合先 `status --json` 核实再继续�
 **归属**：Copilot CLI 会改写状态的命令把 `ZCODE_SESSION_ID` 追加到任务目录 `session.json`
 （最多保留 20 个会话，只读命令不写）。守卫只拦截本会话绑定过的任务；其它会话、其它工作区、
 未绑定的旧任务都不拦截——不用时间过期，因此不会因为人为时间上限放弃仍有可执行工作的任务。
-没有会话标识（手工调用）时只对最近更新的一个任务生效，避免一次性误拦全部历史任务。
+没有会话标识（手工调用）时只有恰好一个候选任务才生效；有多个候选时不按“最近更新”替会话
+选任务，只记 `ambiguous-no-session` 并放行，避免把别人的任务强制续跑。
 
 **放行**：无任务、CLOSED、BLOCKED/`wait`、`stop_guard=false`、任务或工作区目录
 `.stop-guard-off`、`COPILOT_STOP_GUARD=0`、`disable --state <state> --reason "<原因>"`（用户
@@ -210,11 +211,17 @@ BLOCKED/PASS 规避上限、以及新回合先 `status --json` 核实再继续�
 - 它不写 state/session、不消费 Stop 次数；无未闭合任务、文件损坏或输入非法时一律静默
   退出 0（fail-open），不阻断会话启动。
 
-**用户回合提示（`UserPromptSubmit`）**：`copilot_stop_guard.py user-prompt` 只读列出工作区
-未闭合任务（含 BLOCKED 的 `reason`/`needs`）与判断规则：用户本回合补齐授权/决策/条件时，
-先用其原话 `unblock --by user --quote "<原话>"`（或补齐条件），再 `drive` 继续执行；
+**用户回合提示（`UserPromptSubmit`）**：`copilot_stop_guard.py user-prompt` 只读列出**本会话
+负责**的未闭合任务（含 BLOCKED 的 `reason`/`needs`）与判断规则：用户本回合补齐授权/决策/
+条件时，先用其原话 `unblock --by user --quote "<原话>"`（或补齐条件），再 `drive` 继续执行；
 用户没有补齐时不要恢复执行；本提示不是用户新指令，也不构成授权；先 `status --json`
-核对阶段与证据，工作项被其它会话领取时避免并发重复。没有未闭合任务时不注入。
+核对阶段与证据，工作项被其它会话领取时避免并发重复。
+
+其它会话或未绑定会话的旧任务不逐回合展开，也不重复披露（现场与阻塞原因由 `SessionStart`
+指针披露一次）；本会话另有任务时它们只占一行计数。否则一条无关消息也会带上别处旧任务的
+全部细节。归属无法确认（`session.json` 损坏，Stop 会 fail-closed 拦截）的任务仍逐回合提示；
+宿主未给会话标识时只有恰好一个候选任务才展开，多个候选只报数量并提示先 `status --json`
+核对（与 Stop 同一口径：不按“最近更新”替会话选任务）。没有本会话任务时整个块不注入。
 
 `install` 同时写入 `Stop`、`SessionStart`（matcher `startup|resume|compact`）与
 `UserPromptSubmit` 三个事件，`uninstall` 一并移除。
