@@ -52,7 +52,7 @@ import review_policy as RP  # noqa: E402
 import cognition_call as CC  # noqa: E402
 import cognition_schedule as SCH  # noqa: E402
 
-__version__ = "9.10.0"
+__version__ = "9.11.0"
 
 
 class CLIError(Exception):
@@ -249,11 +249,47 @@ DEFAULT_POLICY = "auto"
 # 纯登记/报告/查询命令的默认：只物化义务并给建议，绝不隐式发起付费调用。
 # 生命周期命令（start / drive / plan / closure / cognition-schedule --execute）仍默认 auto。
 REGISTRATION_POLICY = "advise"
+# 可以在本命令内真正消费一条义务的命令：它们都改变任务的生命周期事实（计划登记、
+# 工作项回填、条件核销、重试、解除阻塞、重开、收口、驱动）。纯记录命令
+# （judgment / evidence / report / accept / decide / finding / contract 等）不属于
+# 调度点：写日志不应顺带产生费用，只有命令行显式 `--cognition auto` 才执行。
+DISPATCH_COMMANDS = frozenset({
+    "start", "plan", "record", "rerun", "criterion", "unblock", "reopen",
+    "closure", "cognition-schedule", "drive",
+})
 
 
-def _cognition_policy(args) -> str:
-    raw = str(getattr(args, "cognition", "") or os.environ.get("COPILOT_COGNITION")
-              or getattr(args, "cognition_default", "") or DEFAULT_POLICY)
+def _task_policy(state: dict | None) -> str:
+    """任务**最近一次记录的**调度策略；没有记录时返回空串。
+
+    这是“认知策略随任务生效”的唯一读取口径：`start` 时记录的策略（默认 auto）
+    对同一任务的后续命令持续有效，因此不需要在每条命令上重复 `--cognition
+    auto`，显式 `off` 也能对整条任务生效。当前周期还没有快照时回退到更早周期
+    （重开后第一条命令不应把上一周期声明的策略丢掉）；更早周期同样没有记录时
+    返回空串，由命令自身的默认值决定，不推断历史。
+    """
+    if not isinstance(state, dict):
+        return ""
+    schedule = SCH.schedule_view(state)
+    if not isinstance(schedule, dict):
+        return ""
+    for cycle in range(SCH.current_cycle(state), 0, -1):
+        snapshot = SCH.policy_snapshot(schedule, cycle)
+        value = str(snapshot.get("value") or "").strip().lower()
+        if value in POLICIES:
+            return value
+    return ""
+
+
+def _cognition_policy(args, state: dict | None = None) -> str:
+    raw = str(getattr(args, "cognition", "") or "")
+    if not raw.strip():
+        env = str(os.environ.get("COPILOT_COGNITION") or "")
+        default = str(getattr(args, "cognition_default", "") or DEFAULT_POLICY)
+        # 任务策略随任务生效：显式参数 > 环境变量 > 任务策略 > 命令默认。这样
+        # “自动调度”在 `start` 时决定一次即可，不需要在每条回填命令上重复人工
+        # 开关；显式 off/advise 仍然对整条任务有效。
+        raw = env or _task_policy(state) or default
     value = raw.strip().lower()
     normalized = POLICY_ALIASES.get(value, "")
     if normalized not in POLICIES:
@@ -264,13 +300,17 @@ def _cognition_policy(args) -> str:
     return normalized
 
 
-def _cognition_policy_explicit(args) -> bool:
-    """命令行是否显式给出认知调用策略。
+def _auto_dispatch(args) -> bool:
+    """本命令是否可以自动消费一条义务（仍需有效策略为 auto）。
 
-    纯登记/报告/合同命令的自动执行只认命令行显式 `auto`：环境变量或默认值只能
-    影响建议展示，不能让一条回填命令隐式发起付费调用。
+    两条明确边界：
+    - 命令行显式给了 `--cognition`：尊重调用方（显式 auto 在任何命令上都执行）。
+    - 否则只有生命周期命令是调度点；纯记录命令只物化义务、给可执行命令，绝不
+      因为环境变量或任务默认而在“写日志”时隐式产生费用。
     """
-    return bool(str(getattr(args, "cognition", "") or "").strip())
+    if str(getattr(args, "cognition", "") or "").strip():
+        return True
+    return str(getattr(args, "command", "") or "") in DISPATCH_COMMANDS
 
 
 def _auto_execution_allowed() -> bool:
@@ -399,10 +439,15 @@ def _execute_obligation(path: str, obligation: dict) -> int:
 
 
 def _cognition_schedule_step(path: str, args, *, gates_passed: bool = False,
-                       execute: bool = True, prefer_family: str = "",
+                       execute: bool | None = None, prefer_family: str = "",
                        closure_ready: dict | None = None,
-                       cache: dict | None = None) -> dict:
+                       cache: dict | None = None,
+                       origin: str = "") -> dict:
     """生命周期命令的统一调度步：物化义务 → 显示 →（auto 时）有界执行 1 个。
+
+    `execute=None` 时按命令类型判定（`_auto_dispatch`）：生命周期命令是调度点，
+    纯记录命令只给建议。显式传入布尔值只用于调用方确有独立根据的场景（如
+    `cognition-schedule --execute`）。
 
     `closure_ready` 是 E 阶段（收口 CONSULT）的唯一准入事实，这里只算一次并原样
     交给建议层：最后一个工作项关闭不等于最终工程验证完成，因此不能由工作项耗尽
@@ -411,8 +456,11 @@ def _cognition_schedule_step(path: str, args, *, gates_passed: bool = False,
     `prefer_family` 用于收口：收口前的认知窗口是 E（收口综合判断），不能被更早
     的未执行窗口挤掉；更早的窗口仍按窗口事实记为漏调。
     """
-    policy = _cognition_policy(args)
     state = G.load_state(path)
+    policy = _cognition_policy(args, state)
+    if execute is None:
+        execute = _auto_dispatch(args)
+    origin = origin or str(getattr(args, "command", "") or "")
     if bool((state.get("closure") or {}).get("closed")):
         return {"policy": policy, "closed": True, "executed": "", "state": state}
     readiness = closure_ready if isinstance(closure_ready, dict) \
@@ -420,7 +468,8 @@ def _cognition_schedule_step(path: str, args, *, gates_passed: bool = False,
     advice = G.cognition_advice_summary(state, gates_passed=gates_passed,
                                   closure_ready=readiness, cache=cache)
     synced = G.sync_cognition_schedule(state, advice=advice, policy=policy,
-                                auto_execution=_auto_execution_allowed())
+                                auto_execution=_auto_execution_allowed(),
+                                origin=origin)
     if synced["changes"]:
         G.save_state(path, state)
     due = SCH.due_obligations(state)
@@ -485,13 +534,12 @@ def _print_continuation(path: str, args=None) -> int:
     """
     cache: dict = {}
     if args is not None:
-        # 调度步放在续跑判定之前：先给出（或执行完）当前的认知窗口。纯登记/
-        # 报告命令只在命令行显式 `--cognition auto` 时才真正付费执行；环境变量
-        # 与默认策略只影响建议展示。同一个 cache 让调度步与求值共用同一条命令
-        # 内已经算出的验收事实（证据摘要、质量结论），不重复扫描。
-        step = _cognition_schedule_step(path, args,
-                                        execute=_cognition_policy_explicit(args),
-                                        cache=cache)
+        # 调度步放在续跑判定之前：先给出（或执行完）当前的认知窗口。是否真的
+        # 付费由“有效策略 + 本命令是否为调度点”共同决定：生命周期命令（计划、
+        # 回填、核销、重开、收口）按任务策略执行；纯记录命令只在显式
+        # `--cognition auto` 时执行。同一个 cache 让调度步与求值共用同一条
+        # 命令内已经算出的验收事实（证据摘要、质量结论），不重复扫描。
+        step = _cognition_schedule_step(path, args, cache=cache)
     state = step.get("state") if isinstance(step, dict) and \
         isinstance(step.get("state"), dict) else G.load_state(path)
     ev = G.evaluate(state, cache=cache)
@@ -665,8 +713,8 @@ def cmd_judgment(args) -> int:
         _state_path(args), args.status, args.summary,
         evidence_ids=_evidence_ids(args.evidence))
     print(f"判断已记录：{entry['judgment_id']}（{entry['status']}）")
-    _cognition_schedule_step(_state_path(args), args,
-                       execute=_cognition_policy_explicit(args))
+    # 判断只是审计记录，不是调度点：只有显式 `--cognition auto` 才消费义务。
+    _cognition_schedule_step(_state_path(args), args)
     return 0
 
 
@@ -1834,8 +1882,9 @@ def cmd_cognition_schedule(args) -> int:
     state = G.load_state(path)
     advice = G.cognition_advice_summary(state)
     synced = G.sync_cognition_schedule(state, advice=advice,
-                                 policy=_cognition_policy(args),
-                                 auto_execution=_auto_execution_allowed())
+                                 policy=_cognition_policy(args, state),
+                                 auto_execution=_auto_execution_allowed(),
+                                 origin="cognition-schedule")
     if args.execute:
         # 显式执行：先落盘义务事实，再执行一个（有界），便于脚本按需推进。
         if synced["changes"]:
@@ -1971,8 +2020,7 @@ def cmd_closure(args) -> int:
                   "再执行 closure --close；收口 CONSULT 会在验证完成后自动调度。")
             return 1
         step = _cognition_schedule_step(path, args, gates_passed=True,
-                                        execute=(_cognition_policy(args) == "auto"),
-                                        prefer_family="E",
+                                        prefer_family="E", origin="closure",
                                         closure_ready=readiness, cache=cache)
         # 认知收口判断只是 advisory：采纳与否属于可选审计事实（accepted /
         # modified / rejected），不是工程验收的一部分。这里只提示，不等待。
@@ -1993,7 +2041,7 @@ def cmd_closure(args) -> int:
             print("不登记采纳不影响收口：G1–G3 只由工程事实判定。")
     closure = G.close_task(path, by=args.by, cache=cache,
                            cognition_entry="closure-command",
-                           cognition_policy=_cognition_policy(args),
+                           cognition_policy=_cognition_policy(args, state),
                            cognition_auto=_auto_execution_allowed())
     quality = closure.get("quality") or {}
     print(f"任务已收口：verdict={closure['verdict']} "

@@ -6,9 +6,9 @@
 > 旧名只作事实与审计记录，不代表当前角色、模型、命令或默认配置。
 
 更新：2026-11-25 CST。本文件只记录现场可核实的事实；规划与未完成事项单独标注。
-当前版本：v9.10.0（认知命名收敛与 SOL 退役，已交付 `main`）；v9.9.0（Astra
-默认认知引擎迁移与调用效率优化，已交付 `main`）；v9.8.0 多模态设计认知、v9.7.1 及更早的
-治理记录见下。基线以本次交付的最终提交与运行时核验为准。
+当前版本：v9.11.0（认知自动调度与调用率优化，**工作区，未提交**）；v9.10.0（认知命名收敛与
+SOL 退役，已交付 `main`）；v9.9.0（Astra 默认认知引擎迁移与调用效率优化，已交付 `main`）；
+v9.8.0 多模态设计认知、v9.7.1 及更早的治理记录见下。基线以本次交付的最终提交与运行时核验为准。
 任务 `sol-cognition-governance-p1p3-2026-11-23` 经用户授权一次性 `reopen` 后，已于
 `2026-11-24T07:40:07` 在**最终代码**上重新收口 **CLOSED / PASS**（周期 2，G1–G3 全 PASS）。
 
@@ -16,6 +16,67 @@
 经 PR #9 合并为 `b83cf33`；CI Python 3.10 / 3.12 各 956 项 OK、`--verify-baseline` 通过；
 main 三方（本地 / `origin/main` / `ls-remote`）同为 `b83cf33`（0/0），工作区干净；
 运行时 `--check` 缺失 0 / 不同 0，27 个受管理文件源码与运行时 SHA-256 全部一致。
+
+## 认知自动调度与调用率优化（2026-11-25，v9.11.0，未提交）
+
+依据：用户《Copilot 专项升级：优化 Astra 默认认知大脑的自动调度与实际调用率》。
+任务 `astra-scheduling-upgrade-2026-11-25`（`task-8b5bd5cefba13da0`）。
+**未 commit / push / PR / Tag / Release**（用户明确禁止），改动只在工作区与运行时。
+
+**根因（现场证据）**：Astra 早已是默认模型，但调用链有三道互相独立的闸门——复杂度按
+`task_kind` 短名单判定、策略默认 `advise`、执行只认命令行显式 `--cognition auto`。任一为否
+就不发请求。历史任务数据：41 份策略快照 `off` 23 / `advise` 2 / `auto` 16；88 个任务共 318 条
+义务，只对应 144 次完成调用，大量义务收口时仍为 `due`（如 `open-source-ci-20261121`：
+calls=3、obligations=40，其中 satisfied 3 / skipped 35 / due 2）。那次全局 `AGENTS.md`
+架构评审**根本没有进入 Copilot 状态机**（`.copilot-tasks` 无对应任务目录，
+`~/.zcode/copilot-runs` 最新为 11-22），因此既无复杂度判定、也无义务、无调度点——零调用是
+结构性缺失，不是判断错误。
+
+**本轮改动（源码 + 运行时已同步）**：
+
+- `review_policy.task_complexity` 新增 `high-impact-scope` 信号：目标/条件/边界文字命中治理、
+  规则、架构、协作、门禁类短语（或跨 ≥2 组词元）即升 medium，与 `task_kind` 解耦；`docs` /
+  `mechanical` 不再被文件类型跳过，纯文档错别字类任务仍为 low / 零调用。
+- 策略随任务生效：命令行显式 `--cognition` > `COPILOT_COGNITION` > 任务快照（按周期回退）>
+  命令默认；`start` 记录的 `auto` 对整条任务持续有效，`start --cognition off` 让任务（含
+  `drive`）保持离线。`COPILOT_COGNITION_AUTO` 只放开执行闸门，不改变策略级别。
+- 调度点边界 `DISPATCH_COMMANDS`：生命周期命令（`start`/`plan`/`record`/`rerun`/`criterion`/
+  `unblock`/`reopen`/`closure`/`drive`）执行至多 1 条义务；纯记录命令只物化窗口并打印命令。
+- 义务记录 `opened_by`；`cognition-stats` 增加 `lifecycle`（triggered / invoked / succeeded /
+  failed / failed_before_request / skipped / missed / deferred + `skip_reasons` +
+  `missed_by_origin`），`--workspace` 跨任务聚合。
+- 缺陷修复：`_advance_windows` 以前静默关闭窗口、不返回变更，`sync()` 在 `changes` 为空时不
+  落盘，漏调事实会随内存副本丢失；现在返回变更串并计入 `changes`。
+
+**验证**：活动测试 `1072 OK`（新增 `tests/test_cognition_auto_dispatch.py` 11 项：内容复杂度
+3、任务级策略 2、生命周期观测 4、失败不阻断 1、CLI 暴露 1）；legacy `853` 项失败集合与
+HEAD `2633252` 的 worktree 运行**逐条相同**（146 = 99 failures + 47 errors，32 skipped），
+无新增回归。运行时 `--apply` 后 `--check` 缺失 0 / 不同 0，`--verify-baseline` 通过（27 个
+Git 跟踪文件）。
+
+**真实 Astra 调用（2 次，均由调度窗口发起）**：
+
+- 启动窗口 `SC7d3fd8cba8b9dce456d476b2`（`gpt-6.2-astra`、provider `codex`、
+  `reasoning.effort=high`、`mode=standard`、零工具、单轮），latency 64,482 ms，
+  tokens 3,720 in + 1,911 out = 5,631。
+- 收口窗口 `SC9bc509840ef1af986751b9b9`（同模型/同推理级别/零工具），latency 39,323 ms，
+  tokens 6,257；收口判断把结论限定为“正常承接后的默认调度机制已具备”，并保留“真实架构评审
+  本身未进入状态机”的限制。
+
+两次都是单请求、无重试、无换模型/Provider。收口后 `cognition-accept` 被拒绝（任务已 CLOSED，
+需用户授权 reopen），因此收口采纳仍为未登记的可选审计事实，不阻断开闭。
+
+**本任务自身的生命周期口径**（`cognition-stats`）：triggered 3 / invoked 2 / succeeded 2 /
+skipped 1（`closure-covered`，B 规划窗口被 E 收口判断覆盖）/ failed 0 / missed 0 /
+deferred 0——即“窗口被更晚判断覆盖”与“漏调”不再混为一谈。
+
+**收口**：`closure --close` G1–G3 全 PASS，`verdict=pass`，`phase=CLOSED`
+（任务 `task-8b5bd5cefba13da0`，6 工作项终态、7 条件 met、证据 E1–E6）。
+
+**未验证 / 未完成**：本轮改动未提交，因此 `main` 仍为 `2633252`；未在真实 GUI 会话里跑完整
+`drive` 链路（0 调用路径用 CLI 与夹具覆盖）；“架构评审自动获得调用”仍需在下一次真实评审中
+把宿主承接事实与适用窗口对应起来验证。
+
 
 ## 架构轻量化（2026-11-25，v9.10.0 工作区，未提交）
 

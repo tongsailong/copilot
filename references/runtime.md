@@ -302,15 +302,22 @@ instance、`contract_sha256`、`level`、`status`、`window`。`status` 取值 `
 
 **有界执行**
 
-- 执行点：`start` / `plan` / `record` / `rerun` / `criterion` / `judgment` / `evidence` /
-  `report` / `accept` / `decide` / `block` / `unblock` 与 `drive` 的调度步
-  （`_cognition_schedule_step`），以及 `closure --close` 与 `cognition-schedule --execute`。
+- **调度点（v9.11.0）**：`start` / `plan` / `record` / `rerun` / `criterion` / `unblock` /
+  `reopen` / `closure` 与 `drive` 的调度步（`_cognition_schedule_step`）属于生命周期命令，
+  省略 `--cognition` 时按任务策略判定并执行到期义务（最多 1 条）。
+- **纯记录命令不隐式付费**：`judgment` / `evidence` / `report` / `accept` / `decide` /
+  `block` / `finding` / `contract` 仍会物化窗口并打印可执行命令，但只有命令行显式
+  `--cognition auto` 才真的调用模型；环境变量或任务策略的 `auto` 不使这些命令付费。
+- **策略随任务生效（v9.11.0）**：优先级为命令行显式 `--cognition` > 环境变量
+  `COPILOT_COGNITION` > 任务策略快照（`start` 写入，默认 `auto`，按周期回退读取）>
+  命令默认（生命周期命令 `auto`，其余 `advise`）。因此 `start` 记录后无需逐条命令重复
+  `--cognition auto`；`start --cognition off` 对整条任务（含 `drive`）持续生效。
 - **上限 1 个义务 / 1 次请求 per 命令**：不存在每任务固定次数上限，也不自动重试；剩余
   窗口留给下一条命令（`continuation` 仍要求继续，因此驱动链会自然走到）。
-- 策略 `--cognition auto|advise|off`（默认 `auto`）：`auto` 直接经既有认知通道执行到期义务；
-  `advise` 只打印可直接执行的命令与义务 id；`off` 静默。环境变量 `COPILOT_COGNITION_AUTO`
-  可覆盖：`off` 强制离线，`on` 允许执行；测试进程（`unittest` 已加载）默认不执行，只有
-  显式 `on` 的调度测试才走真实通道。
+- `--cognition auto|advise|off`：`auto` 直接经既有认知通道执行到期义务；`advise` 只打印
+  可直接执行的命令与义务 id；`off` 静默。环境变量 `COPILOT_COGNITION_AUTO` 只控制
+  **是否允许执行**（`off` 强制离线、`on` 允许），不改变策略级别；测试进程（`unittest`
+  已加载）默认不执行，只有显式 `on` 的调度测试才走真实通道。
 - **只读命令永不执行**：`next` / `status` / `cognition-schedule` / `cognition-stats` / `closure-check`
   只物化并展示义务，不写 state、不发请求。
 - **可执行命令只有一个来源**：`cognition-schedule` 与调度步输出的命令带真实状态路径与
@@ -383,6 +390,15 @@ instance、`contract_sha256`、`level`、`status`、`window`。`status` 取值 `
 计数，执行/复用计入分子，合理跳过不进入分母，漏调单列。打印命令、预检通过与模拟响应
 都不算执行。分母为 0 时 `rate` 输出 `null`（不是 100%），任务级 `not_registered`
 表示“应当登记却没有义务记录”。
+
+**生命周期观测（v9.11.0）**：`task_stats()` / `stats()` 额外输出 `lifecycle`，按
+triggered（条件成立）/ invoked（真正发起请求）/ succeeded / failed（含
+failed_before_request）/ skipped / missed / deferred 归类同一批义务，并给出
+`skip_reasons`（按 `skip_by` 或 `skip_reason`）与 `missed_by_origin`（按义务
+`opened_by` 记录的调度点归因）。`--workspace` 汇总时这些计数跨任务相加、原因字典合并
+排序。它解释“为什么没有调用”，不参与覆盖率分母，也不是门禁。义务同时记录 `opened_by`
+（`start` / `plan` / `record` / `drive` / `closure` …），便于定位是哪条生命周期命令
+开了窗口却没有走到执行。
 
 ## 6. 收口与重开
 
