@@ -343,6 +343,7 @@ class SolSingleRoundKeyTests(Base):
 
     def test_force_overrides_same_materials_reuse(self):
         state = {"sol_calls": [{"status": "completed", "mode": "REVIEW",
+                                "model": SR.DEFAULT_MODEL,
                                 "materials_sha256": "a" * 64}]}
         self.assertEqual(SR.single_round_decision(
             state, "a" * 64, mode="REVIEW")["action"], "reuse")

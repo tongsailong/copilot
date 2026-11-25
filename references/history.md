@@ -18,6 +18,26 @@
 
 <!-- v9.5.0–v9.7.1 条目于 2026-11-24 从 SKILL.md 版本段迁入，正文未改写；SKILL.md 只保留当前版本与跨版本不变量。 -->
 
+## v9.9.0（Astra 默认认知引擎迁移与调用效率优化，2026-11-25）
+
+- **默认模型迁移**：所有认知入口（CONSULT / PLAN / 事件再咨询 / 收口判断 / THINK 别名）默认
+  `gpt-6.2-astra`（`codex`、high、standard、Responses API、零工具单轮）。`gpt-6.2-sol` 只作
+  显式兼容（`--model gpt-6.2-sol`），不自动回退、不在失败后切换；历史 SOL 记录、审计与历史
+  文档只读保留。模型 ID 仍只存在于 `sol_review.py`。
+- **模型身份入账与复用门**：记录/失败/审计/请求摘要带 `provider`、`model_key`
+  （`codex:<model>`）；复用只命中同模型记录，缺模型归属的历史记录不被当成新模型响应。
+- **退避按模型隔离**：`state["model_backoff"]`（`copilot-model-backoff/v2`），键
+  `provider + model + error_class`；服务端 `Retry-After` 逐模型独立遵守，成功只清本模型。
+  旧 `state["sol_backoff"]` 单例只读兼容，不继承给 Astra：SOL 过载不冻结 Astra，Astra 过载
+  也不阻塞显式 SOL 调用。
+- **调用语义分离**：纯登记/报告/合同命令默认 `advise`，自动执行只认命令行显式
+  `--cognition auto` / `--sol auto`；修掉 `judgment` 无 `--sol` 时默认真发 CONSULT 的路径。
+  `start` / `closure` / `drive` 保持默认 `auto`。
+- **复用与指标**：复用键含 `task_id` + 归一化上下文 + 模型 + 提示词版本；命中写
+  `sol_reuses`；`sol-stats` 增加 `by_model`（Token、耗时、重复调用）与 `reuse`。
+- **完整性**：`incomplete` / `max_output_tokens` / 空文本仍记为失败；24000 输出预算与 300 s
+  超时不变。未改 CPA 配置、OAuth、Provider 或模型路由。
+
 ## v9.7.1（认知记录与义务处置的终态闭环）
 
 - **历史采纳只补可证明的结论**：`sol-accept --historical` 只为**已收口**任务开放，`pending`

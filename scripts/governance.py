@@ -4269,12 +4269,22 @@ def review_admission(state: dict, *, triggers: list[str] | None = None,
 # ── SOL 调用记录：单一权威流 `sol_calls` + 历史只读兼容 ──────────────────────
 SOL_CALLS_KEY = "sol_calls"
 LEGACY_SOL_KEYS = ("sol_reviews", "sol_advisories")
-# 上游退避状态：唯一用途是"已知上游要求等待时不再发新请求"，不是门禁、不是
-# 阶段，也不改变生命周期；到期即失效，成功调用即清除。
+# 复用命中登记：只用于观测“避免了多少重复付费”，不是调用记录、不进门禁，
+# 也不影响复用判定本身（判定只看主体摘要与模型）。
+SOL_REUSES_KEY = "sol_reuses"
+SOL_REUSE_LIMIT = 200
+# ── 模型级退避状态：窗口按 provider:model 隔离 ──────────────────────────────
+# 单一用途不变：已知上游要求等待时不再发新请求；不是门禁、不是阶段。
+# 与 v9.8 的区别是**维度**：窗口按 `provider:model` 各自保存，一个模型的过载
+# 不能冻结另一个模型（SOL 502 不得阻断 Astra，反之亦然）。
+MODEL_BACKOFF_KEY = "model_backoff"
+MODEL_BACKOFF_SCHEMA = "copilot-model-backoff/v2"
+# 历史单例键（v9.8 及更早）：只读兼容。旧记录没有模型维度，只属于历史默认
+# 模型空间，**不继承**为新默认模型的退避状态。
 SOL_BACKOFF_KEY = "sol_backoff"
 SOL_BACKOFF_SCHEMA = "copilot-sol-backoff/v1"
 # 上限**只作用于本地计算的退避**（无有效 Retry-After 时的兜底窗口），用于防止本地
-# 策略把 SOL 长期冻结。服务端明确给出的 Retry-After 是最短等待时间，必须原样遵守，
+# 策略把模型长期冻结。服务端明确给出的 Retry-After 是最短等待时间，必须原样遵守，
 # 不被这个上限、也不被环境变量缩短。
 # 环境变量只能调低本地上限，不能调高，也不能关闭退避。
 SOL_BACKOFF_MAX_SECONDS = 1800.0
@@ -4319,7 +4329,11 @@ def _sol_backoff_max_seconds() -> float:
 
 
 def _sol_backoff_from_failure(record: dict) -> dict | None:
-    """由失败事实推导退避窗口；不适用时返回 None（不写状态）。"""
+    """由失败事实推导退避窗口；不适用时返回 None（不写状态）。
+
+    窗口自带 `provider` / `model` / `model_key`：退避按模型隔离，调用方无须再
+    从别处推断这次等待属于哪个模型。
+    """
     error_class = str(record.get("error_class") or "")
     retry_after = record.get("retry_after")
     hint = round(float(retry_after), 1) if isinstance(retry_after, (int, float)) \
@@ -4339,8 +4353,10 @@ def _sol_backoff_from_failure(record: dict) -> dict | None:
         return None
     created = datetime.now().astimezone()
     until = created + timedelta(seconds=seconds)
+    provider = str(record.get("provider") or "")
+    model = str(record.get("model") or "")
     return {
-        "schema": SOL_BACKOFF_SCHEMA,
+        "schema": MODEL_BACKOFF_SCHEMA,
         "at": created.isoformat(timespec="seconds"),
         "until": until.isoformat(timespec="seconds"),
         "seconds": round(seconds, 1),
@@ -4350,22 +4366,62 @@ def _sol_backoff_from_failure(record: dict) -> dict | None:
         "retry_after": hint or None,
         "retry_after_raw": str(record.get("retry_after_raw") or "")[:120],
         "call_id": str(record.get("call_id") or ""),
-        "note": "上游要求等待：窗口内不发送新请求（不重试、不换 Provider、不改阶段）。",
+        "provider": provider,
+        "model": model,
+        "model_key": (str(record.get("model_key") or "")
+                      or (f"{provider}:{model}" if provider and model else "")),
+        "note": "上游要求等待：窗口内不发送该模型的新请求（不重试、不换 Provider、不改阶段）。",
     }
 
 
-def sol_backoff_status(state: dict, *, now: object = None) -> dict:
-    """只读：当前是否处于上游退避窗口。损坏的记录按失效处理但不静默丢弃。"""
+def _model_backoff_store(state: dict) -> dict:
+    """读取/初始化模型退避表；损坏结构按空表处理（不静默改历史）。"""
+    raw = state.get(MODEL_BACKOFF_KEY)
+    windows: dict = {}
+    if isinstance(raw, dict) and isinstance(raw.get("windows"), dict):
+        windows = {str(key): value for key, value in raw["windows"].items()
+                   if isinstance(value, dict)}
+    return {"schema": MODEL_BACKOFF_SCHEMA, "windows": windows}
+
+
+def store_model_backoff(state: dict, window: dict) -> str:
+    """把窗口写入对应模型槽位；返回写入的 `provider:model` 键（无模型时为 ''）。"""
+    key = str(window.get("model_key") or "")
+    if not key:
+        return ""
+    store = _model_backoff_store(state)
+    slots = store["windows"].setdefault(key, {})
+    error_class = str(window.get("error_class") or "-")
+    previous = slots.get(error_class)
+    # 同分类重复失败取更晚的 until：绝不缩短服务端已经要求过的等待。
+    if isinstance(previous, dict):
+        prev_until = _parse_time(previous.get("until"))
+        new_until = _parse_time(window.get("until"))
+        if prev_until is not None and new_until is not None \
+                and new_until <= prev_until:
+            return key
+    slots[error_class] = window
+    state[MODEL_BACKOFF_KEY] = store
+    return key
+
+
+def _legacy_backoff(state: dict) -> dict | None:
+    """历史单例窗口（v9.8 及更早）：只读兼容，不继承给新默认模型。"""
     raw = state.get(SOL_BACKOFF_KEY)
-    base = {"active": False, "until": "", "remaining_seconds": 0.0,
-            "reason": "", "error_class": "", "invalid": False}
     if not isinstance(raw, dict) or not raw.get("until"):
-        return base
+        return None
+    return dict(raw)
+
+
+def _window_status(raw: dict, current: datetime, *, model: str = "") -> dict:
+    base = {"active": False, "until": str(raw.get("until") or ""),
+            "remaining_seconds": 0.0, "reason": "invalid",
+            "error_class": str(raw.get("error_class") or ""),
+            "invalid": True, "model": model,
+            "provider": str(raw.get("provider") or "")}
     until = _parse_time(raw.get("until"))
-    current = _parse_time(now) if now is not None else datetime.now().astimezone()
     if until is None or current is None:
-        return {**base, "invalid": True, "until": str(raw.get("until") or ""),
-                "reason": str(raw.get("reason") or "")}
+        return base
     if until.tzinfo is None and current.tzinfo is not None:
         until = until.replace(tzinfo=current.tzinfo)
     elif current.tzinfo is None and until.tzinfo is not None:
@@ -4376,12 +4432,67 @@ def sol_backoff_status(state: dict, *, now: object = None) -> dict:
             "remaining_seconds": max(remaining, 0.0),
             "reason": str(raw.get("reason") or ""),
             "error_class": str(raw.get("error_class") or ""),
-            "invalid": False}
+            "invalid": False, "model": model,
+            "provider": str(raw.get("provider") or "")}
 
 
-def clear_sol_backoff(path: str, *, reason: str = "sol_call_completed") -> bool:
-    """清除退避窗口（成功调用或用户显式继续时）。返回是否真的清除了记录。"""
+def sol_backoff_status(state: dict, *, model: str = "",
+                       include_legacy: bool = False,
+                       now: object = None) -> dict:
+    """只读：该模型当前是否处于上游退避窗口。
+
+    `model` 是 `provider:model` 键。给出时只看该模型（及显式允许的历史单例）；
+    未给出时只读历史单例，保持 v9.8 调用方语义。损坏记录按失效处理但不静默丢弃。
+    同一模型可能有多个错误分类窗口：返回剩余时间最长的那个。
+    """
+    base = {"active": False, "until": "", "remaining_seconds": 0.0,
+            "reason": "", "error_class": "", "invalid": False,
+            "model": str(model or ""), "provider": ""}
+    current = _parse_time(now) if now is not None else datetime.now().astimezone()
+    candidates: list[dict] = []
+    if model:
+        store = _model_backoff_store(state)
+        slots = store["windows"].get(str(model))
+        if isinstance(slots, dict):
+            candidates.extend(item for item in slots.values()
+                              if isinstance(item, dict) and item.get("until"))
+        if include_legacy:
+            legacy = _legacy_backoff(state)
+            if legacy is not None:
+                candidates.append(legacy)
+    else:
+        legacy = _legacy_backoff(state)
+        if legacy is not None:
+            candidates.append(legacy)
+    if not candidates:
+        return base
+    rows = [_window_status(item, current, model=str(model or ""))
+            for item in candidates]
+    rows.sort(key=lambda item: (item["active"], item["remaining_seconds"]))
+    return rows[-1]
+
+
+def clear_sol_backoff(path: str, *, model: str = "",
+                      reason: str = "sol_call_completed") -> bool:
+    """清除退避窗口：给定模型时只清该模型，否则清历史单例。返回是否清除了记录。"""
     state = load_state(path)
+    if model:
+        store = _model_backoff_store(state)
+        if str(model) not in store["windows"]:
+            return False
+        removed = store["windows"].pop(str(model))
+        last = ""
+        for slots in removed.values() if isinstance(removed, dict) else []:
+            if isinstance(slots, dict):
+                last = str(slots.get("until") or last)
+        state[MODEL_BACKOFF_KEY] = store
+        _history(state, "sol_backoff_cleared", {
+            "reason": str(reason or ""),
+            "model": str(model),
+            "until": last,
+        })
+        save_state(path, state)
+        return True
     if not isinstance(state.get(SOL_BACKOFF_KEY), dict):
         return False
     previous = state.pop(SOL_BACKOFF_KEY, None)
@@ -4569,12 +4680,45 @@ def record_sol_call(path: str, call: dict, *, mode: str = "",
                                 "link": record["obligation_link"]}
     state.setdefault(SOL_CALLS_KEY, []).append(record)
     _history(state, "sol_call_completed", detail)
-    # 成功调用证明上游可用：清除退避窗口，避免过期窗口继续推迟调度。
-    if isinstance(state.pop(SOL_BACKOFF_KEY, None), dict):
+    # 成功调用只证明**该模型**可用：只清除这个模型的退避窗口（错误分类各自
+    # 独立，成功即整体清除该模型），不清另一个模型、也不清历史单例。
+    key = str(record.get("model_key") or "")
+    if key:
+        store = _model_backoff_store(state)
+        if store["windows"].pop(key, None) is not None:
+            state[MODEL_BACKOFF_KEY] = store
+            _history(state, "sol_backoff_cleared",
+                     {"reason": "sol_call_completed",
+                      "call_id": record["call_id"], "model_key": key})
+    elif isinstance(state.pop(SOL_BACKOFF_KEY, None), dict):
         _history(state, "sol_backoff_cleared",
                  {"reason": "sol_call_completed", "call_id": record["call_id"]})
     save_state(path, state)
     return record
+
+
+def record_sol_reuse(path: str, *, mode: str = "", model: str = "",
+                     model_key: str = "", subject: str = "",
+                     stage: str = "") -> dict:
+    """登记一次“复用已有结论、未重复付费”的事实（观测用，不改变任务状态）。"""
+    state = load_state(path)
+    entry = {
+        "ts": now_iso(),
+        "mode": str(mode or "CONSULT").upper(),
+        "model": str(model or ""),
+        "model_key": str(model_key or ""),
+        "subject": str(subject or "")[:64],
+        "stage": str(stage or "")[:40],
+    }
+    rows = state.setdefault(SOL_REUSES_KEY, [])
+    if not isinstance(rows, list):
+        rows = state[SOL_REUSES_KEY] = []
+    rows.append(entry)
+    if len(rows) > SOL_REUSE_LIMIT:
+        del rows[:-SOL_REUSE_LIMIT]
+    _history(state, "sol_reuse", entry)
+    save_state(path, state)
+    return entry
 
 
 def _find_sol_call(state: dict, call_id: str) -> dict:
@@ -5053,7 +5197,8 @@ def acceptance_quality(calls: list[dict]) -> dict:
 def record_sol_call_failure(path: str, *, mode: str = "CONSULT",
                             error_code: str = "", detail: str = "",
                             materials_sha256: str = "",
-                            model: str = "", obligation_id: str = "",
+                            model: str = "", provider: str = "",
+                            obligation_id: str = "",
                             stage: str = "", request_attempted: bool = True,
                             send_observed: str = "unknown",
                             http_status: int | None = None,
@@ -5104,6 +5249,8 @@ def record_sol_call_failure(path: str, *, mode: str = "CONSULT",
                           if send_observed in ("unknown", "response_received",
                                                "not_attempted") else "unknown"),
         "model": model,
+        "provider": provider,
+        "model_key": (f"{provider}:{model}" if provider and model else ""),
         "created_at": now_iso(),
     }
     # 失败也结算到义务：义务转为 failed（带真实错误码），不重试、不换 Provider。
@@ -5132,19 +5279,37 @@ def record_sol_call_failure(path: str, *, mode: str = "CONSULT",
     })
     # 上游明确要求等待或属于可退避的上游故障时登记退避窗口：调度层据此推迟
     # 义务，避免在 Retry-After 窗口内反复发送注定失败的请求（不改变生命周期）。
+    # 窗口按 provider:model 隔离：一个模型的过载不会冻结另一个模型。
     backoff = _sol_backoff_from_failure(record)
     if backoff:
-        state[SOL_BACKOFF_KEY] = backoff
-        record["backoff"] = {"until": backoff["until"],
-                             "seconds": backoff["seconds"],
-                             "reason": backoff["reason"]}
-        _history(state, "sol_backoff_set", {
-            "until": backoff["until"],
-            "seconds": backoff["seconds"],
-            "reason": backoff["reason"],
-            "error_class": record["error_class"],
-            "retry_after": record["retry_after"],
-        })
+        key = store_model_backoff(state, backoff)
+        if key:
+            record["backoff"] = {"until": backoff["until"],
+                                 "seconds": backoff["seconds"],
+                                 "reason": backoff["reason"],
+                                 "model_key": key}
+            _history(state, "sol_backoff_set", {
+                "until": backoff["until"],
+                "seconds": backoff["seconds"],
+                "reason": backoff["reason"],
+                "error_class": record["error_class"],
+                "retry_after": record["retry_after"],
+                "model_key": key,
+            })
+        else:
+            # 历史调用方没有提供 provider/model：保持 v9.8 单例写入口径，
+            # 该窗口只按历史模型空间读取，不会继承给默认模型。
+            state[SOL_BACKOFF_KEY] = backoff
+            record["backoff"] = {"until": backoff["until"],
+                                 "seconds": backoff["seconds"],
+                                 "reason": backoff["reason"]}
+            _history(state, "sol_backoff_set", {
+                "until": backoff["until"],
+                "seconds": backoff["seconds"],
+                "reason": backoff["reason"],
+                "error_class": record["error_class"],
+                "retry_after": record["retry_after"],
+            })
     save_state(path, state)
     return record
 

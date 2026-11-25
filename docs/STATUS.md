@@ -1,8 +1,8 @@
 # STATUS
 
 更新：2026-11-25 CST。本文件只记录现场可核实的事实；规划与未完成事项单独标注。
-当前版本：v9.8.0（多模态设计认知：真实图片输入、无图/有图双模式、设计协作
-与知识复用）；v9.7.1 及更早的治理记录见下。基线以本次交付的最终提交与运行时核验为准。
+当前版本：v9.9.0（Astra 默认认知引擎迁移与调用效率优化）；v9.8.0 多模态设计认知、
+v9.7.1 及更早的治理记录见下。基线以本次交付的最终提交与运行时核验为准。
 任务 `sol-cognition-governance-p1p3-2026-11-23` 经用户授权一次性 `reopen` 后，已于
 `2026-11-24T07:40:07` 在**最终代码**上重新收口 **CLOSED / PASS**（周期 2，G1–G3 全 PASS）。
 
@@ -10,6 +10,48 @@
 经 PR #9 合并为 `b83cf33`；CI Python 3.10 / 3.12 各 956 项 OK、`--verify-baseline` 通过；
 main 三方（本地 / `origin/main` / `ls-remote`）同为 `b83cf33`（0/0），工作区干净；
 运行时 `--check` 缺失 0 / 不同 0，27 个受管理文件源码与运行时 SHA-256 全部一致。
+
+## Astra 默认认知引擎迁移与调用效率优化（2026-11-25，v9.9.0，源码已改未提交）
+
+任务 `copilot-astra-default-brain-optimization-20261125`，仓库 HEAD `1499bb0`，改动在工作树
+（授权不含 commit / push / 发布）；21 个文件已改（+759/−183）+ 新增 `tests/test_astra_migration.py`
+未跟踪。
+
+- **模型迁移**：`sol_review.py` 只有 `DEFAULT_MODEL="gpt-6.2-astra"` 与 `LEGACY_MODEL="gpt-6.2-sol"`；
+  请求默认 Provider `codex`、`reasoning.effort=high`、`mode=standard`、Responses API、
+  `tools=[]`、`tool_choice="none"`、单轮、无自动重试；回显模型/推理强度/模式不一致拒绝消费。
+  所有实际入口（默认引擎、CONSULT / PLAN、事件 CONSULT、阶段复盘、收口 CONSULT）走同一构造；
+  `gpt-6.2-sol` 仅在显式 `--model gpt-6.2-sol` 时使用，Astra 失败不自动切换、不换 Provider。
+- **调用语义**：生命周期命令默认 auto；纯登记/报告/状态/`judgment` 命令默认 advise，只有
+  命令行显式 `--cognition auto` / `--sol auto` 才执行（修掉 `judgment` 曾隐式触发真实 CONSULT）。
+  旧 `--sol` 旗标与语义保留兼容。
+- **复用与指标**：复用键 = task_id + prompt 版本 + 模型 + 归一化上下文 + 阶段/问题，命中写
+  `state["sol_reuses"]`；缺模型归属的历史记录不复用为 Astra 结果；`stats` / `sol-stats` 新增
+  `by_model`（调用/完成/失败、input·output·reasoning·total tokens、延迟 p50/p95、对象数、
+  重复调用数）与 `reuse`（命中数、按家族/模型）。
+- **模型级退避**：`state["model_backoff"]`（schema `copilot-model-backoff/v2`），窗口键
+  `provider:model` + `error_class`；SOL 过载不冻结 Astra、Astra 过载不阻塞显式 SOL，各自遵守
+  `Retry-After`，成功只清本模型；旧 `state["sol_backoff"]`（v1）只读兼容且不冻结 Astra。
+- **响应完整性**：`DEFAULT_MAX_OUTPUT_TOKENS=24000` 与 `DEFAULT_TIMEOUT=300.0` 未变；空输出、
+  `incomplete`、`max_output_tokens` 记失败而非成功；无自动重试；登记失败留 pending 可恢复。
+- **验证**：活动全量 1036 项 **OK**（86.9 s，0 失败，含 manifest 基线校验）；迁移专项
+  `test_astra_migration.py` 24 项通过；legacy 853 项 / 146 失败，失败集合与 HEAD `1499bb0`
+  既有日志**名称集合完全相同**（sha1 `7b2098d5637df578…`），无实现回归。
+- **基线**：`--baseline` 重建 27 个 Git 跟踪分发文件，`--verify-baseline` 通过。
+- **运行时同步**：`--apply` 写入 9 个文件，`--check` 缺失 0 / 不同 0；27 个分发文件源码与
+  运行时 SHA-256 逐文件一致；运行时 `__version__="9.9.0"`、`DEFAULT_MODEL="gpt-6.2-astra"`。
+- **受控真实调用（1 次，17:49:00 起）**：经正式入口 `sol-consult --obligation SO1` 执行，
+  `SCcb8295085e44fbf3e73412b3`，HTTP 200 / `response.completed`，模型 `gpt-6.2-astra`
+  （`codex:gpt-6.2-astra`）、`effort=high`、`mode=standard`、`zero_tool=true`、单次请求
+  （`sol-audit.jsonl` 仅 1 条）、延迟 76.0 s、tokens in 4244 / out 2118 / total 6362，
+  已写入 `sol_calls` 并结算义务 SO1；采纳结论 `sol-accept → accepted`（E1–E4 证据关联）。
+  `reasoning_tokens` 记为 0：上游本次未返回 reasoning token 明细，按实记录，未推断。
+- **未提交**：本次未执行 commit / push / release；CPA 配置、Provider、OAuth 凭据未改动。
+- **任务状态**：`copilot-astra-default-brain-optimization-20261125` 已 **CLOSED / PASS**
+  （12 项完成条件全部 met，G1–G3 PASS，证据 E1–E6 属本任务）；SO2/SO3 两个调度义务未执行
+  并如实计入覆盖率（SOL 不是门禁，不为收口追加付费调用）。合同 test-policy 第 1 条写作
+  模块路径形式，实际按仓库约定的 `discover` 形式验证（24 项 OK），口径差异见任务目录
+  `test-invocation-note.md`，合同与已登记证据未改动。
 
 ## CPA → SOL 调用可靠性专项（2026-11-25，源码已改未提交）
 

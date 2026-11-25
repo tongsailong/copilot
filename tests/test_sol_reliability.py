@@ -475,10 +475,15 @@ class BackoffDispatchTests(unittest.TestCase):
         return G.load_state(self.state_path)
 
     def _set_backoff(self, seconds: float = 322) -> None:
+        # 退避窗口按 provider+model+error_class 隔离：只写当前默认模型的窗口，
+        # 与真实失败路径（record_sol_call_failure 带 model）保持一致。
         state = self.state()
-        state[G.SOL_BACKOFF_KEY] = G._sol_backoff_from_failure({
+        window = G._sol_backoff_from_failure({
             "error_class": SR.UPSTREAM_OVERLOADED, "retry_after": seconds,
             "http_status": 502, "call_id": "SCfail"})
+        G.store_model_backoff(state, {**window, "model": SR.DEFAULT_MODEL,
+                                      "provider": SR.PROVIDER,
+                                      "model_key": SR.model_key()})
         G.save_state(self.state_path, state)
 
     def _consult(self, *extra: str) -> int:
@@ -520,12 +525,12 @@ class BackoffDispatchTests(unittest.TestCase):
 
     def test_schedule_executes_after_window_closes(self):
         self._sync()
+        self._set_backoff(1)
         state = self.state()
-        state[G.SOL_BACKOFF_KEY] = G._sol_backoff_from_failure({
-            "error_class": SR.UPSTREAM_OVERLOADED, "retry_after": 1})
-        state[G.SOL_BACKOFF_KEY]["until"] = (
-            datetime.now().astimezone()
-            - timedelta(seconds=1)).isoformat(timespec="seconds")
+        window = state[G.MODEL_BACKOFF_KEY]["windows"][SR.model_key()][
+            SR.UPSTREAM_OVERLOADED]
+        window["until"] = (datetime.now().astimezone()
+                           - timedelta(seconds=1)).isoformat(timespec="seconds")
         G.save_state(self.state_path, state)
         args = mock.Mock(state=self.state_path, sol="auto")
         calls = {"count": 0}
@@ -563,7 +568,8 @@ class BackoffDispatchTests(unittest.TestCase):
         self.assertEqual(state["sol_calls"][-1]["status"], "completed")
         events = [item.get("event") for item in state.get("history") or []]
         self.assertIn("sol_backoff_overridden", events)
-        self.assertFalse(G.sol_backoff_status(state)["active"])
+        self.assertFalse(G.sol_backoff_status(
+            state, model=SR.model_key())["active"])
 
     def test_consult_failure_degrades_and_stays_traceable(self):
         error = SR.SolOverloadedError(
@@ -592,7 +598,8 @@ class BackoffDispatchTests(unittest.TestCase):
         self.assertEqual(degraded["status"], "unavailable")
         self.assertEqual(degraded["action"], "continue")
         self.assertEqual(degraded["error_class"], SR.UPSTREAM_OVERLOADED)
-        self.assertTrue(G.sol_backoff_status(self.state())["active"])
+        self.assertTrue(G.sol_backoff_status(
+            self.state(), model=SR.model_key())["active"])
 
     def test_review_failure_returns_real_exit_code(self):
         error = SR.SolAuthError("sol_upstream_auth", "认证失败",
@@ -736,9 +743,15 @@ class StreamTimeoutCrossStageTests(unittest.TestCase):
     def state(self) -> dict:
         return G.load_state(self.state_path)
 
+    def _window(self, state: dict | None = None) -> dict:
+        state = state if state is not None else self.state()
+        return ((state.get(G.MODEL_BACKOFF_KEY) or {}).get("windows", {})
+                .get(SR.model_key(), {}).get(SR.UPSTREAM_STREAM_TIMEOUT, {}))
+
     def _fail_408(self, retry_after=None, raw: str = "") -> dict:
         return G.record_sol_call_failure(
             self.state_path, mode="CONSULT",
+            model=SR.DEFAULT_MODEL, provider=SR.PROVIDER,
             error_code="sol_upstream_stream_timeout",
             detail="stream closed before response.completed",
             http_status=408, retry_after=retry_after,
@@ -778,17 +791,19 @@ class StreamTimeoutCrossStageTests(unittest.TestCase):
 
     def test_408_without_retry_after_creates_local_window(self):
         record = self._fail_408()
-        backoff = self.state()[G.SOL_BACKOFF_KEY]
+        backoff = self._window()
         self.assertEqual(record["backoff"]["reason"], "error-class")
         self.assertEqual(backoff["reason"], "error-class")
         self.assertEqual(backoff["error_class"], SR.UPSTREAM_STREAM_TIMEOUT)
         self.assertEqual(backoff["seconds"], G.SOL_BACKOFF_FALLBACK_SECONDS)
         self.assertNotEqual(backoff["error_class"], SR.UPSTREAM_AUTH)
-        self.assertTrue(G.sol_backoff_status(self.state())["active"])
+        self.assertNotIn(G.SOL_BACKOFF_KEY, self.state())
+        self.assertTrue(G.sol_backoff_status(
+            self.state(), model=SR.model_key())["active"])
 
     def test_408_with_retry_after_uses_server_wait(self):
         self._fail_408(600, raw="600")
-        backoff = self.state()[G.SOL_BACKOFF_KEY]
+        backoff = self._window()
         self.assertEqual(backoff["reason"], "retry-after")
         self.assertEqual(backoff["seconds"], 600)
         self.assertEqual(backoff["retry_after_raw"], "600")
@@ -820,7 +835,7 @@ class StreamTimeoutCrossStageTests(unittest.TestCase):
         self._fail_408(900)
         # 新进程/新会话只读同一 state.json：退避状态不依赖内存、会话绑定或锁。
         fresh = G.load_state(self.state_path)
-        status = G.sol_backoff_status(fresh)
+        status = G.sol_backoff_status(fresh, model=SR.model_key())
         self.assertTrue(status["active"])
         self.assertGreater(status["remaining_seconds"], 0)
         plan_id = self._add_obligation("B", "plan", "PLAN", "planning", "p2")
@@ -830,11 +845,12 @@ class StreamTimeoutCrossStageTests(unittest.TestCase):
     def test_expired_window_resumes_scheduling(self):
         self._fail_408(600)
         state = self.state()
-        state[G.SOL_BACKOFF_KEY]["until"] = (
+        self._window(state)["until"] = (
             datetime.now().astimezone()
             - timedelta(seconds=1)).isoformat(timespec="seconds")
         G.save_state(self.state_path, state)
-        self.assertFalse(G.sol_backoff_status(self.state())["active"])
+        self.assertFalse(G.sol_backoff_status(
+            self.state(), model=SR.model_key())["active"])
         plan_id = self._add_obligation("B", "plan", "PLAN", "planning", "p3")
         code, calls = self._execute(plan_id)
         self.assertEqual(code, 0)

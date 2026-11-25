@@ -12,10 +12,11 @@ Copilot 的 SOL 通道只承担**认知**，不承担决策或执行：
   CONSULT / PLAN 失败按可降级处理（`copilot_dispatch.py sol-consult|sol-plan`
   记录后返回 0，主代理继续），REVIEW 失败仍显式失败，因为它是用户明确要求的
   独立结论。
-* **模型与推理强度是硬门**：统一 `gpt-6.2-sol` + `reasoning.effort="high"`，
-  上游 `model` 回显必须完全一致，`reasoning.effort` / `reasoning.mode` 回显
-  也必须与请求一致（`standard`）；任何不一致都拒绝消费（退出码 9），
-  不允许静默降级到 `medium`/`low` 或其他模型。
+* **模型与推理强度是硬门**：默认 `gpt-6.2-astra` + `reasoning.effort="high"`；
+  上游 `model` 回显必须与本次请求完全一致，`reasoning.effort` / `reasoning.mode`
+  回显也必须与请求一致（`standard`）；任何不一致都拒绝消费（退出码 9），
+  不允许静默降级到 `medium`/`low` 或其他模型。`gpt-6.2-sol` 只在显式
+  `--model gpt-6.2-sol` 时使用，失败不自动切换模型。
 * **三种模式**：CONSULT 是默认认知引擎，任务启动、执行期新证据、阶段复盘与
   收口都能按需发出一次判断；PLAN 在调查之后给出方案比较与规划判断；REVIEW
   只在用户明确要求时做独立复核，输出结构化 findings。三者都是 advisory：
@@ -50,7 +51,14 @@ REVIEW_SCHEMA = "copilot-sol-review/v1"
 # 阶段复盘与收口判断；v1 记录继续只读兼容。
 THINK_SCHEMA = "copilot-sol-think/v2"
 ADMISSION_SCHEMA = "copilot-sol-admission/v1"
-MODEL = "gpt-6.2-sol"
+# 模型身份只在本文档定义的单一注册表里出现：默认认知模型是 Astra；SOL 只作为
+# **显式兼容**保留（`--model gpt-6.2-sol`），任何路径都不会自动回退到它。
+PROVIDER = "codex"
+DEFAULT_MODEL = "gpt-6.2-astra"
+LEGACY_MODEL = "gpt-6.2-sol"
+SUPPORTED_MODELS = (DEFAULT_MODEL, LEGACY_MODEL)
+# 兼容历史调用方与测试：`MODEL` 现在指向默认模型，不再是“唯一模型”。
+MODEL = DEFAULT_MODEL
 BASE_URL = "http://127.0.0.1:8317/v1"
 ENDPOINT = "/responses"
 REASONING_EFFORT = "high"
@@ -573,6 +581,38 @@ def validate_effort(effort: str) -> str:
         "不允许降级到 low/medium，也不使用 xhigh/max。")
 
 
+def resolve_model(model: str = "") -> str:
+    """模型解析：空值 → 默认 Astra；只接受注册表内的模型。
+
+    未知模型名一律拒绝，避免把默认路由意外改到别的 Provider/模型；显式传入
+    `gpt-6.2-sol` 是唯一的兼容路径，且不会因为失败而自动回退。
+    """
+    value = str(model or "").strip() or DEFAULT_MODEL
+    if value not in SUPPORTED_MODELS:
+        raise SolUsageError(
+            "sol_model_unsupported",
+            f"模型 {model!r} 不在支持列表（{', '.join(SUPPORTED_MODELS)}）；"
+            f"默认模型是 {DEFAULT_MODEL}，未发送请求。")
+    return value
+
+
+def model_key(model: str = "", provider: str = "") -> str:
+    """退避/统计隔离键：`provider:model`。"""
+    return f"{str(provider or PROVIDER).strip()}:{resolve_model(model)}"
+
+
+def normalize_context_text(text: object) -> str:
+    """复用键用的上下文归一：只消除空白差异，不改变实际发送内容。
+
+    行尾空白、制表符与连续空行不属于“新的认知对象”；把它们归一后，恢复上下文
+    或重新排版材料不会让同一问题再次付费。代码块缩进保留（只压缩单行内连续空白
+    与行首行尾），避免把结构不同的材料误判为同一对象。
+    """
+    value = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+    lines = [re.sub(r"[ \t]+", " ", line).strip() for line in value.split("\n")]
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
+
+
 def validate_materials(materials: object, mode: str = "CONSULT") -> str:
     """材料前置校验：非空、字符上限；dry-run 与真实调用共用同一口径。
 
@@ -783,10 +823,9 @@ def build_payload(materials: str, *, mode: str = "CONSULT",
     validate_materials(materials, resolved_mode)
     resolved_effort = validate_effort(effort)
     checked_images = validate_images(images)
-    if not str(model or "").strip():
-        raise SolUsageError("sol_model_missing", "模型 ID 为空。")
+    resolved_model = resolve_model(model)
     payload = {
-        "model": model,
+        "model": resolved_model,
         "input": _payload_input(materials, checked_images),
         "store": False,
         "stream": False,
@@ -1529,6 +1568,8 @@ def run_sol(materials: str, *, mode: str = "CONSULT", audit_log: str = "",
             images: list[dict] | None = None) -> dict:
     """发起一次 SOL 调用（CONSULT / PLAN / REVIEW）；任何异常都显式失败。"""
     resolved_mode = normalize_mode(mode)
+    # 模型在一次调用内只解析一次：请求体、身份校验、审计与记录共用同一值。
+    model = resolve_model(model)
     payload = build_payload(
         materials, mode=resolved_mode, model=model, effort=effort,
         max_output_tokens=max_output_tokens, instructions=instructions,
@@ -1551,7 +1592,9 @@ def run_sol(materials: str, *, mode: str = "CONSULT", audit_log: str = "",
     audit_base = {
         "ts": _now_iso(),
         "mode": resolved_mode,
+        "provider": PROVIDER,
         "model_requested": model,
+        "model_key": model_key(model),
         "reasoning_effort": resolved_effort,
         "reasoning_mode": REASONING_MODE,
         "materials_sha256": hashlib.sha256(
@@ -1716,7 +1759,9 @@ def run_sol(materials: str, *, mode: str = "CONSULT", audit_log: str = "",
         "request_attempted": request_attempted,
         "send_observed": send_observed,
         "mode": resolved_mode,
+        "provider": PROVIDER,
         "model": model,
+        "model_key": model_key(model),
         "model_resolved": model_resolved,
         "reasoning_effort": resolved_effort,
         "reasoning_mode": REASONING_MODE,
@@ -1846,7 +1891,7 @@ def _audit_safe(path: str, record: dict) -> str | None:
 # ── 材料、单轮判定与准入 ───────────────────────────────────────────────────
 # 提示词/策略版本：进入单轮判定键。提示词、共享上下文或判定规则实质变化时，
 # 旧结论不再被当成同一审查对象复用（缓存失效条件见 review_subject_sha256）。
-PROMPT_VERSION = "sol-prompt-v5"
+PROMPT_VERSION = "sol-prompt-v6"
 
 _EVIDENCE_LIMIT = 80
 _EVIDENCE_MAX_CHARS = 6000
@@ -1945,7 +1990,7 @@ def _prior_lines(state: dict) -> list[str]:
     return lines
 
 
-def _context_lines(state: dict) -> list[str]:
+def _context_lines(state: dict, model: str = "") -> list[str]:
     """CONSULT / PLAN / REVIEW 共用的任务上下文：一份合同、一套条件与证据。"""
     contract = state.get("contract") or {}
     boundaries = str(contract.get("boundaries") or "").strip()
@@ -1954,7 +1999,7 @@ def _context_lines(state: dict) -> list[str]:
         f"- 风险：{state.get('risk') or 'medium'}",
         f"- 执行后端：{state.get('execution_backend') or 'legacy'}",
         f"- 合同指纹：{state.get('contract_sha256') or '(未登记)'}",
-        f"- 模型：{MODEL}（reasoning.effort={REASONING_EFFORT}，零工具）",
+        f"- 模型：{resolve_model(model)}（reasoning.effort={REASONING_EFFORT}，零工具）",
         f"- 提示词版本：{PROMPT_VERSION}",
         "",
         "## 任务目标",
@@ -1985,11 +2030,13 @@ def _context_lines(state: dict) -> list[str]:
 
 
 def build_prompt(state: dict, materials: str, *, mode: str = "CONSULT",
-                 question: str = "", stage: str = "") -> str:
+                 question: str = "", stage: str = "",
+                 model: str = "") -> str:
     """把共享任务上下文与主代理材料拼成一次完整上下文（三模式共用）。"""
     resolved = normalize_mode(mode)
     if resolved == "REVIEW":
-        lines = [f"# Copilot SOL {resolved} 材料", "", *_context_lines(state)]
+        lines = [f"# Copilot SOL {resolved} 材料", "",
+                 *_context_lines(state, model)]
         lines += [
             "## 主代理提供的审查材料",
             "",
@@ -2004,7 +2051,7 @@ def build_prompt(state: dict, materials: str, *, mode: str = "CONSULT",
         return "\n".join(lines)
     resolved_stage = normalize_stage(stage, mode=resolved)
     lines = [f"# Copilot SOL {resolved} 材料"
-             f"（阶段：{resolved_stage}）", "", *_context_lines(state)]
+             f"（阶段：{resolved_stage}）", "", *_context_lines(state, model)]
     lines += [
         "## 本次需要判断的事项",
         "",
@@ -2030,6 +2077,8 @@ def build_prompt(state: dict, materials: str, *, mode: str = "CONSULT",
         "一次性给出认知结果：核心判断、问题本质、推荐方向、备选方案、关键取舍、"
         "风险与优先级、关键假设、需要用户决定的事项、需要关注的验证信号与重新"
         "咨询的触发条件。未知项写入 unverified；按契约输出单个 JSON 对象。"
+        "优先给结论、依据、风险与建议：不复述任务背景或材料原文，不展示内部"
+        "推理过程，不重复已知事实。"
         "你的输出是认知输入，由 ZCode 主代理决定是否采纳以及如何实现。",
         "",
     ]
@@ -2059,15 +2108,17 @@ def prompt_template_sha256() -> str:
 
 
 def review_subject_sha256(state: dict, materials: str, *, mode: str = "",
-                          question: str = "", stage: str = "") -> str:
+                          question: str = "", stage: str = "",
+                          model: str = "") -> str:
     """单轮判定用的稳定主体摘要（同一份上下文只允许一次调用）。
 
-    缓存键成分：提示词版本、模型与推理强度、目标、合同正文（`done_criteria_text`
-    与边界）、完成条件描述、**证据集合摘要**与主代理材料；认知调用额外绑定模式、
-    阶段与本次问题。以下变化即失效：
-    - 合同/目标/条件描述或材料实质变化；
+    缓存键成分：提示词版本、任务身份、Provider 与模型、推理强度、目标、合同正文
+    （`done_criteria_text` 与边界）、完成条件描述、**证据集合摘要**与主代理材料；
+    认知调用额外绑定模式、阶段与本次问题。以下变化即失效：
+    - 任务、合同/目标/条件描述或材料实质变化；
     - 证据集合变化（新增、摘要变化、归档）；
-    - 提示词版本、模型或推理强度变化（升级后旧结论不再复用）。
+    - 提示词版本、Provider/模型或推理强度变化（换模型后旧结论不再复用）；
+    - 纯空白/排版差异（归一后视为同一对象，不重复付费）。
     条件从 pending 变 met 属于流程状态变化，不是新的审查对象：同一材料在证据
     未变时仍复用已完成的结论，避免上下文恢复后重复付费。
     """
@@ -2083,16 +2134,18 @@ def review_subject_sha256(state: dict, materials: str, *, mode: str = "",
         # 模板本身也进键：改了模式指令/阶段重点却忘记 bump PROMPT_VERSION 时，
         # 旧结论不能在“新提示词”下被复用。
         "prompt_template": prompt_template_sha256(),
-        "model": MODEL,
+        "task_id": str(state.get("task_id") or ""),
+        "provider": PROVIDER,
+        "model": resolve_model(model),
         "reasoning_effort": REASONING_EFFORT,
         "goal": str(state.get("goal") or ""),
-        "contract": str(contract.get("done_criteria_text") or ""),
-        "boundaries": str(contract.get("boundaries") or ""),
+        "contract": normalize_context_text(contract.get("done_criteria_text")),
+        "boundaries": normalize_context_text(contract.get("boundaries")),
         "criteria": criteria,
         "evidence_digest": evidence_digest(state),
-        # 发送的提示词用 materials.strip()，键必须与之一致；否则仅首尾空白差异
-        # 就会让同一提示词被当成新对象而重复付费。
-        "materials": str(materials or "").strip(),
+        # 发送的提示词用 materials.strip()，键必须与之一致；再消除纯空白差异：
+        # 恢复上下文或重新排版材料不会把同一问题当成新对象而重复付费。
+        "materials": normalize_context_text(materials),
     }
     if mode:
         resolved_mode = normalize_mode(mode)
@@ -2141,17 +2194,21 @@ def single_round_decision(state: dict, materials_sha256: str, *,
                           force: bool = False, reason: str = "",
                           trigger: str = "",
                           records_key: str = "sol_calls",
-                          mode: str = "CONSULT") -> dict:
+                          mode: str = "CONSULT", model: str = "") -> dict:
     """单轮判定：同一认知对象直接复用；同模式再次调用必须有实质原因。
 
     CONSULT / PLAN / REVIEW 各自独立判定，不会互相复用；记录统一存放在
     `sol_calls`，历史 `sol_reviews` / `sol_advisories` 仍可只读复用。
+    **模型门**：只复用同一模型的已完成记录；历史 SOL 结论不会被当成 Astra 的
+    新响应（旧记录缺少 `model` 字段时一律视为不可复用）。
     “单轮”约束的是同一认知对象只付一次费，不是调用次数上限：只要问题、阶段
     或材料构成新的认知对象，就可以按对应 trigger 继续调用。
     """
     resolved_mode = normalize_mode(mode)
+    target_model = resolve_model(model)
     records = [item for item in completed_reviews(state, records_key)
-               if record_mode(item) == resolved_mode]
+               if record_mode(item) == resolved_mode
+               and str(item.get("model") or "") == target_model]
     same = [item for item in records
             if str(item.get("materials_sha256") or "") == materials_sha256]
     # `--force` 必须能覆盖复用命中：上下文/进度变了但主体键不变时（工作项、风险、

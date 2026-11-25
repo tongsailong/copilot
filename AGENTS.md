@@ -10,9 +10,11 @@ Copilot 是运行于 ZCode 内的**轻量协作治理 Skill**：负责任务承�
 证据桥接、审计、PARTIAL 持续推进与 G1–G3 收口。ZCode 原生 Agent 是唯一的工程执行与技术
 决策主体；用户侧 ChatGPT 负责需求与产品层目标、交接与验收；SOL 作为默认认知引擎
 （CONSULT / PLAN）按生命周期提供整体判断，用户明确要求时执行一次独立复核（REVIEW），均由
-`gpt-6.2-sol` 零工具单轮调用完成。
+`gpt-6.2-astra` 零工具单轮调用完成。`gpt-6.2-sol` 只保留为显式兼容模型（`--model`），
+不做失败回退。
 
-当前基线 **v9.8.0**（多模态设计认知：`--image` 真实图片输入与无图/有图双模式）。与版本号
+当前基线 **v9.9.0**（Astra 默认认知引擎迁移与调用效率优化：模型身份入账、按模型隔离退避、
+纯登记命令不隐式付费、复用命中与模型级指标）。与版本号
 无关、长期有效的关键约束：
 
 - **执行与续跑**：任务必须经 `start` / `drive` 进入状态机；PARTIAL 不是终点，
@@ -20,8 +22,11 @@ Copilot 是运行于 ZCode 内的**轻量协作治理 Skill**：负责任务承�
   其余工作；`drive` 用 `claims`（短租约）避免并发重复，回填/阻塞自动释放。
 - **SOL 是认知引擎，不是门禁**：生命周期为 A 启动 CONSULT → B 调查后 PLAN → C 升级型事件
   CONSULT → D 中高复杂阶段复盘 → E 最终验证完成后的收口 CONSULT。`sol_schedule.py` 把窗口
-  物化为义务，每条命令最多 1 个义务 / 1 次请求（`--sol auto|advise|off`），同材料同问题复用
-  不重复付费。义务窗口关闭时写 `disposition`：`not-executed` 用**窗口打开时**的策略
+  物化为义务，每条命令最多 1 个义务 / 1 次请求（`--cognition auto|advise|off`，
+  `--sol` 兼容）。生命周期命令默认 `auto`；纯登记/报告/合同命令默认 `advise`，只在命令行
+  显式 `auto` 时才付费执行，`judgment` / `report` / `evidence` 等不得隐式调用模型。同模型、
+  同 task_id、同归一化上下文与同问题时复用，不重复付费；复用命中登记到 `sol_reuses`。
+  义务窗口关闭时写 `disposition`：`not-executed` 用**窗口打开时**的策略
   （`policy_at_open`；历史义务按周期策略快照的变更历史回推，无可证明快照记 `unknown`），
   不用当前配置倒推；`cycle` = 1 + 重开次数，窗口比较不跨周期追溯。`sol-accept` 只记录采纳
   事实，**不因代码已改、测试通过或任务 PASS 推断采纳**。CONSULT / PLAN 失败只登记并降级
@@ -69,12 +74,17 @@ Agent、SOL（CONSULT / PLAN / REVIEW）、DesignWise。Executor 是 ZCode 工�
 ## 3. 模型路由规则
 
 - **唯一远程调用是 SOL（CONSULT / PLAN / REVIEW）**：只有 `scripts/sol_review.py` 可以导入
-  网络客户端、读取本机 CPA 凭据与包含 `gpt-6.2-sol` 模型名；`governance.py`、
+  网络客户端、读取本机 CPA 凭据与包含模型名（默认 `gpt-6.2-astra`；`gpt-6.2-sol` 仅显式
+  兼容）；`governance.py`、
   `copilot_dispatch.py`、`copilot_auto.py`、`native_bridge.py`、`native_agent.py` 不得导入
   网络客户端或已退役的 SOL 模块（`call_gpt` / `review_ledger` / `reply_protocol`）。SOL 只
   接收主代理材料、一次请求、零工具（请求体无 `tools`/`functions`，`tool_choice="none"`）、
   `reasoning.effort="high"`，不自动重试、不换 Provider、不自动二审、不静默降级模型或推理强度。
   上游回显 `model` / `reasoning.effort` / `reasoning.mode` 与请求不一致时拒绝消费。
+  Astra 失败只如实记录并降级，不自动切换 `gpt-6.2-sol`、不换 Provider、不重试。
+- **退避按模型隔离**：窗口键为 `provider + model + error_class`（`state.model_backoff`），
+  SOL 过载不冻结 Astra，Astra 过载不阻塞显式 SOL；成功只清本模型；旧 `state.sol_backoff`
+  单例只读兼容，不继承给新默认模型。
 - **Executor / Reviewer 继承主代理**：Profile 中省略 `model` 或写 `model: inherit`，
   Provider/模型/推理级别跟随主代理当前会话。不得写死官方 DeepSeek 直连模型或任何
   固定 Provider；`thoughtLevel` 只在钉死具体模型时生效，`inherit` 下忽略。

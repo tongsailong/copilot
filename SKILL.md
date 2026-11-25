@@ -1,6 +1,6 @@
 ---
 name: copilot
-description: "Copilot v9.8.0 轻量协作治理：任务承接、合同与完成条件、状态与证据登记、PARTIAL 强制续跑与调度领取、SOL（gpt-6.2-sol，high，零工具）默认认知引擎 CONSULT / PLAN 与生命周期主动调度（义务化、有界自动执行、覆盖率统计）；支持真实图片输入的设计认知咨询与无图认知咨询两种模式。PARTIAL 是连续执行状态而不是终点：只要仍有原始授权内的可执行工作，就必须派生、领取并继续；阻塞按工作项成立，单项缺授权不冻结整个任务。drive 把工作项领取落盘（短租约）避免并发重复，回填/阻塞自动释放；SessionStart 与 UserPromptSubmit 只读提示未闭合任务，用户补齐授权后立即恢复执行。SOL-first 生命周期：简单/机械任务 0 调用；非简单任务启动默认 CONSULT，调查后按需 PLAN（不依赖工作项数量），执行期按可归因事件追加 CONSULT，medium/high 任务可做阶段复盘，有实质进展的非简单任务在最终工程验证完成后、收口前做综合判断；CONSULT/PLAN 可输出可选议程（核心问题/错误前提/遗漏风险/完成条件补充/验证/反例），材料带上次判断与采纳结果，收口周期后不再追加规划或里程碑窗口；生命周期命令把“应调用”物化为调度义务并可直接执行（每条命令最多 1 次，`--sol auto|advise|off`），`sol-stats` 以显式分母统计覆盖率。REVIEW 仅在用户明确要求时执行。调度义务在窗口关闭时写终态处置（完成/覆盖/跳过/失败/未执行/未决）与当时策略快照，`sol-accept --historical` 只为已收口任务补记可证明的采纳或带原因的 pending。SOL 只提供认知输入，ZCode 是唯一技术决策与工程执行主体；G4 原生只读复核已退役，历史台账只读保留。"
+description: "Copilot v9.9.0 轻量协作治理：任务承接、合同与完成条件、状态与证据登记、PARTIAL 强制续跑与调度领取、认知引擎（默认 gpt-6.2-astra，high，零工具） CONSULT / PLAN 与生命周期主动调度（义务化、有界自动执行、覆盖率统计）；支持真实图片输入的设计认知咨询与无图认知咨询两种模式。PARTIAL 是连续执行状态而不是终点：只要仍有原始授权内的可执行工作，就必须派生、领取并继续；阻塞按工作项成立，单项缺授权不冻结整个任务。drive 把工作项领取落盘（短租约）避免并发重复，回填/阻塞自动释放；SessionStart 与 UserPromptSubmit 只读提示未闭合任务，用户补齐授权后立即恢复执行。SOL-first 生命周期：简单/机械任务 0 调用；非简单任务启动默认 CONSULT，调查后按需 PLAN（不依赖工作项数量），执行期按可归因事件追加 CONSULT，medium/high 任务可做阶段复盘，有实质进展的非简单任务在最终工程验证完成后、收口前做综合判断；CONSULT/PLAN 可输出可选议程（核心问题/错误前提/遗漏风险/完成条件补充/验证/反例），材料带上次判断与采纳结果，收口周期后不再追加规划或里程碑窗口；生命周期命令把“应调用”物化为调度义务并可直接执行（每条命令最多 1 次，`--sol auto|advise|off`），`sol-stats` 以显式分母统计覆盖率。REVIEW 仅在用户明确要求时执行。调度义务在窗口关闭时写终态处置（完成/覆盖/跳过/失败/未执行/未决）与当时策略快照，`sol-accept --historical` 只为已收口任务补记可证明的采纳或带原因的 pending。SOL 只提供认知输入，ZCode 是唯一技术决策与工程执行主体；G4 原生只读复核已退役，历史台账只读保留。"
 when_to_use: >
   需要把多步骤工程任务纳入可追踪治理时：任务合同/完成条件需要固定、证据与审计需要绑定、
   长任务需要 PARTIAL 持续推进与上下文恢复、非简单任务需要 SOL 默认认知（启动 CONSULT、
@@ -9,7 +9,7 @@ when_to_use: >
   直接由 ZCode 原生完成，不进入本 Skill。
 ---
 
-# copilot：轻量协作治理（v9.8.0）
+# copilot：轻量协作治理（v9.9.0）
 
 Copilot 是运行在 ZCode 内的**协作治理层**，不是决策模型，也不是执行体。它负责把任务变成可
 追踪的合同、状态、证据与收口条件，并在任务没有真正完成时继续推进。
@@ -25,8 +25,9 @@ Copilot 是运行在 ZCode 内的**协作治理层**，不是决策模型，也�
 - **内置子代理（按需）**：`Explore` 只做独立只读调查；`general-purpose` 只承担边界清晰、
   可独立交付且并行收益明显的工作。二者都由主代理拆分、控制范围并集成结果。
 - **SOL（默认认知引擎与用户要求的独立复核）**：经既有本机 CPA `127` 通道调用
-  `gpt-6.2-sol`（`reasoning.effort=high`，`standard` 模式），**零工具、单轮**地阅读主代理
-  一次性提交的精炼材料。**CONSULT** 是默认认知入口：理解目标与隐含需求、判断问题本质与
+  `gpt-6.2-astra`（`reasoning.effort=high`，`standard` 模式），**零工具、单轮**地阅读主代理
+  一次性提交的精炼材料。`gpt-6.2-sol` 只保留为显式兼容模型（`--model`），既不作为失败回退，
+  也不因 Astra 不可用而自动切换。**CONSULT** 是默认认知入口：理解目标与隐含需求、判断问题本质与
   关键矛盾、比较路线与取舍、提示风险与遗漏、给出调查方向与再咨询条件；**PLAN** 在调查
   之后给出方案比较、优先级与阶段目标；**REVIEW** 只在用户明确要求时输出结构化 findings。
   三者都是 advisory，不执行工程、不做技术决策、不读写台账、不调度子代理，也不做机械式
@@ -79,10 +80,13 @@ start（合同 + 完成条件 + 风险 + 任务类型 + 后端）
   → [仅用户明确要求] sol-review 一次（REVIEW 独立复核）
 ```
 
-`sol-consult` / `sol-plan` / `sol-review` 是显式模型调用入口；其余生命周期命令
-（`start` / `plan` / `record` / `criterion` / `closure` …）和 `drive` 在默认 `--sol auto` 下
-会顺带执行**至多 1 条** recommended 调度义务（1 次请求，失败只记录、不阻断）——所以
-“不调用模型”只对 `--sol off|advise`、读命令和测试进程成立。所有命令其余工作只读写任务
+`sol-consult` / `sol-plan` / `sol-review` 是显式模型调用入口；生命周期命令 `start` /
+`closure` / `drive` 在默认 `--sol auto` 下会顺带执行**至多 1 条** recommended 调度义务
+（1 次请求，失败只记录、不阻断）。**纯登记/报告/合同命令**（`plan` / `record` / `rerun` /
+`criterion` / `judgment` / `evidence` / `report` / `accept` / `decide` / `block` / `unblock` /
+`finding` / `reopen` / `contract`）默认 `advise`：只物化义务并给命令，**绝不隐式付费**；
+只有命令行显式 `--cognition auto` / `--sol auto` 才执行。所以“不调用模型”对读命令、纯登记
+命令的默认行为和测试进程都成立。所有命令其余工作只读写任务
 状态与本地证据/派发文件；其中 `evidence --capture-cmd` 会执行调用方给出的本地命令，
 `handoff` 会做只读 Git 查询。每次 SOL 调用只发一次请求，不自动重试、不自动二审；
 CONSULT / PLAN 失败只记录并降级，不阻断工程推进。失败保留原始 HTTP 状态、上游错误码与
@@ -584,13 +588,16 @@ verify 的结构化质量报告（`copilot-verify-result/v1`）走报告接入�
 | 有界执行 | 每条生命周期命令最多执行 **1 条义务、1 次请求**（`drive` 只在 RUNNING 阶段消费一次，PASS 分支的 E 窗口单独一次）；不循环、不自动重试 |
 | 自动材料 | `--obligation SO<n>` 执行时由状态确定性生成材料（目标、合同、条件、工作项、证据身份与相对上次的实质变化），主代理不必先写材料文件；手动调用仍以 `--materials` 为准 |
 
-**策略开关**：`--sol auto|advise|off`（或 `COPILOT_SOL_AUTO`），默认 `auto`：
+**策略开关**：`--cognition` 是模型无关的正式别名，`--sol` 继续兼容，取值
+`auto|advise|off`（或 `COPILOT_SOL_AUTO`）；生命周期命令默认 `auto`，纯登记/报告命令默认
+`advise`：
 
 - `auto`：`recommended` 级义务直接执行（D 里程碑与 E 收口都是 recommended）；历史 `optional` 义务只提示，收口时按 `not-required` 计合理跳过。
 - `advise`：只打印可直接粘贴的命令（无占位符），不发起调用。
 - `off`：只记录义务，不打印、不执行。
 - 读命令（`status` / `sol-schedule` 不带 `--execute` / `sol-stats` / `handoff`）**永不执行**；
-  测试进程（`unittest` 已加载）默认不自动调用；`COPILOT_SOL_AUTO=off` 可强制离线。
+  纯登记/报告命令只认命令行显式 `auto`；测试进程（`unittest` 已加载）默认不自动调用；
+  `COPILOT_SOL_AUTO=off` 可强制离线。
 
 **执行与结算**：执行仍走既有通道（`_run_sol_channel` → `sol_review`，同一 `sol_calls` 台账、
 同一 `.sol.lock`），不新建平行调用体系。成功写 `source=executed` 与 `call_id`；同一认知对象
@@ -643,9 +650,10 @@ G1–G3 与收口。
   变化、材料有重大遗漏、出现超出当前判断力的重大不确定性。普通测试失败本身不构成再咨询。
 - **治理边界**：结论写入 `sol_calls`（`mode=CONSULT|PLAN`），不进入 Finding 台账、不改变
   完成条件、不影响 G1–G3；是否采纳、如何实施由 ZCode 主代理决定，并用 `sol-accept` 登记。
-- **模型与推理强度**：所有 SOL 模式统一 `gpt-6.2-sol` + `reasoning.effort="high"`
+- **模型与推理强度**：所有认知模式默认 `gpt-6.2-astra` + `reasoning.effort="high"`
   （`standard` 模式），不按角色降级，不允许静默回退到 `medium`/`low` 或其他模型；
   上游回显的 `model`、`reasoning.effort`、`reasoning.mode` 不一致时拒绝消费（退出码 9）。
+  `gpt-6.2-sol` 只能通过 `--model gpt-6.2-sol` 显式选择（历史兼容），不是默认、不是回退。
 
 ### 单轮原则（硬约束）
 
@@ -864,7 +872,23 @@ CONSULT / PLAN 输出契约（`copilot-sol-think/v2`）：`judgment`、`goal_und
 
 ## 版本
 
-当前 **v9.8.0（多模态设计认知：真实图片输入、无图/有图双模式与设计知识复用）**：
+当前 **v9.9.0（Astra 默认认知引擎迁移与调用效率优化）**：
+
+- **默认模型迁移**：所有认知入口（CONSULT / PLAN / 事件再咨询 / 收口判断 / 历史 THINK 别名）
+  默认 `gpt-6.2-astra`（Provider `codex`，`reasoning.effort=high`，`standard`，Responses API，
+  零工具单轮）。`gpt-6.2-sol` 只保留为显式兼容模型（`sol-consult --model gpt-6.2-sol`），
+  不做失败回退、不自动切换，历史 SOL 记录与审计只读保留。
+- **模型身份入账**：记录/失败/审计/复用键都带 `provider` 与 `model_key`（`codex:<model>`）；
+  复用只命中同模型记录，旧记录缺模型归属时一律不当作新模型响应。
+- **退避按模型隔离**：窗口键为 `provider + model + error_class`；SOL 过载不冻结 Astra，
+  Astra 过载不阻塞显式 SOL 调用；成功只清本模型，`Retry-After` 逐模型独立遵守。
+- **调用语义分离**：纯登记/报告/合同命令默认 `advise`（不隐式付费），只有显式
+  `--cognition auto` / `--sol auto` 才执行；`judgment` 不再默认真发 CONSULT。
+- **复用与指标**：复用键含 `task_id` + 归一化上下文 + 模型 + 提示词版本；命中登记到
+  `sol_reuses`；`sol-stats` 增加 `by_model`（请求数、完成/失败、输入/输出/reasoning/总
+  Token、p50/p95 耗时、重复调用）与 `reuse`（命中数、按模型）。
+
+**v9.8.0（多模态设计认知：真实图片输入、无图/有图双模式与设计知识复用）**：
 
 - **真实图片输入**：`sol-consult` / `sol-plan` / `sol-review` 支持 `--image`（最多 6 张、
   单张 ≤8 MB、合计 ≤24 MB，PNG/JPEG/WebP）与 `--image-note`；图片作为 Responses API
@@ -886,8 +910,8 @@ v9.5.0（调度领取与阻塞边界）等条目的完整变更记录已迁入 `
 
 **跨版本不变量**：G1–G3 与收口 fail-closed、`closure_readiness` 收口准入、PARTIAL 强制续跑、
 SOL advisory（CONSULT / PLAN / REVIEW 都不是门禁）、REVIEW 仅用户明确要求、G4 原生只读复核
-已正式退役、SOL 零工具单轮与 `gpt-6.2-sol` + `reasoning.effort="high"`、Provider/模型/凭据与
-授权边界全部不变。
+已正式退役、零工具单轮与默认 `gpt-6.2-astra` + `reasoning.effort="high"`（SOL 仅显式兼容）、
+Provider/模型/凭据与授权边界全部不变。
 
 历史版本（v9.7.1 及更早，含 v9.4.0 上下文引擎、v9.3.0 治理加固、v9.0.0 SOL-first 生命周期、
 v8.x G4 退役与 SOL 单轮复核、v6.x 治理收敛与 v5.x 退役说明）见 `references/history.md`。

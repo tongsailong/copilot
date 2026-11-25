@@ -180,11 +180,12 @@ class UnifiedRecordTests(FusionBase):
         self.assertEqual(admission["sol_calls_total"], 2)
         # 历史 PLAN 记录按 PLAN 计入覆盖：任何已有认知结论都不重复付费。
         self.assertEqual(admission["sol_calls_by_mode"]["PLAN"], 1)
-        # 单轮复用也能命中历史结论，避免升级后重复付费。
+        # 历史记录仍可读、仍计入覆盖，但旧 SOL 结论没有模型归属，不能被当成
+        # Astra 的新响应复用：同一材料在当前默认模型下重新判定为首次调用。
         legacy = merged[0]
         decision = SR.single_round_decision(
             state, legacy["materials_sha256"], mode="REVIEW")
-        self.assertEqual(decision["action"], "reuse")
+        self.assertEqual(decision["action"], "call")
 
     def test_same_id_in_both_stores_is_counted_once(self):
         state = {

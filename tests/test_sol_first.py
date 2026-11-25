@@ -802,7 +802,7 @@ class BoundaryTests(SolFirstBase):
                 self.assertEqual(payload["stage"], stage)
                 self.assertTrue(payload["zero_tool"])
                 self.assertEqual(payload["tool_keys_present"], [])
-                self.assertEqual(payload["model"], "gpt-6.2-sol")
+                self.assertEqual(payload["model"], SR.DEFAULT_MODEL)
         self.assertEqual(open(self.state_path, "rb").read(), before)
 
     def test_review_is_not_auto_derived_from_complexity(self):
