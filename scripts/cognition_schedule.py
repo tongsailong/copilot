@@ -155,7 +155,8 @@ def _next_obligation_id(schedule: dict) -> str:
     return f"SO{index}"
 
 
-def _new_obligation(state: dict, advice: dict, *, now: str) -> dict:
+def _new_obligation(state: dict, advice: dict, *, now: str,
+                    origin: str = "") -> dict:
     family = _text(advice.get("family"))
     event = _text(advice.get("event"))
     instance = _text(advice.get("instance"))
@@ -176,6 +177,9 @@ def _new_obligation(state: dict, advice: dict, *, now: str) -> dict:
         # 收口周期：重开后新建的义务属于新周期，旧义务保持原周期与原始事实。
         "cycle": current_cycle(state),
         "opened_at": now,
+        # 打开窗口的生命周期环节（start/plan/record/drive/closure/...）：漏调
+        # 定位用的是“哪个命令先发现这个窗口”，不是猜测。
+        "opened_by": _text(origin),
         "window": "open",
         "closed_at": "",
         "closed_reason": "",
@@ -494,19 +498,24 @@ def _close(schedule: dict, obligation: dict, *, now: str, reason: str) -> None:
     _stamp_disposition(obligation, now=now, schedule=schedule)
 
 
-def _advance_windows(schedule: dict, *, now: str) -> None:
+def _advance_windows(schedule: dict, *, now: str) -> list[str]:
     """更晚窗口已经“满足”时，关闭更早仍未满足的窗口（漏调因此可见）。
 
     只在确实有更晚窗口成功执行/复用后才关闭：刚创建、被提示但未执行、预算耗尽
     都不关闭窗口，避免把“还没来得及做”误判成漏调。比较只在同一收口周期内进行：
     重开后的收口判断覆盖的是重开后的认知对象，不能追溯性地宣布上一周期的窗口
     已被覆盖。
+
+    返回变更说明：关闭窗口本身会改变“漏调”事实，调用方按 `changes` 决定是否
+    落盘；静默修改会让这条事实随内存副本一起丢失（观察到 missed 只在某些命令
+    后才出现）。
     """
+    changes: list[str] = []
     satisfied = [item for item in schedule["obligations"]
                  if isinstance(item, dict) and item.get("window") == "closed"
                  and _text(item.get("status")) == "satisfied"]
     if not satisfied:
-        return
+        return changes
     # 收口综合判断覆盖了规划比较（B）与里程碑复盘（D）的认知对象：目标达成、
     # 方案是否仍成立、遗漏与下一阶段方向都已在收口判断里综合。**只要同周期的
     # E 窗口已满足就成立**，不能用“最早已满足窗口”的门槛去判断——启动 CONSULT
@@ -531,11 +540,14 @@ def _advance_windows(schedule: dict, *, now: str) -> None:
             item["skip_reason"] = "收口综合判断已覆盖该窗口的认知对象"
             item["finished_at"] = now
             _close(schedule, item, now=now, reason="closure-covered")
+            changes.append(f"义务 {item.get('obligation_id')} 由收口判断覆盖")
             continue
         frontier = frontiers.get(cycle)
         if frontier is None or family >= frontier:
             continue
         _close(schedule, item, now=now, reason="superseded")
+        changes.append(f"义务 {item.get('obligation_id')} 被更晚窗口取代（漏调）")
+    return changes
 
 
 def _expire_superseded(schedule: dict, state: dict, *, now: str) -> list[str]:
@@ -633,7 +645,7 @@ def _collapse_duplicate_windows(schedule: dict, *, now: str) -> list[str]:
 
 def sync(schedule: dict, state: dict, advice: dict, *, now: str,
          closed: bool = False, policy: str = "",
-         auto_execution: bool | None = None) -> list[str]:
+         auto_execution: bool | None = None, origin: str = "") -> list[str]:
     """把当前建议物化为调度义务，并按已发生的事实关闭窗口。
 
     返回人类可读的变更说明（供状态历史/输出使用）。函数只改动传入的 schedule。
@@ -662,7 +674,7 @@ def sync(schedule: dict, state: dict, advice: dict, *, now: str,
                                    instance=instance)
         if existing is None or existing.get("contract_sha256") != \
                 _text(state.get("contract_sha256")):
-            obligation = _new_obligation(state, advice, now=now)
+            obligation = _new_obligation(state, advice, now=now, origin=origin)
             obligation["obligation_id"] = _next_obligation_id(schedule)
             # 打开时点策略：note_policy 已在本轮同步开头记录当前策略，这里把
             # “打开这一刻生效什么”固化到义务上，后续策略变更不覆盖它。
@@ -706,7 +718,7 @@ def sync(schedule: dict, state: dict, advice: dict, *, now: str,
     if closed:
         # 收口前先把“更晚窗口已满足”的事实结算掉：否则更早的里程碑窗口会被
         # 直接 close 成漏调，而它其实已被收口判断覆盖。
-        _advance_windows(schedule, now=now)
+        changes.extend(_advance_windows(schedule, now=now))
         for item in schedule["obligations"]:
             if not isinstance(item, dict) or item.get("window") != "open":
                 continue
@@ -723,7 +735,7 @@ def sync(schedule: dict, state: dict, advice: dict, *, now: str,
                 continue
             _close(schedule, item, now=now, reason="task-closed")
     elif action != "none":
-        _advance_windows(schedule, now=now)
+        changes.extend(_advance_windows(schedule, now=now))
     return changes
 
 
@@ -771,13 +783,15 @@ def summary(state: dict) -> dict:
              "family": item.get("family"), "event": item.get("event"),
              "stage": item.get("stage"), "level": item.get("level"),
              "status": item.get("status"),
+             "opened_by": _text(item.get("opened_by")),
              "cycle": obligation_cycle(item)}
             for item in pending],
         "next": ({"obligation_id": next_item[0].get("obligation_id"),
                   "family": next_item[0].get("family"),
                   "event": next_item[0].get("event"),
                   "mode": next_item[0].get("mode"),
-                  "stage": next_item[0].get("stage")}
+                  "stage": next_item[0].get("stage"),
+                  "opened_by": _text(next_item[0].get("opened_by"))}
                  if next_item else None),
     }
 
@@ -1144,6 +1158,41 @@ def task_stats(state: dict) -> dict:
         code = _text(item.get("event")) or "-"
         by_event[code] = by_event.get(code, 0) + 1
 
+    # 生命周期口径（可观测）：triggered → invoked → succeeded/failed/skipped/missed。
+    # 它把义务的既有状态翻译成一句可核对的话（是否发起过请求、成功/失败/跳过/漏调），
+    # 不改变 coverage 的分子分母，也不把“未调用”一律算成正常跳过：
+    #   * invoked 只认带真实 call_id 的义务（请求进入认知通道并留下调用记录）；
+    #   * failed 包含“请求失败”和“前置条件连续失败后终止”两种，后者另有计数；
+    #   * skipped 按 skip_by 归类；missed 按打开窗口的生命周期环节（opened_by）归类。
+    lifecycle = {
+        "triggered": len(rows),
+        "invoked": len([item for item in rows if _text(item.get("call_id"))]),
+        "succeeded": len([item for item in rows
+                          if _text(item.get("status")) == "satisfied"
+                          and _text(item.get("call_id"))]),
+        "failed": len([item for item in rows
+                       if _text(item.get("status")) == "failed"]),
+        "failed_before_request": len([item for item in rows
+                                      if _text(item.get("status")) == "failed"
+                                      and not _text(item.get("call_id"))]),
+        "skipped": len([item for item in rows
+                        if _text(item.get("status")) == "skipped"]),
+        "missed": len([item for item in rows if is_missed(item)]),
+        "deferred": len([item for item in rows if item.get("deferrals")]),
+        "skip_reasons": {},
+        "missed_by_origin": {},
+    }
+    for item in rows:
+        if _text(item.get("status")) == "skipped":
+            reason = (_text(item.get("skip_by"))
+                      or _text(item.get("skip_reason")) or "-")
+            lifecycle["skip_reasons"][reason] = \
+                lifecycle["skip_reasons"].get(reason, 0) + 1
+        if is_missed(item):
+            origin = _text(item.get("opened_by")) or "-"
+            lifecycle["missed_by_origin"][origin] = \
+                lifecycle["missed_by_origin"].get(origin, 0) + 1
+
     # 终态处置与周期分布：只做观测，不进入 coverage 的分子分母，也不改变 missed
     # 口径。历史义务没有持久化处置时按窗口事实现算（只读，不回写历史状态）。
     raw_schedule = schedule_raw(state)
@@ -1334,6 +1383,7 @@ def task_stats(state: dict) -> dict:
                                and not by_family["A"]["obligations"]),
         "by_family": by_family,
         "by_event": by_event,
+        "lifecycle": lifecycle,
         "cycle": current_cycle(state),
         "dispositions": dispositions,
         "by_cycle": [by_cycle[key] for key in sorted(by_cycle)],
@@ -1409,6 +1459,22 @@ def stats(states: list[dict], *, scope: str = "") -> dict:
     for detail in details:
         for code, count in detail["by_event"].items():
             by_event[code] = by_event.get(code, 0) + count
+    # 生命周期口径跨任务合并：触发/调用/成功/失败/跳过/漏调分开计数，跳过原因与
+    # 漏调位置（opened_by）按来源聚合，便于定位“命中但没分发”的环节。
+    lifecycle = {
+        key: sum(d["lifecycle"][key] for d in details)
+        for key in ("triggered", "invoked", "succeeded", "failed",
+                    "failed_before_request", "skipped", "missed", "deferred")
+    }
+    skip_reasons: dict[str, int] = {}
+    missed_by_origin: dict[str, int] = {}
+    for detail in details:
+        for key, count in detail["lifecycle"]["skip_reasons"].items():
+            skip_reasons[key] = skip_reasons.get(key, 0) + count
+        for key, count in detail["lifecycle"]["missed_by_origin"].items():
+            missed_by_origin[key] = missed_by_origin.get(key, 0) + count
+    lifecycle["skip_reasons"] = dict(sorted(skip_reasons.items()))
+    lifecycle["missed_by_origin"] = dict(sorted(missed_by_origin.items()))
     # 模型级聚合：跨任务按 model_key 合并，耗时用全量样本重算分位，避免“平均值
     # 的平均”掩盖长尾；复用命中同样按模型合并，历史无 model 的记录归 "-"。
     model_rows: dict[str, dict] = {}
@@ -1461,6 +1527,7 @@ def stats(states: list[dict], *, scope: str = "") -> dict:
         "totals": totals,
         "coverage": coverage,
         "by_event": dict(sorted(by_event.items())),
+        "lifecycle": lifecycle,
         "calls": {
             key: sum(d["calls"][key] for d in details) for key in call_keys
         },

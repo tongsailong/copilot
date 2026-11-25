@@ -39,10 +39,31 @@ COMPLEXITY_SIGNALS = {
     "replan-history": "曾出现方案失败并重新规划",
     "reopened": "任务曾重开",
     "user-request": "用户明确要求认知判断或独立复核",
+    "high-impact-scope": "目标或合同涉及治理/架构/协作规则等高影响范围（与任务类型无关）",
 }
 # 任务类型不是“复杂度信号”，而是默认路由前提：非简单类型始终进入认知
 # 流程（至少一次 CONSULT），简单类型只有出现真实升级信号才进入。这样默认
 # standard 任务不会仅凭类型被抬到 high，也不会默认跳过复杂任务。
+
+# ── 高影响范围（v9.11）──────────────────────────────────────────────────
+# 认知价值不能只看任务类型或文件类型：以文档为载体的规则/治理/架构评审同样
+# 可能改变跨模块行为、权限边界或长期协作规则。这里按**合同文字**做确定性识别：
+# 命中一个强短语，或命中两个不同维度的词表，就算 1 个复杂度信号（中等价值）。
+# 它只提升“值得做一次启动判断”的概率，不判断方案对错、不跳过调查，也不构成门禁。
+HIGH_IMPACT_SCOPE_GROUPS = {
+    "治理": ("治理", "规则", "规范", "政策", "策略", "流程", "权限", "合规",
+             "标准", "制度", "governance", "policy", "rules"),
+    "架构": ("架构", "边界", "调用链", "跨模块", "跨项目", "协议", "接口契约",
+             "调度", "全局", "基础设施", "框架", "architecture", "protocol"),
+    "协作": ("角色", "协作", "门禁", "质量门", "认知", "评审", "交接",
+             "agents.md", "skill", "review"),
+}
+# 强短语单独命中即可：它们表示“这次改动会影响其他任务/其他角色/长期规则”。
+HIGH_IMPACT_SCOPE_PHRASES = (
+    "全局规则", "规则评审", "规则优化", "规则体系", "架构评审", "技术选型",
+    "角色边界", "权限模型", "安全策略", "治理升级", "接口契约", "跨项目架构",
+    "跨模块", "质量门禁", "调度策略", "协作规则", "全局配置", "认知调度",
+)
 
 # 只有“升级型”信号才算认知对象发生实质变化、允许第二次调用。结构型信号
 # （工作项数量、依赖、目录、声明的触发因素）只用于判断复杂度：开发过程中证据
@@ -778,6 +799,49 @@ def _module_dirs(state: dict, workspace: str = "") -> list[str]:
     return sorted(dirs)
 
 
+def _scope_texts(state: dict) -> list[str]:
+    """高影响范围识别的输入文本：目标、合同正文、边界与完成条件描述。"""
+    contract = state.get("contract") or {}
+    parts = [_text(state.get("goal")),
+             _text(contract.get("done_criteria_text")),
+             _text(contract.get("boundaries"))]
+    for item in contract.get("criteria") or []:
+        if isinstance(item, dict):
+            parts.append(_text(item.get("description")))
+    return [part for part in parts if part.strip()]
+
+
+def high_impact_scope(state: dict) -> dict:
+    """确定性识别“高影响范围”：规则/治理/架构/协作类内容。
+
+    只用任务目标与合同文字，不读仓库、不调用模型。命中是**复杂度的一个信号**，
+    不是门禁，也不等于确认存在方案取舍：它只避免“因为是文档修改就被当成简单
+    任务”。命中原因（词表维度与短语）一并返回，便于事后核对而不是黑箱判断。
+
+    阈值刻意保守：一个强短语，或两个不同维度的词表同时命中；同一维度的多个词
+    （例如“流程”“权限”都属于治理）不算跨范围影响。
+    """
+    text = "\n".join(_scope_texts(state)).lower()
+    if not text.strip():
+        return {"hit": False, "groups": [], "phrases": [], "detail": ""}
+    groups: list[str] = []
+    hits: list[str] = []
+    for name, terms in HIGH_IMPACT_SCOPE_GROUPS.items():
+        matched = [term for term in terms if term in text]
+        if matched:
+            groups.append(name)
+            hits.extend(matched)
+    phrases = [phrase for phrase in HIGH_IMPACT_SCOPE_PHRASES
+               if phrase.lower() in text]
+    hit = bool(phrases) or len(groups) >= 2
+    detail = ""
+    if hit:
+        shown = list(dict.fromkeys(phrases[:3] + hits))[:6]
+        detail = ("合同目标涉及" + "、".join(groups) + "范围（命中："
+                  + "、".join(shown) + "）")
+    return {"hit": hit, "groups": groups, "phrases": phrases, "detail": detail}
+
+
 def task_complexity(state: dict, *, triggers: list[str] | None = None,
                     workspace: str = "") -> dict:
     """确定性的任务认知复杂度：只用状态事实，不调用任何模型。
@@ -814,6 +878,13 @@ def task_complexity(state: dict, *, triggers: list[str] | None = None,
             requested.append(value)
     if requested:
         add("declared-trigger", "触发因素：" + "、".join(requested))
+
+    # 高影响范围与任务类型解耦：方案类任务已由 plan-kind 覆盖，其余类型（含
+    # docs/mechanical）在合同文字表明规则/架构/协作影响时仍然进入中等复杂度。
+    if kind not in PLAN_KINDS:
+        scope = high_impact_scope(state)
+        if scope["hit"]:
+            add("high-impact-scope", scope["detail"])
 
     actions = _action_list(state, plan_only=True)
     edges = _dependency_edges(actions)

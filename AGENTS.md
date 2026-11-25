@@ -12,20 +12,26 @@ Copilot 是运行于 ZCode 内的**轻量协作治理 Skill**：负责任务承�
 提供整体判断，用户明确要求时执行一次独立复核（REVIEW），均由 `gpt-6.2-astra` 零工具单轮调用
 完成。只有这一个认知模型：没有第二模型、没有 `--model` 切换、没有失败回退。
 
-当前基线 **v9.10.0**（认知命名收敛与 SOL 退役：`sol-*` 命令、`sol_*.py` 文件、`cognition_calls`
-状态键统一改为 `cognition`/认知；旧命令名不再转发，历史状态键只读兼容）。与版本号
-无关、长期有效的关键约束：
+当前基线 **v9.11.0**（认知自动调度与调用率优化：复杂度按合同内容判定、策略随任务生效、
+生命周期调度点、`opened_by` 与 `lifecycle` 观测）。与版本号无关、长期有效的关键约束：
 
 - **执行与续跑**：任务必须经 `start` / `drive` 进入状态机；PARTIAL 不是终点，
   `continuation.required=true` 时必须继续派生/执行；阻塞按工作项成立，单项缺授权不冻结
   其余工作；`drive` 用 `claims`（短租约）避免并发重复，回填/阻塞自动释放。
 - **认知是认知引擎，不是门禁**：生命周期为 A 启动 CONSULT → B 调查后 PLAN → C 升级型事件
-  CONSULT → D 中高复杂阶段复盘 → E 最终验证完成后的收口 CONSULT。`cognition_schedule.py` 把窗口
-  物化为义务，每条命令最多 1 个义务 / 1 次请求（`--cognition auto|advise|off`，无其他别名）。
-  生命周期命令默认 `auto`；纯登记/报告/合同命令默认 `advise`，只在命令行
-  显式 `auto` 时才付费执行，`judgment` / `report` / `evidence` 等不得隐式调用模型。同模型、
+  CONSULT → E 最终验证完成后的收口 CONSULT（D 普通里程碑复盘已退役，不得恢复）。复杂度按
+  **合同内容**判定（`high-impact-scope` 信号：治理/规则/架构/协作/门禁类文字），`docs` /
+  `mechanical` 任务不因文件类型被跳过。`cognition_schedule.py` 把窗口物化为义务，每条命令最多
+  1 个义务 / 1 次请求（`--cognition auto|advise|off`，无其他别名）。
+  策略**随任务生效**：命令行显式 > 环境变量 `COPILOT_COGNITION` > 任务策略快照 > 命令默认；
+  `start` 记录的默认 `auto` 对整条任务有效。**调度点**为生命周期命令（`start`/`plan`/`record`/
+  `rerun`/`criterion`/`unblock`/`reopen`/`closure`/`drive`）：省略 `--cognition` 时按任务策略
+  执行；纯记录命令（`judgment`/`evidence`/`report`/`accept`/`decide`/`block`/`finding`/`contract`）
+  只物化窗口并打印命令，不隐式付费，显式 `--cognition auto` 才执行。同模型、
   同 task_id、同归一化上下文与同问题时复用，不重复付费；复用命中登记到 `cognition_reuses`
-  （历史 `sol_reuses` 只读兼容）。
+  （历史 `sol_reuses` 只读兼容）。义务记录 `opened_by`，`cognition-stats` 输出 `lifecycle`
+  口径（triggered / invoked / succeeded / failed / skipped / missed / deferred 及跳过原因、
+  漏调归因）。
   义务窗口关闭时写 `disposition`：`not-executed` 用**窗口打开时**的策略
   （`policy_at_open`；历史义务按周期策略快照的变更历史回推，无可证明快照记 `unknown`），
   不用当前配置倒推；`cycle` = 1 + 重开次数，窗口比较不跨周期追溯。`cognition-accept` 只记录采纳

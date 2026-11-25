@@ -2304,3 +2304,37 @@
       CPA；G1–G3、`closure_readiness`、PARTIAL 续跑、REVIEW 仅用户明确要求、G4 退役、
       Provider/凭据与授权边界全部不变。本轮只做源码、测试与运行时同步，未 commit / push /
       Tag / Release。
+
+84. **认知自动调度与调用率优化（2026-11-25，v9.11.0 工作区，用户任务）。**
+    - **根因（已确认）**：Astra 早已配置为默认模型，但“会不会被调用”由三个互相独立的
+      闸门串起来——复杂度判定按 `task_kind` 短名单、策略默认 `advise`、执行只在命令行显式
+      `auto` 时成立。三者任一为否就不会发请求，于是“配好了”与“真的调用”长期脱节：历史 41
+      份策略快照里 `off` 23 份、`advise` 2 份、`auto` 16 份，318 条义务只对应 144 次完成调用，
+      大量义务收口时仍是 `due`。会话里那次全局 `AGENTS.md` 架构评审根本没进状态机（无任务
+      目录、无复杂度判定、无义务），所以零调用不是“判断错了”，而是“结构上没有入口”。
+    - **复杂度按内容判定（已确认）**：`review_policy.task_complexity` 新增
+      `high-impact-scope` 信号——目标/完成条件/边界文字命中治理、规则、架构、协作、门禁类
+      短语（或跨 ≥2 组词元）即升级为 medium，**与 `task_kind` 解耦**。`docs` / `mechanical`
+      不再因文件类型被静默跳过；纯文档错别字类任务仍保持 low、零调用。
+    - **策略随任务生效（已确认）**：优先级为命令行显式 `--cognition` > 环境变量
+      `COPILOT_COGNITION` > 任务策略快照（按周期回退）> 命令默认。`start` 写入的快照对整条
+      任务持续有效，`--cognition auto` 不再是每条命令的人工开关；`start --cognition off`
+      让整条任务（含 `drive`）保持离线。`COPILOT_COGNITION_AUTO` 只放开执行闸门，不改变
+      策略级别。
+    - **调度点边界（已确认）**：生命周期命令（`start` / `plan` / `record` / `rerun` /
+      `criterion` / `unblock` / `reopen` / `closure` / `drive`）按有效策略执行至多 1 条义务；
+      纯记录命令（`judgment` / `evidence` / `report` / `accept` / `decide` / `block` /
+      `finding` / `contract`）只物化窗口、打印命令，不隐式付费。这既避免了登记命令的
+      意外花费（v9.9 事故路径），也避免把“登记”当成调度点导致义务长期 `due`。
+    - **可观测性（已确认）**：义务记录 `opened_by`（哪条生命周期命令开的窗口），
+      `cognition-stats` 输出 `lifecycle`（triggered / invoked / succeeded / failed /
+      failed_before_request / skipped / missed / deferred，含 `skip_reasons` 与
+      `missed_by_origin`），`--workspace` 跨任务聚合。这是“为什么没调用”的确定性答案，
+      不参与覆盖率分母、不是门禁、也不证明结论质量。
+    - **窗口关闭必须落盘（缺陷修复）**：`_advance_windows` 以前在内存里关闭窗口却不返回
+      变更，`sync()` 于是在 `changes` 为空时不保存，漏调事实随内存副本一起丢失。现在关闭动作
+      返回变更串并计入 `changes`，调用方按变更落盘的语义才成立。
+    - **边界与不变量**：认知仍是 advisory——不改变阶段、G1–G3、技术方案或授权；同模型同上下文
+      同问题仍复用；失败只登记并降级；无每工作项强制调用、无人工次数上限、无重试与模型切换；
+      D 阶段、G4、强制 Reviewer 不恢复；Provider/凭据/CPA 与全局 `AGENTS.md` 未改动；本轮只改
+      源码、测试、文档与运行时同步，未 commit / push / PR / Release。

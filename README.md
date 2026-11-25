@@ -28,9 +28,11 @@ Copilot 是运行在 ZCode 内的**轻量协作治理 Skill**。它把多步骤�
 - **证据与绑定**：证据先登记再消费，执行/复核结果绑定 `task/contract/plan/work_item/result sha256`；
   文件型证据重读校验摘要。
 - **收口门禁 G1–G3（fail-closed）**：工作项终态、合同/条件/证据完整性、Finding 台账与停摆检查。
-- **认知生命周期调度**：A–E 五个认知窗口物化为持久化义务（`state.cognition_schedule`），由生命周期
-  命令在自身事务内**有界执行**（每条命令最多 1 个义务 / 1 次请求），`--cognition auto|advise|off` 控制；
-  `cognition-stats` 给出显式分母的覆盖率统计。
+- **认知生命周期调度**：A 启动 / B 规划 / C 事件 / E 收口四个认知窗口物化为持久化义务
+  （`state.cognition_schedule`，D 里程碑复盘已退役），由生命周期命令在自身事务内**有界执行**
+  （每条命令最多 1 个义务 / 1 次请求）；策略随任务生效（命令行显式 > `COPILOT_COGNITION` >
+  任务快照 > 命令默认），`--cognition auto|advise|off` 控制；`cognition-stats` 给出覆盖率与
+  `lifecycle` 生命周期口径。
 - **收口时序（v9.6.1）**：`closure_readiness` 是收口 CONSULT 与 G1–G3 的唯一准入——最终工程验证
   完成前不执行收口判断；验证完成 → 认知收口 CONSULT → 主 Agent 用 `cognition-accept` 登记独立判断 →
   G1–G3 收口。同一验证摘要复用结论，摘要变化即旧结论失效。
@@ -195,8 +197,9 @@ python3 -B scripts-sync/sync_runtime.py --baseline --verify-baseline
 
 | 版本 | 要点 |
 |---|---|
+| **v9.11.0** | 认知自动调度与调用率优化：复杂度按**合同内容**判定，新增 `high-impact-scope` 信号（治理/规则/架构/协作/门禁类文字），`docs`/`mechanical` 任务不因文件类型被跳过；策略**随任务生效**（命令行显式 > `COPILOT_COGNITION` > 任务快照 > 命令默认，`start` 记录的 `auto` 对整条任务有效，任务级 `off` 对 `drive` 也生效）；调度点收敛为生命周期命令，纯记录命令不隐式付费；义务记录 `opened_by`，`cognition-stats` 输出 `lifecycle`（触发/调用/成功/失败/跳过/漏调/延后 + 跳过原因 + 漏调归因）；窗口关闭动作计入 `changes` 并落盘 |
 | **v9.10.0** | 认知命名收敛与 SOL 退役：`sol_review.py`/`sol_schedule.py` → `cognition_call.py`/`cognition_schedule.py`，`sol-*` 命令 → `cognition-*`（旧命令名与 `--sol` 别名**一并移除**，不保留跳转表）；状态键统一为 `cognition_calls`/`cognition_reuses`/`cognition_schedule`，`sol_calls`/`sol_reviews`/`sol_advisories`/`sol_reuses`/`sol_backoff`/`sol_schedule` 只读兼容（不迁移、不回写、不再写旧退避单例）；`gpt-6.2-sol` 与 `--model` 彻底移除，只剩 `gpt-6.2-astra`；`knowledge_handoff`/`context_engine` 的 `sol` 目标名改 `cognition`（别名兼容） |
-| v9.9.0 | Astra 默认认知引擎迁移与调用效率优化：默认 `gpt-6.2-astra`（当时的 `gpt-6.2-sol` 显式兼容已于 v9.10.0 移除）；记录/审计/复用键带 `provider`+`model_key`；退避按 `provider+model+error_class` 隔离；纯登记/报告/合同命令默认 `advise`，`judgment` 等不再隐式付费调用；`--cognition` 为模型无关别名；复用命中登记 `cognition_reuses`，`cognition-stats` 增加 `by_model` 与 `reuse` 指标 |
+| v9.9.0 | Astra 默认认知引擎迁移与调用效率优化：默认 `gpt-6.2-astra`（当时的 `gpt-6.2-sol` 显式兼容已于 v9.10.0 移除）；记录/审计/复用键带 `provider`+`model_key`；退避按 `provider+model+error_class` 隔离；纯登记/报告/合同命令不再隐式付费调用；`--cognition` 为模型无关别名；复用命中登记 `cognition_reuses`，`cognition-stats` 增加 `by_model` 与 `reuse` 指标 |
 | v9.8.0 | 多模态设计认知：认知 `--image` 真实图片输入（最多 6 张、单张 ≤8 MB、合计 ≤24 MB，PNG/JPEG/WebP），审计仅存名称/类型/字节/尺寸/sha256/说明，图片指纹进入请求摘要；无图认知咨询与有图视觉咨询双模式；设计协作协议、创造性候选、采纳台账与知识复用边界；沿用现有 Memory/知识通道，不新建审美记忆系统 |
 | **v9.7.1** | 认知记录闭环：`cognition-accept --historical` 只为已收口任务补记复核（`pending` 必须写原因；重复执行幂等、不覆盖既有结论、不据结果一致推断采纳）；调度义务写终态处置（`completed`/`covered`/`skipped`/`failed`/`not-executed`/`unsettled`）与当时策略快照，`not-executed` 无快照即 `unknown`；义务带收口周期编号，重开前后严格分离；锁等待失败留痕但不算失败 |
 | v9.7.0 | 认知主动调度：CONSULT/PLAN 可选议程（`agenda`，只读呈现）；材料带历史判断、采纳与未处理议程；收口周期后不再追加 B/D 窗口；`blockage-change` 只由未解除阻塞触发；采纳待回填可见；`cognition-stats` 增加议程/采纳/收口后调用观察值；capture 草稿带认知溯源 |

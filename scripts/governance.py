@@ -6810,7 +6810,8 @@ def cognition_advice_summary(state: dict, *, gates_passed: bool = False,
 def sync_cognition_schedule(state: dict, *, closed: bool = False,
                       advice: dict | None = None,
                       now: str | None = None, policy: str = "",
-                      auto_execution: bool | None = None) -> dict:
+                      auto_execution: bool | None = None,
+                      origin: str = "") -> dict:
     """把当前生命周期建议物化为调度义务（只改内存状态，调用方负责保存）。
 
     这是调度层的唯一写入口：义务的创建、刷新、复用满足、窗口关闭都在这里发生，
@@ -6823,7 +6824,8 @@ def sync_cognition_schedule(state: dict, *, closed: bool = False,
     schedule = SCH.ensure_schedule(state)
     is_closed = closed or bool((state.get("closure") or {}).get("closed"))
     changes = SCH.sync(schedule, state, advice, now=moment, closed=is_closed,
-                      policy=policy, auto_execution=auto_execution)
+                      policy=policy, auto_execution=auto_execution,
+                      origin=origin)
     if changes:
         _history(state, "cognition_schedule_sync", {
             "changes": changes,

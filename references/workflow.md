@@ -3,11 +3,13 @@
 本文是 Copilot 的**操作层**权威说明：命令、参数、退出码与标准回合流程。
 语义（阶段判定、派生规则、门禁细节）见 `runtime.md`、`review.md`、`agent-bridge.md`。
 `cognition-consult` / `cognition-plan` / `cognition-review` 是显式模型调用入口；生命周期命令
-（`start` / `closure` / `drive`）在默认 `--cognition auto`（`--cognition` 兼容）下会顺带执行
-至多 1 条 recommended 调度义务（1 次请求）。纯登记/报告/合同命令默认 `advise`：只物化
-义务并打印命令，只有命令行显式 `auto` 才付费执行——所以“不调用模型”对读命令、纯登记
-命令默认行为与测试进程成立。其余工作只读写本地任务状态文件。每次认知调用只发一次请求，
-不自动重试、不自动二审；CONSULT / PLAN 失败只记录并降级，不阻断工程推进。
+（`start` / `plan` / `record` / `rerun` / `criterion` / `unblock` / `reopen` / `closure` /
+`drive`）在有效策略为 `auto` 时会顺带执行至多 1 条 recommended 调度义务（1 次请求），
+策略默认随任务生效（`start` 写入 `auto`，`--cognition off` 可让整条任务离线）。纯记录/报告/
+合同命令默认 `advise`：只物化义务并打印命令，只有命令行显式 `auto` 才付费执行——所以
+“不调用模型”对读命令、纯记录命令默认行为与测试进程成立。其余工作只读写本地任务状态文件。
+每次认知调用只发一次请求，不自动重试、不自动二审；CONSULT / PLAN 失败只记录并降级，
+不阻断工程推进。
 
 ## 1. 状态文件
 
@@ -35,13 +37,16 @@
 python3 -B scripts/copilot_dispatch.py <子命令> --state <state.json> [参数]
 ```
 
-生命周期命令（`start` / `closure`）与 `copilot_auto.py drive` 接受
-`--cognition auto|advise|off`（`--cognition` 兼容，默认 `auto`）：做一次有界调度步，最多执行
-1 条义务、1 次请求；`optional` 级只提示；读命令永不执行。纯登记/报告/合同命令
-（`plan` / `record` / `rerun` / `criterion` / `judgment` / `evidence` / `report` / `accept` /
-`decide` / `block` / `unblock` / `finding` / `contract` / `reopen`）默认 `advise`：回填后
+生命周期命令（`start` / `plan` / `record` / `rerun` / `criterion` / `unblock` / `reopen` /
+`closure`）与 `copilot_auto.py drive` 接受 `--cognition auto|advise|off`：做一次有界调度步，
+最多执行 1 条义务、1 次请求；`optional` 级只提示；读命令永不执行。**省略 `--cognition` 时
+策略随任务生效**：命令行显式 > `COPILOT_COGNITION` > 任务快照（`start` 写入，默认 `auto`）>
+命令默认，因此 `start` 之后无需逐条重复 `--cognition auto`，`start --cognition off`
+会让整条任务（含 `drive`）保持离线。纯记录/报告/合同命令（`judgment` / `evidence` /
+`report` / `accept` / `decide` / `block` / `finding` / `contract`）默认 `advise`：回填后
 只物化义务、给出可粘贴命令，不隐式调用模型；确需顺带执行时必须在该条命令上显式写
-`--cognition auto`。`COPILOT_COGNITION_AUTO=off` 可整体关闭自动执行。
+`--cognition auto`。`COPILOT_COGNITION_AUTO=off` 可整体关闭自动执行，`on` 只放开测试进程的
+执行闸门，不改变策略级别。
 
 | 子命令 | 用途 | 关键参数 |
 |---|---|---|

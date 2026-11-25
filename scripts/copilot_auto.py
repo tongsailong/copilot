@@ -216,9 +216,11 @@ def _drive_cognition_step(path: str, args, *, gates_passed: bool = False,
     """drive 内的有界调度步：失败只打印，不改变 drive 的退出码与阶段。"""
     try:
         D = _dispatch_module()
+        # 传 `execute=None`：由调度层按“有效策略 + 本命令是否为调度点”判定。
+        # drive 是调度点，因此 `--cognition` 省略时按任务记录的策略（默认 auto）
+        # 执行，显式 off/advise 或任务级 off 都不会付费。
         return D._cognition_schedule_step(
             path, args, gates_passed=gates_passed,
-            execute=(D._cognition_policy(args) == "auto"),
             prefer_family=prefer_family,
             closure_ready=closure_ready, cache=cache)
     except Exception as exc:  # noqa: BLE001 — 认知不可用不阻断工程推进
