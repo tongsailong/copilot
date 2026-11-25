@@ -57,11 +57,11 @@ python3 -B scripts/copilot_dispatch.py <子命令> --state <state.json> [参数]
 | `block` / `unblock` | 记录/解除真实阻塞 | `block --reason ... --needs ... (--work-item A2 [--work-item A3] [--criterion C2] | --scope task [--force])`；`unblock --reason ... [--block-id B...] [--by user --quote "<原话>"]`（多条未解除时必须指定）；解除后被冻结工作项自动恢复 `pending`。仍有可执行项时任务级 `--scope task` 被拒绝，必须显式 `--force`，状态记录 `ready_at_creation`/`forced_scope`；`--by user` 必须带原话，记录 `resolved_by` 与 `authorization_source=caller-declared` |
 | `closure-check` | 只读检查 G1–G3 | `--json` |
 | `review-admission` | SOL-first 生命周期建议的单一确定性入口（只读、不写状态、不是门禁）：先算任务类型、复杂度与已有 SOL 覆盖，再给出 `advice.action`（`none`/`reuse`/`consult`/`plan`/`review`）、建议模式、阶段与命令 | `--trigger security`（可重复）、`--reason`、`--user-request`、`--review-request`、`--json`；返回 `decision`、`advice`、`task_kind`、`complexity`、`recommended_action`/`recommended_mode`/`recommended_stage`、`sol_calls_total` |
-| `sol-consult` | SOL 默认认知入口：材料 + 问题 → 一次请求 → 目标理解/问题本质/路线与取舍/风险/调查方向/再咨询条件；建议写入统一 `sol_calls`（`mode=CONSULT`），不入门禁；失败只登记并降级 | `--materials <file>`（调度执行时可省略）、`--question`（必填，`--obligation` 时回落到义务问题）、`--stage <understanding\|planning\|development\|stage\|closure>`、`--obligation SO<n>`（按调度义务执行，材料由状态确定性生成）、`--lock-timeout <秒>`、`--knowledge-file`、`--dry-run`、`--list`、`--json`、`--timeout`、`--max-output-tokens`、`--audit-log`（默认 `sol-audit.jsonl`）、`--output-dir`；再次调用：`--force --trigger <user-request\|scope-changed\|new-risk\|materials-omitted\|strategy-failed\|major-uncertainty\|stage-result> --reason` |
+| `sol-consult` | SOL 默认认知入口：材料 + 问题 → 一次请求 → 目标理解/问题本质/路线与取舍/风险/调查方向/再咨询条件；建议写入统一 `sol_calls`（`mode=CONSULT`），不入门禁；失败只登记并降级 | `--materials <file>`（调度执行时可省略）、`--question`（必填，`--obligation` 时回落到义务问题）、`--stage <understanding\|planning\|development\|stage\|closure>`、`--obligation SO<n>`（按调度义务执行，材料由状态确定性生成）、`--lock-timeout <秒>`、`--knowledge-file`、`--dry-run`、`--list`、`--json`、`--timeout`、`--max-output-tokens`、`--audit-log`（默认 `sol-audit.jsonl`）、`--output-dir`、`--ignore-backoff`（默认在上游退避窗口内不发请求；仅在上游已确认恢复时显式使用，仍然只发一次、不重试）；再次调用：`--force --trigger <user-request\|scope-changed\|new-risk\|materials-omitted\|strategy-failed\|major-uncertainty\|stage-result> --reason` |
 | `sol-plan` | SOL 调查后规划判断：方案比较、取舍、优先级、阶段目标与验收关注点；记录写入统一 `sol_calls`（`mode=PLAN`） | 参数同 `sol-consult`；省略 `--stage` 时默认 `planning` |
 | `sol-think` | 历史别名：等同 `sol-consult`（`mode=CONSULT`），保留给既有调用方 | 参数同 `sol-consult` |
 | `sol-accept` | 回填主代理对 SOL 建议的采纳结论（事实记录，不改变阶段、G1–G3 或授权）。v2 记录含实际决策、理由、modified 差异、证据引用与 `advice_ref`；缺项只给非阻断提示。`--historical` 只用于**已收口**任务的历史复核：`--status pending` 必须配 `--reason`（可加 `--reason-code`），重复执行幂等、不覆盖既有已决结论、不把已决结论降级为 `pending`；不因代码已改、测试通过或任务 PASS 推断采纳 | `--call-id SC...`、`--status accepted\|modified\|rejected\|pending`、`--decision`、`--rationale`（省略回落 `--reason`）、`--delta`、`--evidence-ref E1,E3`（可重复/逗号分隔，指向本任务已登记证据）、`--source-ref`（报告章节/文件路径，只定位不核验）、`--evidence-note`、`--note`、`--reason`、`--reason-code`、`--historical`、`--decided-by`（默认 `zcode`）、`--json` |
-| `sol-schedule` | SOL 生命周期调度视图（只读）：义务清单、漏调、终态处置与所属周期、下一条可执行项与可直接粘贴的命令；`--execute` 时有界执行 1 条 `recommended` 义务（1 次请求，失败只记录） | `--state`、`--execute`、`--json`、`--sol auto\|advise\|off`；不带 `--execute` 不写状态 |
+| `sol-schedule` | SOL 生命周期调度视图（只读）：义务清单、漏调、终态处置与所属周期、下一条可执行项与可直接粘贴的命令；`--execute` 时有界执行 1 条 `recommended` 义务（1 次请求，失败只记录）；同时显示当前上游退避窗口（窗口内不发起新请求） | `--state`、`--execute`、`--json`、`--sol auto\|advise\|off`；不带 `--execute` 不写状态 |
 | `sol-stats` | SOL 调度覆盖率（显式分母）：建议/执行/复用/跳过/失败/漏调/未登记分开统计，含事件分布、采纳分布、义务终态处置与周期分布、tokens 与延迟 | `--state` 或 `--workspace <根>`（聚合 `.copilot-tasks/*/state.json`）、`--json` |
 | `agent-policy` | Agent 调度建议：主代理默认，Explore/general-purpose 按需（只读、不派发）。判定顺序：子代理不可用 → 主代理；写入冲突 → 主代理；`--research-only` → Explore（绝不交给全工具代理）；独立交付物需并发且有收益才建议 general-purpose；其余 → 主代理 | `--needs-independent-context`、`--parallel`、`--independent-deliverable`、`--write-conflict`、`--saves-time`、`--research-only`、`--subagent-unavailable`、`--json` |
 | `finding` | 查看 / 更新 Finding 台账（不触发复核） | `--list`；`--id F1 --status open\|fixed\|verified\|closed\|regressed\|dropped --evidence E1[,E2] --note`；`fixed`/`verified` 必须有证据，多个证据可用逗号分隔；回填成功后按续跑判定返回 10 |
@@ -261,6 +261,43 @@ PARTIAL 时不需要额外命令：直接再次 `drive`，由本地派生工作�
 证据）时打印缺口并返回 10，不执行 SOL、不收口；补齐测试与证据后再 `drive`（或
 `closure --close`）即自动执行一次收口 CONSULT，然后停在 `EXIT_EXECUTE` 等 `sol-accept`。
 手动 `sol-consult --stage closure` 同样被缺口与“摘要不符”拒绝。
+
+### SOL 失败分类与上游退避窗口
+
+一次 SOL 调用失败时，Copilot 保留原始 HTTP 状态、上游错误码与 `Retry-After`（数值化后的
+秒数 + 原始文本 `retry_after_raw`），并归入十类 `error_class`（写入 `sol-audit.jsonl` 与
+`sol_calls`）：
+
+| `error_class` | 典型来源 | 处理 |
+|---|---|---|
+| `upstream_overloaded` | 502/503 + `server_is_overloaded` / overloaded；529 | 登记失败、进入退避窗口，**不自动重试、不换 Provider** |
+| `upstream_stream_timeout` | 408 / `request_timeout` / 上游流在完成前断开 | 同上；408 不是客户端超时 |
+| `upstream_credential_cooling` | 本地 CPA 在凭据冷却期直接回 503 `auth_unavailable` | 同上；**不记作凭据失效或认证失败** |
+| `upstream_auth` | 401/403 | 记录真实认证错误，不进入退避窗口 |
+| `upstream_rate_limit` | 429 配额/限流 | 走既有配额错误处理 |
+| `upstream_server_error` | 5xx | 进入退避窗口 |
+| `upstream_client_error` | 400/404/405/409/422 等请求侧错误 | 记录，不进入退避窗口 |
+| `client_timeout` | 本地 socket 读超时 | 记录；`send_observed=unknown`（不假设上游是否已处理） |
+| `network_error` / `response_incomplete` | 传输异常 / 响应体不可解析、流被截断、`status=incomplete`、空文本 | 记录为失败，**绝不登记为成功认知** |
+
+退避窗口（`state["sol_backoff"]`，schema `copilot-sol-backoff/v1`）：
+
+- **服务端 `Retry-After` 是最短等待时间**：有效值（秒、毫秒、HTTP-date）原样遵守，
+  **不被** 1800 秒上限、也不被 `COPILOT_SOL_BACKOFF_MAX` 缩短。HTTP-date 按 UTC（缺失时区
+  按 GMT）换算为剩余秒数；已过期或无法解析时不用它，退回本地策略。
+- **本地策略才有上限**：没有有效服务端值时按 `error_class` 取默认窗口（60 秒），
+  该值受 `COPILOT_SOL_BACKOFF_MAX`（只能下调，不能调高或关闭）与 1800 秒上限约束。
+- 窗口记录 `until`（绝对恢复时间）、`seconds`、`reason`（`retry-after` / `error-class`）、
+  原始 `retry_after_raw` 与 `call_id`，失败记录同时保留同样字段供审计追溯。
+- **不是门禁**：不改变阶段、条件、G1–G3，也不派生工作项；窗口期内 `sol-schedule --execute`
+  与自动调度只登记义务 deferral，不发请求。
+- 成功调用自动清除；手动 `sol-consult` / `sol-plan` / `sol-review` 在窗口内直接拒绝并说明剩余时间，
+  确需立即重试必须在确认上游已恢复后显式加 `--ignore-backoff`（仍然只发一次、不重试）。
+- **跨阶段、跨进程、跨会话一致**：窗口写在任务 `state.json`，不依赖内存、会话绑定或锁；
+  startup 失败后 plan 与 closure 在窗口内只登记 deferral，新会话恢复、`--resume` 或人工执行
+  SOL 命令同样遵守，窗口到期后自动恢复既有调度频率（不降低 startup / plan / closure 频率）。
+- 失败只登记降级：CONSULT / PLAN 失败退出 0，主代理按既有授权继续工程推进；REVIEW 失败返回
+  真实非零退出码。
 
 ## 5. 正式 REVIEW 与已退役的 G4
 

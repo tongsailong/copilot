@@ -11,6 +11,48 @@
 main 三方（本地 / `origin/main` / `ls-remote`）同为 `b83cf33`（0/0），工作区干净；
 运行时 `--check` 缺失 0 / 不同 0，27 个受管理文件源码与运行时 SHA-256 全部一致。
 
+## CPA → SOL 调用可靠性专项（2026-11-25，源码已改未提交）
+
+任务 `cpa-sol-reliability-2026-11-25`，仓库 HEAD `66c24ac`，改动在工作树（授权不含
+commit/push）。现场事实与已修缺陷：
+
+- **真实根因（三方互证：`sol-audit.jsonl` / `sol_calls` / CPA 日志与 trace）**：
+  - 408 = 上游 Codex 流在 `response.completed` 前断开（`request_timeout`，
+    "stream closed before response.completed"，本次观测 80.6 s），不是本地 300 s 读超时，
+    也不是宿主终止；历史上 235 s 的成功调用证明超时设置不构成瓶颈，未上调。
+  - 502 = 上游 Codex 真实过载（`server_is_overloaded`），`Retry-After` 304–375 s，
+    2026-11-24 21:16 至 2026-11-25 15:51 持续存在。
+  - 503 = 本地 CPA 在凭据冷却期快速拒绝，文案带 `auth_unavailable`，但成因是上游过载；
+    当时 `oauth.request-scoped-errors` 只匹配 500/502/503，502 过载按 `Retry-After`
+    冷却唯一凭据，冷却期内请求被拒成 503（CPA 侧问题，仅记录，未改配置）。
+    上一轮把 408 也写进这条链条（"408 落回默认瞬时冷却"），follow-up 只读核实后更正，见下条 ④。
+- **Copilot 侧缺陷（已修）**：HTTP 状态与 `Retry-After` 被丢弃、错误只有单一类别、客户端
+  超时被误记 `send_observed=response_received`、跨命令没有退避窗口（每条命令各自重试）、
+  失败记录缺 `upstream_code`/`request_id`/`trace_id`。新增十类 `error_class`、原始状态与
+  追踪字段透传、`sol_backoff` 退避窗口（成功即清、不是门禁）、`--ignore-backoff` 显式覆盖；
+  一次调用仍只发一次请求，未引入任何自动重试。
+- **follow-up 复核修正（2026-11-25，同批未提交改动）**：① 退避窗口此前把服务端 `Retry-After`
+  与本地兜底一起按 1800 s 截断，违反"服务端等待是最短时间"语义；现服务端值（秒/毫秒/
+  HTTP-date）原样遵守，`COPILOT_SOL_BACKOFF_MAX` 只约束无服务端值时的本地兜底窗口，
+  `retry_after_raw` 一并入审计。② 分类实为十类，上一轮报告与文档写的"九类"已更正。
+  ③ 上一轮工作区改动实为 9 项（8 个已列 + `manifests/source-baseline.sha256`），原报告
+  文件清单漏列基线文件。④ 408 归因更正：CPA 8.1.2 的合成 408（`request_timeout`）已在
+  executor 层标记 `IsRequestScoped`，`MarkResult` 跳过冷却，不会冻结凭据；历史 503 的真实
+  成因是 12:16 之前的 502 过载冷却。完整证据链与可选最小配置方案（未执行）见
+  `.copilot-tasks/cpa-sol-reliability-followup-2026-11-25/cpa-408-diagnosis.md`。
+- **输出预算**：`DEFAULT_MAX_OUTPUT_TOKENS=24000`、`DEFAULT_TIMEOUT=300.0` 与改动前一致；
+  `git log -S"32768"` 证明该值从未出现在 `sol_review.py`，不存在 32768 → 8192 的回归。
+- **验证**：活动测试 995 OK（含 `tests/test_sol_reliability.py` 39 项）；legacy 853 例 /
+  146 失败，与 HEAD `66c24ac` 失败集合 sha1 相同（`726c6d68…`）；运行时 `--check` 0/0、
+  `--verify-baseline` 通过、baseline 27 文件。
+- **受控真实调用（1 次，15:51:09）**：仍为 HTTP 502 `server_is_overloaded`，
+  `Retry-After=311 s`，1 次尝试、零工具、未重试、未换 Provider；审计与 `sol_calls` 均记
+  `error_class=upstream_overloaded`，义务置 `failed`（失败不冒充认知），
+  `sol_backoff` 至 `15:56:26`，`sol-schedule` 可见。
+- **未解决**：上游仍处于过载窗口，真实 E2E 成功路径无法在上游恢复前复现（已由夹具覆盖
+  全部分类与恢复路径）。CPA 侧"408 冷却"问题经 follow-up 只读核实为不成立（见 ④）；
+  如需对透传 408 做防御，可选最小规则见诊断文档，未改配置、未重启、未改凭据。
+
 ## 开发效能与自主交付闭环专项（2026-11-24 实施，2026-11-25 正式交付）
 
 任务 `dev-efficiency-2026-11-24`（`task-fd963b4e34918738`）实施时授权不含 commit/push，

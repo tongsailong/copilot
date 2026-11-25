@@ -304,11 +304,40 @@ def _obligation_argv(path: str, obligation: dict, *,
     return argv
 
 
+def _sol_backoff_text(status: dict) -> str:
+    if not status.get("active"):
+        return ""
+    cls = str(status.get("error_class") or "")
+    label = SR.ERROR_CLASS_LABEL.get(cls, "")
+    reason = f"分类 {cls}" + (f"（{label}）" if label else "") if cls \
+        else str(status.get("reason") or "")
+    return (f"上游退避窗口内（至 {status.get('until')}，剩余 "
+            f"{status.get('remaining_seconds', 0):g}s，{reason or '未知原因'}）")
+
+
+def _defer_for_backoff(path: str, obligation_id: str, status: dict) -> None:
+    """退避窗口内不发送请求：只给义务留一次推迟痕迹（保持待执行、不结算）。"""
+    current = G.load_state(path)
+    row = SS.find_obligation(current, obligation_id=obligation_id)
+    if row is not None:
+        SS.note_deferral(row, now=G.now_iso(),
+                         reason="upstream-backoff: " + _sol_backoff_text(status))
+        G.save_state(path, current)
+
+
 def _execute_obligation(path: str, obligation: dict) -> int:
     """执行一个调度义务：复用既有通道，一次请求，失败只记录不阻断。"""
     state = G.load_state(path)
     obligation_id = str(obligation.get("obligation_id") or "")
     mode = str(obligation.get("mode") or "CONSULT").upper()
+    # 上游明确要求等待时（502 过载 / 凭据冷却 / 流中断）不发送注定失败的请求：
+    # 义务保持 due，窗口关闭后自动恢复；不重试、不换 Provider、不改阶段。
+    backoff = G.sol_backoff_status(state)
+    if backoff.get("active"):
+        _defer_for_backoff(path, obligation_id, backoff)
+        print(f"SOL 调度：{_sol_backoff_text(backoff)}，本次不发起请求；"
+              "义务保持待执行，窗口关闭后继续。", file=sys.stderr)
+        return 0
     argv = _obligation_argv(path, obligation,
                             round_two=_obligation_round_two(state, obligation))
     try:
@@ -391,6 +420,18 @@ def _sol_schedule_step(path: str, args, *, gates_passed: bool = False,
         return result
     target = due[0]
     if policy == "auto" and execute and _auto_execution_allowed():
+        backoff = G.sol_backoff_status(state)
+        if backoff.get("active"):
+            # 上游要求等待：不发起请求、不结算义务，只留推迟痕迹。
+            _defer_for_backoff(path, str(target.get("obligation_id") or ""),
+                               backoff)
+            result["deferred"] = {"obligation": str(target.get("obligation_id")),
+                                  "until": backoff.get("until"),
+                                  "remaining_seconds": backoff.get("remaining_seconds"),
+                                  "error_class": backoff.get("error_class")}
+            print(f"SOL 调度：{_sol_backoff_text(backoff)}，本次不执行"
+                  f"{target.get('obligation_id')}；义务保持待执行。")
+            return result
         result["executed"] = str(target.get("obligation_id"))
         result["exit"] = _execute_obligation(path, target)
         return result
@@ -1068,15 +1109,44 @@ def _invoke_sol_once(*, state_path: str, task_dir: str, prompt: str,
                 max_output_tokens=args.max_output_tokens,
                 timeout=args.timeout, images=images or None)
         except SR.SolError as exc:
+            error_class = str(getattr(exc, "error_class", "") or "")
+            http_status = getattr(exc, "http_status", None)
+            retry_after = getattr(exc, "retry_after", None)
+            retry_after_raw = str(getattr(exc, "retry_after_raw", "") or "")
             G.record_sol_call_failure(
                 state_path, mode=mode, error_code=exc.code, detail=exc.detail,
                 materials_sha256=digest, model=SR.MODEL,
                 obligation_id=str(getattr(args, "obligation_id", "") or ""),
                 stage=stage,
                 request_attempted=bool(getattr(exc, "request_attempted", True)),
-                send_observed=str(getattr(exc, "send_observed", "unknown")))
-            print(f"SOL {mode} 失败 [{exc.code}]：{exc.detail or ''}",
-                  file=sys.stderr)
+                send_observed=str(getattr(exc, "send_observed", "unknown")),
+                http_status=http_status if isinstance(http_status, int) else None,
+                retry_after=(retry_after
+                             if isinstance(retry_after, (int, float)) else None),
+                retry_after_raw=retry_after_raw,
+                upstream_code=str(getattr(exc, "upstream_code", "") or ""),
+                error_class=error_class,
+                request_id=str(getattr(exc, "request_id", "") or ""),
+                trace_id=str(getattr(exc, "trace_id", "") or ""))
+            label = SR.ERROR_CLASS_LABEL.get(error_class, "")
+            facts = []
+            if http_status:
+                facts.append(f"HTTP {http_status}")
+            if error_class:
+                facts.append(f"分类 {error_class}"
+                            + (f"（{label}）" if label else ""))
+            if retry_after:
+                facts.append(f"Retry-After {retry_after:g}s"
+                             + (f"（原始 {retry_after_raw}）"
+                                if retry_after_raw not in ("", f"{retry_after:g}")
+                                else ""))
+            if getattr(exc, "upstream_code", ""):
+                facts.append(f"上游 code {exc.upstream_code}")
+            if getattr(exc, "trace_id", ""):
+                facts.append(f"trace {exc.trace_id}")
+            print(f"SOL {mode} 失败 [{exc.code}]"
+                  + (f" {' · '.join(facts)}" if facts else "")
+                  + f"：{exc.detail or ''}", file=sys.stderr)
             if mode == "REVIEW":
                 print("已记录真实失败原因，未自动重试、未切换 Provider；"
                       "独立复核未完成，如实报告，不伪造结论。",
@@ -1092,6 +1162,11 @@ def _invoke_sol_once(*, state_path: str, task_dir: str, prompt: str,
                     "action": "continue",
                     "mode": mode,
                     "error": exc.code,
+                    "error_class": error_class,
+                    "http_status": http_status,
+                    "retry_after": retry_after,
+                    "retry_after_raw": retry_after_raw,
+                    "upstream_code": str(getattr(exc, "upstream_code", "") or ""),
                     "detail": exc.detail,
                     "materials_sha256": digest,
                 })
@@ -1363,6 +1438,26 @@ def _run_sol_channel(args, mode: str) -> int:
             return outcome
         if (state.get("closure") or {}).get("closed"):
             raise CLIError(cfg["closed_note"] + "（--list 仍可只读查看）。")
+        # 已知上游要求等待时，手动路径也不发射注定失败的请求（复用判定在前：
+        # 已有结论的复用不需要付费，不受窗口影响）。
+        if getattr(args, "ignore_backoff", False):
+            # 显式越过窗口是一次可审计的例外事实，不是新的默认行为。
+            overridden = G.sol_backoff_status(state)
+            if overridden.get("active"):
+                G._history(state, "sol_backoff_overridden", {
+                    "mode": mode,
+                    "until": overridden.get("until"),
+                    "remaining_seconds": overridden.get("remaining_seconds"),
+                    "error_class": overridden.get("error_class"),
+                })
+                G.save_state(path, state)
+        else:
+            backoff = G.sol_backoff_status(state)
+            if backoff.get("active"):
+                raise CLIError(
+                    f"SOL 调用被上游退避窗口推迟：{_sol_backoff_text(backoff)}；"
+                    "本次未发起请求，既有失败原因已记录。窗口关闭后重新执行即可；"
+                    "确需立即重试（上游已确认恢复）时显式加 --ignore-backoff。")
         audit_log = args.audit_log or os.path.join(task_dir, "sol-audit.jsonl")
         result, code = _invoke_sol_once(
             state_path=path, task_dir=task_dir, prompt=prompt,
@@ -1659,7 +1754,9 @@ def _sol_schedule_view(state: dict, path: str) -> dict:
     return {"schema": SS.SCHEDULE_SCHEMA, "summary": SS.summary(state),
             "obligations": rows,
             "next": (due[0].get("obligation_id") if due else ""),
-            "command": command}
+            "command": command,
+            # 上游退避窗口是调度事实而不是门禁：只读展示，到期自动失效。
+            "backoff": G.sol_backoff_status(state)}
 
 
 def cmd_sol_schedule(args) -> int:
@@ -1709,6 +1806,9 @@ def cmd_sol_schedule(args) -> int:
         print("可直接执行：" + view["command"])
     else:
         print("当前没有待执行的 recommended 级义务。")
+    if (view.get("backoff") or {}).get("active"):
+        print(f"上游退避窗口：{_sol_backoff_text(view['backoff'])}，"
+              "窗口内不发起新请求。")
     print("说明：调度义务是「应调用」的事实记录；SOL 仍是 advisory，不构成门禁。")
     return 0
 
@@ -2393,6 +2493,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="再次复核的实质原因类型")
     p.add_argument("--force", action="store_true",
                    help="已有结论且材料不同时，允许按 --trigger/--reason 再调用一次")
+    p.add_argument("--ignore-backoff", action="store_true",
+                   help="忽略上游退避窗口强制发起请求（默认窗口内不发请求；"
+                        "仅在上游已确认恢复时使用，仍然只发一次、不重试）")
     p.add_argument("--dry-run", action="store_true",
                    help="只构建并校验请求（零工具/材料大小），不发请求、不写状态")
     p.add_argument("--list", action="store_true", help="只读列出生效的 SOL 复核记录")
@@ -2449,6 +2552,9 @@ def build_parser() -> argparse.ArgumentParser:
         parser.add_argument("--force", action="store_true",
                             help="已有同模式结论且材料不同时，按 --trigger/--reason "
                                  "再调用一次（声明决策价值，不是次数上限）")
+        parser.add_argument("--ignore-backoff", action="store_true",
+                            help="忽略上游退避窗口强制发起请求（默认窗口内不发请求；"
+                                 "仅在上游已确认恢复时使用，仍然只发一次、不重试）")
         parser.add_argument("--dry-run", action="store_true",
                             help="只构建并校验请求（零工具/材料预算/推理强度），"
                                  "不发请求、不写状态")

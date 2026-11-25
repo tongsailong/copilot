@@ -39,6 +39,9 @@ import re
 import time
 import urllib.parse
 
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+
 from lib_common import redact as _redact_text
 import review_policy as _RP
 
@@ -144,18 +147,42 @@ def _safe_url(raw: object) -> str:
 
 
 class SolError(Exception):
-    """SOL 复核错误基类；`exit_code` 是调用方应返回的进程退出码。"""
+    """SOL 调用错误基类；`exit_code` 是调用方应返回的进程退出码。
+
+    除错误码与详情外，错误对象还携带可机器判读的上游事实：HTTP 状态、上游错误码、
+    Retry-After、请求/追踪 ID 与稳定分类 `error_class`。这些字段只用于诊断与退避
+    判断，不改变"单次请求、不自动重试、不切换 Provider"的语义，也不构成成功证据。
+    """
 
     exit_code = EXIT_UPSTREAM
 
-    def __init__(self, code: str, detail: str = ""):
+    def __init__(self, code: str, detail: str = "", *,
+                 http_status: int | None = None,
+                 retry_after: int | None = None,
+                 retry_after_raw: str = "",
+                 upstream_code: str = "",
+                 error_class: str = "",
+                 request_id: str = "",
+                 trace_id: str = "",
+                 response_received: bool = False):
         super().__init__(detail or code)
         self.code = code
         self.detail = detail
-        # True only after the transport callable is entered; urllib cannot prove
-        # that any request bytes reached the socket, so wire-level send stays unknown.
+        self.http_status = http_status
+        self.retry_after = retry_after
+        # 原始 Retry-After 文本（可能是 HTTP-date）：数值化后仍保留原值供审计。
+        self.retry_after_raw = str(retry_after_raw or "")
+        self.upstream_code = str(upstream_code or "")
+        self.error_class = str(error_class or "")
+        self.request_id = str(request_id or "")
+        self.trace_id = str(trace_id or "")
+        # 收到过 HTTP 响应（哪怕是错误响应）时发送事实是确定的；只有客户端
+        # 超时/网络异常才保持 unknown。urllib 无法证明字节是否出站，但可以证明
+        # 是否读到了响应。
+        self.response_received = bool(response_received)
         self.request_attempted = False
-        self.send_observed = "not_attempted"
+        self.send_observed = ("response_received" if self.response_received
+                              else "not_attempted")
 
 
 class SolUsageError(SolError):
@@ -194,6 +221,86 @@ class SolReasoningError(SolError):
     """上游回显的推理强度/模式与请求不一致：Provider 覆盖参数，拒绝消费。"""
 
     exit_code = EXIT_IDENTITY
+
+
+# ── 上游失败分类（稳定、机器可读；只描述事实，不决定重试） ────────────────
+# 分类用于诊断与退避判断，不改变"一次调用一次请求、不自动重试、不切 Provider"。
+# 关键不变量：`auth_unavailable` 是 CPA 的调度结果（凭据冷却），不是认证失效；
+# 真正的认证失败是 401/403。因此过载/冷却永远不会被归入 `upstream_auth`。
+UPSTREAM_OVERLOADED = "upstream_overloaded"
+UPSTREAM_STREAM_TIMEOUT = "upstream_stream_timeout"
+UPSTREAM_CREDENTIAL_COOLING = "upstream_credential_cooling"
+UPSTREAM_AUTH = "upstream_auth"
+UPSTREAM_RATE_LIMIT = "upstream_rate_limit"
+UPSTREAM_SERVER = "upstream_server_error"
+UPSTREAM_CLIENT = "upstream_client_error"
+CLIENT_TIMEOUT = "client_timeout"
+NETWORK_ERROR = "network_error"
+RESPONSE_INCOMPLETE = "response_incomplete"
+
+ERROR_CLASS_CODE = {
+    UPSTREAM_OVERLOADED: "sol_upstream_overloaded",
+    UPSTREAM_STREAM_TIMEOUT: "sol_upstream_stream_timeout",
+    UPSTREAM_CREDENTIAL_COOLING: "sol_upstream_credential_cooling",
+    UPSTREAM_AUTH: "sol_upstream_auth",
+    UPSTREAM_RATE_LIMIT: "sol_quota",
+    UPSTREAM_SERVER: "sol_upstream_server_error",
+    UPSTREAM_CLIENT: "sol_upstream_client_error",
+}
+
+ERROR_CLASS_LABEL = {
+    UPSTREAM_OVERLOADED: "上游模型容量过载",
+    UPSTREAM_STREAM_TIMEOUT: "上游流在完成前断开",
+    UPSTREAM_CREDENTIAL_COOLING: "CPA 凭据冷却窗口内本地拒绝",
+    UPSTREAM_AUTH: "上游认证失败",
+    UPSTREAM_RATE_LIMIT: "上游限流/配额",
+    UPSTREAM_SERVER: "上游 5xx 错误",
+    UPSTREAM_CLIENT: "上游拒绝请求本身（4xx）",
+    CLIENT_TIMEOUT: "客户端等待超时",
+    NETWORK_ERROR: "网络/传输错误",
+    RESPONSE_INCOMPLETE: "响应不完整或不可消费",
+}
+
+# 这些分类表示上游明确不可用：调度层应在 Retry-After 窗口内推迟新请求，
+# 而不是换一条同质请求制造更多无效调用（仍然不自动重试）。
+UPSTREAM_RETRYABLE_CLASSES = frozenset({
+    UPSTREAM_OVERLOADED, UPSTREAM_CREDENTIAL_COOLING, UPSTREAM_SERVER,
+})
+
+
+class SolOverloadedError(SolUpstreamError):
+    """上游容量过载（`server_is_overloaded` / 529 / 503 过载）。"""
+
+
+class SolStreamTimeoutError(SolUpstreamError):
+    """上游流在 `response.completed` 之前断开（HTTP 408 / `request_timeout`）。"""
+
+
+class SolCredentialCoolingError(SolUpstreamError):
+    """CPA 凭据冷却导致的本地 503（`auth_unavailable`）。
+
+    这是调度结果而不是认证失效：不得据此轮换凭据、更换 Provider 或判定账号
+    认证不可用；只按上游 Retry-After 推迟下一次请求。
+    """
+
+
+class SolAuthError(SolUpstreamError):
+    """上游认证失败（401/403）；需人工核实，不自动重试、不切换 Provider。"""
+
+
+class SolUpstreamClientError(SolUpstreamError):
+    """上游拒绝了请求本身（4xx，非认证/限流）；请求构造需要检查。"""
+
+
+_UPSTREAM_ERROR_CLASSES = {
+    UPSTREAM_OVERLOADED: SolOverloadedError,
+    UPSTREAM_STREAM_TIMEOUT: SolStreamTimeoutError,
+    UPSTREAM_CREDENTIAL_COOLING: SolCredentialCoolingError,
+    UPSTREAM_AUTH: SolAuthError,
+    UPSTREAM_RATE_LIMIT: SolQuotaError,
+    UPSTREAM_SERVER: SolUpstreamError,
+    UPSTREAM_CLIENT: SolUpstreamClientError,
+}
 
 
 # ── 凭据（只返回值，绝不回显、绝不写日志） ─────────────────────────────────
@@ -841,6 +948,176 @@ def _quota_signal(status: int, payload: object) -> dict | None:
     return None
 
 
+def _header_lookup(headers, name: str) -> str:
+    """大小写不敏感地读取单个响应头；只返回值，不记录整组头。"""
+    if headers is None:
+        return ""
+    try:
+        value = headers.get(name)
+        if value:
+            return str(value).strip()
+    except (AttributeError, TypeError):
+        pass
+    try:
+        items = headers.items()
+    except (AttributeError, TypeError):
+        return ""
+    target = name.lower()
+    for key, value in items:
+        if str(key).lower() == target and value:
+            return str(value).strip()
+    return ""
+
+
+def _parse_retry_after_date(value: str) -> int | None:
+    """RFC 7231 HTTP-date → 距现在的秒数（≥1）。
+
+    时区缺失按 UTC 解释（HTTP-date 规定为 GMT）；已过去的时间或无法解析的值返回
+    None，由本地退避策略兜底——不把过去时间当成"立即重试"，也不猜时区。
+    """
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = parsedate_to_datetime(text)
+    except (TypeError, ValueError, IndexError, OverflowError):
+        return None
+    if parsed is None:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    try:
+        delta = (parsed - datetime.now(timezone.utc)).total_seconds()
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if delta <= 0:
+        return None
+    return max(1, int(round(delta)))
+
+
+def _retry_after_seconds(headers, payload: object,
+                         raw_out: dict | None = None) -> int | None:
+    """提取 Retry-After（秒），优先响应头，其次错误体里的 headers。
+
+    支持三种形式：数值秒、`retry-after-ms`（毫秒）、RFC 7231 HTTP-date（换算为
+    剩余秒数）。HTTP-date 已过期或取值无法解析时返回 None —— 由本地退避策略兜底，
+    不猜测、不把过去时间当作"可以立刻重试"。
+
+    `raw_out` 只用于保留原始头部值供审计追溯，不参与判定。
+    """
+    sources = [headers]
+    if isinstance(payload, dict):
+        err = payload.get("error")
+        if isinstance(err, dict):
+            sources.append(err.get("headers"))
+        sources.append(payload.get("headers"))
+    seconds = None
+    for source in sources:
+        if source is None:
+            continue
+        try:
+            items = list(source.items())
+        except (AttributeError, TypeError):
+            continue
+        for key, value in items:
+            key = str(key).lower()
+            if key not in ("retry-after", "retry-after-ms"):
+                continue
+            text = str(value).strip()
+            if raw_out is not None and key == "retry-after" and text \
+                    and not raw_out.get("retry_after_raw"):
+                raw_out["retry_after_raw"] = text
+            try:
+                number = float(text)
+            except (TypeError, ValueError):
+                if key == "retry-after":
+                    dated = _parse_retry_after_date(text)
+                    if dated is not None:
+                        return dated
+                continue
+            if number <= 0:
+                continue
+            if key == "retry-after":
+                return max(1, int(round(number)))
+            if seconds is None:
+                seconds = max(1, int(round(number / 1000.0)))
+    return seconds
+
+
+def _payload_error_message(payload: object) -> str:
+    if isinstance(payload, dict):
+        err = payload.get("error")
+        if isinstance(err, dict):
+            return str(err.get("message") or "")
+        if err:
+            return str(err)
+        return str(payload.get("message") or "")
+    return ""
+
+
+def _payload_error_code(payload: object) -> str:
+    if isinstance(payload, dict):
+        err = payload.get("error")
+        if isinstance(err, dict):
+            return str(err.get("code") or "")
+        return str(payload.get("code") or "")
+    return ""
+
+
+def classify_upstream_failure(status: int, payload: object) -> str:
+    """把一次上游 HTTP 错误映射成稳定分类；只描述事实，不决定重试。
+
+    顺序很重要：`auth_unavailable` 先于 5xx 判定，避免 CPA 冷却被当成认证失效；
+    408/`request_timeout` 先于过载判定，保留"流在完成前断开"的语义。
+    """
+    code = _payload_error_code(payload).lower()
+    message = (_payload_error_message(payload)
+               + " " + (str((payload or {}).get("error") or "")
+                        if isinstance(payload, dict) else "")).lower()
+    text = f"{code} {message}"
+    status = int(status or 0)
+    if status == 429 or code in ("usage_limit_reached", "model_cooldown"):
+        return UPSTREAM_RATE_LIMIT
+    if "auth_unavailable" in text or "no auth available" in text:
+        # 凭据冷却 / 调度结果：不是认证失效，不得据此轮换凭据或换 Provider。
+        return UPSTREAM_CREDENTIAL_COOLING
+    if status == 408 or code == "request_timeout" \
+            or "stream disconnected before completion" in text \
+            or "stream closed before response.completed" in text:
+        return UPSTREAM_STREAM_TIMEOUT
+    if "server_is_overloaded" in text or "overloaded" in text or status == 529:
+        return UPSTREAM_OVERLOADED
+    if status in (401, 403):
+        return UPSTREAM_AUTH
+    if status in (400, 404, 405, 409, 422):
+        return UPSTREAM_CLIENT
+    return UPSTREAM_SERVER
+
+
+def _upstream_failure_detail(status: int, upstream_code: str,
+                             retry_after: int | None, payload: object,
+                             error_class: str) -> str:
+    """构造脱敏、限长的失败说明；保留诊断所需的原始状态与上游错误码。"""
+    parts = [f"HTTP {status}",
+             f"upstream_code={upstream_code or 'unknown'}",
+             f"class={error_class}"]
+    if retry_after:
+        parts.append(f"Retry-After={retry_after}s")
+    message = _payload_error_message(payload)
+    if message:
+        parts.append("upstream_message=" + _safe_detail(message, 160))
+    hint = {
+        UPSTREAM_OVERLOADED: "上游瞬时容量不足，不是本地认证或配置故障",
+        UPSTREAM_STREAM_TIMEOUT: "上游流在 response.completed 之前断开，本次无有效回复",
+        UPSTREAM_CREDENTIAL_COOLING: "CPA 凭据冷却窗口内的本地拒绝，不是认证失效，不轮换凭据",
+        UPSTREAM_AUTH: "上游认证失败，需人工核实凭据",
+        UPSTREAM_RATE_LIMIT: "上游限流/配额，按 Retry-After 等待",
+        UPSTREAM_SERVER: "上游 5xx 错误",
+        UPSTREAM_CLIENT: "上游拒绝请求本身，需检查请求构造",
+    }.get(error_class, "上游错误")
+    return f"{hint}（{'；'.join(parts)}）；未自动重试、未切换 Provider。"
+
+
 # ── 输出解析（严格 JSON，允许单个围栏；不做叙述猜测） ──────────────────────
 def _no_duplicates(pairs):
     seen = {}
@@ -1156,41 +1433,68 @@ def _post_once(url: str, key: str, body: dict, timeout: float) -> dict:
             payload = json.loads(raw.decode("utf-8", errors="replace"))
         except ValueError:
             pass
+        error_headers = getattr(exc, "headers", None)
+        request_id = (_header_lookup(error_headers, "X-Request-Id")
+                      or _header_lookup(error_headers, "OpenAI-Request-Id"))
+        trace_id = _header_lookup(error_headers, "X-Cpa-Trace-Id")
+        retry_raw: dict = {}
+        retry_after = _retry_after_seconds(error_headers, payload, retry_raw)
+        retry_after_raw = str(retry_raw.get("retry_after_raw") or "")
+        upstream_code = _payload_error_code(payload)
         quota = _quota_signal(exc.code, payload)
         if quota:
             raise SolQuotaError(
                 "sol_quota",
-                f"上游限流/冷却（HTTP {exc.code}，code={quota['code']}）；"
-                "未自动重试、未切换 Provider。") from None
-        raise SolUpstreamError(
-            "sol_upstream_error",
-            f"上游 HTTP {exc.code}: "
-            f"{_safe_detail(raw.decode('utf-8', errors='replace'), 300)}") from None
-    except (socket.timeout, TimeoutError) as exc:
+                f"上游限流/冷却（HTTP {exc.code}，code={quota['code']}"
+                + (f"，Retry-After={retry_after}s" if retry_after else "")
+                + "）；未自动重试、未切换 Provider。",
+                http_status=int(exc.code), retry_after=retry_after,
+                retry_after_raw=retry_after_raw,
+                upstream_code=upstream_code or str(quota["code"]),
+                error_class=UPSTREAM_RATE_LIMIT, request_id=request_id,
+                trace_id=trace_id, response_received=True) from None
+        error_class = classify_upstream_failure(exc.code, payload)
+        error_cls = _UPSTREAM_ERROR_CLASSES[error_class]
+        raise error_cls(
+            ERROR_CLASS_CODE[error_class],
+            _upstream_failure_detail(exc.code, upstream_code, retry_after,
+                                     payload, error_class),
+            http_status=int(exc.code), retry_after=retry_after,
+            retry_after_raw=retry_after_raw,
+            upstream_code=upstream_code, error_class=error_class,
+            request_id=request_id, trace_id=trace_id,
+            response_received=True) from None
+    except (socket.timeout, TimeoutError):
         raise SolTimeoutError(
             "sol_timeout",
-            f"请求在 {timeout:g}s 内未完成；结果未知，未自动重试。") from None
+            f"请求在 {timeout:g}s 内未完成；结果未知，未自动重试。",
+            error_class=CLIENT_TIMEOUT) from None
     except urllib_error.URLError as exc:
         reason = getattr(exc, "reason", exc)
         if isinstance(reason, (socket.timeout, TimeoutError)):
             raise SolTimeoutError(
                 "sol_timeout",
-                f"请求在 {timeout:g}s 内未完成；结果未知，未自动重试。") from None
+                f"请求在 {timeout:g}s 内未完成；结果未知，未自动重试。",
+                error_class=CLIENT_TIMEOUT) from None
         raise SolUpstreamError("sol_transport_error",
-                               _safe_detail(reason)) from None
+                               _safe_detail(reason),
+                               error_class=NETWORK_ERROR) from None
     except (http_client.HTTPException, OSError) as exc:
         # 响应读到一半中断、连接重置、Content-Length 不足等：请求已发出，
         # 结果未知。显式映射为 SolError，确保进入失败审计与状态登记。
         raise SolUpstreamError(
             "sol_transport_error",
-            _safe_detail(f"{type(exc).__name__}: {exc}")) from None
+            _safe_detail(f"{type(exc).__name__}: {exc}"),
+            error_class=NETWORK_ERROR) from None
     try:
         payload = json.loads(raw.decode("utf-8", errors="replace"))
     except ValueError as exc:
-        raise SolResponseError("sol_response_json_invalid", str(exc)) from None
+        raise SolResponseError("sol_response_json_invalid", str(exc),
+                               error_class=RESPONSE_INCOMPLETE) from None
     if not isinstance(payload, dict):
         raise SolResponseError("sol_response_not_object",
-                               type(payload).__name__)
+                               type(payload).__name__,
+                               error_class=RESPONSE_INCOMPLETE)
     payload["_http_status"] = status
     # 只保留追踪标识：请求 ID 用于取证，不回显任何响应头或凭据。
     try:
@@ -1275,13 +1579,26 @@ def run_sol(materials: str, *, mode: str = "CONSULT", audit_log: str = "",
             response.setdefault("_send_observed", "response_received")
     except SolError as exc:
         attempted = transport_entered
-        observed = "unknown" if transport_entered else "not_attempted"
+        # 收到过 HTTP 响应（含错误响应）时发送事实是确定的；客户端超时/网络
+        # 异常才保持 unknown。
+        if getattr(exc, "response_received", False):
+            observed = "response_received"
+        else:
+            observed = "unknown" if transport_entered else "not_attempted"
         exc.request_attempted = attempted
         exc.send_observed = observed
         _audit_safe(audit_log, {**audit_base, "ok": False,
                            "request_attempted": attempted,
                            "send_observed": observed,
-                           "error": exc.code, "detail": exc.detail,
+                           "error": exc.code,
+                           "error_class": str(getattr(exc, "error_class", "")),
+                           "http_status": getattr(exc, "http_status", None),
+                           "retry_after": getattr(exc, "retry_after", None),
+                           "retry_after_raw": str(getattr(exc, "retry_after_raw", "")),
+                           "upstream_code": str(getattr(exc, "upstream_code", "")),
+                           "request_id": str(getattr(exc, "request_id", "")),
+                           "trace_id": str(getattr(exc, "trace_id", "")),
+                           "detail": exc.detail,
                            "elapsed_ms": int((time.monotonic() - started) * 1000)})
         raise
     elapsed_ms = int((time.monotonic() - started) * 1000)
@@ -1294,8 +1611,12 @@ def run_sol(materials: str, *, mode: str = "CONSULT", audit_log: str = "",
     if quota:
         exc = SolQuotaError(
             "sol_quota",
-            f"HTTP 200 携带限流/冷却（code={quota['code']}）；未自动重试。")
+            f"HTTP 200 携带限流/冷却（code={quota['code']}）；未自动重试。",
+            http_status=int(status or 0), error_class=UPSTREAM_RATE_LIMIT,
+            upstream_code=str(quota["code"]), request_id=request_id,
+            trace_id=trace_id, response_received=True)
         _audit_safe(audit_log, {**audit_base, "ok": False, "error": exc.code,
+                           "error_class": UPSTREAM_RATE_LIMIT,
                            "http_status": status, "request_id": request_id,
                            "trace_id": trace_id, "elapsed_ms": elapsed_ms})
         raise exc
@@ -1306,9 +1627,13 @@ def run_sol(materials: str, *, mode: str = "CONSULT", audit_log: str = "",
     except (AttributeError, TypeError, ValueError, KeyError) as exc:
         _audit_safe(audit_log, {**audit_base, "ok": False,
                            "error": "sol_malformed_response",
+                           "error_class": RESPONSE_INCOMPLETE,
                            "detail": f"{type(exc).__name__}: {exc}",
                            "http_status": status, "elapsed_ms": elapsed_ms})
-        raise SolResponseError("sol_malformed_response", str(exc)) from None
+        raise SolResponseError("sol_malformed_response", str(exc),
+                               http_status=int(status or 0),
+                               error_class=RESPONSE_INCOMPLETE,
+                               response_received=True) from None
     model_resolved = response.get("model")
     identity_ok = (isinstance(model_resolved, str)
                    and model_resolved.strip() == model)
@@ -1364,9 +1689,14 @@ def run_sol(materials: str, *, mode: str = "CONSULT", audit_log: str = "",
                            "error": exc.code})
         raise exc
     if problem:
-        exc = SolResponseError("sol_response_incomplete", problem)
+        exc = SolResponseError("sol_response_incomplete", problem,
+                               http_status=int(status or 0),
+                               error_class=RESPONSE_INCOMPLETE,
+                               request_id=request_id, trace_id=trace_id,
+                               response_received=True)
         _audit_safe(audit_log, {**audit_base, **common_audit, "ok": False,
-                           "error": exc.code, "detail": problem})
+                           "error": exc.code, "error_class": RESPONSE_INCOMPLETE,
+                           "detail": problem})
         raise exc
     text_sha = hashlib.sha256(text.encode("utf-8")).hexdigest()
     try:
