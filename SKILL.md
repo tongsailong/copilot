@@ -85,7 +85,11 @@ start（合同 + 完成条件 + 风险 + 任务类型 + 后端）
 “不调用模型”只对 `--sol off|advise`、读命令和测试进程成立。所有命令其余工作只读写任务
 状态与本地证据/派发文件；其中 `evidence --capture-cmd` 会执行调用方给出的本地命令，
 `handoff` 会做只读 Git 查询。每次 SOL 调用只发一次请求，不自动重试、不自动二审；
-CONSULT / PLAN 失败只记录并降级，不阻断工程推进。完整命令矩阵见 `references/workflow.md`；
+CONSULT / PLAN 失败只记录并降级，不阻断工程推进。失败保留原始 HTTP 状态、上游错误码与
+`Retry-After`（秒数 + 原始文本）并归入十类 `error_class`；上游过载/流中断/凭据冷却期 503 会写
+`sol_backoff` 退避窗口（服务端 Retry-After 是最短等待、原样遵守不被本地上限缩短；到期自动失效、
+成功即清、不是门禁），窗口内调度只登记 deferral、手动调用直接拒绝，确认上游恢复后可加
+`--ignore-backoff`（仍只发一次）。完整命令矩阵见 `references/workflow.md`；
 阶段机与驱动语义见 `references/runtime.md`。
 
 ## 模式

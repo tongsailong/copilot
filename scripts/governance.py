@@ -4269,6 +4269,129 @@ def review_admission(state: dict, *, triggers: list[str] | None = None,
 # ── SOL 调用记录：单一权威流 `sol_calls` + 历史只读兼容 ──────────────────────
 SOL_CALLS_KEY = "sol_calls"
 LEGACY_SOL_KEYS = ("sol_reviews", "sol_advisories")
+# 上游退避状态：唯一用途是"已知上游要求等待时不再发新请求"，不是门禁、不是
+# 阶段，也不改变生命周期；到期即失效，成功调用即清除。
+SOL_BACKOFF_KEY = "sol_backoff"
+SOL_BACKOFF_SCHEMA = "copilot-sol-backoff/v1"
+# 上限**只作用于本地计算的退避**（无有效 Retry-After 时的兜底窗口），用于防止本地
+# 策略把 SOL 长期冻结。服务端明确给出的 Retry-After 是最短等待时间，必须原样遵守，
+# 不被这个上限、也不被环境变量缩短。
+# 环境变量只能调低本地上限，不能调高，也不能关闭退避。
+SOL_BACKOFF_MAX_SECONDS = 1800.0
+SOL_BACKOFF_FALLBACK_SECONDS = 60.0
+# 这些分类表示上游明确不可用或连接被上游切断：窗口内重复同质请求只会制造
+# 无效调用（仍然不自动重试，只是推迟调度）。
+SOL_BACKOFF_CLASSES = frozenset({
+    "upstream_overloaded", "upstream_credential_cooling",
+    "upstream_server_error", "upstream_stream_timeout",
+})
+# 错误码 → 分类（历史调用方只传 error_code 时仍能落到正确分类）。
+_SOL_CLASS_BY_ERROR_CODE = {
+    "sol_upstream_overloaded": "upstream_overloaded",
+    "sol_upstream_stream_timeout": "upstream_stream_timeout",
+    "sol_upstream_credential_cooling": "upstream_credential_cooling",
+    "sol_upstream_auth": "upstream_auth",
+    "sol_quota": "upstream_rate_limit",
+    "sol_upstream_server_error": "upstream_server_error",
+    "sol_upstream_client_error": "upstream_client_error",
+    "sol_timeout": "client_timeout",
+    "sol_transport_error": "network_error",
+    "sol_response_incomplete": "response_incomplete",
+    "sol_malformed_response": "response_incomplete",
+    "sol_response_json_invalid": "response_incomplete",
+    "sol_response_not_object": "response_incomplete",
+}
+
+
+def _infer_error_class(error_code: str) -> str:
+    return _SOL_CLASS_BY_ERROR_CODE.get(str(error_code or "").strip(), "")
+
+
+def _sol_backoff_max_seconds() -> float:
+    raw = os.environ.get("COPILOT_SOL_BACKOFF_MAX", "")
+    try:
+        value = float(str(raw).strip())
+    except (TypeError, ValueError):
+        return SOL_BACKOFF_MAX_SECONDS
+    if value <= 0:
+        return SOL_BACKOFF_MAX_SECONDS
+    return min(value, SOL_BACKOFF_MAX_SECONDS)
+
+
+def _sol_backoff_from_failure(record: dict) -> dict | None:
+    """由失败事实推导退避窗口；不适用时返回 None（不写状态）。"""
+    error_class = str(record.get("error_class") or "")
+    retry_after = record.get("retry_after")
+    hint = round(float(retry_after), 1) if isinstance(retry_after, (int, float)) \
+        and float(retry_after) > 0 else 0.0
+    if hint > 0:
+        # 服务端 Retry-After 是**最短**等待时间：原样遵守，不被本地上限或环境变量
+        # 缩短（缩短会立刻撞回上游的同一个过载/流中断状态，属于制造无效请求）。
+        reason = "retry-after"
+        seconds = hint
+    elif error_class in SOL_BACKOFF_CLASSES:
+        # 没有服务端要求时才用本地策略兜底，这时上限才有意义。
+        reason = "error-class"
+        seconds = min(SOL_BACKOFF_FALLBACK_SECONDS, _sol_backoff_max_seconds())
+    else:
+        return None
+    if seconds <= 0:
+        return None
+    created = datetime.now().astimezone()
+    until = created + timedelta(seconds=seconds)
+    return {
+        "schema": SOL_BACKOFF_SCHEMA,
+        "at": created.isoformat(timespec="seconds"),
+        "until": until.isoformat(timespec="seconds"),
+        "seconds": round(seconds, 1),
+        "reason": reason,
+        "error_class": error_class,
+        "http_status": record.get("http_status"),
+        "retry_after": hint or None,
+        "retry_after_raw": str(record.get("retry_after_raw") or "")[:120],
+        "call_id": str(record.get("call_id") or ""),
+        "note": "上游要求等待：窗口内不发送新请求（不重试、不换 Provider、不改阶段）。",
+    }
+
+
+def sol_backoff_status(state: dict, *, now: object = None) -> dict:
+    """只读：当前是否处于上游退避窗口。损坏的记录按失效处理但不静默丢弃。"""
+    raw = state.get(SOL_BACKOFF_KEY)
+    base = {"active": False, "until": "", "remaining_seconds": 0.0,
+            "reason": "", "error_class": "", "invalid": False}
+    if not isinstance(raw, dict) or not raw.get("until"):
+        return base
+    until = _parse_time(raw.get("until"))
+    current = _parse_time(now) if now is not None else datetime.now().astimezone()
+    if until is None or current is None:
+        return {**base, "invalid": True, "until": str(raw.get("until") or ""),
+                "reason": str(raw.get("reason") or "")}
+    if until.tzinfo is None and current.tzinfo is not None:
+        until = until.replace(tzinfo=current.tzinfo)
+    elif current.tzinfo is None and until.tzinfo is not None:
+        current = current.replace(tzinfo=until.tzinfo)
+    remaining = round((until - current).total_seconds(), 1)
+    return {"active": remaining > 0,
+            "until": str(raw.get("until") or ""),
+            "remaining_seconds": max(remaining, 0.0),
+            "reason": str(raw.get("reason") or ""),
+            "error_class": str(raw.get("error_class") or ""),
+            "invalid": False}
+
+
+def clear_sol_backoff(path: str, *, reason: str = "sol_call_completed") -> bool:
+    """清除退避窗口（成功调用或用户显式继续时）。返回是否真的清除了记录。"""
+    state = load_state(path)
+    if not isinstance(state.get(SOL_BACKOFF_KEY), dict):
+        return False
+    previous = state.pop(SOL_BACKOFF_KEY, None)
+    _history(state, "sol_backoff_cleared", {
+        "reason": str(reason or ""),
+        "until": str((previous or {}).get("until") or ""),
+    })
+    save_state(path, state)
+    return True
+
 # v9：SOL 默认认知引擎——CONSULT / PLAN 是一等模式，REVIEW 仍只在用户明确
 # 要求时执行；THINK 是 v8.4–v8.5 的历史模式名，只读兼容并归入 CONSULT。
 SOL_MODES = ("CONSULT", "PLAN", "REVIEW")
@@ -4446,6 +4569,10 @@ def record_sol_call(path: str, call: dict, *, mode: str = "",
                                 "link": record["obligation_link"]}
     state.setdefault(SOL_CALLS_KEY, []).append(record)
     _history(state, "sol_call_completed", detail)
+    # 成功调用证明上游可用：清除退避窗口，避免过期窗口继续推迟调度。
+    if isinstance(state.pop(SOL_BACKOFF_KEY, None), dict):
+        _history(state, "sol_backoff_cleared",
+                 {"reason": "sol_call_completed", "call_id": record["call_id"]})
     save_state(path, state)
     return record
 
@@ -4928,12 +5055,26 @@ def record_sol_call_failure(path: str, *, mode: str = "CONSULT",
                             materials_sha256: str = "",
                             model: str = "", obligation_id: str = "",
                             stage: str = "", request_attempted: bool = True,
-                            send_observed: str = "unknown") -> dict:
-    """登记一次失败的 SOL 调用；失败不改变任务阶段，也不阻断主代理继续。"""
+                            send_observed: str = "unknown",
+                            http_status: int | None = None,
+                            retry_after: float | None = None,
+                            retry_after_raw: str = "",
+                            upstream_code: str = "",
+                            error_class: str = "",
+                            request_id: str = "",
+                            trace_id: str = "") -> dict:
+    """登记一次失败的 SOL 调用；失败不改变任务阶段，也不阻断主代理继续。
+
+    除错误码外保留原始 HTTP 状态、上游 code、Retry-After 与 trace 标识，供后续
+    任务直接从既有证据判断是上游过载、流中断、凭据冷却、认证还是客户端超时，
+    不需要重新复现。`error_class` 为空时按错误码推断（历史调用方兼容）。
+    """
     state = load_state(path)
     resolved = str(mode or "CONSULT").upper()
     if resolved not in RECORD_SOL_MODES:
         raise GovernanceError(f"未知 SOL 模式：{resolved}")
+    error = str(error_code or "sol_error")
+    cls = str(error_class or "").strip() or _infer_error_class(error)
     record = {
         "schema": "copilot-sol-call-failure/v1",
         "call_id": "SC" + secrets.token_hex(12),
@@ -4942,7 +5083,20 @@ def record_sol_call_failure(path: str, *, mode: str = "CONSULT",
         # 阶段只用于审计定位（例如收口窗口失败）：失败记录不构成任何结论。
         "stage": str(stage or "")[:40],
         "status": "failed",
-        "error": str(error_code or "sol_error"),
+        "error": error,
+        # 分类是判定依据；error 是当时的退出码/错误标识，两者并存不互相替代。
+        "error_class": cls,
+        "http_status": (int(http_status)
+                        if isinstance(http_status, int) and http_status > 0 else None),
+        "retry_after": (round(float(retry_after), 1)
+                        if isinstance(retry_after, (int, float))
+                        and float(retry_after) > 0 else None),
+        # 原始 Retry-After 文本（可能是 HTTP-date）：数值化后的等待秒数另存，
+        # 两者都保留，便于审计复核“服务端到底要求等多久”。
+        "retry_after_raw": str(retry_after_raw or "")[:120],
+        "upstream_code": str(upstream_code or "")[:120],
+        "request_id": str(request_id or "")[:120],
+        "trace_id": str(trace_id or "")[:120],
         "detail": str(detail or "")[:2000],
         "materials_sha256": str(materials_sha256 or ""),
         "request_attempted": bool(request_attempted),
@@ -4968,10 +5122,29 @@ def record_sol_call_failure(path: str, *, mode: str = "CONSULT",
         "call_id": record["call_id"],
         "mode": resolved,
         "error": record["error"],
+        "error_class": record["error_class"],
+        "http_status": record["http_status"],
+        "retry_after": record["retry_after"],
+        "upstream_code": record["upstream_code"],
         "materials_sha256": record["materials_sha256"],
         "request_attempted": record["request_attempted"],
         "send_observed": record["send_observed"],
     })
+    # 上游明确要求等待或属于可退避的上游故障时登记退避窗口：调度层据此推迟
+    # 义务，避免在 Retry-After 窗口内反复发送注定失败的请求（不改变生命周期）。
+    backoff = _sol_backoff_from_failure(record)
+    if backoff:
+        state[SOL_BACKOFF_KEY] = backoff
+        record["backoff"] = {"until": backoff["until"],
+                             "seconds": backoff["seconds"],
+                             "reason": backoff["reason"]}
+        _history(state, "sol_backoff_set", {
+            "until": backoff["until"],
+            "seconds": backoff["seconds"],
+            "reason": backoff["reason"],
+            "error_class": record["error_class"],
+            "retry_after": record["retry_after"],
+        })
     save_state(path, state)
     return record
 
