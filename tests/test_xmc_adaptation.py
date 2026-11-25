@@ -192,7 +192,9 @@ class CrossTurnResumeTests(WorkspaceCase):
 
         proc = self.run_guard(session=NEW_SESSION)
         self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
-        self.assertIn("t1", proc.stderr)
+        # 按状态文件的完整路径断言，而不是任务目录名（"t1"/"t9"）：临时目录的
+        # 随机后缀本身就可能包含这些短串，会让断言假过或假失败。
+        self.assertIn(self.task_dir, proc.stderr)
 
         state = G.load_state(self.state_path)
         actions = {a["id"]: a for a in state["actions"]}
@@ -219,13 +221,16 @@ class CrossTurnResumeTests(WorkspaceCase):
 
         here = self.run_guard()
         self.assertEqual(here.returncode, 2, here.stdout + here.stderr)
-        self.assertIn("t1", here.stderr)
-        self.assertNotIn("t9", here.stderr, "不得把其它工作区的任务当成当前任务")
+        # 用完整路径定位工作区，避免随机临时目录名（可能含 "t1"/"t9"）造成串扰误判。
+        self.assertIn(self.task_dir, here.stderr)
+        self.assertNotIn(other_dir, here.stderr,
+                         "不得把其它工作区的任务当成当前任务")
 
         there = self.run_guard(payload={"cwd": other.name})
         self.assertEqual(there.returncode, 2, there.stdout + there.stderr)
-        self.assertIn("t9", there.stderr)
-        self.assertNotIn("t1", there.stderr, "不得把本工作区的任务带进其它工作区")
+        self.assertIn(other_dir, there.stderr)
+        self.assertNotIn(self.task_dir, there.stderr,
+                         "不得把本工作区的任务带进其它工作区")
 
 
 class GoalModeDocsTests(unittest.TestCase):
