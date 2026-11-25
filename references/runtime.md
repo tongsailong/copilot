@@ -240,15 +240,15 @@ BLOCKED/PASS 规避上限、以及新回合先 `status --json` 核实再继续�
 schema 按普通字段读取。写入路径只创建/更新 `cognition_schedule`，旧键不迁移、不改写、
 不删除；因此旧任务重开时会得到一份新的调度结构，历史义务仍是 raw 状态里的审计事实。
 
-**五个认知窗口（family A–E，与 `review_policy.cognition_advice` 同一口径）**
+**认知窗口（family A/B/C/E，与 `review_policy.cognition_advice` 同一口径；D 已退役）**
 
 | 窗口 | 时机 | 模式 |
 |---|---|---|
 | A | 启动 / 未覆盖当前合同的 CONSULT | CONSULT（understanding） |
-| B | 调查后方案取舍（方案类任务、声明触发、中高复杂或 ≥2 工作项） | PLAN（planning） |
+| B | 调查后方案取舍（方案类任务、声明触发或中高复杂；工作项数量本身不是理由） | PLAN（planning） |
 | C | 重大新证据（六类事件：`material-evidence-change` / `decision-point` / `risk-escalation` / `replan-history` / `scope-changed` / `reopened`） | CONSULT（development） |
-| D | 里程碑复盘（中高复杂 + ≥2 完成项，或 ≥1 完成项 + 已核销条件；recommended） | CONSULT（stage） |
-| E | 收口综合判断（最终工程验证完成后、G1–G3 收口之前的非简单有进展任务，medium 也是 recommended） | CONSULT（closure） |
+| ~~D~~ | **已退役**：里程碑复盘不再自动派生义务；历史状态的 D 义务只读结算 | — |
+| E | 收口综合判断（最终工程验证完成后、G1–G3 收口之前，中/高认知价值且有实质进展的任务） | CONSULT（closure） |
 
 **义务与窗口**：每条义务记录 `obligation_id`（`SO<n>`）、family / mode / stage / event /
 instance、`contract_sha256`、`level`、`status`、`window`。`status` 取值 `due` / `claimed` /
@@ -260,18 +260,17 @@ instance、`contract_sha256`、`level`、`status`、`window`。`status` 取值 `
 - **窗口只在事实发生后关闭**：更晚窗口真的被满足时，更早仍未满足的窗口才记为
   `superseded`（漏调可见）；刚创建、只给提示、预算耗尽都不关闭窗口，避免把“还没来得及
   做”误判成漏调。`due` / `claimed` 落在已关闭窗口上即派生 `missed`。
-- **同一 family + event 只保留一个未执行窗口**：连续进展会反复打开同一里程碑窗口，旧的
-  未执行窗口在新建时即记 `skipped` + `skip_by=superseded-by-newer` 并关闭（历史状态里
-  已堆积的多条打开窗口在下一次同步时同样收敛成一条）；`in_flight` 不被取代。否则一次
-  连续进展就会堆出多条打开窗口，收口时被误算成多条漏调。
-- **D / E 都是 recommended（含 medium）**：里程碑复盘与收口综合判断对中高复杂有进展任务
-  是必需窗口；`due_obligations()` 只取 recommended，标成 optional 会让它们结构性无法自动
-  执行（`drive` / `closure` 永远取不到）。历史 `optional` 义务在收口时按
-  `skipped` + `skip_by=not-required` 结算为合理跳过，`missed` 只统计确实应执行而未执行的
-  窗口；收口前先结算“更晚窗口已满足”，更早的里程碑记 `superseded` 而不是漏调。
-- **收口覆盖最新里程碑**：E 已满足时仍未执行的 D 窗口记 `skipped` +
-  `skip_by=closure-covered`（收口综合判断覆盖了里程碑复盘的认知对象）——最后一批进展刚
-  打开 D 窗口就收口时不计漏调；其它更早窗口（A/B/C）仍按 `superseded` 记漏调。
+- **同一 family + event 只保留一个未执行窗口**：同一窗口反复出现时，旧的未执行窗口在
+  新建时即记 `skipped` + `skip_by=superseded-by-newer` 并关闭（历史状态里已堆积的多条
+  打开窗口在下一次同步时同样收敛成一条）；`in_flight` 不被取代，避免把一条认知对象
+  堆成多条漏调。
+- **E 是 recommended（含 medium）**：收口综合判断对中高复杂有进展任务是必需窗口；
+  `due_obligations()` 只取 recommended，标成 optional 会让它结构性无法自动执行
+  （`drive` / `closure` 永远取不到）。历史 `optional` 义务在收口时按 `skipped` +
+  `skip_by=not-required` 结算为合理跳过，`missed` 只统计确实应执行而未执行的窗口。
+- **历史 D 窗口只读结算**：当前版本不再创建里程碑窗口；旧状态里残留的 D 义务在收口时
+  按 `skipped` + `skip_by=closure-covered`（同周期 E 已满足）或 `superseded` 结算，
+  不计漏调、不重新打开。
 - **合同修订**：旧合同下仍在 open 的义务显式记为 `skipped` + `skip_by=contract-amended`
   并关闭窗口——旧事实留在审计里，但不进入新合同的覆盖率分母。
 
@@ -317,21 +316,21 @@ instance、`contract_sha256`、`level`、`status`、`window`。`status` 取值 `
 - **可执行命令只有一个来源**：`cognition-schedule` 与调度步输出的命令带真实状态路径与
   `--obligation`，可原样执行；`evaluate` / `review-admission` 里的 `cognition.command` 仍是
   含 `<>` 占位的**模板**，只用于说明意图，不能当作已执行或可直接执行。
-- **收口顺序固定**：最终工程验证完成（收口准入通过）→ 认知收口综合判断（family E，
-  `prefer_family="E"`）→ ZCode 最终验收（`cognition-accept`，accepted / modified / rejected 任一）
-  → `close_task` 的 G1–G3 收口。E 窗口不占用 `drive` RUNNING 分支的那个额度，
-  `close_task` 记录的 `closure.cognition_entry`（`drive` / `closure-command`）标明本次收口由哪个
-  入口完成；收口时仍 open 的窗口记为 `pending_before_close`，未满足的记
-  `missed_before_close`。验收这一步是强制的顺序事实：`governance.closure_acceptance_pending()`
-  在当前摘要的收口 CONSULT 尚无裁决记录时让 `close_task` 失败关闭、`continuation` 给
-  `action="accept"`、`drive` / `closure --close` 停在 `EXIT_EXECUTE` / `EXIT_CONTINUE`。
-  裁决不是认知批准权：三种结论都可继续，验收也不替代用户对质量报告的接受。
+- **收口顺序**：最终工程验证完成（收口准入通过）→ 认知收口综合判断（family E，
+  `prefer_family="E"`，如建议）→ `close_task` 的 G1–G3 收口。E 窗口不占用 `drive`
+  RUNNING 分支的那个额度，`close_task` 记录的 `closure.cognition_entry`（`drive` /
+  `closure-command`）标明本次收口由哪个入口完成；收口时仍 open 的窗口记为
+  `pending_before_close`，未满足的记 `missed_before_close`。
+- **认知采纳不是收口一步**：`cognition-accept` 只是可选的采纳审计记录
+  （accepted / modified / rejected），`closure_acceptance_pending()` 只读提示、不阻止收口；
+  完全不调用认知、或调用了但不登记采纳，都不影响 G1–G3 与收口。PWW 质量报告的**用户接受**
+  仍是 G2 的一部分，不因认知解耦而放宽。
 - **收口准入唯一口径（v9.6.1）**：`governance.closure_readiness(state)` 是 E 窗口与收口
   的唯一准入，返回 `ready` / `digest` / `all_actions_terminal` / `criteria_satisfied` /
   `final_evidence_recorded` / `required_tests_completed` / `no_pending_required_work` /
   `verification_passed` / `blockers`。先查便宜事实（工作项终态、完成条件、证据、必要
   测试、重开后无进展、开放 finding），全部通过才算确定性门禁（不含质量报告的**用户
-  接受**——那是 ZCode 验收之后的用户一步，不能把认知挡在它后面）。工作项全部关闭、
+  接受**——那是 G2 内由用户完成的独立一步，与认知采纳无关）。工作项全部关闭、
   G1–G3 通过都**不等于**最终验证完成：合同 `test_policy.required=true` 时必须存在带
   `capture_cmd` 的采集证据（词元按序匹配声明命令，允许插入 `-B` 等运行器参数）或结构化
   质量报告给出 `required_tests_executed=true`。
@@ -344,8 +343,7 @@ instance、`contract_sha256`、`level`、`status`、`window`。`status` 取值 `
 - **入口一致**：`record` / `rerun` / `criterion` / `evidence` 等回填命令只更新义务，
   `drive` 在验证缺口时返回 `EXIT_EXECUTE` 并拒绝执行 E，`closure --close` 在验证缺口时
   直接失败（退出码 1）而不收口，`cognition-consult --stage closure` 在缺口或摘要不符时拒绝调用，
-  `close_task` 对缺测试证据的任务拒绝收口、对等待验收的收口 CONSULT 同样拒绝收口。
-  任何入口都不能绕过验证、E 调度或 ZCode 验收。
+  `close_task` 对缺测试证据的任务拒绝收口。任何入口都不能绕过最终工程验证。
 - **E 是 advisory**：收口 CONSULT 返回的风险与遗漏由 ZCode 独立核实、修复并定向验证；
   它不是门禁，不需要认知 PASS 才能收口，失败只降级。
 - **失败降级**：请求失败（配额、网络、超时、截断、模型身份不符等）按 `record_cognition_obligation_error`
@@ -377,9 +375,9 @@ instance、`contract_sha256`、`level`、`status`、`window`。`status` 取值 `
 **覆盖率统计（观测，不是门禁）**：`cognition-stats --state <path>` 或 `--workspace <dir>` 按
 合同口径输出应调/实际执行/失败/复用/合理跳过/应调未执行与原因、CONSULT 与 PLAN 的阶段
 分布、六类事件分布、采纳（accepted/modified/rejected）、tokens 与延迟。分母只统计当前
-合同下的适用窗口：启动＝非简单任务、规划＝`plan_admission().required`、收口＝非简单、有实质进展且
-复杂度为 medium/high（`closure_eligible_tasks` 在 totals 中单列）、事件＝已识别事件数减去
-合理跳过数。任务级窗口（A 启动 / B 规划 / E 收口）的分母是“本任务是否适用”（0/1），
+合同下的适用窗口：启动＝复杂度 medium/high（存在真实认知价值信号；`risk=medium` 默认值不是信号）、
+规划＝`plan_admission().required`、收口＝有实质进展且复杂度 medium/high
+（`closure_eligible_tasks` 在 totals 中单列）、事件＝已识别事件数减去合理跳过数。任务级窗口（A 启动 / B 规划 / E 收口）的分母是“本任务是否适用”（0/1），
 所以分子也按任务计 1 次：满足＝**真实执行或复用**（`by_family` 仍分别保留执行/复用/
 跳过/漏调的条数，用于解释“覆盖了几次”）。事件窗口按“每出现一次事件 → 一个适用窗口”
 计数，执行/复用计入分子，合理跳过不进入分母，漏调单列。打印命令、预检通过与模拟响应
@@ -389,7 +387,9 @@ instance、`contract_sha256`、`level`、`status`、`window`。`status` 取值 `
 ## 6. 收口与重开
 
 - `closure_check` 依次检查 G1–G3（工作项终态、合同/条件/证据/台账、无停摆），全部通过才
-  `passed=true`；G4 已退役，不再参与。
+  `passed=true`；G4 已退役，不再参与。三道门是**基础事实检查**，对低/中/高风险任务同等
+  适用，但不强制复核、认知采纳、PWW 或合同未声明的测试流程；`blocking` finding 在任何
+  风险等级阻断，`major` 只在 `risk=high` 阻断（普通任务进 `warnings`）。
 - `closure --close` 需要 G1–G3 通过，写入 `closure`（时间、`by`、`iteration_id`、门禁快照、
   `cognition_entry`）并把阶段固定为 CLOSED；未结束的迭代同时标记为 `CLOSED` 并补 `ended`，
   之后的修改一律拒绝。收口前先消费 family E 的收口认知窗口（§5）：成功则是收口前的
@@ -433,11 +433,12 @@ instance、`contract_sha256`、`level`、`status`、`window`。`status` 取值 `
 ### Goal 模式（可选，仅用户发起）
 
 `/goal`（headless `--target`）让宿主跨回合持续同一目标，可超出单回合 3 次续跑上限；普通任务
-不使用。启用条件：多阶段复杂工作、目标清晰可验证、权限客户端已确认可用。约束：
+不使用——它**不是默认机制**，普通任务继续用 `drive` + Stop 守卫。启用条件：多阶段复杂工作、
+目标清晰可验证、权限客户端已确认可用。约束：
 
 - 只能由用户发起；Copilot 与主代理不得自行启用，也不得把既有任务改造成 goal 目标。
 - Goal 与 Plan 互斥，不为启用 goal 强制切换会话模式。
-- objective 与合同目标一致；目标变化走 `contract --amend`，不只改 objective。
+- **objective 对齐合同目标**；目标变化走 `contract --amend`，不只改 objective。
 - 验收仍以 Copilot 最终状态与 G1–G3 为准；goal 自报完成/校验器结论不是工程 PASS。
 - 缺少权限客户端时如实报告并停下，**不得用 `--mode yolo` 绕过审批**；不调用未公开的预算/目标接口。
 - 连续无进展、token 异常增长、权限错误反复出现时先 `/goal pause` 并排查。

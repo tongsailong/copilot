@@ -206,7 +206,9 @@ class RegistrationNoImplicitCallTests(unittest.TestCase):
         G.start_state(self.state_path, goal="交付可复核结果",
                       contract=F.CONTRACT, risk="medium",
                       task_id="astra-efficiency", workspace=self.dir,
-                      task_kind="standard")
+                      # 方案类任务＝真实的认知价值信号：默认 standard/medium 不再
+                      # 产生任何义务（P0-3），这里要验证的是“显式 auto 会执行”。
+                      task_kind="architecture")
         self.materials = os.path.join(self.dir, "materials.md")
         with open(self.materials, "w", encoding="utf-8") as fh:
             fh.write("材料正文\n")

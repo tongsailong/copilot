@@ -234,6 +234,9 @@ def drive(args) -> int:
     # 生命周期调度（v9.6）：drive 是有界消费点，每条命令最多执行 1 个义务。
     # 收口前的窗口（family E）在 PASS 分支单独处理，不占用这个额度。
     cognition_used = False
+    # 固定步数只是“单进程内的有界工作量”，不是任务完成上限：跑满步数时按
+    # 进展摘要判断是“还在推进”还是“原地打转”，前者继续、后者才报错。
+    progress_start = G.progress_digest(G.load_state(path))
     for step in range(MAX_DRIVE_STEPS):
         state = G.load_state(path)
         evaluation = G.evaluate(state, cache=cache)
@@ -262,8 +265,8 @@ def drive(args) -> int:
                     "请检查阻塞范围（--work-item）与完成条件归属。")
             return EXIT_WAIT
         if phase == "PASS":
-            # 收口顺序固定：最终工程验证（PASS + 验证完成）→ 认知收口综合判断 →
-            # 收口。验证缺口（合同要求的测试没有执行痕迹）时两步都不做：交给
+            # 收口顺序：最终工程验证（PASS + 验证完成）→ 按需的收口认知判断 →
+            # 收口。验证缺口（合同要求的测试没有执行痕迹）时暂不收口：交给
             # continuation 的 verify 动作，由主代理先补齐验证。
             readiness = evaluation.get("closure_readiness")
             if not isinstance(readiness, dict):
@@ -273,25 +276,29 @@ def drive(args) -> int:
                       "暂不执行认知收口判断、暂不收口。")
                 for blocker in G.closure_blockers_text(readiness):
                     print(f"- {blocker}")
-                print("先执行合同要求的必要测试并登记验证结果，再重新 drive。")
+                print("先补齐上述验证缺口（必要测试的执行证据、条件核销、证据登记"
+                      "或质量报告的用户接受），再重新 drive。")
                 return EXIT_EXECUTE
             # 这里必须消费调度，否则收口 CONSULT 在 drive 路径上永远不可达。
-            _drive_cognition_step(path, args, gates_passed=True, prefer_family="E",
-                            closure_ready=readiness, cache=cache)
-            # 顺序：最终验证 → 认知收口判断 → ZCode 独立验收 → G1–G3 收口。刚执行完
-            # E 就收口会跳过 ZCode 的判断（收口后又不能再登记，已被 CLOSED 拒绝），
-            # 所以这里停下来把判断交回主代理；采纳/修改/否决任一条都能继续。
-            pending_acceptance = G.closure_acceptance_pending(G.load_state(path))
+            step = _drive_cognition_step(path, args, gates_passed=True,
+                                         prefer_family="E",
+                                         closure_ready=readiness, cache=cache)
+            # 认知收口判断是 advisory：采纳只是可选审计记录，不阻塞收口。
+            # 调度步返回的内存状态可直接复用；但它真执行了认知调用时，新记录由
+            # 子进程写入磁盘，内存副本已过期，必须重读。
+            fresh = step.get("state") if isinstance(step, dict) else None
+            if not isinstance(fresh, dict) or step.get("executed"):
+                fresh = G.load_state(path)
+            pending_acceptance = G.closure_acceptance_pending(fresh)
             if pending_acceptance:
-                print("认知收口判断已完成，等待 ZCode 独立验收后再收口：")
+                print("提醒（非阻断）：收口阶段有已生成、未登记的认知判断：")
                 print(f"- 调用：{pending_acceptance['call_id']}"
                       f"（stage=closure，最终验证摘要 "
                       f"{pending_acceptance['digest']}）")
-                print("下一步：copilot_dispatch.py cognition-accept --state <state> "
+                print("可选：copilot_dispatch.py cognition-accept --state <state> "
                       f"--call-id {pending_acceptance['call_id']} "
                       "--status accepted|modified|rejected --rationale <依据>")
-                print("登记判断后再 drive：此时才执行 G1–G3 收口。")
-                return EXIT_EXECUTE
+                print("不登记采纳不影响收口：G1–G3 只由工程事实判定。")
             closure = G.close_task(path, cache=cache, cognition_entry="drive")
             print(f"G1–G3 通过，任务已收口：verdict={closure.get('verdict')} "
                   f"iteration={closure['iteration_id']} by={closure['closed_by']}")
@@ -377,10 +384,16 @@ def drive(args) -> int:
         if after == before and not any(a["origin"] == "partial-next"
                                        for a in created):
             print("警告：本次派生没有改变进展摘要；下一轮若重复，将记录替代方案要求。")
-    print(f"连续 {MAX_DRIVE_STEPS} 步仍未收敛；状态已保留，请检查工作项是否被反复"
-          "派生。", file=sys.stderr)
+    state = G.load_state(path)
+    if G.progress_digest(state) != progress_start:
+        # 本次驱动确实推进了进展（派生/回填/条件核销），只是单进程步数用完：
+        # 这是“继续”而不是错误，下一轮 drive 从新状态接着走。
+        print(f"本次已推进进展，达到单进程 {MAX_DRIVE_STEPS} 步上限；"
+              "状态已保存，继续执行下一轮 drive。")
+        return EXIT_EXECUTE
+    print(f"连续 {MAX_DRIVE_STEPS} 步没有产生任何进展；状态已保留，"
+          "请检查工作项是否被反复派生同一任务。", file=sys.stderr)
     return EXIT_ERROR
-
 
 # ── ingest ─────────────────────────────────────────────────────────────────
 def _existing_result(state: dict, sha: str) -> dict | None:

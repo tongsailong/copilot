@@ -782,12 +782,12 @@ def task_complexity(state: dict, *, triggers: list[str] | None = None,
                     workspace: str = "") -> dict:
     """确定性的任务认知复杂度：只用状态事实，不调用任何模型。
 
-    低复杂度（0 个信号）＝简单/局部改动：认知默认 0 调用。
-    1 个信号＝中等复杂度：值得一次主动认知辅助。
-    2 个及以上＝高复杂度：优先在策略/方案阶段用一次判断收敛。
+    复杂度是**认知价值**的输入，不是风险等级的同义词：`risk=high` 是其中一个
+    信号，`risk=medium`（默认值）本身不产生任何信号。低复杂度（0 个信号）＝简单/
+    局部改动：认知默认 0 调用。1 个信号＝中等价值；2 个及以上＝高价值。
 
-    未声明或声明为标准类型时按非简单处理：复杂度不确定时默认调用认知，而不是
-    默认跳过。简单类型也必须由风险、触发因素、计划结构与证据范围共同确认。
+    `task_kind` 只是任务分类：未声明（standard）不再自动等于“需要认知”，是否
+    调用仍由真实信号决定；只有显式声明为方案类任务时才构成规划价值。
     """
     codes: list[str] = []
     details: dict[str, str] = {}
@@ -803,6 +803,10 @@ def task_complexity(state: dict, *, triggers: list[str] | None = None,
     risk = "medium" if risk == "normal" else risk
     if risk == "high":
         add("risk-high", "task.risk=high")
+    if kind in PLAN_KINDS:
+        # 显式声明为方案类任务本身就是“自评不确定性”的声明：它表示存在多方案
+        # 取舍、架构选择或需要比较的研究结论。默认 standard 不产生任何信号。
+        add("plan-kind", f"任务类型={kind}（方案类）")
     requested = []
     for item in triggers or []:
         value = _text(item).lower()
@@ -938,9 +942,9 @@ def plan_admission(state: dict, *, triggers: list[str] | None = None,
                    workspace: str = "") -> dict:
     """PLAN 准入的唯一判定口径（建议与覆盖率统计共用）。
 
-    不再由工作项数量单独决定：方案类任务类型、中/高复杂、多工作项都构成
-    “存在实质方案决策”。单工作项任务只要命中任一条件也要规划；只有既无信号、
-    又无第二项工作、也不是方案类任务时才跳过。
+    规划价值来自**复杂度信号或方案类任务类型**，不来自工作项数量本身：把“有 2 个
+    工作项”当成自动规划理由，会让普通多步骤任务也产生认知义务。显式声明触发、
+    依赖边、多模块、重规划历史等信号仍会提高复杂度（见 task_complexity）。
     """
     if triggers is None:
         # 调用方未显式传入时读取任务自己声明的触发因素：准入只有一个口径，
@@ -953,8 +957,7 @@ def plan_admission(state: dict, *, triggers: list[str] | None = None,
                 if _text(item.get("status")) in TERMINAL_STATUSES])
     understood = bool(profile["readiness"]["understood"])
     kind = profile["task_kind"]
-    required = (profile["level"] in ("medium", "high") or planned >= 2
-                or kind in PLAN_KINDS)
+    required = (profile["level"] in ("medium", "high") or kind in PLAN_KINDS)
     return {
         "required": bool(required and understood),
         "understood": understood,
@@ -963,8 +966,8 @@ def plan_admission(state: dict, *, triggers: list[str] | None = None,
         "planned": planned,
         "done": done,
         "non_simple": bool(profile.get("non_simple")),
-        "reason": ("方案类任务、中/高复杂或多工作项" if required
-                   else "既无方案类信号也没有第二项工作"),
+        "reason": ("方案类任务或中/高认知复杂度" if required
+                   else "既无方案类信号也没有中/高认知复杂度"),
     }
 
 
@@ -1212,18 +1215,20 @@ def cognition_advice(state: dict, *, calls: list[dict] | None = None,
                workspace: str = "") -> dict:
     """认知默认认知生命周期建议（只读建议，不是门禁，也不派生工作项）。
 
-    生命周期与调用策略（v9.6 事件驱动）：
+    生命周期与调用策略（事件驱动，认知按价值触发）：
 
-    1. 简单/机械任务（无信号且类型明确简单）→ 0 调用；复杂度不确定时按非简单处理。
-    2. A 启动：非简单任务 → 一次 CONSULT（目标理解、问题本质、约束与主要风险）。
-    3. B 规划：已形成现场事实且存在实质方案决策 → 一次 PLAN；准入不再由工作项
-       数量单独决定（方案类任务、声明触发、中/高复杂、多工作项任一即可）。
+    1. 简单/机械任务（无中/高复杂信号）→ 0 调用；默认 task_kind 不再自动等于
+       “需要认知”，是否有价值只看真实信号（影响面、真实产物、自评不确定性）。
+    2. A 启动：**存在中/高认知价值信号**的非简单任务 → 一次 CONSULT；普通局部
+       修复不因任务未声明类型就自动调用。
+    3. B 规划：已形成现场事实且存在实质方案决策 → 一次 PLAN；准入由复杂度信号
+       或方案类任务类型决定，不由工作项数量单独决定。
     4. C 执行期：出现可归因的新事件（实质证据变化、决策点、风险上升、重规划、
        合同修订、重开）→ 追加 CONSULT；普通证据追加与常规进展不触发。
-    5. D 里程碑：medium/high 任务完成实质工作后 → 可选阶段复盘（按 progress_key
-       去重，不按时间或证据条数）。
-    6. E 收口：有实质进展的非简单任务在最终验证后 → 收口综合判断（按收口周期
-       去重）；认知不拥有 PASS 批准权，也不是门禁。
+    5. D 里程碑：**不再自动生成**。需要阶段复盘时由 ZCode 自行判断并手动发起
+       `cognition-consult --stage stage`；没有自动义务、也不进入覆盖率分母。
+    6. E 收口：有实质进展且中/高认知价值任务在最终验证后 → 收口综合判断（按收口
+       周期去重）；认知不拥有 PASS 批准权，也不是门禁。
     7. REVIEW 只由用户明确要求，不由阶段或风险自动派生。
 
     输出中的 `family` / `event` / `instance` / `level` 是调度层持久化“义务”的稳定
@@ -1292,7 +1297,6 @@ def cognition_advice(state: dict, *, calls: list[dict] | None = None,
     if not events and new_codes:
         events = _signals_to_events(new_codes)
     new_events = [str(item.get("code") or "") for item in events]
-    risk = _text(state.get("risk")).lower()
     level = profile["level"]
     kind = profile["task_kind"]
     actions = _action_list(state, plan_only=True)
@@ -1306,7 +1310,6 @@ def cognition_advice(state: dict, *, calls: list[dict] | None = None,
         state, triggers=triggers, workspace=workspace)["required"]
     # 收口综合判断只对“有实质工程进展”的非简单任务有认知价值。
     progressed = has_substantive_progress(state)
-    progress_key = cognition_progress_key(state)
     closure_cycle = closure_key(state)
     # E 阶段准入＝最终工程验证完成（统一由 governance.closure_readiness 判定）。
     # 缺省时沿用旧的 `gates_passed` 口径，只为历史调用点兼容；调度链路一律传入。
@@ -1325,15 +1328,11 @@ def cognition_advice(state: dict, *, calls: list[dict] | None = None,
                 and _text(item.get("closure_key") or closure_cycle) == closure_cycle))
         for item in consult_calls)
     # 本收口周期（合同 + 重开次数）是否已经有收口判断。收口判断已经综合了方案与
-    # 阶段成果，之后再补 B 规划或 D 里程碑属于对同一认知对象重复付费；只有升级型
-    # 事件（C）或新的最终验证摘要（E）可以打开新窗口。
+    # 阶段成果，之后再补 B 规划属于对同一认知对象重复付费；只有升级型事件（C）或
+    # 新的最终验证摘要（E）可以打开新窗口。
     closure_cycle_consulted = any(
         _call_stage(item) == "closure"
         and _text(item.get("closure_key") or closure_cycle) == closure_cycle
-        for item in consult_calls)
-    stage_consulted_now = any(
-        _call_stage(item) == "stage"
-        and _text(item.get("progress_digest")) == progress_key
         for item in consult_calls)
     base = {
         "schema": COGNITION_ADVICE_SCHEMA,
@@ -1369,10 +1368,13 @@ def cognition_advice(state: dict, *, calls: list[dict] | None = None,
         base["reason"] = ("任务处于 BLOCKED：先解除授权/决策/资源缺口；认知不提供本地事实，"
                           "也不能替代用户决定。")
         return base
-    if level == "low" and not profile.get("non_simple") \
-            and not user_request and not review_requested:
-        base["reason"] = ("简单/机械任务（无中高复杂信号）：主代理自检、diff 与必要"
-                          "测试闭环，认知保持 0 调用。")
+    if level == "low" and not events and not user_request and not review_requested:
+        # 没有中/高认知价值信号：普通局部修复与机械任务保持 0 调用。风险等级
+        # 默认 medium 不构成信号，也不单独触发任何阶段（见 task_complexity）。
+        # 升级型事件（重大失败、方案被推翻、风险或范围变化）仍然放行：它们本身
+        # 就是“值得再判断一次”的可归因事实。
+        base["reason"] = ("简单/局部任务（无中/高认知价值信号）：主代理自检、diff 与"
+                          "必要测试闭环，认知保持 0 调用；需要时可手动发起咨询。")
         return base
 
     def command_for(mode: str, stage: str, trigger: str) -> str:
@@ -1407,10 +1409,9 @@ def cognition_advice(state: dict, *, calls: list[dict] | None = None,
     # 终态、条件尚未核销或必要测试没有验证痕迹时，E 保持待执行而不是拿不完整的
     # 材料去问收口问题。仍未处理的动态事件优先于收口判断。
     if final_verified:
-        if not closure_consulted and progressed \
-                and (risk == "high" or level in ("high", "medium")):
-            # 收口综合判断对非简单有进展任务是必需窗口：medium 也必须是 recommended，
-            # 否则调度层按 recommended 取义务时永远取不到，收口 CONSULT 结构性不可达。
+        if not closure_consulted and progressed and level in ("high", "medium"):
+            # 收口综合判断只对“有认知价值且确有进展”的任务成立。复杂度来自真实
+            # 信号（高风险是其中一个信号），不由 risk 标签单独决定。
             recommended = "recommended"
             event = "closure"
             trigger = _retry_trigger(new_codes) if new_codes else "stage-result"
@@ -1441,10 +1442,12 @@ def cognition_advice(state: dict, *, calls: list[dict] | None = None,
                           "认知，继续按本地证据收口。")
         return base
 
-    # ── 阶段 A：非简单任务启动默认 CONSULT ──────────────────────────────
+    # ── 阶段 A：有认知价值的非简单任务在启动时 CONSULT ──────────────────
     # 已有可归因的新事件时走 C（合同修订会让旧结论不再“覆盖”，但语境已经从
     # 启动变成范围变化，问题也应问“哪些旧结论仍成立”而不是“重新理解任务”）。
-    if not covered["CONSULT"] and not events:
+    # 没有中/高价值信号（level=low）时不会走到这里：普通局部修复不因“任务未声明
+    # 为简单类型”就自动产生启动义务。
+    if not covered["CONSULT"] and not events and level in ("medium", "high"):
         stage = "understanding" if not understood else "development"
         if attempted["CONSULT"]:
             trigger = "user-request" if user_request else "scope-changed"
@@ -1459,9 +1462,9 @@ def cognition_advice(state: dict, *, calls: list[dict] | None = None,
             "instance": sha256_text(canonical_json(
                 [snapshot["contract_sha256"], "startup"]))[:16],
             "question": question_for("startup", base),
-            "reason": ("非简单任务从启动阶段默认获得一次认知 CONSULT："
-                       "确认目标理解、问题判断、关键矛盾、初步策略与主要风险；"
-                       "随后由 ZCode 自主调查并核实。"),
+            "reason": ("任务存在中/高认知价值信号（影响面、真实产物或自评不确定性）："
+                       "建议在启动阶段做一次 CONSULT，确认目标理解、关键矛盾、"
+                       "初步策略与主要风险；随后由 ZCode 自主调查并核实。"),
             "command": command_for("CONSULT", stage, trigger),
         })
         if user_request:
@@ -1527,34 +1530,11 @@ def cognition_advice(state: dict, *, calls: list[dict] | None = None,
         })
         return base
 
-    # ── 阶段 D：medium/high 任务在重要里程碑后可做一次复盘 ───────────────
-    # 里程碑以“已完成的实质工作”计量，不用证据条数或时间：medium/high 任务在
-    # 完成 ≥2 个工作项（或 ≥1 个工作项且已核销条件）后构成可归因的里程碑。
-    # 同一 progress_key 只复盘一次，普通进度推进不会反复触发。
-    milestone_done = done >= 2 or (done >= 1 and any(
-        _text(item.get("status")) == "met"
-        for item in (state.get("contract") or {}).get("criteria") or []
-        if isinstance(item, dict)))
-    if level in ("medium", "high") and milestone_done and not all_done \
-            and not stage_consulted_now and not closure_cycle_consulted:
-        base["second_round"] = True
-        base["trigger"] = "stage-result"
-        base.update({
-            "action": "consult", "recommended_action": "recommended",
-            "mode": "CONSULT", "phase": "stage", "stage": "stage",
-            "family": "D", "event": "milestone", "level": "recommended",
-            # A stage window is stable for one contract/reopen cycle. Routine
-            # action, evidence, or criterion updates must not mint a new D.
-            "instance": sha256_text(canonical_json([
-                snapshot["contract_sha256"], snapshot["reopen_seq"],
-                "milestone"]))[:16],
-            "question": question_for("milestone", base),
-            "reason": (f"{level} 复杂任务已完成 {done} 个工作项：在阶段边界做一次"
-                       "成果复盘（是否偏离目标、未解决问题与下一阶段方向）；"
-                       "同一进度只复盘一次，进度前进后旧窗口被新窗口取代。"),
-            "command": command_for("CONSULT", "stage", "stage-result"),
-        })
-        return base
+    # ── 阶段 D：已退役（不再自动生成里程碑复盘义务）─────────────────────
+    # 阶段复盘属于“由 ZCode 按实际问题决定”的可选判断，不再作为生命周期节点：
+    # 需要时手动执行 `cognition-consult --stage stage`。取消自动生成后，普通进度
+    # 推进不会再制造 D 窗口，也不会在收口时被记成漏调；历史 state 里的 D 义务
+    # 只读兼容（仍可展示、结算与统计）。
 
     base.update({
         "action": "reuse", "mode": "CONSULT",
@@ -1709,7 +1689,8 @@ def pending_acceptance(calls: list[dict] | None, *, limit: int = 5) -> list[dict
     """已完成但尚未回填采纳结果的认知调用（只读提示，不构成门禁）。
 
     这些调用已经产生过判断成本，主代理应明确采纳/调整/拒绝并说明实际落地，
-    避免结论沉睡在台账里；E 收口的采纳门仍由 `closure_acceptance_pending` 单独管。
+    避免结论沉睡在台账里；采纳只是可选审计记录，不是收口门禁（`closure-acceptance-
+    pending` 只用于事后核对当时还有哪些未登记判断）。
     """
     rows: list[dict] = []
     for item in _cognitive_calls(calls):

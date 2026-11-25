@@ -152,10 +152,10 @@ class SchedulingBase(unittest.TestCase):
 
     def accept(self, *, status: str = "accepted",
                rationale: str = "ZCode 独立判断：结论与证据一致") -> dict:
-        """登记 ZCode 对最近一次收口 CONSULT 的采纳判断。
+        """登记 ZCode 对最近一次收口 CONSULT 的采纳判断（可选审计记录）。
 
-        顺序是「最终验证 → 收口 CONSULT → ZCode 验收 → G1–G3 收口」：这一步
-        缺省会被拒绝收口，因为收口后状态为 CLOSED，再登记就不再被允许。
+        采纳不是收口门禁：缺省不影响收口。但收口后状态为 CLOSED，再登记就不
+        再被允许，所以需要保留这条审计事实时要在收口前登记。
         """
         calls = [item for item in self.state().get("cognition_calls") or []
                  if isinstance(item, dict)
@@ -226,7 +226,8 @@ class StartupTests(SchedulingBase):
         self.assertIsNone(stats["coverage"]["startup"]["rate"])
 
     def test_standard_startup_consult_is_executed_by_lifecycle_command(self):
-        self.start()
+        # 方案类任务＝真实认知价值信号；默认 standard 不做任何认知调用（P0-3）。
+        self.start(kind="architecture")
         state, _ = self.sync()
         rows = self.obligations("A")
         self.assertEqual(len(rows), 1)
@@ -264,7 +265,7 @@ class StartupTests(SchedulingBase):
             code = CD.main(["start", "--state", self.state_path,
                             "--goal", "交付可复核结果",
                             "--criteria-file", criteria,
-                            "--task-kind", "feature", "--risk", "medium",
+                            "--task-kind", "architecture", "--risk", "medium",
                             "--workspace", self.dir, "--cognition", policy])
         return code, out.getvalue()
 
@@ -290,7 +291,7 @@ class StartupTests(SchedulingBase):
         self.assertEqual(rows[0]["window"], "open")
 
     def test_advise_policy_gives_runnable_command_without_calling(self):
-        self.start()
+        self.start(kind="architecture")
         self.sync()
         result, out, _err = self.step("advise")
         self.assertEqual(result["executed"], "")
@@ -303,7 +304,7 @@ class StartupTests(SchedulingBase):
         self.assertIn("可直接执行", out)
 
     def test_off_policy_records_obligation_silently(self):
-        self.start()
+        self.start(kind="architecture")
         result, out, _err = self.step("off")
         self.assertEqual(result["executed"], "")
         self.assertEqual(result["command"], "")
@@ -316,7 +317,7 @@ class StartupTests(SchedulingBase):
             self.assertFalse(CD._auto_execution_allowed())
 
     def test_same_window_never_creates_two_obligations(self):
-        self.start()
+        self.start(kind="architecture")
         self.sync()
         self.sync()
         self.sync()
@@ -509,30 +510,32 @@ class MilestoneAndClosureTests(SchedulingBase):
         self.record("PLAN")
         self.done(2)
 
-    def test_medium_milestone_is_recommended_and_auto_executed(self):
-        """medium 里程碑复盘是 recommended：真的进入自动执行，而不是永久挂起。"""
+    def test_milestone_no_longer_produces_obligation(self):
+        """D 阶段已退役：普通进度推进不再生成里程碑义务，也不再计入覆盖率分母。"""
         self._medium_with_milestone()
         advice = self.advice()
-        self.assertEqual(advice["family"], "D")
-        self.assertEqual(advice["event"], "milestone")
-        self.assertEqual(advice["recommended_action"], "recommended")
+        self.assertNotEqual(advice["family"], "D")
+        self.assertNotEqual(advice["event"], "milestone")
         state, _ = self.sync()
-        rows = self.obligations("D")
-        self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]["level"], "recommended")
+        self.assertEqual(self.obligations("D"), [])
         with self.cognition_channel() as calls:
             result, _out, _err = self.step("auto")
-        self.assertEqual(calls["count"], 1)  # recommended 级自动执行一次
-        self.assertEqual(result["executed"], rows[0]["obligation_id"])
-        row = self.obligations("D")[0]
-        self.assertEqual(row["status"], "satisfied")
-        self.assertEqual(row["window"], "closed")
+        self.assertEqual(calls["count"], 0)
+        self.assertEqual(result["executed"], "")
+        stats = SCH.task_stats(state)
+        self.assertEqual(stats["by_family"]["D"]["obligations"], 0)
         self.assertEqual(SCH.summary(self.state())["missed"], 0)
 
-    def test_closure_window_covers_fresh_milestone_window(self):
-        """最后一批进展刚打开 D 窗口就收口：E 已满足时算合理跳过，不是漏调。"""
+    def test_closure_window_covers_legacy_milestone_window(self):
+        """历史遗留的 D 窗口（升级前状态）在 E 已满足时算合理跳过，不是漏调。"""
         self._medium_with_milestone()
-        self.sync()
+        state = self.state()
+        schedule = SCH.ensure_schedule(state)
+        schedule["obligations"].append({
+            "obligation_id": "SXD", "family": "D", "event": "milestone",
+            "instance": "legacy-milestone", "status": "due", "window": "open",
+            "level": "recommended", "opened_at": "2026-11-21T20:00:00+08:00"})
+        self.save(state)
         state = self.state()
         schedule = SCH.ensure_schedule(state)
         schedule["obligations"].append(
@@ -564,7 +567,8 @@ class MilestoneAndClosureTests(SchedulingBase):
             "opened_at": "2026-11-01T00:00:00+08:00", "level": "optional"})
         self.save(state)
         state = self.state()
-        G.sync_cognition_schedule(state, advice=self.advice(), closed=True)
+        # 传空建议：这里只验证“历史 optional 义务收口结算”，不与复用分支混淆。
+        G.sync_cognition_schedule(state, advice={"action": "none"}, closed=True)
         self.save(state)
         legacy = [item for item in SCH.obligations(self.state())
                   if item["obligation_id"] == "SX9"][0]
@@ -581,35 +585,31 @@ class MilestoneAndClosureTests(SchedulingBase):
                          digest)
         self.assertNotEqual(self.advice()["family"], "D")
 
-    def test_routine_progress_does_not_create_new_milestone_window(self):
-        """工作项继续推进不会因 progress digest 改变反复新开 D 窗口。"""
+    def test_routine_progress_does_not_create_milestone_window(self):
+        """工作项继续推进既不新开 D 窗口，也不产生新的付费义务。"""
         self._medium_with_milestone()
         self.sync()
-        first = self.obligations("D")
-        self.assertEqual(len(first), 1)
+        self.assertEqual(self.obligations("D"), [])
         self.done(1)
         state, _ = self.sync()
-        rows = self.obligations("D")
-        self.assertEqual(len(rows), 1, rows)
-        self.assertEqual(rows[0]["obligation_id"], first[0]["obligation_id"])
-        self.assertEqual(rows[0]["status"], "due")
+        self.assertEqual(self.obligations("D"), [])
         self.assertEqual(SCH.task_stats(state)["by_family"]["D"]["missed"], 0)
 
-    def test_reopen_starts_a_new_milestone_cycle(self):
+    def test_reopen_does_not_recreate_milestone_window(self):
+        """重开只打开新周期的事件窗口，不再重建里程碑义务。"""
         self._medium_with_milestone()
         self.sync()
-        first = self.obligations("D")[0]
         state = self.state()
         state["closure"]["reopen_history"].append({"at": "now"})
-        # The reopen event (C) has priority; record it as the new judgment
-        # baseline, then ensure D gets a distinct identity for this cycle.
+        # 重开事件（C）优先；先把它登记为新基线，再确认不会额外生成 D 义务。
         baseline = RP.cognition_event_snapshot(state)
         for call in state["cognition_calls"]:
             call["cognition_event_snapshot"] = baseline
         self.save(state)
         advice = self.advice()
-        self.assertEqual(advice["family"], "D")
-        self.assertNotEqual(advice["instance"], first["instance"])
+        self.assertNotEqual(advice["family"], "D")
+        state, _ = self.sync()
+        self.assertEqual(self.obligations("D"), [])
 
     def test_legacy_duplicate_milestone_windows_are_collapsed(self):
         """历史状态里已堆积的多条打开窗口在下一次同步时收成一条。"""
@@ -628,30 +628,30 @@ class MilestoneAndClosureTests(SchedulingBase):
         legacy = [item for item in self.obligations("D")
                   if str(item["obligation_id"]).startswith("SX")]
         self.assertEqual(sorted(item["status"] for item in legacy),
-                         ["skipped", "skipped"])
-        due = [item for item in self.obligations("D") if item["status"] == "due"]
+                         ["due", "skipped"])
+        due = [item for item in legacy if item["status"] == "due"]
         self.assertEqual(len(due), 1)
-        self.assertGreater(due[0]["opened_at"], "2026-11-02T00:00:00+08:00")
+        self.assertEqual(due[0]["opened_at"], "2026-11-02T00:00:00+08:00")
         self.assertEqual(SCH.task_stats(state)["by_family"]["D"]["missed"], 0)
 
-    def test_drive_executes_closure_consult_before_close(self):
-        """drive 先执行 E，再停在等待 ZCode 验收，最后才收口。"""
+    def test_drive_executes_closure_consult_then_closes(self):
+        """drive 在最终验证后执行 E，并就同一份验证直接收口（采纳可选）。"""
         self.start(risk="high", kind="feature")
         self.plan(1)
         self.close_all()
         self.assertEqual(G.evaluate(self.state())["phase"], "PASS")
-        args = argparse.Namespace(state=self.state_path, sol="auto",
+        args = argparse.Namespace(state=self.state_path, cognition="auto",
                                   max_actions=1, dispatch_out="")
         out = io.StringIO()
         with self.cognition_channel() as calls, \
                 contextlib.redirect_stdout(out), \
                 contextlib.redirect_stderr(io.StringIO()):
             code = CA.drive(args)
-        # 第一次 drive：E 已执行，但 ZCode 还没有登记判断 → 不收口。
-        self.assertEqual(code, CA.EXIT_EXECUTE)
+        self.assertEqual(code, CA.EXIT_DONE)
         self.assertEqual(calls["count"], 1)
         state = self.state()
-        self.assertFalse(state["closure"]["closed"])
+        self.assertTrue(state["closure"]["closed"])
+        self.assertEqual(state["closure"]["cognition_entry"], "drive")
         closure_calls = [item for item in state["cognition_calls"]
                          if item.get("stage") == "closure"]
         self.assertEqual(len(closure_calls), 1)
@@ -660,34 +660,18 @@ class MilestoneAndClosureTests(SchedulingBase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["status"], "satisfied")
         self.assertEqual(rows[0]["call_id"], closure_calls[0]["call_id"])
-        self.assertIn("等待 ZCode 独立验收", out.getvalue())
+        # 认知采纳只是可选审计记录：提示存在，但不阻止收口。
         self.assertIn("cognition-accept", out.getvalue())
-        pending = G.closure_acceptance_pending(state)
-        self.assertEqual(pending["call_id"], closure_calls[0]["call_id"])
-        # 登记验收后再 drive：此时才执行 G1–G3 收口（E 不重复付费）。
-        self.accept()
-        with self.cognition_channel() as again, \
-                contextlib.redirect_stdout(io.StringIO()), \
-                contextlib.redirect_stderr(io.StringIO()):
-            self.assertEqual(CA.drive(args), CA.EXIT_DONE)
-        self.assertEqual(again["count"], 0)
-        state = self.state()
-        self.assertEqual(state["closure"]["closed"], True)
-        self.assertEqual(state["closure"]["cognition_entry"], "drive")
-        self.assertIsNone(G.closure_acceptance_pending(state))
-        # 顺序：SOL 调用 → ZCode 验收 → 收口（history 只增）。
-        kinds = [item.get("event") for item in state.get("history") or []]
-        self.assertLess(kinds.index("cognition_call_completed"),
-                        kinds.index("cognition_call_acceptance"))
-        self.assertLess(kinds.index("cognition_call_acceptance"),
-                        kinds.index("task_closed"))
+        self.assertIn("不登记采纳不影响收口", out.getvalue())
+        self.assertEqual(
+            state["closure"]["cognition_acceptance"]["required"], False)
 
     def test_closure_command_marks_cognition_entry(self):
         self.start(risk="high", kind="feature")
         self.plan(1)
         self.close_all()
         args = argparse.Namespace(state=self.state_path, close=True,
-                                  by="zcode-native", sol="off")
+                                  by="zcode-native", cognition="off")
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(CD.cmd_closure(args), 0)
         state = self.state()
@@ -700,22 +684,22 @@ class MilestoneAndClosureTests(SchedulingBase):
         self.assertTrue(any("认知调度" in line for line in warnings), warnings)
 
     def test_medium_closure_command_executes_closure_consult(self):
-        """medium 任务的收口 CONSULT 也是 recommended：closure 入口真的执行它。"""
+        """medium 任务的收口 CONSULT 是 recommended：closure 入口执行它并收口。"""
         self.start(kind="feature", triggers=["architecture"])
         self.plan(2)
         self.close_all()
         args = argparse.Namespace(state=self.state_path, close=True,
-                                  by="zcode-native", sol="auto")
+                                  by="zcode-native", cognition="auto")
         out = io.StringIO()
         with self.cognition_channel() as calls, \
                 contextlib.redirect_stdout(out), \
                 contextlib.redirect_stderr(io.StringIO()):
             code = CD.cmd_closure(args)
-        # E 已执行，但还缺 ZCode 验收：--close 不能绕过这一步。
-        self.assertEqual(code, CD.EXIT_CONTINUE)
+        self.assertEqual(code, 0)
         self.assertEqual(calls["count"], 1)
         state = self.state()
-        self.assertFalse(state["closure"]["closed"])
+        self.assertTrue(state["closure"]["closed"])
+        self.assertEqual(state["closure"]["cognition_entry"], "closure-command")
         closure_calls = [item for item in state["cognition_calls"]
                          if item.get("stage") == "closure"]
         self.assertEqual(len(closure_calls), 1)
@@ -724,18 +708,7 @@ class MilestoneAndClosureTests(SchedulingBase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["status"], "satisfied")
         self.assertEqual(rows[0]["window"], "closed")
-        self.assertIn("等待 ZCode 独立验收", out.getvalue())
-        self.assertNotIn("任务已收口", out.getvalue())
-        # 登记验收后再执行 closure --close：E 复用，不重复付费。
-        self.accept()
-        with self.cognition_channel() as again, \
-                contextlib.redirect_stdout(io.StringIO()), \
-                contextlib.redirect_stderr(io.StringIO()):
-            self.assertEqual(CD.cmd_closure(args), 0)
-        self.assertEqual(again["count"], 0)
-        state = self.state()
-        self.assertTrue(state["closure"]["closed"])
-        self.assertEqual(state["closure"]["cognition_entry"], "closure-command")
+        self.assertIn("任务已收口", out.getvalue())
         self.assertEqual(state["closure"]["cognition_schedule"]["missed"], 0)
 
     def test_closure_consult_is_reused_within_same_cycle(self):
@@ -767,7 +740,7 @@ class MilestoneAndClosureTests(SchedulingBase):
 # ── 复用、合同修订、失败与阻塞 ────────────────────────────────────────────
 class DeduplicationTests(SchedulingBase):
     def test_reuse_satisfies_open_obligation_without_paying_again(self):
-        self.start()
+        self.start(kind="architecture")
         self.sync()
         self.record("CONSULT")
         state, _ = self.sync()
@@ -778,7 +751,7 @@ class DeduplicationTests(SchedulingBase):
         self.assertEqual(len(state["cognition_calls"]), 1)  # 没有第二次付费
 
     def test_contract_amendment_skips_old_obligations(self):
-        self.start()
+        self.start(kind="architecture")
         self.sync()
         old = self.obligations("A")[0]
         G.amend_contract(self.state_path,
@@ -818,7 +791,7 @@ class DeduplicationTests(SchedulingBase):
         self.assertEqual(failed["send_observed"], "unknown")
 
     def test_failure_records_real_reason_and_keeps_task_running(self):
-        self.start()
+        self.start(kind="architecture")
         self.sync()
         with self.cognition_channel(error=CC.CognitionQuotaError("cognition_quota", "429")):
             result, _out, err = self.step("auto")
@@ -845,7 +818,7 @@ class DeduplicationTests(SchedulingBase):
         self.assertEqual(self.advice()["action"], "none")
 
     def test_item_level_block_does_not_freeze_schedule(self):
-        self.start()
+        self.start(kind="architecture")
         self.plan(2)
         G.add_block(self.state_path, "A1 等待用户授权", "用户授权",
                     work_items=["A1"], criteria=[])
@@ -1033,7 +1006,8 @@ class GateAndStatsTests(SchedulingBase):
     def test_stats_separate_suggestion_execution_reuse_skip_failure(self):
         state = {
             "task_id": "t2", "goal": "g", "risk": "medium",
-            "task_kind": "standard", "contract_sha256": "c2",
+            # 方案类任务＝真实认知价值信号（P0-3）：统计用例要构造“适用”的任务。
+            "task_kind": "architecture", "contract_sha256": "c2",
             "contract": {"criteria": [{"criterion_id": "C1", "status": "met",
                                       "description": "x"}]},
             "actions": [{"id": "A1", "status": "done", "title": "x"}],
@@ -1088,7 +1062,8 @@ class GateAndStatsTests(SchedulingBase):
         plain = os.path.join(tasks, "t-plain", "state.json")
         os.makedirs(os.path.dirname(plain))
         G.start_state(plain, goal="普通任务", contract=CONTRACT,
-                      risk="medium", task_id="t-plain", workspace=self.dir)
+                      risk="medium", task_id="t-plain", workspace=self.dir,
+                      triggers=["core-logic"])
         trivial = os.path.join(tasks, "t-trivial", "state.json")
         os.makedirs(os.path.dirname(trivial))
         G.start_state(trivial, goal="琐碎任务", contract=CONTRACT,
@@ -1104,7 +1079,7 @@ class GateAndStatsTests(SchedulingBase):
         self.assertEqual(payload["coverage"]["startup"]["numerator"], 0)
 
     def test_cognition_schedule_view_is_read_only_without_execute(self):
-        self.start()
+        self.start(kind="architecture")
         before = self._state_bytes()
         proc = F.run_cli("copilot_dispatch.py", "cognition-schedule",
                          "--state", self.state_path, "--json")
@@ -1349,7 +1324,7 @@ class ClosureAdmissionTests(SchedulingBase):
         self.actions_done()
         self.criteria_met()
         self.assertEqual(G.evaluate(self.state())["phase"], "PASS")
-        args = argparse.Namespace(state=self.state_path, sol="auto",
+        args = argparse.Namespace(state=self.state_path, cognition="auto",
                                   max_actions=1, dispatch_out="")
         with self.cognition_channel() as calls, \
                 contextlib.redirect_stdout(io.StringIO()), \
@@ -1385,31 +1360,25 @@ class ClosureAdmissionTests(SchedulingBase):
         self.assertEqual(rows[0]["status"], "satisfied")
         self.assertEqual(len(self.closure_calls()), 1)
 
-    def test_drive_runs_closure_consult_after_verification(self):
-        """验证完成后同一条 drive 路径执行 E，再停在等待验收，最后才收口。"""
+    def test_drive_runs_closure_consult_and_closes(self):
+        """验证完成后同一条 drive 路径执行 E，并直接收口（采纳只是可选记录）。"""
         self.verified()
         digest = G.closure_readiness(self.state())["digest"]
-        args = argparse.Namespace(state=self.state_path, sol="auto",
+        args = argparse.Namespace(state=self.state_path, cognition="auto",
                                   max_actions=1, dispatch_out="")
+        out = io.StringIO()
         with self.cognition_channel() as calls, \
-                contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stdout(out), \
                 contextlib.redirect_stderr(io.StringIO()):
             code = CA.drive(args)
-        self.assertEqual(code, CA.EXIT_EXECUTE)
+        self.assertEqual(code, CA.EXIT_DONE)
         self.assertEqual(calls["count"], 1)
-        state = self.state()
-        self.assertFalse(state["closure"]["closed"])
-        self.assertEqual(self.closure_calls()[0]["final_verification_digest"],
-                         digest)
-        self.accept()
-        with self.cognition_channel() as again, \
-                contextlib.redirect_stdout(io.StringIO()), \
-                contextlib.redirect_stderr(io.StringIO()):
-            self.assertEqual(CA.drive(args), CA.EXIT_DONE)
-        self.assertEqual(again["count"], 0)
         state = self.state()
         self.assertTrue(state["closure"]["closed"])
         self.assertEqual(state["closure"]["final_verification_digest"], digest)
+        self.assertEqual(self.closure_calls()[0]["final_verification_digest"],
+                         digest)
+        self.assertIn("不登记采纳不影响收口", out.getvalue())
 
     def test_closure_consult_failure_degrades_without_blocking(self):
         self.verified()
@@ -1428,7 +1397,7 @@ class ClosureAdmissionTests(SchedulingBase):
         self.assertIn("失败", err)
         # SOL 不可用不等于验证失败：工程验收仍按真实证据完成，不因此阻塞。
         args = argparse.Namespace(state=self.state_path, close=True,
-                                  by="zcode-native", sol="advise")
+                                  by="zcode-native", cognition="advise")
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(CD.cmd_closure(args), 0)
         self.assertTrue(self.state()["closure"]["closed"])
@@ -1452,7 +1421,7 @@ class ClosureAdmissionTests(SchedulingBase):
         self.actions_done()
         self.criteria_met()
         args = argparse.Namespace(state=self.state_path, close=True,
-                                  by="zcode-native", sol="auto")
+                                  by="zcode-native", cognition="auto")
         out = io.StringIO()
         with self.cognition_channel() as calls, contextlib.redirect_stdout(out):
             code = CD.cmd_closure(args)
@@ -1471,8 +1440,8 @@ class ClosureAdmissionTests(SchedulingBase):
             G.close_task(self.state_path)
         self.assertIn("测试", str(ctx.exception))
 
-    def test_closure_consult_runs_before_acceptance_and_close(self):
-        """顺序固定：E → ZCode 验收 → 收口；`--close` 不能跳过验收。"""
+    def test_closure_consult_does_not_gate_closure(self):
+        """E 与收口在同一入口完成：未登记采纳只提示，不阻断收口。"""
         self.verified()
         digest = G.closure_readiness(self.state())["digest"]
         with self.cognition_channel() as calls:
@@ -1481,28 +1450,21 @@ class ClosureAdmissionTests(SchedulingBase):
         self.assertFalse(self.state()["closure"]["closed"])
         self.assertTrue(G.closure_check(self.state())["passed"])
         args = argparse.Namespace(state=self.state_path, close=True,
-                                  by="zcode-native", sol="advise")
+                                  by="zcode-native", cognition="advise")
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            self.assertEqual(CD.cmd_closure(args), CD.EXIT_CONTINUE)
-        state = self.state()
-        self.assertFalse(state["closure"]["closed"])
-        self.assertIn("等待 ZCode 独立验收", out.getvalue())
-        # 直接调用 governance 收口同样被拒绝：任何入口都不能跳过验收。
-        with self.assertRaises(G.GovernanceError) as ctx:
-            G.close_task(self.state_path)
-        self.assertIn("采纳判断", str(ctx.exception))
-        self.accept()
-        with contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(CD.cmd_closure(args), 0)
         state = self.state()
         self.assertTrue(state["closure"]["closed"])
         self.assertEqual(state["closure"]["final_verification_digest"], digest)
-        events = [item.get("event") for item in state.get("history") or []]
-        self.assertLess(events.index("cognition_call_completed"),
-                        events.index("cognition_call_acceptance"))
-        self.assertLess(events.index("cognition_call_acceptance"),
-                        events.index("task_closed"))
+        self.assertEqual(state["closure"]["cognition_entry"], "closure-command")
+        self.assertIn("不登记采纳不影响收口", out.getvalue())
+        # 采纳是收口前的可选审计记录：收口后不能倒补，但缺它从未阻止收口。
+        call_id = self.closure_calls()[0]["call_id"]
+        with self.assertRaises(G.GovernanceError) as ctx:
+            G.record_cognition_acceptance(self.state_path, call_id,
+                                          status="accepted", rationale="补记")
+        self.assertIn("已收口", str(ctx.exception))
         self.assertEqual(state["closure"]["cognition_schedule"]["missed"], 0)
 
     def _reset_workspace(self) -> None:
@@ -1528,7 +1490,7 @@ class ClosureAdmissionTests(SchedulingBase):
                     G.closure_acceptance_pending(self.state()))
                 self.assertEqual(CD.cmd_closure(argparse.Namespace(
                     state=self.state_path, close=True, by="zcode-native",
-                    sol="off")), 0)
+                    cognition="off")), 0)
                 self.assertTrue(self.state()["closure"]["closed"])
 
     def test_closed_task_cannot_take_acceptance_after_the_fact(self):
@@ -1540,7 +1502,7 @@ class ClosureAdmissionTests(SchedulingBase):
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(CD.cmd_closure(argparse.Namespace(
                 state=self.state_path, close=True, by="zcode-native",
-                sol="off")), 0)
+                cognition="off")), 0)
         call_id = self.closure_calls()[0]["call_id"]
         with self.assertRaises(G.GovernanceError) as ctx:
             G.record_cognition_acceptance(self.state_path, call_id,
@@ -1607,7 +1569,7 @@ class ClosureAdmissionTests(SchedulingBase):
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(CD.cmd_closure(argparse.Namespace(
                 state=self.state_path, close=True, by="zcode-native",
-                sol="off")), 0)
+                cognition="off")), 0)
         closure = self.state()["closure"]
         self.assertEqual(closure["final_verification_digest"], digest)
         self.assertEqual(

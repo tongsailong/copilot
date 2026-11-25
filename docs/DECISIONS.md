@@ -1201,6 +1201,57 @@
     - **不变量**：不删除/覆盖任何原有文件；不用忽略规则隐藏源码、测试或未完成工作；不改历史
       提交、不 amend、不使用 `git add -A`/`git add .`。
 
+71. **架构轻量化：认知解耦、风险适配门禁与单一验收事实源（2026-11-25，用户维护任务）。**
+    依据：用户《Copilot Skill v9.10.0 架构轻量化与执行效率优化》；版本维持 v9.10.0，不机械
+    升版。目标是让 Copilot 回到“轻量协作治理层”，而不是第二套执行/审批体系。
+    - **认知采纳不是收口门禁**：`close_task`、`closure --close`、`drive` 的 PASS 路径都不再
+      检查 `closure_acceptance_pending()`；该函数降级为只读提示，收口记录
+      `closure.cognition_acceptance.required=false` 并留下当时未采纳的调用 id 供审计。
+      `cognition-accept` 保留为可选采纳记录（accepted/modified/rejected），不登记、甚至
+      rejected 都不影响收口。理由：认知是 advisory，采纳与否属于主代理判断，不能成为
+      工程验收的前置条件。PWW 质量报告的**用户接受**仍是 G2 的一部分，未削弱。
+    - **D 里程碑退休**：`cognition_advice` 不再生成 D 义务；A（启动理解）/B（调查后规划）/
+      C（升级型事件）/E（收口综合判断）保留，触发只看真实信号（影响面 × 真实产物 × 自评
+      不确定性）。普通进度、证据追加、工作项增减都不打开新窗口；历史状态里的 D 义务在收口
+      时按 `closure-covered`/`superseded` 只读结算，不计漏调。
+    - **复杂度 / 风险 / 任务类型解耦**：`task_complexity` 新增 `plan-kind` 信号；
+      `risk=medium`（默认值）、`standard` 类型、工作项数量都不再构成信号；`plan_admission`
+      去掉“工作项 ≥2 即需规划”；`cognition_schedule.task_stats` 的 `closure_eligible` 与收口
+      覆盖率分母同样只按“复杂度中/高 + 实质进展”判定（不沿用“非简单类别”），与 E 窗口触发
+      逐字一致，避免义务已建而分母为 0 的聚合失真。
+      `task_stats` 的启动覆盖率分母由“非简单任务”改为“复杂度 medium/high”，避免把普通
+      standard 任务算成“应调未执行”的假漏调；`not_registered` 同样只针对本应拥有启动窗口
+      的任务。
+    - **G1–G3 风险适配**：`_gate_findings` 中 `blocking` 在任何风险下都阻断，`major` 只在
+      `risk=high` 阻断，非高风险时作为 `advisory` 提醒进入 warnings 而不影响 `passed`。
+      普通任务不因缺少 Reviewer、历史 G4 或认知意见而无法收口；正式 REVIEW 仍只在用户明确
+      要求时登记。
+    - **单一验收事实源**：`final_acceptance(deep=False|True)` + `_acceptance_facts` +
+      `_acceptance_fingerprint` 取代 `verification_gates` 与分散的 readiness/check 扫描；
+      `closure_readiness`（廉价）与 `closure_check`/`close_task`（深检）共用同一份事实与同一
+      cache，`quality_summary` 按状态版本记忆。`_acceptance_facts` 不读证据文件、不跑代码
+      范围；只有廉价事实通过后深检才做文件型校验。`final_acceptance` 的 cache 键含
+      `(task_id, save_seq)`，跨命令不复用，避免旧结论套到新状态。
+    - **状态读取去重**：`_cognition_schedule_step` 返回本次调度后的内存状态；`drive`、
+      `closure --close` 与回填命令不再二次 `load_state`。真执行了认知调用时记录由子进程落盘，
+      内存副本过期，仍显式重读。
+    - **drive 步数上限语义**：达到 `MAX_DRIVE_STEPS` 时按 `progress_digest` 判定——有进展
+      返回 `EXIT_EXECUTE` 让下一轮继续，无进展才 `EXIT_ERROR`。固定步数只是单进程工作量
+      边界，不是任务完成上限。
+    - **文档**：`SKILL.md` 76,926 → 65,865 B（−14.4%），生命周期/信号/D 退役/采纳非门禁
+      只保留一处权威表述；`references/runtime.md`、`workflow.md`、`review.md`、
+      `docs/PROJECT-CHARTER.md` 同步语义（含 Goal 模式约束原文保留，既有测试词元不变）。
+    - **实测（同场景 A/B，基线 worktree `b2156df` vs 当前工作区，各 3 轮取中位数）**：
+      `record` 状态读取 3 → 2 次、`closure --close` 4 → 3 次；`closure` 中位 34.4 → 31.9 ms、
+      `record` 33.9 → 30.9 ms；`status`/`closure-check` 在噪声内；`cognition-schedule` 因
+      统一准入多算一次廉价事实而 +3 ms 量级。质量结论真实计算次数与基线相同（closure 3 次），
+      无重复付费回归。不宣称加速比；`state.json` 序列化与 fsync 仍是收口路径的主要成本。
+    - **不变量**：PARTIAL 续跑与项级阻塞、Stop/SessionStart/UserPromptSubmit 钩子、Context
+      Engine 召回、Astra 单模型（`gpt-6.2-astra`）零工具单轮、G4 退役、PWW、授权边界与
+      “不新增模型调用”不变。
+    - **未验证**：GUI 新会话的真实 Astra 调用与 Provider 级退避隔离未在本轮重测（未改通道）；
+      真实宿主 Stop 续跑未重跑（钩子未改）。
+
 ## 建议（未采纳）
 
 > 以下为 v5 时期记录，保留原文；其中涉及 `call_gpt.py`、SOL 预算或远程 REVIEW 的建议

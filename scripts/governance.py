@@ -3025,6 +3025,20 @@ def latest_quality_report(state: dict) -> dict | None:
 
 
 def quality_summary(state: dict, *, cache: dict | None = None) -> dict:
+    """PWW 质量结论（只读）。同一命令内按 (任务, save_seq) 复用：收口链路上
+    `_gate_quality` 与 `close_task` 都会用到它，重复计算会重跑代码范围快照。"""
+    if cache is None:
+        return _quality_summary(state, cache=None)
+    key = ("quality_summary",) + _acceptance_fingerprint(state)
+    held = cache.get(key)
+    if isinstance(held, dict):
+        return held
+    result = _quality_summary(state, cache=cache)
+    cache[key] = result
+    return result
+
+
+def _quality_summary(state: dict, *, cache: dict | None = None) -> dict:
     report = latest_quality_report(state)
     if report is None:
         closure = state.get("closure") or {}
@@ -3954,26 +3968,6 @@ def test_verification_evidence(state: dict) -> tuple[bool, str]:
     return False, "missing"
 
 
-def verification_gates(state: dict, *, cache: dict | None = None) -> dict:
-    """最终工程验证的确定性部分（不含用户对质量报告的接受）。
-
-    G1 工作项终态、G2 的合同/条件/证据与 Finding 台账、G3 停摆一起构成“最终
-    工程验证是否完成”。质量报告的**用户接受**刻意不在这里：那是 ZCode 最终
-    验收之后由用户完成的一步，不能把认知收口判断挡在它后面。
-    """
-    criteria = _gate_criteria(state, cache=cache)
-    findings = _gate_findings(state)
-    actions = _gate_actions(state)
-    stalled = _gate_stalled(state)
-    reasons = (criteria["reasons"] + findings["reasons"]
-               + actions["reasons"] + stalled["reasons"])
-    return {"passed": not reasons, "reasons": reasons,
-            "components": {"criteria": criteria["passed"],
-                           "findings": findings["passed"],
-                           "actions": actions["passed"],
-                           "stalled": stalled["passed"]}}
-
-
 def closure_verification_digest(state: dict) -> str:
     """最终验证摘要：一次“最终工程验证”的稳定身份。
 
@@ -4041,12 +4035,11 @@ def _materials_schema_version() -> str:
 
 
 def closure_acceptance_pending(state: dict) -> dict | None:
-    """当前最终验证摘要的收口 CONSULT 是否还缺 ZCode 的采纳判断。
+    """当前最终验证摘要的收口 CONSULT 是否还没有 ZCode 的采纳记录（**只读提示**）。
 
-    顺序要求：最终工程验证 → 认知收口判断 → **ZCode 独立验收（采纳/修改/否决）** →
-    G1–G3 收口。自动路径（`drive`）一旦执行完 E 就立刻收口，等于跳过 ZCode 的判断
-    这一步；收口后再登记又会被 CLOSED 拒绝。这里只查事实，不要求认知 PASS：`rejected`
-    同样是有效判断，E 仍然不是门禁。
+    v9.10.0 起认知采纳不再阻止收口：`close_task`、`closure --close` 与 `drive` 的
+    PASS 路径都不检查本函数。它只用于状态展示与审计（“这次收口判断是否被登记过
+    采纳”），返回值不再是门禁。
 
     返回 `{"call_id": ...}` 表示存在“当前摘要已完成、但还没有判断记录”的收口调用。
     """
@@ -4070,39 +4063,34 @@ def closure_acceptance_pending(state: dict) -> dict | None:
     return None
 
 
-def closure_readiness(state: dict, *, gates: dict | None = None,
-                      cache: dict | None = None) -> dict:
-    """E 阶段（收口 CONSULT）的统一准入：最终工程验证是否真的完成。
+FINAL_ACCEPTANCE_SCHEMA = "copilot-final-acceptance/v1"
 
-    `record` 关闭最后一个工作项、`criterion` 核销条件、`closure --close`、`drive`
-    的 PASS 分支都用同一判定，避免“工作项做完 ＝ 可以收口咨询”。
 
-    判定顺序是先廉价事实（工作项终态、条件全 met 且有证据、必要测试有验证痕迹、
-    台账无未闭合 blocking/major），再跑会重读证据文件的 `verification_gates`：
-    未完成的任务不会为每条命令多付一次文件重读。
+def _acceptance_fingerprint(state: dict) -> tuple:
+    """单次命令内的缓存身份：任务 + 已落盘序号（内存改写后再保存会换键）。"""
+    return (str(state.get("task_id") or ""), _save_seq(state))
+
+
+def _acceptance_facts(state: dict) -> dict:
+    """最终验收的廉价事实：不重读证据文件、不跑代码范围、不调用任何模型。
+
+    这些事实（工作项终态、条件核销、证据引用存在性、必要测试痕迹、重开进展、
+    未解除阻塞、台账严重度）足以判定“收口准入是否还差东西”；只有廉价事实全部
+    通过时才需要再跑会读文件的 G2 细节（证据摘要、PWW 质量报告、代码范围）。
     """
     contract = state.get("contract") or {}
     criteria = [item for item in contract.get("criteria") or []
                 if isinstance(item, dict)]
-    actions = [item for item in state.get("actions") or []
-               if isinstance(item, dict)
-               and str(item.get("origin") or "") != "g4-review"]
     evidence = {str(item.get("id") or ""): item
                 for item in state.get("evidence") or [] if isinstance(item, dict)}
-    blockers: list[dict] = []
-
-    pending = [str(item.get("id") or "") for item in actions
+    unresolved_blocks = [block for block in state.get("blocks") or []
+                         if isinstance(block, dict) and not block.get("resolved_at")]
+    tracked = _tracked_actions(state)
+    pending = [str(item.get("id") or "") for item in tracked
                if str(item.get("status") or "") not in TERMINAL]
-    if pending:
-        blockers.append({"code": "actions_not_terminal",
-                         "detail": "未终态工作项：" + "、".join(sorted(pending))})
     unmet = [str(item.get("criterion_id") or "") for item in criteria
              if str(item.get("status") or "") != "met"]
-    if unmet or not criteria:
-        blockers.append({"code": "criteria_not_satisfied",
-                         "detail": "未核销完成条件：" + ("、".join(sorted(unmet))
-                                                        or "合同没有完成条件")})
-    missing_refs = []
+    missing_refs: list[str] = []
     for criterion in criteria:
         cid = str(criterion.get("criterion_id") or "")
         refs = [str(ref.get("id") or "")
@@ -4115,44 +4103,156 @@ def closure_readiness(state: dict, *, gates: dict | None = None,
             entry = evidence.get(eid)
             if entry is None or entry.get("dropped"):
                 missing_refs.append(f"{cid}:{eid}")
+    tests_ok, tests_source = test_verification_evidence(state)
+    reopened = _reopened_without_progress(state)
+    findings = _gate_findings(state)
+    blockers: list[dict] = []
+    if unresolved_blocks:
+        blockers.append({"code": "unresolved_blocks",
+                         "detail": "存在未解除的阻塞："
+                                   + "、".join(str(block.get("block_id") or "")
+                                              for block in unresolved_blocks)})
+    if pending:
+        blockers.append({"code": "actions_not_terminal",
+                         "detail": "未终态工作项：" + "、".join(sorted(pending))})
+    if unmet or not criteria:
+        blockers.append({"code": "criteria_not_satisfied",
+                         "detail": "未核销完成条件：" + ("、".join(sorted(unmet))
+                                                        or "合同没有完成条件")})
     if missing_refs:
         blockers.append({"code": "final_evidence_missing",
-                         "detail": "条件没有可用证据：" + "、".join(sorted(set(missing_refs)))})
-    tests_ok, tests_source = test_verification_evidence(state)
+                         "detail": "条件没有可用证据："
+                                   + "、".join(sorted(set(missing_refs)))})
     if not tests_ok:
         blockers.append({"code": "required_tests_missing",
                          "detail": "合同要求运行测试，但还没有执行报告或命令采集证据"})
-    if _reopened_without_progress(state):
+    if reopened:
         # 重开表示用户认为旧结论不成立；旧条件的证据不能代表重开后的结果。
         blockers.append({"code": "reopened_without_progress",
                          "detail": "任务重开后尚未产生新的实质进展："
                                    "旧验证不能替新结果背书"})
-    open_findings = [str(item.get("finding_id") or "")
-                     for item in RP.blocking_findings(state)]
-    if open_findings:
-        blockers.append({"code": "findings_open",
-                         "detail": "未闭合 blocking/major finding："
-                                   + "、".join(open_findings)})
-    verification = gates
-    if not blockers and verification is None:
-        verification = verification_gates(state, cache=cache)
-    if verification is not None and not verification.get("passed"):
-        for reason in verification.get("reasons") or []:
+    for reason in findings["reasons"]:
+        blockers.append({"code": str(reason.get("code") or "finding"),
+                         "detail": str(reason.get("detail") or "")})
+    return {
+        "criteria": criteria,
+        "pending": pending,
+        "unmet": unmet,
+        "missing_refs": missing_refs,
+        "tests_ok": bool(tests_ok),
+        "tests_source": tests_source,
+        "reopened": bool(reopened),
+        "unresolved_blocks": unresolved_blocks,
+        "findings": findings,
+        "gates": {"G1": _gate_actions(state), "G3": _gate_stalled(state)},
+        "blockers": blockers,
+        "digest": closure_verification_digest(state),
+        "iteration_id": _current_iteration_id(state),
+    }
+
+
+def final_acceptance(state: dict, *, task_dir: str = "",
+                     cache: dict | None = None, deep: bool = True) -> dict:
+    """最终验收的单一事实源（G1–G3 + 收口准入）。
+
+    - `deep=True`：完整验收（会重读证据文件、计算 PWW 代码范围），供
+      `closure-check` 与 `close_task` 使用。
+    - `deep=False`：只算廉价事实；廉价事实已发现缺口时不再跑文件型检查，
+      供 `evaluate`/`drive` 的高频路径使用（与旧 `closure_readiness` 同口径）。
+
+    认知采纳不属于工程验收：本函数不读也不要求 `cognition-accept`。PWW 质量报告
+    的用户接受仍是 G2 的一部分（`_gate_quality`），不因认知解耦而放宽。
+
+    `cache` 是单次命令内的计算缓存（键含任务与 save_seq），同一命令重复调用只算
+    一次；跨命令不共享，避免把旧结论套到新状态上。
+    """
+    if cache is None:
+        cache = {}
+    key = ("final_acceptance", bool(deep)) + _acceptance_fingerprint(state)
+    held = cache.get(key)
+    if isinstance(held, dict):
+        return held
+    facts = _acceptance_facts(state)
+    blockers = list(facts["blockers"])
+    gates = {"G1": facts["gates"]["G1"],
+             "G2": {"passed": None, "reasons": []},
+             "G3": facts["gates"]["G3"]}
+    reasons: list[dict] = []
+    quality = None
+    verification = None
+    warnings = (contract_source_warnings(state)
+                + evidence_warnings(state, task_dir=task_dir)
+                + cognition_schedule_warnings(state))
+    if deep or not blockers:
+        criteria_gate = _gate_criteria(state, cache=cache)
+        quality_gate = _gate_quality(state, cache=cache)
+        findings_gate = facts["findings"]
+        g2_reasons = (criteria_gate["reasons"] + quality_gate["reasons"]
+                      + findings_gate["reasons"])
+        gates["G2"] = {
+            "passed": (criteria_gate["passed"] and quality_gate["passed"]
+                       and findings_gate["passed"]),
+            "reasons": g2_reasons,
+        }
+        reasons = [{"gate": name, **reason}
+                   for name in ("G1", "G2", "G3")
+                   for reason in gates[name]["reasons"]]
+        for reason in reasons:
             blockers.append({"code": str(reason.get("code") or "gate"),
                              "detail": str(reason.get("detail") or "")})
+        quality = quality_gate["quality"]
+        verification = not reasons
+    if facts["findings"].get("advisory"):
+        warnings = warnings + [
+            f"未闭合 Finding（{severity}，非高风险按提醒处理，不阻断收口）：{detail}"
+            for severity in ("major",)
+            for detail in facts["findings"]["advisory"]]
+    result = {
+        "schema": FINAL_ACCEPTANCE_SCHEMA,
+        "passed": None if verification is None else verification,
+        "ready": not blockers,
+        "digest": facts["digest"],
+        "iteration_id": facts["iteration_id"],
+        "gates": gates,
+        "reasons": reasons,
+        "blockers": blockers,
+        "quality": quality,
+        "warnings": warnings,
+        "advisory_findings": list(facts["findings"].get("advisory") or []),
+        "all_actions_terminal": not facts["pending"],
+        "criteria_satisfied": (not facts["unmet"] and bool(facts["criteria"])),
+        "final_evidence_recorded": not facts["missing_refs"],
+        "required_tests_completed": facts["tests_ok"],
+        "tests_source": facts["tests_source"],
+        "no_pending_required_work": (not facts["pending"]
+                                     and not facts["findings"]["reasons"]),
+        "verification_passed": verification,
+        "blocks_resolved": not facts["unresolved_blocks"],
+    }
+    cache[key] = result
+    return result
+
+
+def closure_readiness(state: dict, *, cache: dict | None = None) -> dict:
+    """E 阶段（收口 CONSULT）的统一准入：最终工程验证是否真的完成。
+
+    `record` 关闭最后一个工作项、`criterion` 核销条件、`closure --close`、`drive`
+    的 PASS 分支都用同一判定（委托 `final_acceptance(deep=False)`），避免
+    “工作项做完 ＝ 可以收口咨询”，也避免高频路径重复跑会读文件的检查。
+    """
+    result = final_acceptance(state, cache=cache, deep=False)
     return {
         "schema": "copilot-closure-readiness/v1",
-        "ready": not blockers,
-        "digest": closure_verification_digest(state),
-        "all_actions_terminal": not pending,
-        "criteria_satisfied": not unmet and bool(criteria),
-        "final_evidence_recorded": not missing_refs,
-        "required_tests_completed": bool(tests_ok),
-        "tests_source": tests_source,
-        "no_pending_required_work": not pending and not open_findings,
-        "verification_passed": None if verification is None
-        else bool(verification.get("passed")),
-        "blockers": blockers,
+        "ready": bool(result["ready"]),
+        "digest": result["digest"],
+        "all_actions_terminal": result["all_actions_terminal"],
+        "criteria_satisfied": result["criteria_satisfied"],
+        "final_evidence_recorded": result["final_evidence_recorded"],
+        "required_tests_completed": result["required_tests_completed"],
+        "tests_source": result["tests_source"],
+        "no_pending_required_work": result["no_pending_required_work"],
+        "verification_passed": result["verification_passed"],
+        "blockers": result["blockers"],
     }
 
 
@@ -5768,14 +5868,21 @@ def review_metrics(state: dict, *, task_dir: str = "") -> dict:
 
 
 def _gate_findings(state: dict) -> dict:
-    """Finding 台账门禁：未闭合 blocking/major 阻断收口（所有风险等级）。
+    """Finding 台账门禁（按风险适配，不要求所有任务建立完整台账）。
 
-    G4 退役后，台账不再由高风险专用复核统一检查：advisory 复核（认知）报告
-    的 blocking/major 仍进入台账，主代理必须修复并用定向验证推进生命周期，
-    或在给出反证后显式驳回；未闭合条目在任何风险等级下都阻断收口。
+    - `blocking` 是真实缺陷：任何风险等级都阻断收口（不得用“普通任务”降低完成
+      条件）。
+    - `major` 只在 `risk=high` 时阻断；普通任务的未闭合 major 作为提醒
+      （`advisory`）呈现，由主代理判断是否构成真实阻塞并推进修复。
     """
+    high = str(state.get("risk") or "").strip().lower() == "high"
     reasons = []
+    advisory: list[str] = []
     for item in RP.blocking_findings(state):
+        severity = str(item.get("severity") or "").strip().lower()
+        if severity != "blocking" and not high:
+            advisory.append(_finding_reason_detail(item))
+            continue
         status = str(item.get("status") or "open")
         code = ("native_review_finding_unverified" if status == "fixed" else
                 "native_review_finding_regressed" if status == "regressed" else
@@ -5785,7 +5892,7 @@ def _gate_findings(state: dict) -> dict:
             "detail": _finding_reason_detail(item),
             "finding_id": str(item.get("finding_id") or ""),
         })
-    return {"passed": not reasons, "reasons": reasons}
+    return {"passed": not reasons, "reasons": reasons, "advisory": advisory}
 
 
 def cognition_schedule_warnings(state: dict) -> list[str]:
@@ -5816,30 +5923,15 @@ def cognition_schedule_warnings(state: dict) -> list[str]:
 
 def closure_check(state: dict, *, task_dir: str = "",
                   cache: dict | None = None) -> dict:
-    """三道门收口检查。`cache` 只在单次命令内复用证据摘要。"""
-    if cache is None:
-        cache = {}
-    criteria = _gate_criteria(state, cache=cache)
-    quality = _gate_quality(state, cache=cache)
-    findings = _gate_findings(state)
-    risks = {
-        "G1": _gate_actions(state),
-        "G2": {"passed": criteria["passed"] and quality["passed"]
-               and findings["passed"],
-               "reasons": criteria["reasons"] + quality["reasons"]
-               + findings["reasons"]},
-        "G3": _gate_stalled(state),
-    }
-    reasons = []
-    for name in ("G1", "G2", "G3"):
-        for reason in risks[name]["reasons"]:
-            reasons.append({"gate": name, **reason})
-    return {"passed": not reasons, "iteration_id": _current_iteration_id(state),
-            "gates": risks, "reasons": reasons,
-            "quality": quality["quality"],
-            "warnings": contract_source_warnings(state)
-            + evidence_warnings(state, task_dir=task_dir)
-            + cognition_schedule_warnings(state)}
+    """三道门收口检查（G1–G3）。委托 `final_acceptance(deep=True)`，同一命令内
+    复用已算出的证据摘要、质量结论与代码范围。"""
+    result = final_acceptance(state, task_dir=task_dir, cache=cache, deep=True)
+    return {"passed": bool(result["passed"]),
+            "iteration_id": result["iteration_id"],
+            "gates": result["gates"],
+            "reasons": result["reasons"],
+            "quality": result["quality"],
+            "warnings": result["warnings"]}
 
 
 def close_task(path: str, *, by: str = "zcode-native", cognition_entry: str = "",
@@ -5850,37 +5942,40 @@ def close_task(path: str, *, by: str = "zcode-native", cognition_entry: str = ""
     state = load_state(path)
     if bool((state.get("closure") or {}).get("closed")):
         return state["closure"]
-    if any(not b.get("resolved_at") for b in state.get("blocks") or []):
+    # 最终验收只算一次（`final_acceptance(deep=True)`）：G1–G3、证据摘要、PWW 质量
+    # 报告与代码范围都在同一次计算里，收口不再重复扫描同一批事实。
+    check = final_acceptance(state, task_dir=os.path.dirname(os.path.abspath(path)),
+                             cache=cache, deep=True)
+    if not check["blocks_resolved"]:
         raise GovernanceError("存在未解除的阻塞：先 unblock 再收口。")
-    check = closure_check(state, task_dir=os.path.dirname(os.path.abspath(path)),
-                          cache=cache)
     if not check["passed"]:
         summary = "; ".join(f"{r.get('gate')}:{r.get('code')}" for r in check["reasons"])
         raise GovernanceError(f"G1–G3 未通过，不能收口：{summary}")
     # 最终工程验证的确定性缺口：合同要求执行测试，却没有任何对应的验证痕迹。
     # G1–G3 不解释合同 test_policy 的执行情况，所以这里单独判一次；这不是新增
     # 门禁，而是把合同自己写明的要求落实到收口动作上（drive 与 closure 共用）。
-    tests_ok, _tests_source = test_verification_evidence(state)
-    if not tests_ok:
+    if not check["required_tests_completed"]:
         raise GovernanceError(
             "合同要求执行的测试没有任何验证证据（执行报告或带 capture_cmd 的命令"
             "输出）：最终工程验证尚未完成，不能收口；先执行测试并登记结果。")
-    if _reopened_without_progress(state):
+    if any(str(item.get("code")) == "reopened_without_progress"
+           for item in check["blockers"]):
         # 重开后的 PASS 必须由重开之后的新进展支撑：否则直接 close 会绕过
         # evaluate 的同一判定，让“用户认为旧结论不成立”变成一句空话。
         raise GovernanceError(
             "任务重开后尚未产生新的实质进展（新证据、工作项结果或条件重核销）："
             "旧 PASS 不能直接复用；先完成重开要求的工作再收口。")
+    # 认知采纳是可选记录，不是收口门禁：认知结论本身只是 advisory，未登记采纳
+    # 不影响工程验收。这里只把“当时还有未采纳的收口判断”作为事实快照留下，供
+    # 事后审计；`cognition-accept` 仍可在收口前登记（accepted/modified/rejected）。
     pending_acceptance = closure_acceptance_pending(state)
-    if pending_acceptance:
-        # 顺序：最终验证 → 认知收口判断 → ZCode 独立验收 → G1–G3 收口。
-        # 缺这一步就收口，等于让自动路径跳过 ZCode 对认知结论的判断；收口后再登记
-        # 又会被 CLOSED 拒绝。这里不要求认知 PASS（rejected 同样有效）。
-        raise GovernanceError(
-            f"收口 CONSULT {pending_acceptance['call_id']} 还没有 ZCode 的采纳判断："
-            f"先执行 cognition-accept --call-id {pending_acceptance['call_id']} "
-            "--status accepted|modified|rejected（并写明依据），再收口。")
-    quality = quality_summary(state, cache=cache)
+    cognition_acceptance = {
+        "required": False,
+        "pending_call_id": (pending_acceptance or {}).get("call_id") or "",
+        "note": "认知采纳是可选审计事实，不是收口门禁（G1–G3 只由工程事实判定）。",
+    }
+    quality = check["quality"] if isinstance(check.get("quality"), dict) \
+        else quality_summary(state, cache=cache)
     # 原始质量结论与任务关闭状态分离：用户接受 PWW 不把 verdict 改写为 PASS。
     verdict = PWW if quality.get("verdict") == PWW else "pass"
     closure_quality = {
@@ -5894,7 +5989,7 @@ def close_task(path: str, *, by: str = "zcode-native", cognition_entry: str = ""
         "binding_current": quality.get("binding_current"),
     }
     # 收口前把调度窗口按事实关闭，并快照进 closure：收口之后仍能核对“当时还有
-    # 哪些义务未执行”。这不是门禁——closure_check 已在上方按 G1–G3 判定。
+    # 哪些义务未执行”。这不是门禁——工程验收已在上方由最终验收统一判定。
     schedule_before = SCH.summary(state)
     sync_cognition_schedule(state, closed=True, policy=cognition_policy,
                       auto_execution=cognition_auto)
@@ -5910,6 +6005,7 @@ def close_task(path: str, *, by: str = "zcode-native", cognition_entry: str = ""
         "cognition_schedule": schedule_snapshot,
         "verdict": verdict,
         "quality": closure_quality,
+        "cognition_acceptance": cognition_acceptance,
         "iteration_id": _current_iteration_id(state),
         "closed_at": now_iso(),
         "final_verification_digest": closure_verification_digest(state),
@@ -6614,20 +6710,8 @@ def continuation(state: dict, *, cache: dict | None = None,
             "next_command": "copilot_auto.py drive --state <state>（G1–G3 已通过，立即收口）",
             "reason": "完成条件与 G1–G3 已通过：收口是下一步，不是等待用户",
         })
-        pending_acceptance = closure_acceptance_pending(state)
-        if pending_acceptance:
-            # 收口前还欠 ZCode 对认知收口判断的独立验收（顺序：验证 → E → 验收 →
-            # G1–G3）。这不是认知门禁：采纳、修改、否决任一记录都能继续。
-            base.update({
-                "action": "accept",
-                "next_command": (
-                    "copilot_dispatch.py cognition-accept --state <state> --call-id "
-                    f"{pending_acceptance['call_id']} --status accepted|modified|rejected"
-                    " --rationale <依据>"),
-                "reason": ("收口 CONSULT "
-                           f"{pending_acceptance['call_id']} 等待 ZCode 独立验收："
-                           "先登记采纳/修改/否决，再收口"),
-            })
+        # 认知采纳不是收口前置：未登记 `cognition-accept` 也照常收口。需要登记时
+        # 主代理可在收口前调用 cognition-accept（accepted/modified/rejected）。
         return base
     ready = [str(a.get("id") or "") for a in ready_actions(state)]
     if ready:

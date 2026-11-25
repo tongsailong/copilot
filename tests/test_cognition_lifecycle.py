@@ -173,18 +173,24 @@ class RoutingTests(CognitionLifecycleBase):
                           G.evaluate(G.load_state(self.state_path)).get(
                               "next_commands") or [] if "sol-" in cmd])
 
-    def test_undeclared_task_defaults_to_non_simple_consult(self):
-        self.start()  # 未声明 task_kind → standard（非简单）
+    def test_undeclared_standard_task_gets_zero_calls(self):
+        # 未声明 task_kind（standard）＋默认 risk=medium 不构成任何认知价值信号：
+        # 普通任务按 0 调用推进，不因“没写类型”或“默认风险等级”被抬进认知流程。
+        self.start()
+        state = G.load_state(self.state_path)
         advice = self.advice()
         self.assertEqual(advice["task_kind"], "standard")
-        self.assertEqual(advice["action"], "consult")
-        self.assertEqual(advice["mode"], "CONSULT")
-        self.assertEqual(advice["stage"], "understanding")
-        self.assertFalse(advice["second_round"])
-        self.assertIn("cognition-consult", advice["command"])
+        self.assertEqual(advice["action"], "none")
+        self.assertEqual(advice["recommended_action"], "not_needed")
+        self.assertEqual(advice["command"], "")
+        synced = G.sync_cognition_schedule(state, advice=advice)
+        self.assertEqual(synced["changes"], [])
+        self.assertEqual(state.get("cognition_schedule", {}).get(
+            "obligations") or [], [])
 
     def test_plan_is_suggested_after_investigation(self):
-        self.start(kind="feature")
+        # 方案价值的来源是真实信号（这里声明核心逻辑触发），不是工作项数量。
+        self.start(kind="feature", triggers=["core-logic"])
         self.record("CONSULT")
         self.plan(2)
         self.evidence()
@@ -200,7 +206,7 @@ class RoutingTests(CognitionLifecycleBase):
         advice = self.advice()
         self.assertEqual(advice["action"], "consult")
         self.assertEqual(advice["stage"], "understanding")
-        self.assertIn("非简单任务从启动阶段默认", advice["reason"])
+        self.assertIn("中/高认知价值信号", advice["reason"])
 
     def test_architecture_task_gets_consult_then_plan(self):
         self.start(kind="architecture")
@@ -233,7 +239,7 @@ class RoutingTests(CognitionLifecycleBase):
         self.assertIn("--force", advice["command"])
 
     def test_ordinary_execution_steps_do_not_trigger(self):
-        self.start(kind="feature")
+        self.start(kind="feature", triggers=["core-logic"])
         self.record("CONSULT", signals=[])
         self.plan(3)
         self.evidence()
@@ -242,7 +248,7 @@ class RoutingTests(CognitionLifecycleBase):
         self.assertEqual(self.advice()["action"], "reuse")
 
     def test_no_repeat_without_new_information(self):
-        self.start(kind="feature")
+        self.start(kind="feature", triggers=["core-logic"])
         self.record("CONSULT", signals=[])
         self.plan(3)
         self.evidence()
@@ -253,7 +259,7 @@ class RoutingTests(CognitionLifecycleBase):
         self.assertEqual(advice["command"], "")
 
     def test_contract_change_allows_new_plan(self):
-        self.start(kind="feature")
+        self.start(kind="feature", triggers=["core-logic"])
         self.record("CONSULT")
         self.plan(2)
         self.evidence()
@@ -288,7 +294,7 @@ class RoutingTests(CognitionLifecycleBase):
 
 class HandoffTests(CognitionLifecycleBase):
     def test_advice_is_handed_back_to_zcode_without_creating_work(self):
-        self.start(kind="standard")
+        self.start(kind="architecture")
         state = G.load_state(self.state_path)
         evaluation = G.evaluate(state)
         self.assertEqual(evaluation["cognition"]["action"], "consult")
@@ -632,7 +638,7 @@ class FailureTests(CognitionLifecycleBase):
         self.assertFalse(metrics["default_covered"])
 
     def test_partial_recovery_reuses_existing_conclusions(self):
-        self.start(kind="feature")
+        self.start(kind="feature", triggers=["core-logic"])
         self.record("CONSULT", signals=[])
         self.plan(2)
         self.evidence()
@@ -677,7 +683,7 @@ class FailureTests(CognitionLifecycleBase):
 
 class BoundaryTests(CognitionLifecycleBase):
     def test_work_item_block_does_not_freeze_other_work(self):
-        self.start(kind="feature")
+        self.start(kind="feature", triggers=["core-logic"])
         self.record("CONSULT")
         self.plan(2)
         self.evidence()
@@ -695,20 +701,31 @@ class BoundaryTests(CognitionLifecycleBase):
         self.assertEqual(advice["action"], "none")
         self.assertIn("BLOCKED", advice["reason"])
 
-    def test_closure_consult_is_deduplicated_by_progress(self):
+    def test_closure_consult_is_deduplicated_by_final_verification(self):
+        # 收口判断按最终验证摘要去重：同一份最终验证不重复付费，验证事实变化才
+        # 打开新窗口。阶段复盘（D）不再自动生成，因此普通进度推进不产生义务。
         self.start(risk="high", kind="feature")
-        self.record("CONSULT", signals=["risk-high", "multi-action"])
+        self.record("CONSULT", signals=["risk-high", "plan-kind"])
         self.plan(4)
         self.evidence(modules=2, count=2)
         self.done(2)
-        self.record("PLAN", signals=["risk-high", "multi-action"])
-        first = self.advice()
-        self.assertEqual(first["stage"], "stage")
+        self.record("PLAN", signals=["risk-high", "plan-kind"])
+        mid = self.advice()
+        self.assertNotEqual(mid["stage"], "stage")
+        self.assertNotEqual(mid["family"], "D")
+        self.close_all()
+        first = self.advice(gates_passed=True)
+        self.assertEqual(first["stage"], "closure")
         self.assertEqual(first["recommended_action"], "recommended")
-        digest = RP.cognition_progress_key(G.load_state(self.state_path))
-        self.record("CONSULT", signals=["risk-high", "multi-action"],
-                    stage="stage", progress_digest=digest)
-        second = self.advice()
+        self.record("CONSULT", signals=["risk-high", "plan-kind"],
+                    stage="closure")
+        state = G.load_state(self.state_path)
+        target = [item for item in state["cognition_calls"]
+                  if item.get("stage") == "closure"][-1]
+        target["final_verification_digest"] = (
+            G.closure_readiness(G.load_state(self.state_path))["digest"])
+        G.save_state(self.state_path, state)
+        second = self.advice(gates_passed=True)
         self.assertEqual(second["action"], "reuse")
 
     def test_closure_consult_precedes_review(self):

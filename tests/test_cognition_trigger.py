@@ -202,12 +202,13 @@ class SimpleTaskZeroCallTests(TriggerBase):
         self.assertEqual(advice["mode"], "")
 
     def test_not_understood_task_gets_understanding_consult(self):
-        """还没有计划与证据时，启动阶段默认一次理解性 CONSULT。"""
+        """有真实认知价值信号（这里 risk=high）且尚无计划与证据时，启动阶段
+        给一次理解性 CONSULT。"""
         self.start(risk="high")
         advice = self.advice()
         self.assertEqual(advice["action"], "consult")
         self.assertEqual(advice["stage"], "understanding")
-        self.assertIn("非简单任务从启动阶段默认获得", advice["reason"])
+        self.assertIn("中/高认知价值信号", advice["reason"])
 
 
 class ProactiveTriggerTests(TriggerBase):
