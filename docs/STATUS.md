@@ -24,8 +24,9 @@ main 三方（本地 / `origin/main` / `ls-remote`）同为 `b83cf33`（0/0）�
 - **交付（2026-11-25）**：提交 `8804e52`（53 文件，+2829/−2710，12 个文件被 Git 识别为
   rename）经 PR #14 merge commit 合并为 `ec5984a`；CI Python 3.10 / 3.12 各 `Ran 1040 tests` /
   `OK (skipped=1)`，编译检查与 `--verify-baseline` 均通过；本地 / `origin/main` / `ls-remote`
-  三方同为 `ec5984a`（0/0），工作区干净；运行时 `--check` 缺失 0 / 不同 0，27 个受管文件
-  SHA-256 逐一致，无 `sol_review.py` / `sol_schedule.py` 残留；未建 Tag / Release。
+  三方一致（#14 合并时 `ec5984a`，交付记录 #15 合并后 main tip 为 `a01d509`，0/0），工作区干净；
+  运行时 `--check` 缺失 0 / 不同 0，27 个受管文件 SHA-256 逐一致，无
+  `sol_review.py` / `sol_schedule.py` 残留；未建 Tag / Release。
 - **命名收敛**：`sol_review.py` → `cognition_call.py`、`sol_schedule.py` → `cognition_schedule.py`，
   10 个 `test_sol_*` 测试模块改名为 `test_cognition_*`（`git mv`）。
   状态键统一为 `cognition_calls` / `cognition_reuses` / `cognition_schedule`，`model_backoff`
