@@ -69,8 +69,7 @@ python3 -B scripts/copilot_dispatch.py <子命令> --state <state.json> [参数]
 | `agent-policy` | Agent 调度建议：主代理默认，Explore/general-purpose 按需（只读、不派发）。判定顺序：子代理不可用 → 主代理；写入冲突 → 主代理；`--research-only` → Explore（绝不交给全工具代理）；独立交付物需并发且有收益才建议 general-purpose；其余 → 主代理 | `--needs-independent-context`、`--parallel`、`--independent-deliverable`、`--write-conflict`、`--saves-time`、`--research-only`、`--subagent-unavailable`、`--json` |
 | `finding` | 查看 / 更新 Finding 台账（不触发复核） | `--list`；`--id F1 --status open\|fixed\|verified\|closed\|regressed\|dropped --evidence E1[,E2] --note`；`fixed`/`verified` 必须有证据，多个证据可用逗号分隔；回填成功后按续跑判定返回 10 |
 | `review-metrics` | 统计统一认知调用流（`cognition.consult_total` / `cognition.plan_total` / `cognition.failed` / `cognition.modes`）、准入门槛、停止标记与 Finding 计数 | `--state`；历史 G4 数据标记 `g4.retired` |
-| `closure` | 收口：G1–G3 通过与**最终工程验证完成**（`closure_readiness`：工作项终态、条件核销、证据、合同必要测试的执行痕迹、finding 台账）都必须满足；验证有缺口时失败关闭（退出码 1）；补完后同一条命令先做收口 CONSULT、再由主代理
-`cognition-accept` 登记独立判断，才能收口（`closure_acceptance_pending` 未满足时失败关闭） | `--close`、`--by`、`--cognition auto\|advise\|off` |
+| `closure` | 收口：G1–G3 通过与**最终工程验证完成**（`closure_readiness`：工作项终态、条件核销、证据、合同必要测试的执行痕迹、finding 台账）都必须满足；验证有缺口时失败关闭（退出码 1）；补完后同一条命令先做收口 CONSULT（如建议）、再走 G1–G3 收口；`cognition-accept` 只是可选的采纳审计记录，不登记不影响收口 | `--close`、`--by`、`--cognition auto\|advise\|off` |
 | `reopen` | 用户授权后重开 | `--reason`（必填，写用户原话/要求）、`--authorized-by user`（必填；调用方自报声明，不是凭证）；`reopen_history` 标注 `authorization_source=caller-declared` |
 | `handoff` | 只读列出生效交付清单：分支/HEAD/上游、已暂存、未暂存、未跟踪分类 | `--state`（可选）、`--cwd`、`--limit`、`--json`；不提交、不删除、不改 `.gitignore` |
 | `contract` | 查看/修订合同与条件 | `--show`、`--amend --contract-file/--criteria-file`、`--test-policy`/`--test-policy-file`（省略则保留原策略）、`--authorized-by user` + `--authorization-note "用户要求"`（破坏性修订必需）；BLOCKED 时也可修订；登记源文件摘要，文件被改动时 `status` 给出非阻断提醒。**破坏性修订**指待核销条件净减少（删掉未满足条件）或放松 `test_policy`，没有用户授权或未写明用户要求时 fail-closed；改写措辞/拆分/合并但只要不减少待核销条数不需要授权。合同历史记录 `authorized_by`、`authorization_source=caller-declared`、授权说明、新增/删除的未核销条数与被删除条件及旧指纹。`--authorized-by` 是调用方自报声明，不是可验证凭证：审计时须以用户原话/授权说明为准 |
@@ -259,11 +258,12 @@ python3 -B scripts/copilot_auto.py drive --state T/state.json    # PASS → 0
 
 PARTIAL 时不需要额外命令：直接再次 `drive`，由本地派生工作项。
 
-收口顺序是**最终工程验证 → 收口 CONSULT → ZCode `cognition-accept` 独立验收 → G1–G3 收口**：
-`drive` 在 PASS 但验证有缺口（例如合同 `test_policy.required=true` 却没有 `--capture-cmd`
-证据）时打印缺口并返回 10，不执行认知、不收口；补齐测试与证据后再 `drive`（或
-`closure --close`）即自动执行一次收口 CONSULT，然后停在 `EXIT_EXECUTE` 等 `cognition-accept`。
-手动 `cognition-consult --stage closure` 同样被缺口与“摘要不符”拒绝。
+收口顺序是**最终工程验证 → 收口 CONSULT（如建议）→ G1–G3 收口**：`drive` 在 PASS 但验证
+有缺口（例如合同 `test_policy.required=true` 却没有 `--capture-cmd` 证据）时打印缺口并
+返回 10，不执行认知、不收口；补齐测试与证据后再 `drive`（或 `closure --close`）即自动执行
+一次收口 CONSULT（任务有中/高认知价值时），随后直接收口。`cognition-accept` 只是可选的
+采纳审计记录：不登记、甚至明确 rejected，都不阻止收口。手动
+`cognition-consult --stage closure` 同样被缺口与“摘要不符”拒绝。
 
 ### 认知失败分类与上游退避窗口
 

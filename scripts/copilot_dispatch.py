@@ -204,7 +204,7 @@ EXIT_CONTINUE = 10
 # 只读命令不写任何文件（含 session.json 会话绑定）：它们的契约是“只看不改”。
 READ_ONLY_COMMANDS = frozenset({
     "closure-check", "review-metrics", "review-admission", "agent-policy",
-    "handoff", "legacy-status", "next", "brief", "render", "status", "quality",
+    "handoff", "legacy-status", "next", "status", "quality",
     "cognition-stats",
 })
 
@@ -414,7 +414,7 @@ def _cognition_schedule_step(path: str, args, *, gates_passed: bool = False,
     policy = _cognition_policy(args)
     state = G.load_state(path)
     if bool((state.get("closure") or {}).get("closed")):
-        return {"policy": policy, "closed": True, "executed": ""}
+        return {"policy": policy, "closed": True, "executed": "", "state": state}
     readiness = closure_ready if isinstance(closure_ready, dict) \
         else G.closure_readiness(state, cache=cache)
     advice = G.cognition_advice_summary(state, gates_passed=gates_passed,
@@ -433,8 +433,11 @@ def _cognition_schedule_step(path: str, args, *, gates_passed: bool = False,
                 if isinstance(item, dict) and item.get("window") == "open"
                 and str(item.get("status") or "") == "due"
                 and str(item.get("level") or "") != "recommended"]
+    # `state` 是本次调度后的内存状态（需要时已落盘）：调用方继续求值/收口时
+    # 直接复用，不再重新读一遍 state.json（大任务的状态可达数百 KB）。
     result = {"policy": policy, "advice": advice.get("action"),
               "schedule": synced["schedule"], "executed": "", "command": "",
+              "state": state,
               "closure_ready": readiness.get("ready"),
               "closure_blockers": list(readiness.get("blockers") or []),
               "optional": [str(item.get("obligation_id")) for item in optional]}
@@ -480,13 +483,18 @@ def _print_continuation(path: str, args=None) -> int:
     阶段报告与工作项回填都是进度记录，不是任务终点。退出码 10 沿用 `drive`
     的口径（有待执行工作），调用方必须继续而不是收束回合。
     """
+    cache: dict = {}
     if args is not None:
-        # 调度步放在续跑判定之前：先给出（或执行完）当前的认知窗口。
-        # 纯登记/报告命令只在命令行显式 `--cognition auto` / `--cognition auto` 时才
-        # 真正付费执行；环境变量与默认策略只影响建议展示。
-        _cognition_schedule_step(path, args, execute=_cognition_policy_explicit(args))
-    state = G.load_state(path)
-    ev = G.evaluate(state)
+        # 调度步放在续跑判定之前：先给出（或执行完）当前的认知窗口。纯登记/
+        # 报告命令只在命令行显式 `--cognition auto` 时才真正付费执行；环境变量
+        # 与默认策略只影响建议展示。同一个 cache 让调度步与求值共用同一条命令
+        # 内已经算出的验收事实（证据摘要、质量结论），不重复扫描。
+        step = _cognition_schedule_step(path, args,
+                                        execute=_cognition_policy_explicit(args),
+                                        cache=cache)
+    state = step.get("state") if isinstance(step, dict) and \
+        isinstance(step.get("state"), dict) else G.load_state(path)
+    ev = G.evaluate(state, cache=cache)
     cont = ev.get("continuation") or {}
     if cont.get("required"):
         print(f"续跑：必须继续（{cont.get('action')}）—— {cont.get('reason')}")
@@ -1942,9 +1950,9 @@ def cmd_closure(args) -> int:
     path = _state_path(args)
     if not args.close:
         return cmd_closure_check(args)
-    # 收口顺序固定为：最终工程验证（G1–G3）→ 认知收口综合判断 → 收口。
-    # 认知没有 PASS 批准权，也不阻断收口：advise/off 都会照常收口，未执行的
-    # 收口窗口按窗口事实记为漏调并写入 closure.cognition_schedule。
+    # 收口顺序：最终工程验证（G1–G3）→ 按需的收口认知判断 → 收口。
+    # 认知没有 PASS 批准权，也不阻断收口：`cognition-accept` 只是可选的采纳
+    # 审计记录，未登记采纳、甚至完全不调用认知，都不影响收口（见 P0-1）。
     state = G.load_state(path)
     cache: dict = {}
     gates = G.closure_check(state,
@@ -1962,25 +1970,27 @@ def cmd_closure(args) -> int:
             print("先补齐上述验证（测试执行结果、证据登记或条件核销），"
                   "再执行 closure --close；收口 CONSULT 会在验证完成后自动调度。")
             return 1
-        _cognition_schedule_step(path, args, gates_passed=True,
-                           execute=(_cognition_policy(args) == "auto"),
-                           prefer_family="E", closure_ready=readiness,
-                           cache=cache)
-        # 顺序：最终验证 → 收口 CONSULT → ZCode 独立验收 → G1–G3。刚执行完 E
-        # 就直接收口，等于让 `--close` 绕过 ZCode 对认知结论的判断（收口后
-        # 状态已 CLOSED，再登记会被拒绝）。这里停在等待验收，退出码与回填类
-        # 命令一致（10 = 仍有必须继续的下一步）。
-        pending_acceptance = G.closure_acceptance_pending(G.load_state(path))
+        step = _cognition_schedule_step(path, args, gates_passed=True,
+                                        execute=(_cognition_policy(args) == "auto"),
+                                        prefer_family="E",
+                                        closure_ready=readiness, cache=cache)
+        # 认知收口判断只是 advisory：采纳与否属于可选审计事实（accepted /
+        # modified / rejected），不是工程验收的一部分。这里只提示，不等待。
+        # 调度步返回的内存状态就是刚写入的事实，可直接复用；但它真执行了认知
+        # 调用时，新记录由子进程写入磁盘，内存副本已过期，必须重读。
+        fresh = step.get("state") if isinstance(step, dict) else None
+        if not isinstance(fresh, dict) or step.get("executed"):
+            fresh = G.load_state(path)
+        pending_acceptance = G.closure_acceptance_pending(fresh)
         if pending_acceptance:
-            print("认知收口判断已完成，等待 ZCode 独立验收后再收口：")
+            print("提醒（非阻断）：收口阶段有已生成、未登记的认知判断：")
             print(f"- 调用：{pending_acceptance['call_id']}"
                   f"（stage=closure，最终验证摘要 "
                   f"{pending_acceptance['digest']}）")
-            print("下一步：copilot_dispatch.py cognition-accept --state <state> "
+            print("可选：copilot_dispatch.py cognition-accept --state <state> "
                   f"--call-id {pending_acceptance['call_id']} "
                   "--status accepted|modified|rejected --rationale <依据>")
-            print("登记判断后再执行 closure --close：此时才执行 G1–G3 收口。")
-            return EXIT_CONTINUE
+            print("不登记采纳不影响收口：G1–G3 只由工程事实判定。")
     closure = G.close_task(path, by=args.by, cache=cache,
                            cognition_entry="closure-command",
                            cognition_policy=_cognition_policy(args),
@@ -2394,7 +2404,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_plan)
     _add_cognition_policy(p, default=REGISTRATION_POLICY)
 
-    for name in ("next", "brief", "render", "status"):
+    # `brief`/`render` 曾是 `next` 的同义别名，没有任何调用者或外部契约；
+    # v9.10.0 收敛为 `status`（渲染视图）与 `next`（只看下一步）。
+    for name in ("next", "status"):
         p = sub.add_parser(name, help="查看阶段、工作项、G1–G3 与下一步")
         p.add_argument("--state", required=True)
         p.add_argument("--json", action="store_true")

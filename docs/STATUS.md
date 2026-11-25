@@ -17,6 +17,66 @@
 main 三方（本地 / `origin/main` / `ls-remote`）同为 `b83cf33`（0/0），工作区干净；
 运行时 `--check` 缺失 0 / 不同 0，27 个受管理文件源码与运行时 SHA-256 全部一致。
 
+## 架构轻量化（2026-11-25，v9.10.0 工作区，未提交）
+
+依据：用户《Copilot Skill v9.10.0 架构轻量化与执行效率优化》。版本维持 v9.10.0，**未提交、
+未推送、未建 PR/Tag/Release**（用户明确保留变更待后续授权）。
+
+- **认知与收口解耦**：`close_task` / `closure --close` / `drive` PASS 路径不再检查
+  `closure_acceptance_pending()`；`closure.cognition_acceptance.required=false`，未采纳的
+  收口调用只作提示与审计。`cognition-accept` 保留为可选采纳记录。PWW 用户接受仍是 G2 的
+  一部分（`test_pass_with_warnings_still_requires_user_acceptance` 覆盖）。
+- **D 里程碑退休**：`cognition_advice` 不再生成 D 义务（A/B/C/E 保留）；普通进度与证据追加
+  不打开新窗口；历史 D 义务按 `closure-covered`/`superseded` 只读结算。
+- **复杂度口径**：`risk=medium` 默认值、`standard` 类型、工作项数量都不再是认知信号；
+  新增 `plan-kind`（方案类任务）；`plan_admission` 不再因 ≥2 工作项要求规划；启动覆盖率分母
+  改为“复杂度 medium/high”，`not_registered` 同口径。
+- **收口覆盖率与 E 窗口同口径（2026-11-25 最终核验修复）**：`task_stats` 的
+  `closure_eligible` 原要求“非简单类别”，而 E 义务只按“复杂度中/高 + 实质进展”创建，
+  于是 `kind=docs/mechanical` 等简单类别 + 真实信号（如 `risk=high`）的任务会出现
+  “义务已建但分母为 0”：满足后分子进聚合、分母不进，多任务聚合覆盖率可超过 100% 或掩盖
+  其它任务的漏调。现改为 `cognition_applicable and progressed`，与 `cognition_advice`
+  的 E 触发逐字一致；`test_closure_coverage_matches_the_e_window` 回归覆盖。
+- **G1–G3 风险适配**：`blocking` 恒阻断；`major` 只在 `risk=high` 阻断，非高风险降为提醒。
+- **G1–G3 适用性核实（2026-11-25，仅文档）**：低风险普通任务实测三道门全 PASS，不要求复核、
+  认知采纳、PWW 或合同未声明的测试；低风险 `blocking` 仍阻断 G2；合同要求测试缺失由
+  `closure_readiness` / `close_task` 阻断（`closure_check` 只报三道门）；高风险 `major` 阻断。
+  实现符合“基础事实检查 ≠ 高风险流程”，本轮只修正 `SKILL.md`、`references/review.md`、
+  `references/runtime.md` 中“blocking/major 所有风险等级阻断”的过期表述，**代码未改**。
+- **单一验收事实源**：`final_acceptance` + `_acceptance_facts` + `_acceptance_fingerprint`
+  取代 `verification_gates`；`closure_readiness`/`closure_check`/`close_task` 共用事实与单命令
+  cache，`quality_summary` 按状态版本记忆。
+- **状态读取去重**：`_cognition_schedule_step` 返回内存状态，`drive` 与 `closure --close`
+  不再二次读盘（执行了认知调用时仍重读，因为记录由子进程写入）。
+- **drive 上限语义**：达到 `MAX_DRIVE_STEPS` 时按 `progress_digest`——
+  有进展返回 `EXIT_EXECUTE`（“本次已推进进展…继续执行下一轮 drive”），无进展才
+  `EXIT_ERROR`。
+- **文档**：`SKILL.md` 76,926 → 65,865 B（−14.4%）；`references/runtime.md`、`workflow.md`、
+  `review.md`、`docs/PROJECT-CHARTER.md` 与实现对齐（D 退役、采纳非门禁、启动分母）。
+
+**验证（当前最终代码）**：活动套件 `python3 -B -m unittest discover -s tests -p 'test_*.py'`
+**1060 项 OK**（124.1 s，含新增 `tests/test_lightweight_architecture.py` 20 项）；
+`legacy/tests` 853 项 `99F+47E+32S`，失败测试 id 集合与基线名单**对称差为空**；
+运行时 `--apply` 写入 9 文件、`--check` 缺失 0/不同 0（27 个受管理文件）、`--baseline`
+27 项、`--verify-baseline` 通过。未受管理的运行时 `hm.txt` 默认保留、未改动。
+
+**最终核验追加（2026-11-25 收口前）**：`closure_eligible` 口径修复 + 1 项回归测试（活动套件
+共 1061 项）。定向重跑 `test_lightweight_architecture` 21 项、`test_cognition_scheduling`
+87 项、`test_v95_scheduling` 23 项、`test_cognition_obligation_disposition` 22 项、
+`test_cognition_lifecycle` 45 项全 OK；`--apply` 同步 1 文件、`--baseline` 27 项、
+`--verify-baseline` 通过、`--check` 缺失 0/不同 0。修复后未整体重跑活动全量套件（仅新增
+1 项并改动该口径，其余用例覆盖范围未变）。
+
+**性能（同场景 A/B，基线 worktree `b2156df` vs 当前工作区，各 3 轮中位数）**：
+`record` 状态读取 3 → 2 次、`closure --close` 4 → 3 次；`closure` 34.4 → 31.9 ms、
+`record` 33.9 → 30.9 ms；`status`/`closure-check` 在噪声内（13.9–16.7 ms）；
+`cognition-schedule` 因统一准入多算一次廉价事实，+3 ms 量级。质量结论真实计算次数与基线
+相同（closure 3 次）。未宣称加速比；`state.json` 序列化 + fsync 仍是收口主成本。
+
+**未验证**：GUI 新会话真实 Astra 调用、Provider 级退避隔离（本轮未改通道、未发请求）；
+真实宿主 Stop 续跑与 SessionStart 注入未重跑（钩子未改）；上述性能为本地同机进程内测量，
+不代表宿主端到端时延。
+
 ## 认知命名收敛与 SOL 退役（2026-11-25，v9.10.0，已交付 `main`）
 
 开发基线 `f2832bf`（v9.9.0 交付后的 main）；全部改动经 PR #14 合并入 `main`。

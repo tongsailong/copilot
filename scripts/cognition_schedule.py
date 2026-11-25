@@ -1108,14 +1108,14 @@ def task_stats(state: dict) -> dict:
                          for t in state.get("admission_triggers") or []
                          if isinstance(t, dict) and t.get("name")],
         workspace=_text(state.get("workspace")))
-    non_simple = admission["non_simple"]
+    cognition_applicable = admission["level"] in ("medium", "high")
     progressed = RP.has_substantive_progress(state)
-    # 收口窗口的适用条件必须与建议口径一致（complexity medium/high 或高风险），
-    # 否则会出现“分母要求却永远不可能创建义务”的假漏调。
-    closure_eligible = bool(
-        non_simple and progressed
-        and (_text(state.get("risk")).lower() == "high"
-             or admission["level"] in ("medium", "high")))
+    # 收口窗口的适用条件必须与建议口径逐字一致（`cognition_advice` 的 E：复杂度
+    # 中/高 + 有实质进展）。不沿用任务类别（`non_simple`）：真实信号决定复杂度，
+    # 简单类别 + 高风险的真实任务同样会创建 E 义务。两处口径不一致会产生双向
+    # 失真——分母要求却永远创建不出义务（假漏调），或义务已满足却不进分母，
+    # 让多任务聚合覆盖率超过 100% 或掩盖其它任务的漏调。
+    closure_eligible = bool(cognition_applicable and progressed)
 
     by_family: dict[str, dict] = {}
     for family in RP.COGNITION_FAMILIES:
@@ -1164,8 +1164,13 @@ def task_stats(state: dict) -> dict:
     # 原始义务计数，避免通过缩小分母制造覆盖率。
     coverage = {
         "startup": {
-            "denominator": 1 if non_simple else 0,
-            "reason": "非简单任务（启动 CONSULT 适用；按任务计 1 次）",
+            # 与建议口径一致：启动窗口只对“存在中/高认知价值信号”的任务适用。
+            # 用任务类别（非简单）当分母会制造假漏调——普通 standard 任务按设计
+            # 不做启动 CONSULT，不能事后算成“应调未执行”。
+            "denominator": 1 if cognition_applicable else 0,
+            "reason": (f"启动 CONSULT 适用：复杂度 {admission['level']}"
+                       "（按任务计 1 次）" if cognition_applicable else
+                       f"启动 CONSULT 不适用：复杂度 {admission['level']}"),
             "numerator": _window_covered(by_family["A"]),
             "skipped": by_family["A"]["skipped"],
             "missed": by_family["A"]["missed"],
@@ -1181,7 +1186,9 @@ def task_stats(state: dict) -> dict:
         },
         "closure": {
             "denominator": 1 if closure_eligible else 0,
-            "reason": "有实质进展的非简单任务（收口 CONSULT 适用；按任务计 1 次）",
+            "reason": ("有实质进展且中/高认知价值任务（收口 CONSULT 适用；"
+                       "按任务计 1 次）" if closure_eligible else
+                       "收口 CONSULT 不适用：无实质进展或复杂度不足"),
             "numerator": _window_covered(by_family["E"]),
             "skipped": by_family["E"]["skipped"],
             "missed": by_family["E"]["missed"],
@@ -1311,14 +1318,20 @@ def task_stats(state: dict) -> dict:
     }
     return {
         "task_id": _text(state.get("task_id")),
-        "eligible": bool(non_simple),
+        # 认知适用＝存在真实的认知价值信号（中/高复杂度），不是“任务类别非
+        # 简单”：`risk=medium` 默认值不构成任何适用性。启动窗口先于调查，因此
+        # 不看 `plan_admission().required`（那个判定还要求已经调查出事实）。
+        "eligible": bool(cognition_applicable),
         "plan_eligible": bool(admission["required"]),
         "progressed": bool(progressed),
         "closure_eligible": closure_eligible,
         "level": admission["level"],
         "task_kind": admission["task_kind"],
         "obligations": len(rows),
-        "not_registered": bool(non_simple and not by_family["A"]["obligations"]),
+        # “应登记而未登记”只适用于本应拥有启动窗口的任务：低认知价值任务
+        # （0 信号）按设计要求不产生任何义务，不能算作登记缺口。
+        "not_registered": bool(cognition_applicable
+                               and not by_family["A"]["obligations"]),
         "by_family": by_family,
         "by_event": by_event,
         "cycle": current_cycle(state),
@@ -1507,7 +1520,7 @@ def stats(states: list[dict], *, scope: str = "") -> dict:
             "议程条数与采纳率都不说明判断正确；post_closure_calls 是调度缺陷信号"
             "（收口判断之后仍追加非收口认知调用），应为 0。",
             "acceptance.unrecorded 只表示调用已完成但未回填采纳，不等于“被忽略”，"
-            "也不影响 G1–G3；E 收口的采纳门由 closure_acceptance_pending 单独判定。",
+            "也不影响 G1–G3；认知采纳只是可选审计记录，不是收口门禁。",
             "dispositions / by_cycle 是观察值而非门禁：completed/covered/skipped/"
             "failed/not-executed/unsettled 只描述窗口关闭时的实际结果，不改 coverage "
             "分子分母、不改 missed、不阻止收口；not-executed 的理由里若没有当时的"

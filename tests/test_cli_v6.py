@@ -145,7 +145,7 @@ class LegacyCliTests(unittest.TestCase):
 
     def test_status_alias_reports_phase(self):
         self.assertEqual(self.start().returncode, 0)
-        for name in ("status", "next", "brief", "render"):
+        for name in ("status", "next"):
             proc = F.run_cli("copilot_dispatch.py", name, "--state", self.state,
                              "--json")
             self.assertEqual(proc.returncode, 0, proc.stderr)

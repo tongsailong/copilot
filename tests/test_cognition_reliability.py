@@ -497,7 +497,9 @@ class BackoffDispatchTests(unittest.TestCase):
         G.start_state(self.state_path, goal="交付可复核结果",
                       contract=F.CONTRACT, risk="medium",
                       task_id="reliability", workspace=self.dir,
-                      task_kind="standard")
+                      # 方案类任务＝真实认知价值信号：本组测试需要一个可调度义务；
+                      # 默认 standard + risk=medium 不再产生义务。
+                      task_kind="architecture")
         self.materials = os.path.join(self.dir, "materials.md")
         with open(self.materials, "w", encoding="utf-8") as fh:
             fh.write("材料正文\n")
@@ -660,7 +662,9 @@ class RecoveryTests(unittest.TestCase):
         G.start_state(self.state_path, goal="交付可复核结果",
                       contract=F.CONTRACT, risk="medium",
                       task_id="reliability", workspace=self.dir,
-                      task_kind="standard")
+                      # 方案类任务＝真实认知价值信号：本组测试需要一个可调度义务；
+                      # 默认 standard + risk=medium 不再产生义务。
+                      task_kind="architecture")
         self.materials = os.path.join(self.dir, "materials.md")
         with open(self.materials, "w", encoding="utf-8") as fh:
             fh.write("材料正文\n")
@@ -766,7 +770,7 @@ class StreamTimeoutCrossStageTests(unittest.TestCase):
         G.start_state(self.state_path, goal="复核 408 跨阶段退避",
                       contract=F.CONTRACT, risk="medium",
                       task_id="stream-timeout", workspace=self.dir,
-                      task_kind="standard")
+                      task_kind="architecture")
         self.materials = os.path.join(self.dir, "materials.md")
         with open(self.materials, "w", encoding="utf-8") as fh:
             fh.write("材料正文\n")
