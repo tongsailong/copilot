@@ -77,7 +77,9 @@ MAX_SNIPPET = 240
 CACHE_KEEP = 8
 PER_FILE_HITS = 4
 
-PACK_LIMITS = {"self": 12000, "sol": 8000, "subagent": 5000}
+PACK_LIMITS = {"self": 12000, "cognition": 8000, "subagent": 5000}
+# 历史 `--target sol` 归一为 `cognition`（只改名，不保留第二条路径）。
+PACK_TARGET_ALIASES = {"sol": "cognition"}
 PACK_MAX_HIT_FILES = 8
 PACK_MAX_SNIPPETS = 3
 PACK_MAX_POINTERS = 8
@@ -690,15 +692,15 @@ def _phase_of(state: dict) -> str:
         return str(state.get("phase") or "未知")
 
 
-def _sol_cognition(state: dict, *, limit: int = 5) -> list[dict]:
-    """已完成的 SOL 认知判断与采纳结论（只读；供候选草稿溯源）。
+def _cognition_summary(state: dict, *, limit: int = 5) -> list[dict]:
+    """已完成的认知判断与采纳结论（只读；供候选草稿溯源）。
 
     这是“本次任务得出过哪些判断、主代理怎么采纳”的事实，不是知识结论：草稿仍
     需要主 Agent 按现场核验、去重与判定住所后才能入库。REVIEW 记录不在此列
     （复核发现走 finding 台账）。
     """
     rows: list[dict] = []
-    for item in state.get("sol_calls") or []:
+    for item in state.get("cognition_calls") or []:
         if not isinstance(item, dict) or item.get("status") != "completed":
             continue
         mode = str(item.get("mode") or "").upper()
@@ -755,7 +757,7 @@ def _state_snapshot(state_path: str) -> dict:
         "evidence": [e for e in state.get("evidence") or [] if isinstance(e, dict)],
         "reports": [r for r in state.get("reports") or [] if isinstance(r, dict)],
         "plans": [p for p in state.get("plans") or [] if isinstance(p, dict)],
-        "sol_cognition": _sol_cognition(state),
+        "cognition": _cognition_summary(state),
         "phase": _phase_of(state),
         "updated": str(state.get("updated") or ""),
     }
@@ -969,10 +971,16 @@ def _compose(*, project: dict, snapshot: dict | None, terms: list[str],
     return "\n".join(lines).rstrip() + "\n"
 
 
+def normalize_pack_target(value: str) -> str:
+    text = str(value or "").strip().lower()
+    return PACK_TARGET_ALIASES.get(text, text)
+
+
 def build_pack(*, project: dict, target: str, snapshot: dict | None,
                hits: list[dict] | None, recall_status: dict | None,
                terms: list[str], requirement: str = "",
                handoff_text: str = "") -> tuple[str, dict]:
+    target = normalize_pack_target(target)
     if target not in PACK_LIMITS:
         _fail("TARGET_INVALID", f"target 必须是 {sorted(PACK_LIMITS)}。")
     limit = PACK_LIMITS[target]
@@ -1078,9 +1086,9 @@ def build_capture(*, project: dict, snapshot: dict, state_path: str,
     if unmet:
         head.append("- 未闭合条件（不得写成已确认结论）："
                     + "、".join(c["id"] for c in unmet))
-    cognition = snapshot.get("sol_cognition") or []
+    cognition = snapshot.get("cognition") or []
     if cognition:
-        head += ["", "## SOL 认知与采纳（任务内事实，不是可复用结论）", ""]
+        head += ["", "## 认知与采纳（任务内事实，不是可复用结论）", ""]
         for item in cognition:
             head.append(f"- {item['call_id']}（{item['mode']}/{item['stage']}，"
                         f"采纳：{item['acceptance']}）："
@@ -1162,7 +1170,7 @@ def build_capture(*, project: dict, snapshot: dict, state_path: str,
         "met_criteria": [c["id"] for c in met],
         "unmet_criteria": [c["id"] for c in unmet],
         "evidence": [str(e.get("id")) for e in evidence],
-        "sol_cognition_calls": len(cognition),
+        "cognition_calls": len(cognition),
         "dedupe_hits": len((dedupe or {}).get("hits") or []),
         "file_name": name,
         "sha256": C.sha256_text(text),
@@ -1256,7 +1264,7 @@ def _handoff_text(path: str, target: str) -> str:
         _fail("KNOWLEDGE_EXTENSION_MISSING",
               "缺少 scripts/knowledge_handoff.py，无法校验 --handoff-file。")
     try:
-        return module.render_file(path, target="sol" if target == "self" else target)
+        return module.render_file(path, target="cognition" if target == "self" else target)
     except module.HandoffError as exc:
         _fail(exc.code, exc.message)
     return ""
@@ -1407,7 +1415,8 @@ def main(argv: list[str] | None = None) -> int:
     p_pack.add_argument("--workspace", default="")
     p_pack.add_argument("--cwd", default="")
     p_pack.add_argument("--state", default="")
-    p_pack.add_argument("--target", choices=sorted(PACK_LIMITS), default="self")
+    p_pack.add_argument("--target", type=normalize_pack_target,
+                        choices=sorted(PACK_LIMITS), default="self")
     p_pack.add_argument("--keywords", default="")
     p_pack.add_argument("--requirement", default="")
     p_pack.add_argument("--handoff-file", default="")

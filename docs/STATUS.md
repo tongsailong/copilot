@@ -1,8 +1,14 @@
 # STATUS
 
+> **术语说明（v9.10.0，2026-11-25）**：本文件保留历史原文。SOL 术语与 `sol_*` 文件名、`sol-*`
+> 命令名、`sol_calls`/`sol_reuses`/`sol_schedule` 状态键已统一为“认知 / cognition”，
+> `gpt-6.2-sol` 与 `--model` 已移除，认知只剩 `gpt-6.2-astra` 单一模型。历史段落里的
+> 旧名只作事实与审计记录，不代表当前角色、模型、命令或默认配置。
+
 更新：2026-11-25 CST。本文件只记录现场可核实的事实；规划与未完成事项单独标注。
-当前版本：v9.9.0（Astra 默认认知引擎迁移与调用效率优化）；v9.8.0 多模态设计认知、
-v9.7.1 及更早的治理记录见下。基线以本次交付的最终提交与运行时核验为准。
+当前版本：v9.10.0（认知命名收敛与 SOL 退役；开发中，源码已改、未提交）；v9.9.0（Astra
+默认认知引擎迁移与调用效率优化，已交付 `main`）；v9.8.0 多模态设计认知、v9.7.1 及更早的
+治理记录见下。基线以本次交付的最终提交与运行时核验为准。
 任务 `sol-cognition-governance-p1p3-2026-11-23` 经用户授权一次性 `reopen` 后，已于
 `2026-11-24T07:40:07` 在**最终代码**上重新收口 **CLOSED / PASS**（周期 2，G1–G3 全 PASS）。
 
@@ -10,6 +16,44 @@ v9.7.1 及更早的治理记录见下。基线以本次交付的最终提交与�
 经 PR #9 合并为 `b83cf33`；CI Python 3.10 / 3.12 各 956 项 OK、`--verify-baseline` 通过；
 main 三方（本地 / `origin/main` / `ls-remote`）同为 `b83cf33`（0/0），工作区干净；
 运行时 `--check` 缺失 0 / 不同 0，27 个受管理文件源码与运行时 SHA-256 全部一致。
+
+## 认知命名收敛与 SOL 退役（2026-11-25，v9.10.0，源码已改未提交）
+
+仓库 HEAD `f2832bf`（= `origin/main`），改动全部在工作树与索引；**授权不含 commit / push / PR / 合并**。
+
+- **命名收敛**：`sol_review.py` → `cognition_call.py`、`sol_schedule.py` → `cognition_schedule.py`，
+  10 个 `test_sol_*` 测试模块改名为 `test_cognition_*`（`git mv`，索引中为 12 个 `R100`）。
+  状态键统一为 `cognition_calls` / `cognition_reuses` / `cognition_schedule`，`model_backoff`
+  按 `provider+model+error_class` 隔离。
+- **单一模型**：`gpt-6.2-sol` 与 `--model` 彻底删除，只剩 `gpt-6.2-astra`（`codex`、`effort=high`、
+  零工具、单轮、无重试、无回退）。`resolve_model("")` 返回 astra，其他模型名一律
+  `CognitionUsageError`，任何路由都无法切回旧模型。
+- **旧入口按消费者事实收窄**：`sol-*` CLI 命令与 `--sol` 参数别名在审查后**连同跳转表一并删除**
+  （帮助、错误信息与执行路径都只有 `cognition-*` 一套）；`test_legacy_sol_cli_entries_are_gone`
+  守卫这一点（含 `--help` 输出不得出现 `sol-` / `--sol`）。
+- **历史只读兼容**（仅保留有真实数据需求的部分，不迁移、不回写）：
+  `sol_calls`（27/30 个本机任务状态仍只用旧键）、`sol_schedule`（22 个任务有该键，21 个没有
+  `cognition_schedule`，靠 `schedule_raw()` 只读回退；两键并存时以新键为准）、
+  `sol_backoff`（3 个历史任务）与 v8 的 `sol_reviews` / `sol_advisories`；
+  `sol_reuses` 只读合并进复用统计。`legacy-status` 继续只读查看 v1/v2 历史状态与台账。
+- **本轮修掉两个真实缺陷**：① 失败记录缺少模型身份时仍会写入旧单例 `sol_backoff`（违反“不产生
+  新的 SOL 格式数据”）→ 改为记 `backoff_skipped=missing-model-identity` 且不落盘；
+  ② `sol_schedule` 无读取路径、旧任务调度视图会丢 → 增加只读回退（写入仍只更新
+  `cognition_schedule`）。同时删除零调用者的 `clear_cognition_backoff`（其实现会 pop 旧键）。
+- **测试**：活动全量 **1040 项 OK**（75.96 s，0 失败，含 manifest 基线校验）；相对 HEAD 的
+  1036 项，净 +4 而**没有任何模块缩小发现范围**：`test_astra_migration` 24→24（5 对纯改名、
+  1 对语义替换、2 项合并为 1 项更强断言、新增 1 项 CLI 守卫），`test_cognition_reliability`
+  +1（缺模型身份不写旧窗口），`test_cognition_scheduling` +3（旧调度只读兼容）。
+  定向复跑 `test_astra_migration` 24、`test_cognition_reliability` 57、
+  `test_cognition_scheduling` 87、`test_governance` 43、`test_architecture` 14，全部 OK。
+- **legacy 未复跑**：本轮改动只触及当前 `scripts/` 的认知路径，不改变 v5 历史契约；上一轮已核对
+  `legacy/tests` 146 项失败/错误集合与 HEAD 逐条一致。
+- **运行时**：源码与运行时 `SKILL.md` 均为 v9.10.0，`--check` 缺失 0 / 不同 0，27 个分发文件
+  SHA-256 逐一致；`hm.txt` 未受管理按设计保留。本会话 Skill 元数据仍是启动期缓存的 v9.9.0
+  描述，需新会话刷新。
+- **基线**：`--baseline` 重建 27 个 Git 跟踪分发文件，`--verify-baseline` 通过。
+- **未验证**：未提交 / 未推送 / 无 CI 结果；未执行收口窗口的真实认知（E）调用；真实宿主下
+  `cognition-*` 命令的端到端调用未在本轮重跑（此前 v9.9.0 有 1 次真实 Astra 取证）。
 
 ## Astra 默认认知引擎迁移与调用效率优化（2026-11-25，v9.9.0，已交付 `main`）
 

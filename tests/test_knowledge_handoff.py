@@ -63,7 +63,7 @@ class HandoffBase(unittest.TestCase):
 class ValidationTests(HandoffBase):
     def test_read_requires_excerpt_present_in_card(self):
         entries = KH.load_handoff(self.write_input([self.entry()]))
-        text = KH.render(entries, target="sol")
+        text = KH.render(entries, target="cognition")
         self.assertIn("主代理声明已读", text)
         self.assertIn("开屏长冷却从 60 分钟改为 2 分钟", text)
         self.assertIn(self.card, text)
@@ -71,7 +71,7 @@ class ValidationTests(HandoffBase):
     def test_read_evidence_is_rendered_but_not_verified(self):
         entries = KH.load_handoff(self.write_input([self.entry(
             read_evidence="sess_demo: Read <card> at 15:00")]))
-        text = KH.render(entries, target="sol")
+        text = KH.render(entries, target="cognition")
         self.assertIn("阅读证据：sess_demo: Read <card> at 15:00", text)
         self.assertIn("不证明宿主工具调用", text)
 
@@ -102,7 +102,7 @@ class ValidationTests(HandoffBase):
     def test_index_only_is_labeled(self):
         entries = KH.load_handoff(self.write_input([self.entry(
             status="index-only", decision="", excerpt="")]))
-        text = KH.render(entries, target="sol")
+        text = KH.render(entries, target="cognition")
         self.assertIn("index-only（仅索引，未读正文", text)
         self.assertNotIn("历史决策", text)
 
@@ -117,7 +117,7 @@ class ValidationTests(HandoffBase):
         entries = KH.load_handoff(self.write_input([self.entry(
             status="unverified", decision="可能是 2 分钟",
             excerpt="待核实的线索")]))
-        text = KH.render(entries, target="sol")
+        text = KH.render(entries, target="cognition")
         self.assertIn("待核实线索：可能是 2 分钟", text)
         self.assertIn("未核实摘录", text)
         self.assertNotIn("历史决策", text)
@@ -206,11 +206,11 @@ class DispatchCompositionTests(HandoffBase):
         self.assertEqual(materials, "正文")
         self.assertEqual(meta, {})
 
-    def test_knowledge_block_reaches_sol_prompt(self):
-        import sol_review as SR
+    def test_knowledge_block_reaches_cognition_prompt(self):
+        import cognition_call as CC
         source = self.write_input([self.entry()])
-        block = KH.render_file(source, target="sol")
-        prompt = SR.build_prompt(
+        block = KH.render_file(source, target="cognition")
+        prompt = CC.build_prompt(
             {"goal": "改冷却", "contract": {"done_criteria_text": "C1"},
              "risk": "medium"},
             "当前证据\n\n" + block, mode="REVIEW")

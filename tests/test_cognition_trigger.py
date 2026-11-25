@@ -23,7 +23,7 @@ import v6_support as F
 
 G = F.G
 import review_policy as RP  # noqa: E402  v6_support 已把 scripts/ 加入 sys.path
-import sol_review as SR  # noqa: E402
+import cognition_call as CC  # noqa: E402
 import copilot_dispatch as CD  # noqa: E402
 import copilot_auto as CA  # noqa: E402
 
@@ -91,7 +91,7 @@ class TriggerBase(unittest.TestCase):
                contract: str | None = None, status: str = "completed") -> dict:
         state = G.load_state(self.state_path)
         call = {
-            "call_id": f"SC{mode.lower()}{len(state.get('sol_calls') or [])}",
+            "call_id": f"SC{mode.lower()}{len(state.get('cognition_calls') or [])}",
             "mode": mode,
             "status": status,
             "contract_sha256": contract
@@ -106,11 +106,11 @@ class TriggerBase(unittest.TestCase):
         if signals is not None:
             call["complexity"] = "medium"
             call["complexity_signals"] = list(signals)
-        return G.record_sol_call(self.state_path, call, mode=mode,
+        return G.record_cognition_call(self.state_path, call, mode=mode,
                                  materials_sha256="m" * 64)
 
     def advice(self, **kwargs) -> dict:
-        return G.sol_advice_summary(G.load_state(self.state_path), **kwargs)
+        return G.cognition_advice_summary(G.load_state(self.state_path), **kwargs)
 
 
 class ComplexityTests(TriggerBase):
@@ -118,7 +118,7 @@ class ComplexityTests(TriggerBase):
         self.start(risk="low")
         self.plan(1)
         self.evidence()
-        profile = G.sol_advice_summary(G.load_state(self.state_path))["complexity"]
+        profile = G.cognition_advice_summary(G.load_state(self.state_path))["complexity"]
         self.assertEqual(profile["level"], "low")
         self.assertEqual(profile["signal_codes"], [])
         self.assertEqual(profile["counts"]["plan_actions"], 1)
@@ -127,7 +127,7 @@ class ComplexityTests(TriggerBase):
         self.start()
         self.plan(3)
         self.evidence(modules=2, count=2)
-        profile = G.sol_advice_summary(G.load_state(self.state_path))["complexity"]
+        profile = G.cognition_advice_summary(G.load_state(self.state_path))["complexity"]
         self.assertEqual(profile["level"], "medium")
         self.assertIn("multi-module", profile["signal_codes"])
 
@@ -135,7 +135,7 @@ class ComplexityTests(TriggerBase):
         self.start(risk="high")
         self.plan(5, deps=True)
         self.evidence(modules=2, count=2)
-        profile = G.sol_advice_summary(G.load_state(self.state_path))["complexity"]
+        profile = G.cognition_advice_summary(G.load_state(self.state_path))["complexity"]
         self.assertEqual(profile["level"], "high")
         for code in ("risk-high", "multi-action", "interdependent",
                      "multi-module"):
@@ -180,7 +180,7 @@ class ComplexityTests(TriggerBase):
 
 
 class SimpleTaskZeroCallTests(TriggerBase):
-    def test_simple_task_gets_no_sol_advice(self):
+    def test_simple_task_gets_no_cognition_advice(self):
         self.start(risk="low")
         self.plan(1)
         self.evidence()
@@ -220,7 +220,7 @@ class ProactiveTriggerTests(TriggerBase):
         self.assertEqual(advice["mode"], "CONSULT")
         self.assertEqual(advice["phase"], "development")
         self.assertEqual(advice["recommended_action"], "recommended")
-        self.assertIn("sol-consult", advice["command"])
+        self.assertIn("cognition-consult", advice["command"])
         self.assertFalse(advice["second_round"])
 
     def test_high_risk_with_evidence_uses_same_cognitive_entry(self):
@@ -230,7 +230,7 @@ class ProactiveTriggerTests(TriggerBase):
         advice = self.advice()
         self.assertEqual(advice["mode"], "CONSULT")
         self.assertEqual(advice["action"], "consult")
-        self.assertIn("sol-consult", advice["command"])
+        self.assertIn("cognition-consult", advice["command"])
 
     def test_drive_prints_the_proactive_advice(self):
         self.start(risk="high")
@@ -243,7 +243,7 @@ class ProactiveTriggerTests(TriggerBase):
             code = CA.drive(args)
         self.assertEqual(code, CA.EXIT_EXECUTE)
         rendered = out.getvalue()
-        self.assertIn("SOL CONSULT", rendered)
+        self.assertIn("认知 CONSULT", rendered)
         self.assertIn("advisory", rendered)
 
     def test_cli_admission_exposes_complexity_and_mode(self):
@@ -356,16 +356,16 @@ class MaterialChangeTests(TriggerBase):
         advice = self.advice()
         self.assertEqual(advice["action"], "consult")
         # 合同修订后是新的认知对象，但 CLI 仍按“同模式已有记录”要求 --force；
-        # 建议命令必须可执行，不能给出会被 sol_review_requires_reason 拒绝的命令。
+        # 建议命令必须可执行，不能给出会被 cognition_review_requires_reason 拒绝的命令。
         self.assertTrue(advice["second_round"])
-        self.assertIn("sol-consult", advice["command"])
+        self.assertIn("cognition-consult", advice["command"])
         self.assertIn("--force --trigger scope-changed", advice["command"])
         # 建议命令必须能被 CLI 真正接受，而不只是字符串看起来正确。
         materials = os.path.join(self.dir, "materials.md")
         with open(materials, "w", encoding="utf-8") as fh:
             fh.write("合同修订后的材料\n")
         proc = F.run_cli(
-            "copilot_dispatch.py", "sol-consult", "--state", self.state_path,
+            "copilot_dispatch.py", "cognition-consult", "--state", self.state_path,
             "--materials", materials, "--question", "合同修订后怎么判断？",
             "--force", "--trigger", "scope-changed",
             "--reason", "合同修订后重新判断", "--dry-run", "--json")
@@ -378,7 +378,7 @@ class MaterialChangeTests(TriggerBase):
         first = self.advice(review_requested=True)
         self.assertEqual(first["action"], "review")
         self.assertEqual(first["mode"], "REVIEW")
-        self.assertIn("sol-review", first["command"])
+        self.assertIn("cognition-review", first["command"])
         self.assertNotIn("--force", first["command"])
         self.record("REVIEW")
         covered = self.advice(review_requested=True)
@@ -415,7 +415,7 @@ class GatesNoAutoCallTests(TriggerBase):
         self.assertNotEqual(advice["mode"], "REVIEW")
         self.assertTrue(advice["covered"]["CONSULT"])
 
-    def test_closure_never_derives_sol_work_items(self):
+    def test_closure_never_derives_cognition_work_items(self):
         self.start(risk="high")
         self.plan(5, deps=True)
         self.evidence(modules=2, count=2)
@@ -427,7 +427,7 @@ class GatesNoAutoCallTests(TriggerBase):
 
 
 class AdvisorySemanticsTests(TriggerBase):
-    def test_sol_findings_do_not_change_phase_or_gates(self):
+    def test_cognition_findings_do_not_change_phase_or_gates(self):
         self.start(risk="high")
         self.plan(1)
         state = G.load_state(self.state_path)
@@ -441,7 +441,7 @@ class AdvisorySemanticsTests(TriggerBase):
             "complexity_signals": ["risk-high"],
             "completed_at": G.now_iso(),
         }
-        G.record_sol_call(self.state_path, call, mode="REVIEW")
+        G.record_cognition_call(self.state_path, call, mode="REVIEW")
         state = G.load_state(self.state_path)
         evaluation = G.evaluate(state)
         self.assertNotEqual(evaluation["phase"], "CLOSED")
@@ -459,8 +459,8 @@ class AdvisorySemanticsTests(TriggerBase):
         self.start(risk="high")
         self.plan(5, deps=True)
         self.evidence(modules=2, count=2)
-        G.record_sol_call_failure(self.state_path, mode="CONSULT",
-                                  error_code="sol_timeout", detail="300s",
+        G.record_cognition_call_failure(self.state_path, mode="CONSULT",
+                                  error_code="cognition_timeout", detail="300s",
                                   materials_sha256="x" * 64)
         advice = self.advice()
         self.assertEqual(advice["action"], "consult")
@@ -470,7 +470,7 @@ class AdvisorySemanticsTests(TriggerBase):
 
 
 class BlockedAndClosedTests(TriggerBase):
-    def test_blocked_task_gets_no_sol_advice(self):
+    def test_blocked_task_gets_no_cognition_advice(self):
         self.start(risk="high")
         self.plan(5, deps=True)
         self.evidence(modules=2, count=2)
@@ -480,7 +480,7 @@ class BlockedAndClosedTests(TriggerBase):
         self.assertEqual(advice["action"], "none")
         self.assertIn("BLOCKED", advice["reason"])
 
-    def test_closed_task_gets_no_sol_advice(self):
+    def test_closed_task_gets_no_cognition_advice(self):
         self.start(risk="high")
         self.plan(2)
         self.close_all()
@@ -521,7 +521,7 @@ class ExplicitRequestTests(TriggerBase):
         payload = json.loads(proc.stdout)
         self.assertEqual(payload["recommended_action"], "recommended")
 
-    def test_direct_sol_call_still_works_without_advice(self):
+    def test_direct_cognition_call_still_works_without_advice(self):
         """用户显式调用永远可用：admission 只是建议，不阻断 CLI。"""
         self.start(risk="high")
         self.plan(1)
@@ -536,7 +536,7 @@ class ExplicitRequestTests(TriggerBase):
             knowledge_file="")
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            self.assertEqual(CD.cmd_sol_think(args), 0)
+            self.assertEqual(CD.cmd_cognition_consult(args), 0)
         self.assertEqual(json.loads(out.getvalue())["mode"], "CONSULT")
 
 

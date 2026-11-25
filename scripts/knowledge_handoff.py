@@ -6,7 +6,7 @@
 - 只接受 Memory/Vault 正式目录内的卡片；不是通用文件读取器。
 - `read` 状态的摘录必须真实出现在卡片正文中，防止把路径或摘要冒充已读。
 - `index-only` / `unverified` 明确标注，不能携带“已确认”结论。
-- 输出只含必要摘录，默认上限 8,000 字符；SOL 与子 Agent 共用同一份结构。
+- 输出只含必要摘录，默认上限 8,000 字符；认知与子 Agent 共用同一份结构。
 
 用法：
 
@@ -51,7 +51,14 @@ import lib_common as C  # noqa: E402
 
 MAX_ENTRIES = 5
 MAX_ENTRY_EXCERPT = 1600
-TARGET_LIMITS = {"sol": 8000, "subagent": 5000}
+TARGET_LIMITS = {"cognition": 8000, "subagent": 5000}
+# 历史 `--target sol` 只是旧名：归一为 `cognition`，不再产出新口径。
+TARGET_ALIASES = {"sol": "cognition"}
+
+
+def normalize_target(value: str) -> str:
+    return TARGET_ALIASES.get(str(value or "").strip().lower(),
+                              str(value or "").strip().lower())
 STATUSES = {"read", "index-only", "unverified"}
 KINDS = {"memory", "vault", "file"}
 ALLOWED_ROOTS = (
@@ -236,7 +243,8 @@ def _status_text(entry: dict) -> str:
     return "unverified（未核实；不得作为当前事实）"
 
 
-def render(entries: list[dict], target: str = "sol") -> str:
+def render(entries: list[dict], target: str = "cognition") -> str:
+    target = normalize_target(target)
     if target not in TARGET_LIMITS:
         _fail("TARGET_INVALID", f"target 必须是 {sorted(TARGET_LIMITS)}。")
     total_chars = sum(len(e["excerpt"]) for e in entries)
@@ -250,7 +258,7 @@ def render(entries: list[dict], target: str = "sol") -> str:
         "",
         "> 状态：read=主代理声明已读且脚本核对摘录来源（不证明宿主工具调用）；"
         "index-only=仅索引未读；unverified=未核实。",
-        "> 路径只用于追溯；SOL/子 Agent 只能使用下方摘录，不能假设自己读过卡片。",
+        "> 路径只用于追溯；认知/子 Agent 只能使用下方摘录，不能假设自己读过卡片。",
         "",
     ]
     for entry in entries:
@@ -289,7 +297,7 @@ def _write_atomic(path: str, text: str) -> None:
             os.unlink(tmp)
 
 
-def render_file(path: str, target: str = "sol") -> str:
+def render_file(path: str, target: str = "cognition") -> str:
     return render(load_handoff(path), target=target)
 
 
@@ -317,10 +325,12 @@ def main(argv: list[str] | None = None) -> int:
     build = sub.add_parser("build", help="校验并输出 Markdown 交接块")
     build.add_argument("--input", required=True, help="交接 JSON；- 表示 stdin")
     build.add_argument("--output", required=True, help="输出 Markdown；- 表示 stdout")
-    build.add_argument("--target", choices=sorted(TARGET_LIMITS), default="sol")
+    build.add_argument("--target", type=normalize_target,
+                       choices=sorted(TARGET_LIMITS), default="cognition")
     check = sub.add_parser("check", help="只校验，输出 JSON 摘要")
     check.add_argument("--input", required=True, help="交接 JSON；- 表示 stdin")
-    check.add_argument("--target", choices=sorted(TARGET_LIMITS), default="sol")
+    check.add_argument("--target", type=normalize_target,
+                       choices=sorted(TARGET_LIMITS), default="cognition")
     args = parser.parse_args(argv)
     try:
         entries = load_handoff(args.input)

@@ -2,11 +2,11 @@
 
 本文是 Copilot 的**操作层**权威说明：命令、参数、退出码与标准回合流程。
 语义（阶段判定、派生规则、门禁细节）见 `runtime.md`、`review.md`、`agent-bridge.md`。
-`sol-consult` / `sol-plan` / `sol-review` 是显式模型调用入口；生命周期命令
-（`start` / `closure` / `drive`）在默认 `--cognition auto`（`--sol` 兼容）下会顺带执行
+`cognition-consult` / `cognition-plan` / `cognition-review` 是显式模型调用入口；生命周期命令
+（`start` / `closure` / `drive`）在默认 `--cognition auto`（`--cognition` 兼容）下会顺带执行
 至多 1 条 recommended 调度义务（1 次请求）。纯登记/报告/合同命令默认 `advise`：只物化
 义务并打印命令，只有命令行显式 `auto` 才付费执行——所以“不调用模型”对读命令、纯登记
-命令默认行为与测试进程成立。其余工作只读写本地任务状态文件。每次 SOL 调用只发一次请求，
+命令默认行为与测试进程成立。其余工作只读写本地任务状态文件。每次认知调用只发一次请求，
 不自动重试、不自动二审；CONSULT / PLAN 失败只记录并降级，不阻断工程推进。
 
 ## 1. 状态文件
@@ -36,18 +36,18 @@ python3 -B scripts/copilot_dispatch.py <子命令> --state <state.json> [参数]
 ```
 
 生命周期命令（`start` / `closure`）与 `copilot_auto.py drive` 接受
-`--cognition auto|advise|off`（`--sol` 兼容，默认 `auto`）：做一次有界调度步，最多执行
+`--cognition auto|advise|off`（`--cognition` 兼容，默认 `auto`）：做一次有界调度步，最多执行
 1 条义务、1 次请求；`optional` 级只提示；读命令永不执行。纯登记/报告/合同命令
 （`plan` / `record` / `rerun` / `criterion` / `judgment` / `evidence` / `report` / `accept` /
 `decide` / `block` / `unblock` / `finding` / `contract` / `reopen`）默认 `advise`：回填后
 只物化义务、给出可粘贴命令，不隐式调用模型；确需顺带执行时必须在该条命令上显式写
-`--cognition auto`。`COPILOT_SOL_AUTO=off` 可整体关闭自动执行。
+`--cognition auto`。`COPILOT_COGNITION_AUTO=off` 可整体关闭自动执行。
 
 | 子命令 | 用途 | 关键参数 |
 |---|---|---|
 | `start` | 创建任务合同 | `--goal`、`--contract-file`、`--criteria-file`、`--task-kind <kind>`（默认 `standard`，简单类型见 `trivial`/`mechanical`/`docs`/`format`）、`--trigger <name>`（可重复，声明 security/permissions/core-logic/...）、`--test-policy`/`--test-policy-file`（JSON：`required`/`commands`/`report`/`artifacts`/`require_*`）、`--risk low\|medium\|high`（历史 `normal` 等价 `medium`）、`--backend legacy\|native`、`--task-id`、`--mode`、`--note`、`--workspace`（省略取状态文件所在目录的 git 根）；`risk=high` 不再强制 native |
 | `plan` | 登记 ZCode 本地计划 | `--plan <plan.json>`（或 stdin）、`--source` |
-| `status` / `next` | 查看阶段、工作项、门禁、下一步与 SOL 建议 | `--json` |
+| `status` / `next` | 查看阶段、工作项、门禁、下一步与认知建议 | `--json` |
 | `record` | 回填工作项结果 | `--id`、`--status`、`--result`、`--evidence E1`（可重复） |
 | `rerun` | 把已终结工作项重开为 pending（修复后重新验证） | `--id`、`--reason`；旧结果保留在 `rerun_history` |
 | `criterion` | 核销完成条件 | `--id C1`、`--status pending\|met\|not_met`、`--evidence`（`met` 必填） |
@@ -59,18 +59,18 @@ python3 -B scripts/copilot_dispatch.py <子命令> --state <state.json> [参数]
 | `decide` | 记录用户/任务决策 | `--text`、`--source`；**不能替代 PWW 接受** |
 | `block` / `unblock` | 记录/解除真实阻塞 | `block --reason ... --needs ... (--work-item A2 [--work-item A3] [--criterion C2] | --scope task [--force])`；`unblock --reason ... [--block-id B...] [--by user --quote "<原话>"]`（多条未解除时必须指定）；解除后被冻结工作项自动恢复 `pending`。仍有可执行项时任务级 `--scope task` 被拒绝，必须显式 `--force`，状态记录 `ready_at_creation`/`forced_scope`；`--by user` 必须带原话，记录 `resolved_by` 与 `authorization_source=caller-declared` |
 | `closure-check` | 只读检查 G1–G3 | `--json` |
-| `review-admission` | SOL-first 生命周期建议的单一确定性入口（只读、不写状态、不是门禁）：先算任务类型、复杂度与已有 SOL 覆盖，再给出 `advice.action`（`none`/`reuse`/`consult`/`plan`/`review`）、建议模式、阶段与命令 | `--trigger security`（可重复）、`--reason`、`--user-request`、`--review-request`、`--json`；返回 `decision`、`advice`、`task_kind`、`complexity`、`recommended_action`/`recommended_mode`/`recommended_stage`、`sol_calls_total` |
-| `sol-consult` | SOL 默认认知入口：材料 + 问题 → 一次请求 → 目标理解/问题本质/路线与取舍/风险/调查方向/再咨询条件；建议写入统一 `sol_calls`（`mode=CONSULT`），不入门禁；失败只登记并降级 | `--materials <file>`（调度执行时可省略）、`--question`（必填，`--obligation` 时回落到义务问题）、`--stage <understanding\|planning\|development\|stage\|closure>`、`--obligation SO<n>`（按调度义务执行，材料由状态确定性生成）、`--lock-timeout <秒>`、`--knowledge-file`、`--dry-run`、`--list`、`--json`、`--timeout`、`--max-output-tokens`、`--audit-log`（默认 `sol-audit.jsonl`）、`--output-dir`、`--ignore-backoff`（默认在上游退避窗口内不发请求；仅在上游已确认恢复时显式使用，仍然只发一次、不重试）、`--model`（省略为 `gpt-6.2-astra`；`gpt-6.2-sol` 仅显式兼容，不回退）；再次调用：`--force --trigger <user-request\|scope-changed\|new-risk\|materials-omitted\|strategy-failed\|major-uncertainty\|stage-result> --reason` |
-| `sol-plan` | SOL 调查后规划判断：方案比较、取舍、优先级、阶段目标与验收关注点；记录写入统一 `sol_calls`（`mode=PLAN`） | 参数同 `sol-consult`；省略 `--stage` 时默认 `planning` |
-| `sol-think` | 历史别名：等同 `sol-consult`（`mode=CONSULT`），保留给既有调用方 | 参数同 `sol-consult` |
-| `sol-accept` | 回填主代理对 SOL 建议的采纳结论（事实记录，不改变阶段、G1–G3 或授权）。v2 记录含实际决策、理由、modified 差异、证据引用与 `advice_ref`；缺项只给非阻断提示。`--historical` 只用于**已收口**任务的历史复核：`--status pending` 必须配 `--reason`（可加 `--reason-code`），重复执行幂等、不覆盖既有已决结论、不把已决结论降级为 `pending`；不因代码已改、测试通过或任务 PASS 推断采纳 | `--call-id SC...`、`--status accepted\|modified\|rejected\|pending`、`--decision`、`--rationale`（省略回落 `--reason`）、`--delta`、`--evidence-ref E1,E3`（可重复/逗号分隔，指向本任务已登记证据）、`--source-ref`（报告章节/文件路径，只定位不核验）、`--evidence-note`、`--note`、`--reason`、`--reason-code`、`--historical`、`--decided-by`（默认 `zcode`）、`--json` |
-| `sol-schedule` | SOL 生命周期调度视图（只读）：义务清单、漏调、终态处置与所属周期、下一条可执行项与可直接粘贴的命令；`--execute` 时有界执行 1 条 `recommended` 义务（1 次请求，失败只记录）；同时显示当前上游退避窗口（窗口内不发起新请求） | `--state`、`--execute`、`--json`、`--sol auto\|advise\|off`；不带 `--execute` 不写状态 |
-| `sol-stats` | SOL 调度覆盖率（显式分母）：建议/执行/复用/跳过/失败/漏调/未登记分开统计，含事件分布、采纳分布、义务终态处置与周期分布、tokens（输入/输出/reasoning/总）与延迟、`by_model`（请求数/完成/失败/Token/p50/p95/重复调用）与 `reuse`（命中数、按模型） | `--state` 或 `--workspace <根>`（聚合 `.copilot-tasks/*/state.json`）、`--json` |
+| `review-admission` | 认知生命周期建议的单一确定性入口（只读、不写状态、不是门禁）：先算任务类型、复杂度与已有认知覆盖，再给出 `advice.action`（`none`/`reuse`/`consult`/`plan`/`review`）、建议模式、阶段与命令 | `--trigger security`（可重复）、`--reason`、`--user-request`、`--review-request`、`--json`；返回 `decision`、`advice`、`task_kind`、`complexity`、`recommended_action`/`recommended_mode`/`recommended_stage`、`cognition_calls_total` |
+| `cognition-consult` | 认知判断入口：材料 + 问题 → 一次请求 → 目标理解/问题本质/路线与取舍/风险/调查方向/再咨询条件；建议写入统一 `cognition_calls`（`mode=CONSULT`），不入门禁；失败只登记并降级 | `--materials <file>`（调度执行时可省略）、`--question`（必填，`--obligation` 时回落到义务问题）、`--stage <understanding\|planning\|development\|stage\|closure>`、`--obligation SO<n>`（按调度义务执行，材料由状态确定性生成）、`--lock-timeout <秒>`、`--knowledge-file`、`--dry-run`、`--list`、`--json`、`--timeout`、`--max-output-tokens`、`--audit-log`（默认 `cognition-audit.jsonl`）、`--output-dir`、`--ignore-backoff`（默认在上游退避窗口内不发请求；仅在上游已确认恢复时显式使用，仍然只发一次、不重试）；模型固定 `gpt-6.2-astra`，没有 `--model` 开关；再次调用：`--force --trigger <user-request\|scope-changed\|new-risk\|materials-omitted\|strategy-failed\|major-uncertainty\|stage-result> --reason` |
+| `cognition-plan` | 认知调查后规划判断：方案比较、取舍、优先级、阶段目标与验收关注点；记录写入统一 `cognition_calls`（`mode=PLAN`） | 参数同 `cognition-consult`；省略 `--stage` 时默认 `planning` |
+| ~~`sol-consult`~~ | v9.10.0 已移除（不保留跳转表，解析阶段即拒绝）；改用 `cognition-consult`，`--sol` 也改用 `--cognition` | — |
+| `cognition-accept` | 回填主代理对认知建议的采纳结论（事实记录，不改变阶段、G1–G3 或授权）。v2 记录含实际决策、理由、modified 差异、证据引用与 `advice_ref`；缺项只给非阻断提示。`--historical` 只用于**已收口**任务的历史复核：`--status pending` 必须配 `--reason`（可加 `--reason-code`），重复执行幂等、不覆盖既有已决结论、不把已决结论降级为 `pending`；不因代码已改、测试通过或任务 PASS 推断采纳 | `--call-id SC...`、`--status accepted\|modified\|rejected\|pending`、`--decision`、`--rationale`（省略回落 `--reason`）、`--delta`、`--evidence-ref E1,E3`（可重复/逗号分隔，指向本任务已登记证据）、`--source-ref`（报告章节/文件路径，只定位不核验）、`--evidence-note`、`--note`、`--reason`、`--reason-code`、`--historical`、`--decided-by`（默认 `zcode`）、`--json` |
+| `cognition-schedule` | 认知生命周期调度视图（只读）：义务清单、漏调、终态处置与所属周期、下一条可执行项与可直接粘贴的命令；`--execute` 时有界执行 1 条 `recommended` 义务（1 次请求，失败只记录）；同时显示当前上游退避窗口（窗口内不发起新请求） | `--state`、`--execute`、`--json`、`--cognition auto\|advise\|off`；不带 `--execute` 不写状态 |
+| `cognition-stats` | 认知调度覆盖率（显式分母）：建议/执行/复用/跳过/失败/漏调/未登记分开统计，含事件分布、采纳分布、义务终态处置与周期分布、tokens（输入/输出/reasoning/总）与延迟、`by_model`（请求数/完成/失败/Token/p50/p95/重复调用）与 `reuse`（命中数、按模型） | `--state` 或 `--workspace <根>`（聚合 `.copilot-tasks/*/state.json`）、`--json` |
 | `agent-policy` | Agent 调度建议：主代理默认，Explore/general-purpose 按需（只读、不派发）。判定顺序：子代理不可用 → 主代理；写入冲突 → 主代理；`--research-only` → Explore（绝不交给全工具代理）；独立交付物需并发且有收益才建议 general-purpose；其余 → 主代理 | `--needs-independent-context`、`--parallel`、`--independent-deliverable`、`--write-conflict`、`--saves-time`、`--research-only`、`--subagent-unavailable`、`--json` |
 | `finding` | 查看 / 更新 Finding 台账（不触发复核） | `--list`；`--id F1 --status open\|fixed\|verified\|closed\|regressed\|dropped --evidence E1[,E2] --note`；`fixed`/`verified` 必须有证据，多个证据可用逗号分隔；回填成功后按续跑判定返回 10 |
-| `review-metrics` | 统计统一 SOL 调用流（`sol.calls_total` / `sol.by_mode`）、准入门槛、停止标记与 Finding 计数 | `--state`；历史 G4 数据标记 `g4.retired` |
+| `review-metrics` | 统计统一认知调用流（`cognition.consult_total` / `cognition.plan_total` / `cognition.failed` / `cognition.modes`）、准入门槛、停止标记与 Finding 计数 | `--state`；历史 G4 数据标记 `g4.retired` |
 | `closure` | 收口：G1–G3 通过与**最终工程验证完成**（`closure_readiness`：工作项终态、条件核销、证据、合同必要测试的执行痕迹、finding 台账）都必须满足；验证有缺口时失败关闭（退出码 1）；补完后同一条命令先做收口 CONSULT、再由主代理
-`sol-accept` 登记独立判断，才能收口（`closure_acceptance_pending` 未满足时失败关闭） | `--close`、`--by`、`--sol auto\|advise\|off` |
+`cognition-accept` 登记独立判断，才能收口（`closure_acceptance_pending` 未满足时失败关闭） | `--close`、`--by`、`--cognition auto\|advise\|off` |
 | `reopen` | 用户授权后重开 | `--reason`（必填，写用户原话/要求）、`--authorized-by user`（必填；调用方自报声明，不是凭证）；`reopen_history` 标注 `authorization_source=caller-declared` |
 | `handoff` | 只读列出生效交付清单：分支/HEAD/上游、已暂存、未暂存、未跟踪分类 | `--state`（可选）、`--cwd`、`--limit`、`--json`；不提交、不删除、不改 `.gitignore` |
 | `contract` | 查看/修订合同与条件 | `--show`、`--amend --contract-file/--criteria-file`、`--test-policy`/`--test-policy-file`（省略则保留原策略）、`--authorized-by user` + `--authorization-note "用户要求"`（破坏性修订必需）；BLOCKED 时也可修订；登记源文件摘要，文件被改动时 `status` 给出非阻断提醒。**破坏性修订**指待核销条件净减少（删掉未满足条件）或放松 `test_policy`，没有用户授权或未写明用户要求时 fail-closed；改写措辞/拆分/合并但只要不减少待核销条数不需要授权。合同历史记录 `authorized_by`、`authorization_source=caller-declared`、授权说明、新增/删除的未核销条数与被删除条件及旧指纹。`--authorized-by` 是调用方自报声明，不是可验证凭证：审计时须以用户原话/授权说明为准 |
@@ -226,7 +226,7 @@ python3 -B scripts/copilot_auto.py ingest --state <state.json> [--result-file f]
 - `--result-file`：`copilot-native-result/v2` 执行信封；校验绑定与证据后回填工作项状态，
   重复回填同一 `result_sha256` 是幂等成功。
 - 复核不再经 `ingest`：原生复核信封已随 G4 退役，`--review-file` 参数已移除；独立复核
-  使用 `sol-review`（SOL 零工具单轮复核，advisory）。
+  使用 `cognition-review`（SOL 零工具单轮复核，advisory）。
 - 被拒绝时退出码 12，错误码写在 stderr，状态不被部分写入。
 
 ## 4. 标准回合
@@ -259,17 +259,17 @@ python3 -B scripts/copilot_auto.py drive --state T/state.json    # PASS → 0
 
 PARTIAL 时不需要额外命令：直接再次 `drive`，由本地派生工作项。
 
-收口顺序是**最终工程验证 → 收口 CONSULT → ZCode `sol-accept` 独立验收 → G1–G3 收口**：
+收口顺序是**最终工程验证 → 收口 CONSULT → ZCode `cognition-accept` 独立验收 → G1–G3 收口**：
 `drive` 在 PASS 但验证有缺口（例如合同 `test_policy.required=true` 却没有 `--capture-cmd`
-证据）时打印缺口并返回 10，不执行 SOL、不收口；补齐测试与证据后再 `drive`（或
-`closure --close`）即自动执行一次收口 CONSULT，然后停在 `EXIT_EXECUTE` 等 `sol-accept`。
-手动 `sol-consult --stage closure` 同样被缺口与“摘要不符”拒绝。
+证据）时打印缺口并返回 10，不执行认知、不收口；补齐测试与证据后再 `drive`（或
+`closure --close`）即自动执行一次收口 CONSULT，然后停在 `EXIT_EXECUTE` 等 `cognition-accept`。
+手动 `cognition-consult --stage closure` 同样被缺口与“摘要不符”拒绝。
 
-### SOL 失败分类与上游退避窗口
+### 认知失败分类与上游退避窗口
 
-一次 SOL 调用失败时，Copilot 保留原始 HTTP 状态、上游错误码与 `Retry-After`（数值化后的
-秒数 + 原始文本 `retry_after_raw`），并归入十类 `error_class`（写入 `sol-audit.jsonl` 与
-`sol_calls`）：
+一次认知调用失败时，Copilot 保留原始 HTTP 状态、上游错误码与 `Retry-After`（数值化后的
+秒数 + 原始文本 `retry_after_raw`），并归入十类 `error_class`（写入 `cognition-audit.jsonl` 与
+`cognition_calls`）：
 
 | `error_class` | 典型来源 | 处理 |
 |---|---|---|
@@ -288,21 +288,20 @@ PARTIAL 时不需要额外命令：直接再次 `drive`，由本地派生工作�
 单例只读兼容且不冻结 Astra）：
 
 - **服务端 `Retry-After` 是最短等待时间**：有效值（秒、毫秒、HTTP-date）原样遵守，
-  **不被** 1800 秒上限、也不被 `COPILOT_SOL_BACKOFF_MAX` 缩短。HTTP-date 按 UTC（缺失时区
+  **不被** 1800 秒上限、也不被 `COPILOT_COGNITION_BACKOFF_MAX` 缩短。HTTP-date 按 UTC（缺失时区
   按 GMT）换算为剩余秒数；已过期或无法解析时不用它，退回本地策略。
 - **本地策略才有上限**：没有有效服务端值时按 `error_class` 取默认窗口（60 秒），
-  该值受 `COPILOT_SOL_BACKOFF_MAX`（只能下调，不能调高或关闭）与 1800 秒上限约束。
+  该值受 `COPILOT_COGNITION_BACKOFF_MAX`（只能下调，不能调高或关闭）与 1800 秒上限约束。
 - 窗口记录 `until`（绝对恢复时间）、`seconds`、`reason`（`retry-after` / `error-class`）、
   原始 `retry_after_raw` 与 `call_id`，失败记录同时保留同样字段供审计追溯。
-- **不是门禁**：不改变阶段、条件、G1–G3，也不派生工作项；窗口期内 `sol-schedule --execute`
+- **不是门禁**：不改变阶段、条件、G1–G3，也不派生工作项；窗口期内 `cognition-schedule --execute`
   与自动调度只登记义务 deferral，不发请求。
-- **按模型隔离**：SOL 过载不冻结 Astra，Astra 过载不阻塞显式 SOL 调用；`Retry-After` 逐模型
+- **按模型隔离**：认知过载不冻结 Astra，Astra 过载不阻塞显式认知调用；`Retry-After` 逐模型
   独立遵守；成功调用只清除本模型的窗口。
-- 成功调用自动清除；手动 `sol-consult` / `sol-plan` / `sol-review` 在窗口内直接拒绝并说明剩余时间，
+- 成功调用自动清除；手动 `cognition-consult` / `cognition-plan` / `cognition-review` 在窗口内直接拒绝并说明剩余时间，
   确需立即重试必须在确认上游已恢复后显式加 `--ignore-backoff`（仍然只发一次、不重试）。
 - **跨阶段、跨进程、跨会话一致**：窗口写在任务 `state.json`，不依赖内存、会话绑定或锁；
-  startup 失败后 plan 与 closure 在窗口内只登记 deferral，新会话恢复、`--resume` 或人工执行
-  SOL 命令同样遵守，窗口到期后自动恢复既有调度频率（不降低 startup / plan / closure 频率）。
+  startup 失败后 plan 与 closure 在窗口内只登记 deferral，新会话恢复、`--resume` 或人工执行认知命令同样遵守，窗口到期后自动恢复既有调度频率（不降低 startup / plan / closure 频率）。
 - 失败只登记降级：CONSULT / PLAN 失败退出 0，主代理按既有授权继续工程推进；REVIEW 失败返回
   真实非零退出码。
 
@@ -343,7 +342,7 @@ v7 及更早的高风险任务通过 `review-context --create-attempt`、`native
 `capability` 与 `copilot_auto.py ingest --review-file` 完成原生只读复核；这些命令与
 `g4_attest`/`g4_shadow`/`test_execution` 已在 v8.0.0 删除。历史状态中的
 `native_reviews` / `review_attempts` / `g4_attestations` 只读保留，不参与当前门禁。
-现在需要独立意见时，按第 2 节用 `sol-review` 执行一次；它的 findings 进入 Finding 台账，
+现在需要独立意见时，按第 2 节用 `cognition-review` 执行一次；它的 findings 进入 Finding 台账，
 由主代理修复并用定向测试验证。
 
 ## 6. 历史只读
@@ -391,7 +390,7 @@ python3 -B scripts/efficiency_report.py --workspace /path/to/ws [--workspace /pa
 | `result_sha_mismatch` | 信封内容与 `result_sha256` 不符；重新生成信封 |
 | `evidence_tampered` / `evidence_sha_changed` | 证据文件变化或引用摘要不符；用新证据登记，不覆盖旧记录 |
 | `evidence_foreign` | 证据属于其他任务；使用本任务证据 |
-| `native_review_retired` | 使用了已退役的原生复核信封；改用 `sol-review` |
+| `native_review_retired` | 使用了已退役的原生复核信封；改用 `cognition-review` |
 | `schema_retired` | 使用了 v1 信封；改成 v2 |
 | CAS 并发冲突（无单独错误码） | `save_seq` 比较交换发现其他进程已写入；重新读取状态后重做本步 |
 

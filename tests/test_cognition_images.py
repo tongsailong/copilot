@@ -21,7 +21,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(os.path.dirname(HERE), "scripts"))
 
-import sol_review as SR  # noqa: E402
+import cognition_call as CC  # noqa: E402
 
 
 def png_bytes(width: int = 2, height: int = 2,
@@ -42,7 +42,7 @@ def png_bytes(width: int = 2, height: int = 2,
 
 def cognitive_reply() -> str:
     payload = {
-        "schema": SR.THINK_SCHEMA,
+        "schema": CC.THINK_SCHEMA,
         "judgment": "先看真实像素再判断",
         "goal_understanding": "确认设计是否真的改进",
         "essence": "判断依赖实际画面",
@@ -67,7 +67,7 @@ def cognitive_reply() -> str:
 def fake_transport(response_text: str):
     def transport(url, key, body, timeout):
         return {
-            "model": SR.MODEL,
+            "model": CC.MODEL,
             "status": "completed",
             "output": [{"type": "message", "status": "completed",
                         "content": [{"type": "output_text",
@@ -92,30 +92,30 @@ class ImagePayloadTests(unittest.TestCase):
         return path
 
     def test_text_payload_keeps_string_input(self):
-        payload = SR.build_payload("only text")
+        payload = CC.build_payload("only text")
         self.assertIsInstance(payload["input"], str)
         self.assertEqual(payload["tool_choice"], "none")
 
     def test_image_payload_uses_content_blocks_in_order(self):
         first = self.write("a.png", png_bytes(3, 4))
         second = self.write("b.png", png_bytes(5, 6, (10, 20, 30, 255)))
-        images = SR.load_images([first, second], labels=["P1 默认", "P2 空态"])
-        payload = SR.build_payload("materials", images=images)
+        images = CC.load_images([first, second], labels=["P1 默认", "P2 空态"])
+        payload = CC.build_payload("materials", images=images)
         self.assertIsInstance(payload["input"], list)
         blocks = payload["input"][0]["content"]
         self.assertEqual([b["type"] for b in blocks],
                          ["input_text", "input_image", "input_image"])
         self.assertEqual(blocks[0]["text"], "materials")
         self.assertTrue(blocks[1]["image_url"].startswith("data:image/png;base64,"))
-        meta = SR.image_public_metadata(images)
+        meta = CC.image_public_metadata(images)
         self.assertEqual([m["label"] for m in meta], ["P1 默认", "P2 空态"])
         self.assertEqual((meta[0]["width"], meta[0]["height"]), (3, 4))
         self.assertEqual((meta[1]["width"], meta[1]["height"]), (5, 6))
 
     def test_public_metadata_has_no_pixels_or_path(self):
         path = self.write("a.png", png_bytes())
-        images = SR.load_images([path])
-        meta = SR.image_public_metadata(images)
+        images = CC.load_images([path])
+        meta = CC.image_public_metadata(images)
         blob = json.dumps(meta, ensure_ascii=False)
         self.assertNotIn("base64", blob)
         self.assertNotIn("data_url", blob)
@@ -125,53 +125,53 @@ class ImagePayloadTests(unittest.TestCase):
     def test_digest_changes_with_pixels_and_labels(self):
         one = self.write("a.png", png_bytes(2, 2))
         two = self.write("b.png", png_bytes(3, 3))
-        first = SR.load_images([one])
-        second = SR.load_images([two])
-        self.assertNotEqual(SR.images_digest(first), SR.images_digest(second))
-        relabeled = SR.load_images([one], labels=["换了说明"])
-        self.assertNotEqual(SR.images_digest(first), SR.images_digest(relabeled))
+        first = CC.load_images([one])
+        second = CC.load_images([two])
+        self.assertNotEqual(CC.images_digest(first), CC.images_digest(second))
+        relabeled = CC.load_images([one], labels=["换了说明"])
+        self.assertNotEqual(CC.images_digest(first), CC.images_digest(relabeled))
 
     def test_rejects_unsupported_format(self):
         path = self.write("fake.gif", b"GIF89a" + b"\x00" * 32)
-        with self.assertRaises(SR.SolUsageError) as ctx:
-            SR.load_images([path])
-        self.assertEqual(ctx.exception.code, "sol_image_format_unsupported")
+        with self.assertRaises(CC.CognitionUsageError) as ctx:
+            CC.load_images([path])
+        self.assertEqual(ctx.exception.code, "cognition_image_format_unsupported")
 
     def test_rejects_missing_file(self):
-        with self.assertRaises(SR.SolUsageError) as ctx:
-            SR.load_images([os.path.join(self.tmp.name, "nope.png")])
-        self.assertEqual(ctx.exception.code, "sol_image_missing")
+        with self.assertRaises(CC.CognitionUsageError) as ctx:
+            CC.load_images([os.path.join(self.tmp.name, "nope.png")])
+        self.assertEqual(ctx.exception.code, "cognition_image_missing")
 
     def test_rejects_too_many_images(self):
         paths = [self.write(f"{i}.png", png_bytes()) for i in range(7)]
-        with self.assertRaises(SR.SolUsageError) as ctx:
-            SR.load_images(paths)
-        self.assertEqual(ctx.exception.code, "sol_image_count_exceeded")
+        with self.assertRaises(CC.CognitionUsageError) as ctx:
+            CC.load_images(paths)
+        self.assertEqual(ctx.exception.code, "cognition_image_count_exceeded")
 
     def test_rejects_label_mismatch(self):
         path = self.write("a.png", png_bytes())
-        with self.assertRaises(SR.SolUsageError) as ctx:
-            SR.load_images([path], labels=["a", "b"])
-        self.assertEqual(ctx.exception.code, "sol_image_label_mismatch")
+        with self.assertRaises(CC.CognitionUsageError) as ctx:
+            CC.load_images([path], labels=["a", "b"])
+        self.assertEqual(ctx.exception.code, "cognition_image_label_mismatch")
 
     def test_rejects_invalid_block_structure(self):
-        with self.assertRaises(SR.SolUsageError) as ctx:
-            SR.build_payload("text", images=[{"mime": "image/png"}])
-        self.assertEqual(ctx.exception.code, "sol_image_invalid")
+        with self.assertRaises(CC.CognitionUsageError) as ctx:
+            CC.build_payload("text", images=[{"mime": "image/png"}])
+        self.assertEqual(ctx.exception.code, "cognition_image_invalid")
 
 
 class ImageAuditTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        self.audit = os.path.join(self.tmp.name, "sol-audit.jsonl")
+        self.audit = os.path.join(self.tmp.name, "cognition-audit.jsonl")
 
     def test_audit_records_fingerprint_not_pixels(self):
         path = os.path.join(self.tmp.name, "shot.png")
         with open(path, "wb") as fh:
             fh.write(png_bytes(4, 5))
-        images = SR.load_images([path], labels=["P1 默认 1.0"])
-        result = SR.run_sol(
+        images = CC.load_images([path], labels=["P1 默认 1.0"])
+        result = CC.run_cognition(
             "materials", mode="CONSULT", audit_log=self.audit,
             transport=fake_transport(cognitive_reply()),
             api_key="test-key", base_url="http://127.0.0.1:8317/v1",
@@ -190,7 +190,7 @@ class ImageAuditTests(unittest.TestCase):
         self.assertEqual(record["images"][0]["sha256"], images[0]["sha256"])
 
     def test_text_call_audit_still_marks_text_input(self):
-        result = SR.run_sol(
+        result = CC.run_cognition(
             "materials", mode="CONSULT", audit_log=self.audit,
             transport=fake_transport(cognitive_reply()),
             api_key="test-key", base_url="http://127.0.0.1:8317/v1")

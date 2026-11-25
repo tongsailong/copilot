@@ -1,5 +1,10 @@
 # Copilot Skill 版本与历史（历史记录）
 
+> **术语说明（v9.10.0，2026-11-25）**：本文件保留历史原文。SOL 术语与 `sol_*` 文件名、`sol-*`
+> 命令名、`sol_calls`/`sol_reuses`/`sol_schedule` 状态键已统一为“认知 / cognition”，
+> `gpt-6.2-sol` 与 `--model` 已移除，认知只剩 `gpt-6.2-astra` 单一模型。历史段落里的
+> 旧名只作事实与审计记录，不代表当前角色、模型、命令或默认配置。
+
 > 本文件记录版本沿革与 SOL 通道变化过程，供追溯，**不是当前规则来源**。现行规则见
 > `SKILL.md`、`references/workflow.md`、`runtime.md`、`review.md`、`agent-bridge.md`。
 > **SOL 决策通道已于 v6.0.0（2026-11-12）退役；v7.0.0（2026-11-17）只恢复一次性 REVIEW

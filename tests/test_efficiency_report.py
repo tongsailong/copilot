@@ -33,7 +33,7 @@ def write(path: str, text: str) -> None:
 def task_state(*, task_id: str, closed: bool, created: str, updated: str,
                closed_at: str = "", verdict: str = "",
                criteria: list | None = None, actions: list | None = None,
-               evidence: list | None = None, sol_calls: list | None = None,
+               evidence: list | None = None, cognition_calls: list | None = None,
                obligations: list | None = None,
                reopen: int = 0) -> dict:
     return {
@@ -53,8 +53,8 @@ def task_state(*, task_id: str, closed: bool, created: str, updated: str,
         "contract": {"criteria": criteria or []},
         "actions": actions or [],
         "evidence": evidence or [],
-        "sol_calls": sol_calls or [],
-        "sol_schedule": {"obligations": obligations or []},
+        "cognition_calls": cognition_calls or [],
+        "cognition_schedule": {"obligations": obligations or []},
         "blocks": [],
     }
 
@@ -121,7 +121,7 @@ class EfficiencyReportTests(unittest.TestCase):
                       "rerun_count": 2}],
             evidence=[{"id": "E1", "dropped": False},
                       {"id": "E2", "dropped": True}],
-            sol_calls=[call, pending],
+            cognition_calls=[call, pending],
             obligations=[{"window": "closed"}, {"window": "open"}],
             reopen=1))
         self._task("open", task_state(
@@ -144,13 +144,13 @@ class EfficiencyReportTests(unittest.TestCase):
                          0.5)
         self.assertEqual(
             self.metric(report, "evidence_reuse_ratio")["basis"], "proxy")
-        self.assertEqual(self.metric(report, "sol_calls")["value"], 2)
-        self.assertEqual(self.metric(report, "sol_tokens")["value"], 2000)
-        self.assertEqual(self.metric(report, "sol_latency_p50")["value"], 4000.0)
+        self.assertEqual(self.metric(report, "cognition_calls")["value"], 2)
+        self.assertEqual(self.metric(report, "cognition_tokens")["value"], 2000)
+        self.assertEqual(self.metric(report, "cognition_latency_p50")["value"], 4000.0)
         self.assertEqual(
-            self.metric(report, "sol_acceptance_recorded")["value"], 1)
+            self.metric(report, "cognition_acceptance_recorded")["value"], 1)
         self.assertEqual(
-            self.metric(report, "sol_acceptance_pending")["value"], 1)
+            self.metric(report, "cognition_acceptance_pending")["value"], 1)
         self.assertEqual(self.metric(report, "obligations_open")["value"], 1)
         self.assertEqual(self.metric(report, "urging_count")["basis"],
                          "unavailable")

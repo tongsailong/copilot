@@ -7,7 +7,7 @@
   task / contract / plan（不再绑定任何远程模型轮次）；
 * RESULT：执行方回传实际结果、原始证据文件及其 SHA-256、运行元数据。
 
-独立模型复核由 SOL 零工具单轮复核（`sol_review.py`）承担。v7 及更早的原生复核
+独立模型复核由认知零工具单轮复核（`cognition_call.py`）承担。v7 及更早的原生复核
 信封（`copilot-native-review/*`）与 G4 资格链已随 G4 退役；本模块不再接受或校验
 复核信封，历史复核记录只作为状态里的审计数据保留。
 
@@ -152,7 +152,7 @@ def classify_native_result(envelope: object) -> str:
         return "execution"
     if schema == REVIEW_SCHEMA:
         _fail("native_review_retired",
-              "原生复核信封已随 G4 退役；独立复核请用 sol-review（SOL 零工具单轮）。")
+              "原生复核信封已随 G4 退役；独立复核请用 cognition-review（认知零工具单轮）。")
     if schema in LEGACY_SCHEMAS:
         _fail("schema_retired",
               f"{schema} 属于 v1 SOL 通道，已退役；历史记录请用 legacy-status 只读查看。")
@@ -320,7 +320,7 @@ def validate_dispatch(envelope: object, state: dict, *,
     schema = str(env.get("schema") or "").strip()
     if schema in LEGACY_SCHEMAS:
         _fail("schema_retired",
-              f"{schema} 属于 v1 SOL 通道，已退役；不能用于 v6 派发。")
+              f"{schema} 属于 v1 认知通道，已退役；不能用于 v6 派发。")
     if schema != DISPATCH_SCHEMA:
         _fail("schema_invalid", f"dispatch schema 必须是 {DISPATCH_SCHEMA}。")
     task_id, contract = _require_state_credential(state)
@@ -513,7 +513,7 @@ def validate_execution_result(envelope: object, dispatch: dict | None, state: di
     schema = str(env.get("schema") or "").strip()
     if schema in LEGACY_SCHEMAS:
         _fail("schema_retired",
-              f"{schema} 属于 v1 SOL 通道，已退役；不能用于 v6 回填。")
+              f"{schema} 属于 v1 认知通道，已退役；不能用于 v6 回填。")
     if schema != RESULT_SCHEMA:
         _fail("schema_invalid", f"execution schema 必须是 {RESULT_SCHEMA}。")
     if not isinstance(dispatch, dict):

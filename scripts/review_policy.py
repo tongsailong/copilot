@@ -26,7 +26,7 @@ import re
 
 LEDGER_SCHEMA = "copilot-finding-ledger/v1"
 COMPLEXITY_SCHEMA = "copilot-task-complexity/v2"
-SOL_ADVICE_SCHEMA = "copilot-sol-advice/v4"
+COGNITION_ADVICE_SCHEMA = "copilot-cognition-advice/v4"
 
 # 任务认知复杂度只使用状态里已有的确定性事实：不引入第二个模型，也不引入
 # 评分模型。每个信号都对应一条可复核的现场证据；0 个信号即低复杂度。
@@ -38,9 +38,9 @@ COMPLEXITY_SIGNALS = {
     "interdependent": "多个工作项相互依赖",
     "replan-history": "曾出现方案失败并重新规划",
     "reopened": "任务曾重开",
-    "user-request": "用户明确要求 SOL 判断或独立复核",
+    "user-request": "用户明确要求认知判断或独立复核",
 }
-# 任务类型不是“复杂度信号”，而是默认路由前提：非简单类型始终进入 SOL 认知
+# 任务类型不是“复杂度信号”，而是默认路由前提：非简单类型始终进入认知
 # 流程（至少一次 CONSULT），简单类型只有出现真实升级信号才进入。这样默认
 # standard 任务不会仅凭类型被抬到 high，也不会默认跳过复杂任务。
 
@@ -48,14 +48,14 @@ COMPLEXITY_SIGNALS = {
 # （工作项数量、依赖、目录、声明的触发因素）只用于判断复杂度：开发过程中证据
 # 目录或计划条目增加不代表需要重新判断；范围变化走合同修订（合同指纹变化即
 # 旧结论不再覆盖）。
-SOL_ESCALATION_SIGNALS = ("risk-high", "replan-history", "reopened")
+COGNITION_ESCALATION_SIGNALS = ("risk-high", "replan-history", "reopened")
 
 # ── 生命周期事件（v9.6 主动调度）──────────────────────────────────────────
 # 事件是“认知窗口”的稳定身份，不是复杂度信号。每个事件必须有一条可归因的现场
 # 判据：要么来自状态里已存在的确定性事实（工作项/条件/台账/合同/重开/风险），
 # 要么来自主代理显式登记的影响判断。普通证据追加、备注措辞变化、常规验收进展
 # 都不构成事件，避免把“有变化”误当成“需要重新判断”。
-SOL_EVENTS = {
+COGNITION_EVENTS = {
     "startup": "任务启动：理解目标、隐含需求、问题本质与主要风险",
     "plan-needed": "调查已形成现场事实且存在实质方案决策",
     "material-evidence-change": "实质证据变化：已验证结论被推翻或修复复现",
@@ -71,9 +71,9 @@ SOL_EVENTS = {
 }
 # 事件到生命周期窗口的归属由生命周期判断自身给出（义务里带 family）；
 # 六类动态事件在执行期按新增事实追加，不与启动/规划/里程碑/收口重复计数。
-SOL_FAMILIES = ("A", "B", "C", "D", "E")
+COGNITION_FAMILIES = ("A", "B", "C", "D", "E")
 # 事件 → 追加调用时使用的 --trigger（与 single_round 的触发口径一致）。
-SOL_EVENT_TRIGGERS = {
+COGNITION_EVENT_TRIGGERS = {
     "material-evidence-change": "new-evidence",
     "decision-point": "new-evidence",
     "risk-escalation": "new-risk",
@@ -109,10 +109,10 @@ ADMISSION_TRIGGERS = {
     "release": "高风险发布或不可逆操作",
 }
 
-# 任务类型只用于判断“是否默认进入 SOL 认知流程”，不是工作量估算，也不是
+# 任务类型只用于判断“是否默认进入认知流程”，不是工作量估算，也不是
 # 新的门禁。只有同时满足目标明确、范围很小、实现方式明确、没有重要取舍、
 # 风险低、不需要复杂分析的任务才允许归入简单类型；未声明的任务按 standard
-# 处理（非简单），复杂度不确定时默认调用 SOL。
+# 处理（非简单），复杂度不确定时默认调用认知。
 TASK_KINDS = {
     "trivial": "单个文字、注释或符号修改",
     "mechanical": "已知原因的简单机械修复或常规维护",
@@ -299,7 +299,7 @@ def merge_review(state: dict, review: dict, *, at: str = "",
                  authoritative: bool = True) -> dict:
     """把一条复核的 findings 合并进稳定台账。
 
-    `authoritative=False`（advisory 复核，例如 SOL）只能新增或重复报告 finding，
+    `authoritative=False`（advisory 复核，例如认知）只能新增或重复报告 finding，
     不能把已有问题改成 verified；否则一条参考性结论就能清掉 blocking/major。
     若参考性复核把已关闭的 minor/info 提级为 blocking/major，则允许标为
     regressed（重新阻断，不是清除）。真正的生命周期推进必须来自 ZCode 用定向
@@ -340,7 +340,7 @@ def merge_review(state: dict, review: dict, *, at: str = "",
                 "line": finding.get("line"),
                 "summary": _text(finding.get("summary")),
                 "status": "open",
-                # SOL 复核只提供建议（advisory）；v7 及更早的正式复核记录
+                # 认知复核只提供建议（advisory）；v7 及更早的正式复核记录
                 # （authoritative）仍按原保护级别读取。advisory 的 blocking/major
                 # 可以由主代理在给出反证后 dismiss；authoritative 的只能修复并
                 # 定向验证。
@@ -483,7 +483,7 @@ def merge_review(state: dict, review: dict, *, at: str = "",
             # 执行方一句说明 dismiss（历史 G4 记录与显式权威调用仍适用）。
             item["authority"] = "authoritative"
         else:
-            # 参考性（SOL）复核不能降低已有条目的保护级别。v7 之前的台账条目
+            # 参考性（认知）复核不能降低已有条目的保护级别。v7 之前的台账条目
             # 没有 authority 字段，它们来自正式复核，必须保守按 authoritative
             # 处理；只有 advisory 复核新建的条目才带 advisory。
             item.setdefault("authority", "authoritative")
@@ -719,11 +719,11 @@ def ledger_summary(state: dict) -> dict:
     }
 
 
-# ── SOL 主动介入：任务认知复杂度与调用建议 ──────────────────────────────────
+# ── 认知主动介入：任务认知复杂度与调用建议 ──────────────────────────────────
 #
 # 目标不是增加调用量，而是让真正值得认知推理的任务在**足够了解现场之后**主动获得
-# 一次 SOL 帮助，同时让简单任务保持 0 调用。判断只使用状态里已有的事实：
-# 风险、声明的触发因素、计划结构、证据目录、重规划与重开历史。SOL 仍是 advisory，
+# 一次认知帮助，同时让简单任务保持 0 调用。判断只使用状态里已有的事实：
+# 风险、声明的触发因素、计划结构、证据目录、重规划与重开历史。认知判断仍是 advisory，
 # 这里的任何建议都不参与 G1–G3，也不产生阻塞性工作项。
 def _action_list(state: dict, *, plan_only: bool = False) -> list[dict]:
     """工作项视图；`plan_only` 只保留 ZCode 登记的计划项（排除治理派生项）。"""
@@ -782,11 +782,11 @@ def task_complexity(state: dict, *, triggers: list[str] | None = None,
                     workspace: str = "") -> dict:
     """确定性的任务认知复杂度：只用状态事实，不调用任何模型。
 
-    低复杂度（0 个信号）＝简单/局部改动：SOL 默认 0 调用。
+    低复杂度（0 个信号）＝简单/局部改动：认知默认 0 调用。
     1 个信号＝中等复杂度：值得一次主动认知辅助。
     2 个及以上＝高复杂度：优先在策略/方案阶段用一次判断收敛。
 
-    未声明或声明为标准类型时按非简单处理：复杂度不确定时默认调用 SOL，而不是
+    未声明或声明为标准类型时按非简单处理：复杂度不确定时默认调用认知，而不是
     默认跳过。简单类型也必须由风险、触发因素、计划结构与证据范围共同确认。
     """
     codes: list[str] = []
@@ -879,7 +879,7 @@ def _call_stage(record: dict) -> str:
         or "development"
 
 
-def sol_progress_key(state: dict) -> str:
+def cognition_progress_key(state: dict) -> str:
     """阶段复盘的进度键：工作项状态、证据身份与条件状态的最小投影。
 
     同一进度下不重复建议阶段复盘；新增证据、工作项推进或条件变化后，才构成
@@ -968,7 +968,7 @@ def plan_admission(state: dict, *, triggers: list[str] | None = None,
     }
 
 
-def sol_event_snapshot(state: dict) -> dict:
+def cognition_event_snapshot(state: dict) -> dict:
     """事件判据的确定性快照，用于与上次认知调用比较是否出现新的认知对象。
 
     只使用状态里已有的可归因事实：台账中复现的 finding、曾经 met 又被回退的
@@ -995,7 +995,7 @@ def sol_event_snapshot(state: dict) -> dict:
         for index, item in enumerate(state.get("decisions") or [])
         if isinstance(item, dict))
     # Block facts are normalized and keyed by stable block ID. Status transitions
-    # (active, changed reason/needs, resolved) are compared to the last SOL snapshot.
+    # (active, changed reason/needs, resolved) are compared to the last 认知 snapshot.
     blocks = []
     for item in state.get("blocks") or []:
         if not isinstance(item, dict):
@@ -1053,7 +1053,7 @@ def closure_key(state: dict) -> str:
     因证据增删或时间推移重复付费。调用记录与建议使用同一个函数，避免两处口径
     漂移导致“刚收口完又建议收口”。
     """
-    snapshot = sol_event_snapshot(state)
+    snapshot = cognition_event_snapshot(state)
     return sha256_text(canonical_json(
         [snapshot["contract_sha256"], snapshot["reopen_seq"]]))[:16]
 
@@ -1063,7 +1063,7 @@ def _new_items(current: list[str], previous: list[str]) -> list[str]:
     return [item for item in current if item not in known]
 
 
-def sol_events(state: dict, snapshot: dict, last: dict | None) -> list[dict]:
+def cognition_events(state: dict, snapshot: dict, last: dict | None) -> list[dict]:
     """当前成立的生命周期事件及其“是否新增”。
 
     `last` 是上一次认知调用保存的事件快照。没有快照的旧记录退回复杂度信号口径，
@@ -1097,7 +1097,7 @@ def sol_events(state: dict, snapshot: dict, last: dict | None) -> list[dict]:
                        if isinstance(item, dict) and item.get("block_id")}
     # 只有“仍未解除的阻塞”构成认知事件：新增阻塞、阻塞条件被改写、已解除的阻塞
     # 重新生效都会改变可推进边界。单纯解除不触发——它意味着被冻结的工作恢复，
-    # 由主代理按既有计划继续推进，不需要 SOL 再判断一次，否则每次解除阻塞都会
+    # 由主代理按既有计划继续推进，不需要认知再判断一次，否则每次解除阻塞都会
     # 制造一次重复付费。
     block_changes = []
     for current in snapshot.get("blocks") or []:
@@ -1182,35 +1182,35 @@ def _signals_to_events(codes: list[str]) -> list[dict]:
                  "reopened": "reopened"}.get(code)
         if event:
             rows.append({"code": event, "instance": code,
-                         "detail": SOL_EVENTS[event], "facts": {}})
+                         "detail": COGNITION_EVENTS[event], "facts": {}})
     return rows
 
 
 def _advice_command(mode: str, *, second_round: bool, trigger: str,
                     stage: str = "") -> str:
     if mode == "REVIEW":
-        command = ("copilot_dispatch.py sol-review --state <state> "
+        command = ("copilot_dispatch.py cognition-review --state <state> "
                    "--materials <materials.md>")
     elif mode == "PLAN":
-        command = ("copilot_dispatch.py sol-plan --state <state> "
+        command = ("copilot_dispatch.py cognition-plan --state <state> "
                    "--materials <materials.md> "
                    "--question <本次需要规划判断的事项>")
     else:
         stage_value = stage or "development"
-        command = ("copilot_dispatch.py sol-consult --state <state> "
+        command = ("copilot_dispatch.py cognition-consult --state <state> "
                    "--materials <materials.md> --stage " + stage_value +
-                   " --question <本次真正需要 SOL 判断的事项>")
+                   " --question <本次真正需要认知判断的事项>")
     if second_round:
         command += f" --force --trigger {trigger} --reason <为什么需要再判断>"
     return command
 
 
-def sol_advice(state: dict, *, calls: list[dict] | None = None,
+def cognition_advice(state: dict, *, calls: list[dict] | None = None,
                triggers: list[str] | None = None, gates_passed: bool = False,
                closure_ready: dict | None = None,
                user_request: bool = False, review_requested: bool = False,
                workspace: str = "") -> dict:
-    """SOL 默认认知生命周期建议（只读建议，不是门禁，也不派生工作项）。
+    """认知默认认知生命周期建议（只读建议，不是门禁，也不派生工作项）。
 
     生命周期与调用策略（v9.6 事件驱动）：
 
@@ -1223,7 +1223,7 @@ def sol_advice(state: dict, *, calls: list[dict] | None = None,
     5. D 里程碑：medium/high 任务完成实质工作后 → 可选阶段复盘（按 progress_key
        去重，不按时间或证据条数）。
     6. E 收口：有实质进展的非简单任务在最终验证后 → 收口综合判断（按收口周期
-       去重）；SOL 不拥有 PASS 批准权，也不是门禁。
+       去重）；认知不拥有 PASS 批准权，也不是门禁。
     7. REVIEW 只由用户明确要求，不由阶段或风险自动派生。
 
     输出中的 `family` / `event` / `instance` / `level` 是调度层持久化“义务”的稳定
@@ -1257,7 +1257,7 @@ def sol_advice(state: dict, *, calls: list[dict] | None = None,
     covered["THINK"] = covered["CONSULT"]
     # CLI 的 single_round_decision 按“同模式是否有任何已完成记录”要求 --force，
     # 不按合同过滤。建议命令必须与真实准入一致，否则合同修订后给出的命令会被
-    # 直接拒绝（sol_review_requires_reason）。
+    # 直接拒绝（cognition_review_requires_reason）。
     attempted = {mode: any(_record_mode(item) == mode for item in completed)
                  for mode in ("CONSULT", "PLAN", "REVIEW")}
     last_consult = None
@@ -1282,13 +1282,13 @@ def sol_advice(state: dict, *, calls: list[dict] | None = None,
     new_codes: list[str] = []
     if same_signals:
         new_codes = [code for code in profile["signal_codes"]
-                     if code in SOL_ESCALATION_SIGNALS
+                     if code in COGNITION_ESCALATION_SIGNALS
                      and code not in same_signals]
     # 事件是调度层与复用层的共同依据：快照只取可归因事实；旧记录缺快照时按
     # 升级型信号映射同义事件，保持升级后不重复付费。
-    snapshot = sol_event_snapshot(state)
-    events = sol_events(state, snapshot,
-                        (baseline or {}).get("sol_event_snapshot"))
+    snapshot = cognition_event_snapshot(state)
+    events = cognition_events(state, snapshot,
+                        (baseline or {}).get("cognition_event_snapshot"))
     if not events and new_codes:
         events = _signals_to_events(new_codes)
     new_events = [str(item.get("code") or "") for item in events]
@@ -1306,7 +1306,7 @@ def sol_advice(state: dict, *, calls: list[dict] | None = None,
         state, triggers=triggers, workspace=workspace)["required"]
     # 收口综合判断只对“有实质工程进展”的非简单任务有认知价值。
     progressed = has_substantive_progress(state)
-    progress_key = sol_progress_key(state)
+    progress_key = cognition_progress_key(state)
     closure_cycle = closure_key(state)
     # E 阶段准入＝最终工程验证完成（统一由 governance.closure_readiness 判定）。
     # 缺省时沿用旧的 `gates_passed` 口径，只为历史调用点兼容；调度链路一律传入。
@@ -1336,7 +1336,7 @@ def sol_advice(state: dict, *, calls: list[dict] | None = None,
         and _text(item.get("progress_digest")) == progress_key
         for item in consult_calls)
     base = {
-        "schema": SOL_ADVICE_SCHEMA,
+        "schema": COGNITION_ADVICE_SCHEMA,
         "task_kind": kind,
         "complexity": profile,
         "covered": covered,
@@ -1360,19 +1360,19 @@ def sol_advice(state: dict, *, calls: list[dict] | None = None,
         "command": "",
     }
     if bool((state.get("closure") or {}).get("closed")):
-        base["reason"] = "任务已收口：不再建议新的 SOL 调用（需继续时先由用户授权 reopen）。"
+        base["reason"] = "任务已收口：不再建议新的认知调用（需继续时先由用户授权 reopen）。"
         return base
     if any(not block.get("resolved_at") and not block.get("work_items")
            for block in state.get("blocks") or [] if isinstance(block, dict)):
-        # 任务级阻塞只能由用户补齐授权/决策/资源解除；SOL 不提供本地事实，也不能
-        # 解除阻塞。项级阻塞只冻结对应工作项，其余工作照常推进，不因此停用 SOL。
-        base["reason"] = ("任务处于 BLOCKED：先解除授权/决策/资源缺口；SOL 不提供本地事实，"
+        # 任务级阻塞只能由用户补齐授权/决策/资源解除；认知不提供本地事实，也不能
+        # 解除阻塞。项级阻塞只冻结对应工作项，其余工作照常推进，不因此停用认知。
+        base["reason"] = ("任务处于 BLOCKED：先解除授权/决策/资源缺口；认知不提供本地事实，"
                           "也不能替代用户决定。")
         return base
     if level == "low" and not profile.get("non_simple") \
             and not user_request and not review_requested:
         base["reason"] = ("简单/机械任务（无中高复杂信号）：主代理自检、diff 与必要"
-                          "测试闭环，SOL 保持 0 调用。")
+                          "测试闭环，认知保持 0 调用。")
         return base
 
     def command_for(mode: str, stage: str, trigger: str) -> str:
@@ -1394,7 +1394,7 @@ def sol_advice(state: dict, *, calls: list[dict] | None = None,
         base.update({
             "action": "review", "recommended_action": "recommended",
             "mode": "REVIEW", "phase": "review", "stage": "review",
-            "reason": ("用户明确要求独立复核：执行一次 SOL REVIEW（advisory）；"
+            "reason": ("用户明确要求独立复核：执行一次认知 REVIEW（advisory）；"
                        "结论仍是建议，不构成收口门禁。"),
             "command": _advice_command(
                 "REVIEW", second_round=attempted["REVIEW"],
@@ -1424,7 +1424,7 @@ def sol_advice(state: dict, *, calls: list[dict] | None = None,
                 "final_verification_digest": verification_digest,
                 "question": question_for(event, base),
                 "reason": ("最终工程验证已完成（工作项终态、条件核销、证据与必要"
-                           "测试齐备）：在收口前做一次 SOL 收口综合判断（目标达成"
+                           "测试齐备）：在收口前做一次认知收口综合判断（目标达成"
                            "情况、重要遗漏与剩余风险）；工程验收仍由 ZCode 依据真实"
                            "证据完成。"),
                 "command": command_for("CONSULT", "closure", trigger),
@@ -1438,7 +1438,7 @@ def sol_advice(state: dict, *, calls: list[dict] | None = None,
             })
             return base
         base["reason"] = ("任务没有实质工程进展或复杂度不足：不因阶段自动调用 "
-                          "SOL，继续按本地证据收口。")
+                          "认知，继续按本地证据收口。")
         return base
 
     # ── 阶段 A：非简单任务启动默认 CONSULT ──────────────────────────────
@@ -1459,13 +1459,13 @@ def sol_advice(state: dict, *, calls: list[dict] | None = None,
             "instance": sha256_text(canonical_json(
                 [snapshot["contract_sha256"], "startup"]))[:16],
             "question": question_for("startup", base),
-            "reason": ("非简单任务从启动阶段默认获得一次 SOL CONSULT："
+            "reason": ("非简单任务从启动阶段默认获得一次认知 CONSULT："
                        "确认目标理解、问题判断、关键矛盾、初步策略与主要风险；"
                        "随后由 ZCode 自主调查并核实。"),
             "command": command_for("CONSULT", stage, trigger),
         })
         if user_request:
-            base["reason"] = ("用户明确要求 SOL 判断：直接调用一次 CONSULT；"
+            base["reason"] = ("用户明确要求认知判断：直接调用一次 CONSULT；"
                               "不受复杂度判断限制。")
         return base
     if user_request:
@@ -1477,7 +1477,7 @@ def sol_advice(state: dict, *, calls: list[dict] | None = None,
             "family": "C", "event": "decision-point", "level": "recommended",
             "instance": "user-request",
             "question": question_for("decision-point", base),
-            "reason": ("用户明确要求再次 SOL 判断：按用户要求调用一次（advisory）；"
+            "reason": ("用户明确要求再次认知判断：按用户要求调用一次（advisory）；"
                        "结论不构成门禁。"),
             "command": command_for("CONSULT", "development", "user-request"),
         })
@@ -1490,7 +1490,7 @@ def sol_advice(state: dict, *, calls: list[dict] | None = None,
     # 已被覆盖：合同修订后的第一次判断正属于这一类。
     if events:
         row = events[0]
-        trigger = SOL_EVENT_TRIGGERS.get(row["code"], "new-evidence")
+        trigger = COGNITION_EVENT_TRIGGERS.get(row["code"], "new-evidence")
         base["second_round"] = True
         base["trigger"] = trigger
         base.update({
@@ -1521,7 +1521,7 @@ def sol_advice(state: dict, *, calls: list[dict] | None = None,
                 [snapshot["contract_sha256"], "plan-needed"]))[:16],
             "question": question_for("plan-needed", base),
             "reason": ("已形成现场事实且任务包含多步骤、多方案或重要决策："
-                       "建议调用一次 SOL PLAN 比较方案、确定优先级与验收关注点；"
+                       "建议调用一次认知 PLAN 比较方案、确定优先级与验收关注点；"
                        "最终技术方案仍由 ZCode 决定。"),
             "command": command_for("PLAN", "planning", trigger),
         })
@@ -1561,7 +1561,7 @@ def sol_advice(state: dict, *, calls: list[dict] | None = None,
         "reason": ("本收口周期已有收口综合判断且没有新的升级型事件：不再追加规划、"
                    "里程碑或收口判断，直接复用既有结论。"
                    if closure_cycle_consulted else
-                   "同一合同已有有效 SOL 认知结论且没有新的升级型事件：直接复用，"
+                   "同一合同已有有效认知结论且没有新的升级型事件：直接复用，"
                    "不重复调用。"),
     })
     return base
@@ -1571,7 +1571,7 @@ def question_for(event: str, advice: dict | None = None) -> str:
     """按生命周期窗口给出本次真正需要判断的事项（确定性模板，不含自由文本）。
 
     它只是调用时的默认问题：主代理可以覆盖。问题必须落在“需要判断什么”上，
-    而不是要求 SOL 复述已知事实。
+    而不是要求认知复述已知事实。
     """
     code = _text(event) or "startup"
     return {
@@ -1608,15 +1608,15 @@ def question_for(event: str, advice: dict | None = None) -> str:
                     "业务成功，请指出两者可能不一致的地方）？"
                     "2) 是否仍存在未解决的关键风险、限制或关键反例，足以推翻“已完成”？"
                     "3) 已有证据是否真正支持结论，哪些结论仍只是推断？"
-                    "4) 与之前 SOL 的判断相比，哪些已被证实、哪些已被推翻或不再适用？"
+                    "4) 与之前的判断相比，哪些已被证实、哪些已被推翻或不再适用？"
                     "5) 若继续投入，最值得优先补充的一次验证是什么？"),
-    }.get(code, SOL_EVENTS.get(code) or "请判断本次最需要澄清的事项。")
+    }.get(code, COGNITION_EVENTS.get(code) or "请判断本次最需要澄清的事项。")
 
 
-# ── 主动议程：SOL 可选输出的“需要主代理注意的认知事项” ────────────────────
-# 议程不是工作项、不是门禁，也不进入计划 SHA：它只把 SOL 认为最该被注意的认知
+# ── 主动议程：认知可选输出的“需要主代理注意的认知事项” ────────────────────
+# 议程不是工作项、不是门禁，也不进入计划 SHA：它只把认知认为最该被注意的认知
 # 问题压缩成短短几条，避免长计划或工程指令挤占 ZCode 的工程上下文。类型固定
-# 是为了让 Copilot 能确定性去重与展示，而不是让 SOL 输出自由格式。
+# 是为了让 Copilot 能确定性去重与展示，而不是让认知输出自由格式。
 AGENDA_KINDS = {
     "core-question": "本次最需要回答的实质问题",
     "wrong-premise": "可能的错误前提或隐藏假设",
@@ -1631,7 +1631,7 @@ AGENDA_TEXT_LIMIT = 240
 
 
 def normalize_agenda(raw: object) -> list[dict]:
-    """把 SOL 的可选议程归一为稳定结构：固定类型、短文本、去重、限长。
+    """把认知的可选议程归一为稳定结构：固定类型、短文本、去重、限长。
 
     未知类型归到 `core-question` 而不是丢弃内容；空条目与超长噪声被截断。这里
     不做语义判断，也不把议程变成任务：调用方只读展示。
@@ -1672,7 +1672,7 @@ def _cognitive_calls(calls: list[dict] | None) -> list[dict]:
 
 
 def prior_cognition(calls: list[dict] | None, *, limit: int = 3) -> list[dict]:
-    """最近几次 SOL 判断及其采纳结果：供后续材料做增量比较，避免重复付费。
+    """最近几次认知判断及其采纳结果：供后续材料做增量比较，避免重复付费。
 
     只取判断、阶段、采纳状态与简短差异；不含完整回复，也不替主代理解释采纳。
     `acceptance` 缺失时如实标 `pending`，不推断“已采纳”。
@@ -1695,7 +1695,7 @@ def prior_cognition(calls: list[dict] | None, *, limit: int = 3) -> list[dict]:
 
 
 def open_agenda(calls: list[dict] | None) -> list[dict]:
-    """当前仍未处理的议程：取最近一次认知调用的议程（SOL 会重述仍相关的事项）。
+    """当前仍未处理的议程：取最近一次认知调用的议程（认知会重述仍相关的事项）。
 
     不跨调用累加，避免旧议程无限滞留；采纳结论由 `prior_cognition` 单独呈现。
     """

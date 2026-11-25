@@ -18,7 +18,7 @@ sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(os.path.dirname(HERE), "scripts"))
 
 import governance as G  # noqa: E402
-import sol_review as SR  # noqa: E402
+import cognition_call as CC  # noqa: E402
 import v6_support as F  # noqa: E402
 
 CONTRACT = """## 完成条件
@@ -328,38 +328,38 @@ class SolSingleRoundKeyTests(Base):
     def test_surrounding_whitespace_does_not_create_second_paid_call(self):
         self.start()
         state = self.state()
-        left = SR.review_subject_sha256(state, "  \n材料正文\n\n", mode="CONSULT")
-        right = SR.review_subject_sha256(state, "材料正文", mode="CONSULT")
+        left = CC.review_subject_sha256(state, "  \n材料正文\n\n", mode="CONSULT")
+        right = CC.review_subject_sha256(state, "材料正文", mode="CONSULT")
         self.assertEqual(left, right)
 
     def test_prompt_template_change_invalidates_cached_decision(self):
         self.start()
         state = self.state()
-        before = SR.review_subject_sha256(state, "材料", mode="CONSULT")
-        with mock.patch.object(SR, "prompt_template_sha256",
+        before = CC.review_subject_sha256(state, "材料", mode="CONSULT")
+        with mock.patch.object(CC, "prompt_template_sha256",
                                return_value="0" * 16):
-            after = SR.review_subject_sha256(state, "材料", mode="CONSULT")
+            after = CC.review_subject_sha256(state, "材料", mode="CONSULT")
         self.assertNotEqual(before, after)
 
     def test_force_overrides_same_materials_reuse(self):
-        state = {"sol_calls": [{"status": "completed", "mode": "REVIEW",
-                                "model": SR.DEFAULT_MODEL,
+        state = {"cognition_calls": [{"status": "completed", "mode": "REVIEW",
+                                "model": CC.DEFAULT_MODEL,
                                 "materials_sha256": "a" * 64}]}
-        self.assertEqual(SR.single_round_decision(
+        self.assertEqual(CC.single_round_decision(
             state, "a" * 64, mode="REVIEW")["action"], "reuse")
-        forced = SR.single_round_decision(
+        forced = CC.single_round_decision(
             state, "a" * 64, mode="REVIEW", force=True,
             trigger="scope-changed", reason="用户要求重新复核")
         self.assertEqual(forced["action"], "call")
 
     def test_cpa_url_rejects_query_and_extra_paths(self):
-        self.assertTrue(SR._is_local_cpa_url("http://127.0.0.1:8317"))
-        self.assertTrue(SR._is_local_cpa_url("http://127.0.0.1:8317/v1"))
-        self.assertTrue(SR._is_local_cpa_url("http://127.0.0.1:8317/v1/"))
-        self.assertFalse(SR._is_local_cpa_url("http://127.0.0.1:8317/v1?token=x"))
-        self.assertFalse(SR._is_local_cpa_url("http://127.0.0.1:8317/v1#frag"))
-        self.assertFalse(SR._is_local_cpa_url("http://127.0.0.1:8317/v1/responses"))
-        self.assertFalse(SR._is_local_cpa_url("http://127.0.0.1:9999/v1"))
+        self.assertTrue(CC._is_local_cpa_url("http://127.0.0.1:8317"))
+        self.assertTrue(CC._is_local_cpa_url("http://127.0.0.1:8317/v1"))
+        self.assertTrue(CC._is_local_cpa_url("http://127.0.0.1:8317/v1/"))
+        self.assertFalse(CC._is_local_cpa_url("http://127.0.0.1:8317/v1?token=x"))
+        self.assertFalse(CC._is_local_cpa_url("http://127.0.0.1:8317/v1#frag"))
+        self.assertFalse(CC._is_local_cpa_url("http://127.0.0.1:8317/v1/responses"))
+        self.assertFalse(CC._is_local_cpa_url("http://127.0.0.1:9999/v1"))
 
 
 class KnowledgeHandoffOptionalTests(unittest.TestCase):

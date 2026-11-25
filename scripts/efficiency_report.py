@@ -4,7 +4,7 @@
 复用已经存在的事实来源，给“协作治理本身是否划算”提供可复核的参考：
 
 - Copilot 任务台账（`<workspace>/.copilot-tasks/*/state.json`）：任务时长、条件核销、
-  证据复用、工作项重开、阻塞/重开、SOL 调用与义务、采纳回填；
+  证据复用、工作项重开、阻塞/重开、认知调用与义务、采纳回填；
 - 指令注入面（`SKILL.md` / `AGENTS.md` 字节数）：每次会话/技能调用的固定上下文成本；
 - 自动召回事件（`~/.zcode/copilot-runs/context-recall/events.jsonl`，可选）；
 - 本机宿主库（`--host-db`，只读聚合 `turn_usage` / `model_usage` / `tool_usage` 的
@@ -181,9 +181,9 @@ def _task_row(path: str, state: dict) -> dict:
     criteria = ((state.get("contract") or {}).get("criteria") or [])
     actions = [a for a in state.get("actions") or [] if isinstance(a, dict)]
     evidence = [e for e in state.get("evidence") or [] if isinstance(e, dict)]
-    calls = [c for c in state.get("sol_calls") or [] if isinstance(c, dict)]
-    schedule = state.get("sol_schedule") if isinstance(
-        state.get("sol_schedule"), dict) else {}
+    calls = [c for c in state.get("cognition_calls") or [] if isinstance(c, dict)]
+    schedule = state.get("cognition_schedule") if isinstance(
+        state.get("cognition_schedule"), dict) else {}
     obligations = [o for o in schedule.get("obligations") or []
                    if isinstance(o, dict)]
     created = _parse_iso(state.get("created"))
@@ -247,11 +247,11 @@ def _task_row(path: str, state: dict) -> dict:
         "evidence_dropped": sum(1 for e in evidence if e.get("dropped")),
         "evidence_refs": len(ref_ids),
         "evidence_unique": len(set(ref_ids)),
-        "sol_calls": len(calls),
-        "sol_tokens": tokens,
-        "sol_usage_calls": usage_calls,
-        "sol_latencies": latencies,
-        "sol_acceptances": acceptances,
+        "cognition_calls": len(calls),
+        "cognition_tokens": tokens,
+        "cognition_usage_calls": usage_calls,
+        "cognition_latencies": latencies,
+        "cognition_acceptances": acceptances,
         "obligations": len(obligations),
         "obligations_open": sum(1 for o in obligations
                                 if o.get("window") == "open"),
@@ -273,11 +273,11 @@ def summarize_tasks(rows: list[dict], limit: int = 10) -> dict:
                  if r["duration_hours"] is not None]
     stale = [r for r in open_rows
              if r["open_stale_hours"] is not None and r["open_stale_hours"] >= 24]
-    latencies = [value for r in rows for value in r["sol_latencies"]]
-    tokens = sum(r["sol_tokens"] for r in rows)
-    usage_calls = sum(r["sol_usage_calls"] for r in rows)
-    calls = sum(r["sol_calls"] for r in rows)
-    acceptances = [status for r in rows for status in r["sol_acceptances"]]
+    latencies = [value for r in rows for value in r["cognition_latencies"]]
+    tokens = sum(r["cognition_tokens"] for r in rows)
+    usage_calls = sum(r["cognition_usage_calls"] for r in rows)
+    calls = sum(r["cognition_calls"] for r in rows)
+    acceptances = [status for r in rows for status in r["cognition_acceptances"]]
     accepted = sum(1 for s in acceptances if s in (
         "accepted", "modified", "rejected"))
     pending = sum(1 for s in acceptances if s == "pending")
@@ -322,19 +322,19 @@ def summarize_tasks(rows: list[dict], limit: int = 10) -> dict:
                 round((refs - unique) / refs, 3) if refs else None,
                 basis="proxy",
                 note="同一证据被多个条件/工作项引用；高不等于验证充分。"),
-        _metric("sol_calls", "SOL 调用总数", calls, unit="calls"),
-        _metric("sol_tokens", "SOL Token 合计", tokens if usage_calls else None,
+        _metric("cognition_calls", "认知调用总数", calls, unit="calls"),
+        _metric("cognition_tokens", "认知 Token 合计", tokens if usage_calls else None,
                 unit="tokens", note="" if usage_calls == calls else
                 f"仅 {usage_calls}/{calls} 次调用有 usage 记录。"),
-        _metric("sol_latency_p50", "SOL 延迟 P50",
+        _metric("cognition_latency_p50", "认知延迟 P50",
                 round(_percentile(latencies, 0.5), 1) if latencies else None,
                 unit="ms"),
-        _metric("sol_latency_p95", "SOL 延迟 P95",
+        _metric("cognition_latency_p95", "认知延迟 P95",
                 round(_percentile(latencies, 0.95), 1) if latencies else None,
                 unit="ms"),
-        _metric("sol_acceptance_recorded", "已回填采纳的调用", accepted,
+        _metric("cognition_acceptance_recorded", "已回填采纳的调用", accepted,
                 unit="calls", note="accepted/modified/rejected 的合计。"),
-        _metric("sol_acceptance_pending", "仍 pending 的采纳", pending,
+        _metric("cognition_acceptance_pending", "仍 pending 的采纳", pending,
                 unit="calls", note="观察值，不阻断收口。"),
         _metric("obligations_open", "仍打开的调度义务",
                 sum(r["obligations_open"] for r in rows), unit="obligations",
@@ -357,7 +357,7 @@ def summarize_tasks(rows: list[dict], limit: int = 10) -> dict:
     return {"metrics": metrics, "recent": [
         {key: row[key] for key in (
             "task_id", "workspace", "closed", "verdict", "duration_hours",
-            "criteria_met", "criteria_total", "sol_calls", "sol_tokens",
+            "criteria_met", "criteria_total", "cognition_calls", "cognition_tokens",
             "evidence_total", "reopens")} for row in recent]}
 
 
@@ -551,8 +551,8 @@ def render(report: dict) -> str:
             lines.append(
                 f"- {row['task_id']} [{state}/{row['verdict'] or '-'}] "
                 f"{row['workspace']} · 条件 {row['criteria_met']}/"
-                f"{row['criteria_total']} · SOL {row['sol_calls']} 次/"
-                f"{row['sol_tokens']} tokens · 证据 {row['evidence_total']}"
+                f"{row['criteria_total']} · 认知{row['cognition_calls']} 次/"
+                f"{row['cognition_tokens']} tokens · 证据 {row['evidence_total']}"
                 f" · 重开 {row['reopens']}")
         lines.append("")
     lines.append("说明：本报告只用于观测，不构成门禁、完成证明或质量结论。")

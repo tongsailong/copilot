@@ -28,7 +28,7 @@ python3 -B scripts/context_engine.py recall --workspace <workspace> \
   --keywords '词1|词2' [--scope vault,memory] [--max-lines 40] \
   [--state <state.json>] [--no-cache] [--no-ledger] [--json]
 
-# 上下文包：self 12,000 / sol 8,000 / subagent 5,000 字符
+# 上下文包：self 12,000 / 认知 8,000 / subagent 5,000 字符
 python3 -B scripts/context_engine.py pack --state <state.json> --target subagent \
   [--keywords '词1|词2'] [--requirement '验收要求'] [--handoff-file handoff.json] [--out FILE]
 

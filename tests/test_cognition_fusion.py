@@ -3,7 +3,7 @@
 
 覆盖本轮融合的核心不变量：
 
-1. 三模式共用一份记录流（`sol_calls`）、一份审计与一把锁；历史键只读兼容。
+1. 三模式共用一份记录流（`cognition_calls`）、一份审计与一把锁；历史键只读兼容。
 2. SOL 与门禁共享同一份合同、完成条件、工作项与证据登记。
 3. 确定性优先：门禁仍有缺口时准入建议是 `not_needed`，不调用模型。
 4. SOL 结论是 advisory：不改变阶段、不改变门禁、失败不停摆。
@@ -23,7 +23,7 @@ from unittest import mock
 import v6_support as F
 
 G = F.G
-import sol_review as SR  # noqa: E402  v6_support 已把 scripts/ 加入 sys.path
+import cognition_call as CC  # noqa: E402  v6_support 已把 scripts/ 加入 sys.path
 import copilot_dispatch as CD  # noqa: E402
 
 CONTRACT = """## 完成条件
@@ -33,8 +33,8 @@ CONTRACT = """## 完成条件
 
 def review_record(sha: str = "a" * 64, **overrides) -> dict:
     record = {
-        "schema": SR.REVIEW_SCHEMA,
-        "model": SR.MODEL,
+        "schema": CC.REVIEW_SCHEMA,
+        "model": CC.MODEL,
         "reasoning_effort": "high",
         "materials_sha256": "m" * 64,
         "reply_sha256": sha,
@@ -43,7 +43,7 @@ def review_record(sha: str = "a" * 64, **overrides) -> dict:
         "findings": [],
         "findings_count": {"blocking": 0, "major": 0, "minor": 0, "info": 0},
         "unverified": [],
-        "prompt_version": SR.PROMPT_VERSION,
+        "prompt_version": CC.PROMPT_VERSION,
         "completed_at": G.now_iso(),
     }
     record.update(overrides)
@@ -52,9 +52,9 @@ def review_record(sha: str = "a" * 64, **overrides) -> dict:
 
 def think_record(mode: str = "THINK", **overrides) -> dict:
     record = {
-        "schema": SR.THINK_SCHEMA,
+        "schema": CC.THINK_SCHEMA,
         "mode": mode,
-        "model": SR.MODEL,
+        "model": CC.MODEL,
         "summary": "判断",
         "judgment": "先补测试",
         "essence": "缺少验证",
@@ -65,7 +65,7 @@ def think_record(mode: str = "THINK", **overrides) -> dict:
         "verify": [],
         "reconsult": [],
         "unverified": [],
-        "prompt_version": SR.PROMPT_VERSION,
+        "prompt_version": CC.PROMPT_VERSION,
         "completed_at": G.now_iso(),
     }
     record.update(overrides)
@@ -114,44 +114,44 @@ class FusionBase(unittest.TestCase):
 
 class UnifiedRecordTests(FusionBase):
     def test_all_modes_share_one_record_stream(self):
-        G.record_sol_call(self.state_path, review_record(),
+        G.record_cognition_call(self.state_path, review_record(),
                           mode="REVIEW", materials_sha256="m" * 64)
-        G.record_sol_call(self.state_path, think_record("THINK"),
+        G.record_cognition_call(self.state_path, think_record("THINK"),
                           mode="THINK", materials_sha256="c" * 64)
         # 历史 CONSULT / PLAN 记录仍可读、写入仍兼容旧调用方。
-        G.record_sol_call(self.state_path, think_record("PLAN"),
+        G.record_cognition_call(self.state_path, think_record("PLAN"),
                           mode="PLAN", materials_sha256="p" * 64)
-        G.record_sol_call_failure(self.state_path, mode="THINK",
-                                  error_code="sol_timeout", detail="300s",
+        G.record_cognition_call_failure(self.state_path, mode="THINK",
+                                  error_code="cognition_timeout", detail="300s",
                                   materials_sha256="x" * 64)
         state = G.load_state(self.state_path)
-        self.assertEqual(len(state["sol_calls"]), 4)
+        self.assertEqual(len(state["cognition_calls"]), 4)
         # 不再写历史键：一份记录、一套口径。
         self.assertNotIn("sol_reviews", state)
         self.assertNotIn("sol_advisories", state)
-        self.assertEqual(len(G.list_sol_reviews(state)), 1)
-        self.assertEqual(len(G.list_sol_consult_calls(state)), 2)
-        self.assertEqual(len(G.list_sol_plan_calls(state)), 1)
+        self.assertEqual(len(G.list_cognition_reviews(state)), 1)
+        self.assertEqual(len(G.list_cognition_consult_calls(state)), 2)
+        self.assertEqual(len(G.list_cognition_plan_calls(state)), 1)
         metrics = G.review_metrics(state)
-        self.assertEqual(metrics["sol"]["calls_total"], 4)
+        self.assertEqual(metrics["cognition_reviews"]["calls_total"], 4)
         # CONSULT / PLAN / REVIEW 各自独立计数；历史 THINK 归入 CONSULT。
-        self.assertEqual(metrics["sol"]["by_mode"],
+        self.assertEqual(metrics["cognition_reviews"]["by_mode"],
                          {"CONSULT": 2, "PLAN": 1, "REVIEW": 1})
-        self.assertEqual(metrics["sol_cognitive"]["consult_total"], 2)
-        self.assertEqual(metrics["sol_cognitive"]["plan_total"], 1)
-        self.assertEqual(metrics["sol_cognitive"]["failed"], 1)
+        self.assertEqual(metrics["cognition"]["consult_total"], 2)
+        self.assertEqual(metrics["cognition"]["plan_total"], 1)
+        self.assertEqual(metrics["cognition"]["failed"], 1)
 
     def test_record_ids_are_unified(self):
-        record = G.record_sol_call(self.state_path, think_record("THINK"),
+        record = G.record_cognition_call(self.state_path, think_record("THINK"),
                                    mode="THINK")
         self.assertTrue(record["call_id"].startswith("SC"))
-        self.assertEqual(record["call_id"], G.sol_call_id(record))
-        self.assertEqual(G.sol_call_mode(record), "THINK")
-        legacy = G.record_sol_call(self.state_path,
+        self.assertEqual(record["call_id"], G.cognition_call_id(record))
+        self.assertEqual(G.cognition_call_mode(record), "THINK")
+        legacy = G.record_cognition_call(self.state_path,
                                    think_record("PLAN"),
                                    mode="PLAN")
-        self.assertEqual(G.sol_call_mode(legacy), "PLAN")
-        self.assertEqual(G.sol_ref_mode(legacy), "PLAN")
+        self.assertEqual(G.cognition_call_mode(legacy), "PLAN")
+        self.assertEqual(G.cognition_ref_mode(legacy), "PLAN")
 
     def test_legacy_records_stay_readable(self):
         """v8.1 及更早的任务状态只读兼容：不迁移、不改写、不重复计数。"""
@@ -164,41 +164,41 @@ class UnifiedRecordTests(FusionBase):
             "status": "completed", "advisory_id": "SAlegacy", "mode": "PLAN",
             "materials_sha256": "o" * 64,
             "created_at": "2026-11-02T00:00:00+08:00"}]
-        merged = G.iter_sol_calls(state)
-        self.assertEqual([G.sol_call_id(item) for item in merged],
+        merged = G.iter_cognition_calls(state)
+        self.assertEqual([G.cognition_call_id(item) for item in merged],
                          ["SRlegacy", "SAlegacy"])
-        self.assertEqual(G.sol_call_mode(merged[0]), "REVIEW")
-        self.assertEqual(G.sol_call_mode(merged[1]), "PLAN")
-        self.assertEqual(G.sol_ref_mode(merged[1]), "PLAN")
-        self.assertEqual(len(G.list_sol_reviews(state)), 1)
-        self.assertEqual(len(G.list_sol_consult_calls(state)), 0)
-        self.assertEqual(len(G.list_sol_plan_calls(state)), 1)
+        self.assertEqual(G.cognition_call_mode(merged[0]), "REVIEW")
+        self.assertEqual(G.cognition_call_mode(merged[1]), "PLAN")
+        self.assertEqual(G.cognition_ref_mode(merged[1]), "PLAN")
+        self.assertEqual(len(G.list_cognition_reviews(state)), 1)
+        self.assertEqual(len(G.list_cognition_consult_calls(state)), 0)
+        self.assertEqual(len(G.list_cognition_plan_calls(state)), 1)
         metrics = G.review_metrics(state)
-        self.assertEqual(metrics["sol"]["calls_total"], 2)
-        self.assertEqual(metrics["sol"]["verdicts"]["partial"], 1)
+        self.assertEqual(metrics["cognition_reviews"]["calls_total"], 2)
+        self.assertEqual(metrics["cognition_reviews"]["verdicts"]["partial"], 1)
         admission = G.review_admission(state)
-        self.assertEqual(admission["sol_calls_total"], 2)
+        self.assertEqual(admission["cognition_calls_total"], 2)
         # 历史 PLAN 记录按 PLAN 计入覆盖：任何已有认知结论都不重复付费。
-        self.assertEqual(admission["sol_calls_by_mode"]["PLAN"], 1)
+        self.assertEqual(admission["cognition_calls_by_mode"]["PLAN"], 1)
         # 历史记录仍可读、仍计入覆盖，但旧 SOL 结论没有模型归属，不能被当成
         # Astra 的新响应复用：同一材料在当前默认模型下重新判定为首次调用。
         legacy = merged[0]
-        decision = SR.single_round_decision(
+        decision = CC.single_round_decision(
             state, legacy["materials_sha256"], mode="REVIEW")
         self.assertEqual(decision["action"], "call")
 
     def test_same_id_in_both_stores_is_counted_once(self):
         state = {
-            "sol_calls": [{"call_id": "SC1", "mode": "REVIEW",
+            "cognition_calls": [{"call_id": "SC1", "mode": "REVIEW",
                            "status": "completed"}],
             "sol_reviews": [{"review_id": "SC1", "status": "completed"}],
         }
-        self.assertEqual(len(G.iter_sol_calls(state)), 1)
+        self.assertEqual(len(G.iter_cognition_calls(state)), 1)
 
     def test_think_never_enters_finding_ledger_or_gates(self):
-        G.record_sol_call(self.state_path, think_record("THINK"),
+        G.record_cognition_call(self.state_path, think_record("THINK"),
                           mode="THINK")
-        G.record_sol_call(self.state_path,
+        G.record_cognition_call(self.state_path,
                           review_record(findings=[{
                               "id": "F1", "severity": "major",
                               "file": "a.py", "line": 1, "summary": "可疑"}],
@@ -221,8 +221,8 @@ class SharedContextTests(FusionBase):
         cid = state["contract"]["criteria"][0]["criterion_id"]
         G.record_criterion(self.state_path, cid, "met", evidence_ids=[eid])
         state = G.load_state(self.state_path)
-        prompt = SR.build_prompt(state, "本次 Diff 与测试结果", mode="REVIEW")
-        self.assertIn(f"- 提示词版本：{SR.PROMPT_VERSION}", prompt)
+        prompt = CC.build_prompt(state, "本次 Diff 与测试结果", mode="REVIEW")
+        self.assertIn(f"- 提示词版本：{CC.PROMPT_VERSION}", prompt)
         self.assertIn("## 任务目标", prompt)
         self.assertIn(cid, prompt)
         self.assertIn("## 工作项（按任务状态自动注入）", prompt)
@@ -231,7 +231,7 @@ class SharedContextTests(FusionBase):
         self.assertIn(eid, prompt)
         self.assertIn(f"支持 {cid}", prompt)
         self.assertIn("本次 Diff 与测试结果", prompt)
-        think = SR.build_prompt(state, "材料", mode="CONSULT",
+        think = CC.build_prompt(state, "材料", mode="CONSULT",
                                 question="关键风险是什么？")
         self.assertIn("## 本次需要判断的事项", think)
         self.assertIn("关键风险是什么？", think)
@@ -245,7 +245,7 @@ class SharedContextTests(FusionBase):
                 "id": f"E{index + 1}", "kind": "file",
                 "sha256": f"{index:064d}", "size": 10,
                 "path_hint": f"/tmp/e{index}.txt", "dropped": False})
-        prompt = SR.build_prompt(state, "材料", mode="REVIEW")
+        prompt = CC.build_prompt(state, "材料", mode="REVIEW")
         self.assertIn("条证据已省略", prompt)
         self.assertLess(prompt.count("- E"), 141)
 
@@ -258,41 +258,41 @@ class SharedContextTests(FusionBase):
             probe = json.loads(json.dumps(state))
             for key, value in changes.items():
                 probe[key] = value
-            return SR.review_subject_sha256(probe, materials, mode="REVIEW")
+            return CC.review_subject_sha256(probe, materials, mode="REVIEW")
 
         base = subject()
         # 条件状态变化不是新审查对象。
         status_changed = json.loads(json.dumps(state))
         status_changed["contract"]["criteria"][0]["status"] = "met"
-        self.assertEqual(base, SR.review_subject_sha256(
+        self.assertEqual(base, CC.review_subject_sha256(
             status_changed, materials, mode="REVIEW"))
         # 证据集合变化即失效。
         evidence_changed = json.loads(json.dumps(state))
         evidence_changed["evidence"][0]["sha256"] = "f" * 64
-        self.assertNotEqual(base, SR.review_subject_sha256(
+        self.assertNotEqual(base, CC.review_subject_sha256(
             evidence_changed, materials, mode="REVIEW"))
         # 提示词版本变化即失效（提示词/策略升级后旧结论不复用）。
-        with mock.patch.object(SR, "PROMPT_VERSION", "sol-prompt-next"):
+        with mock.patch.object(CC, "PROMPT_VERSION", "sol-prompt-next"):
             self.assertNotEqual(base, subject())
         # 合同正文、目标与材料变化即失效。
         contract_changed = json.loads(json.dumps(state))
         contract_changed["contract"]["done_criteria_text"] += "\n新增边界"
-        self.assertNotEqual(base, SR.review_subject_sha256(
+        self.assertNotEqual(base, CC.review_subject_sha256(
             contract_changed, materials, mode="REVIEW"))
         self.assertNotEqual(base, subject(goal="另一个目标"))
-        self.assertNotEqual(base, SR.review_subject_sha256(
+        self.assertNotEqual(base, CC.review_subject_sha256(
             state, materials + "+", mode="REVIEW"))
 
     def test_dry_run_reports_cache_key_components(self):
         mat = os.path.join(self.dir, "materials.md")
         with open(mat, "w", encoding="utf-8") as fh:
             fh.write("材料\n")
-        proc = F.run_cli("copilot_dispatch.py", "sol-review", "--state",
+        proc = F.run_cli("copilot_dispatch.py", "cognition-review", "--state",
                          self.state_path, "--materials", mat,
                          "--dry-run", "--json")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         payload = json.loads(proc.stdout)
-        self.assertEqual(payload["prompt_version"], SR.PROMPT_VERSION)
+        self.assertEqual(payload["prompt_version"], CC.PROMPT_VERSION)
         self.assertIn("evidence_digest", payload["cache_key_components"])
         self.assertEqual(payload["mode"], "REVIEW")
         self.assertTrue(payload["zero_tool"])
@@ -326,8 +326,8 @@ class DeterministicFirstTests(FusionBase):
         decision = G.review_admission(state)
         self.assertEqual(decision["recommended_action"], "not_needed")
 
-    def test_sol_review_pass_does_not_change_gates_or_phase(self):
-        G.record_sol_call(self.state_path,
+    def test_cognition_call_pass_does_not_change_gates_or_phase(self):
+        G.record_cognition_call(self.state_path,
                           review_record(findings=[], verdict="pass"),
                           mode="REVIEW", materials_sha256="m" * 64)
         state = G.load_state(self.state_path)
@@ -336,21 +336,21 @@ class DeterministicFirstTests(FusionBase):
         self.assertFalse(check["passed"])
         self.assertEqual(set(check["gates"]), {"G1", "G2", "G3"})
 
-    def test_sol_failure_is_recorded_and_does_not_stop_the_task(self):
+    def test_cognition_failure_is_recorded_and_does_not_stop_the_task(self):
         args = argparse.Namespace(
             state=self.state_path, materials=self._materials(), reason="",
             trigger="", force=False, dry_run=False, list=False, json=True,
             timeout=5, max_output_tokens=100, audit_log="", output_dir="")
         with mock.patch.object(
-                SR, "run_review",
-                side_effect=SR.SolTimeoutError("sol_timeout", "300s")):
-            code = CD.cmd_sol_review(args)
-        self.assertEqual(code, SR.EXIT_TIMEOUT)
+                CC, "run_review",
+                side_effect=CC.CognitionTimeoutError("cognition_timeout", "300s")):
+            code = CD.cmd_cognition_review(args)
+        self.assertEqual(code, CC.EXIT_TIMEOUT)
         state = G.load_state(self.state_path)
-        failed = [item for item in G.iter_sol_calls(state)
+        failed = [item for item in G.iter_cognition_calls(state)
                   if item.get("status") == "failed"]
         self.assertEqual(len(failed), 1)
-        self.assertEqual(failed[0]["error"], "sol_timeout")
+        self.assertEqual(failed[0]["error"], "cognition_timeout")
         self.assertEqual(failed[0]["mode"], "REVIEW")
         self.assertEqual(G.evaluate(state)["phase"], "PARTIAL")
         # 失败不会产生阻塞，也不会派生 SOL/复核类工作项（只有普通缺口派生）。
@@ -371,19 +371,19 @@ class DeterministicFirstTests(FusionBase):
             knowledge_file="")
         out = io.StringIO()
         with mock.patch.object(
-                SR, "run_consult",
-                side_effect=SR.SolQuotaError("sol_quota", "429")), \
+                CC, "run_consult",
+                side_effect=CC.CognitionQuotaError("cognition_quota", "429")), \
                 contextlib.redirect_stdout(out):
-            code = CD.cmd_sol_consult(args)
+            code = CD.cmd_cognition_consult(args)
         self.assertEqual(code, 0)
         degraded = json.loads(out.getvalue())
         self.assertEqual(degraded["status"], "unavailable")
         self.assertEqual(degraded["action"], "continue")
         state = G.load_state(self.state_path)
-        failed = [item for item in G.iter_sol_calls(state)
+        failed = [item for item in G.iter_cognition_calls(state)
                   if item.get("status") == "failed"]
         self.assertEqual(failed[0]["mode"], "CONSULT")
-        self.assertEqual(failed[0]["error"], "sol_quota")
+        self.assertEqual(failed[0]["error"], "cognition_quota")
         self.assertEqual(G.evaluate(state)["phase"], "PARTIAL")
         self.assertEqual(state.get("blocks") or [], [])
 
@@ -398,8 +398,8 @@ class SingleRoundReuseTests(FusionBase):
     def test_same_subject_never_calls_twice(self):
         materials = "材料正文"
         state = G.load_state(self.state_path)
-        digest = SR.review_subject_sha256(state, materials, mode="REVIEW")
-        G.record_sol_call(self.state_path,
+        digest = CC.review_subject_sha256(state, materials, mode="REVIEW")
+        G.record_cognition_call(self.state_path,
                           review_record(materials_sha256=digest),
                           mode="REVIEW", materials_sha256=digest)
         args = argparse.Namespace(
@@ -409,10 +409,10 @@ class SingleRoundReuseTests(FusionBase):
             output_dir="")
         out = io.StringIO()
         with mock.patch.object(
-                SR, "run_review",
+                CC, "run_review",
                 side_effect=AssertionError("must not call")) as call, \
                 contextlib.redirect_stdout(out):
-            self.assertEqual(CD.cmd_sol_review(args), 0)
+            self.assertEqual(CD.cmd_cognition_review(args), 0)
         self.assertEqual(call.call_count, 0)
         self.assertIn("call_id", json.loads(out.getvalue()))
 
@@ -443,24 +443,24 @@ class RecordPathTests(FusionBase):
                         "completed_at": G.now_iso()}
             return call
 
-        with mock.patch.object(SR, "run_review", side_effect=fake("REVIEW")), \
-                mock.patch.object(SR, "run_consult", side_effect=fake("CONSULT")):
+        with mock.patch.object(CC, "run_review", side_effect=fake("REVIEW")), \
+                mock.patch.object(CC, "run_consult", side_effect=fake("CONSULT")):
             self.assertEqual(CD.main([
-                "sol-review", "--state", self.state_path, "--materials",
+                "cognition-review", "--state", self.state_path, "--materials",
                 self._materials()]), 0)
             self.assertEqual(CD.main([
-                "sol-consult", "--state", self.state_path, "--materials",
+                "cognition-consult", "--state", self.state_path, "--materials",
                 self._materials(), "--question", "下一步怎么走？"]), 0)
         self.assertEqual(len(audit_paths), 2)
-        self.assertTrue(all(path.endswith("sol-audit.jsonl")
+        self.assertTrue(all(path.endswith("cognition-audit.jsonl")
                             for path in audit_paths), audit_paths)
         state = G.load_state(self.state_path)
-        self.assertEqual(sorted(item["mode"] for item in state["sol_calls"]),
+        self.assertEqual(sorted(item["mode"] for item in state["cognition_calls"]),
                          ["CONSULT", "REVIEW"])
-        ids = [item["call_id"] for item in state["sol_calls"]]
+        ids = [item["call_id"] for item in state["cognition_calls"]]
         self.assertTrue(all(ident.startswith("SC") for ident in ids))
         # 原始输出文件名必须与统一记录 ID 一致（可按 call_id 直接定位取证）。
-        for item in state["sol_calls"]:
+        for item in state["cognition_calls"]:
             self.assertEqual(os.path.basename(item["reply_path"]),
                              item["call_id"] + ".raw.txt")
 

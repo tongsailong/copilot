@@ -373,11 +373,11 @@ class CaptureTests(ContextEngineBase):
         self.assertRegex(summary["file_name"],
                          r"^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-[a-z0-9-]+-candidate\.md$")
 
-    def test_draft_carries_sol_cognition_and_adoption(self):
+    def test_draft_carries_cognition_summary_and_adoption(self):
         """候选草稿带 SOL 判断与采纳痕迹（只读事实），不把任务内判断当正式知识。"""
         with open(self.state, "r", encoding="utf-8") as fh:
             state = json.load(fh)
-        state["sol_calls"] = [{
+        state["cognition_calls"] = [{
             "call_id": "SCconsult0", "mode": "CONSULT", "status": "completed",
             "stage": "development", "judgment": "先验证迁移脚本幂等性",
             "acceptance": {"status": "modified",
@@ -391,8 +391,8 @@ class CaptureTests(ContextEngineBase):
         with open(self.state, "w", encoding="utf-8") as fh:
             json.dump(state, fh)
         text, summary = self.build()
-        self.assertEqual(summary["sol_cognition_calls"], 1)
-        self.assertIn("SOL 认知与采纳", text)
+        self.assertEqual(summary["cognition_calls"], 1)
+        self.assertIn("认知与采纳", text)
         self.assertIn("先验证迁移脚本幂等性", text)
         self.assertIn("先跑一次空库迁移", text)
         self.assertIn("补了回滚验证", text)
@@ -480,7 +480,7 @@ class WiringTests(ContextEngineBase):
         with open(os.path.join(SCRIPTS, "context_engine.py"), "r", encoding="utf-8") as fh:
             source = fh.read()
         for forbidden in ("import socket", "urllib.request", "import requests",
-                          "http.client", "sol_review", "openai"):
+                          "http.client", "import cognition_call", "openai"):
             self.assertNotIn(forbidden, source)
 
 

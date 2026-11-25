@@ -73,13 +73,13 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual(decision["scope"], "triggered")
 
     def test_unknown_risk_fails_closed(self):
-        import sol_review as SR
-        with self.assertRaises(SR.SolUsageError):
+        import cognition_call as CC
+        with self.assertRaises(CC.CognitionUsageError):
             G.review_admission({"risk": "whatever", "sol_reviews": []})
-        with self.assertRaises(SR.SolUsageError):
+        with self.assertRaises(CC.CognitionUsageError):
             G.review_admission({"risk": "", "sol_reviews": []})
 
-    def test_high_risk_recommends_sol_advisory(self):
+    def test_high_risk_recommends_cognition_advisory(self):
         decision = G.review_admission({"risk": "high", "sol_reviews": []})
         self.assertEqual(decision["decision"], "recommended")
         self.assertEqual(decision["scope"], "high-risk")
@@ -95,18 +95,18 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual(decision["triggers"], ["security"])
 
     def test_unknown_trigger_is_rejected(self):
-        import sol_review as SR
-        with self.assertRaises(SR.SolUsageError):
+        import cognition_call as CC
+        with self.assertRaises(CC.CognitionUsageError):
             G.review_admission({"risk": "normal", "sol_reviews": []},
                                triggers=["looks-complex"])
 
-    def test_baseline_sol_review_is_visible(self):
+    def test_baseline_cognition_call_is_visible(self):
         state = {"risk": "medium", "sol_reviews": [{
             "status": "completed", "review_id": "SR1", "verdict": "partial",
             "materials_sha256": "a" * 64, "created_at": "now"}]}
         decision = G.review_admission(state)
-        self.assertEqual(decision["sol_reviews_total"], 1)
-        self.assertEqual(decision["last_sol_review"]["verdict"], "partial")
+        self.assertEqual(decision["review_calls_total"], 1)
+        self.assertEqual(decision["last_review_call"]["verdict"], "partial")
 
 
 class FindingLedgerTests(unittest.TestCase):
@@ -380,7 +380,7 @@ class IngestLedgerTests(unittest.TestCase):
 
     def _record(self, findings, sha="s" * 64):
         return {
-            "review_id": "SR" + sha[:10], "task_id": "task-1",
+            "review_id": "CC" + sha[:10], "task_id": "task-1",
             "verdict": "pass", "findings": findings,
             "findings_count": {"blocking": 0, "major": len(findings),
                                "minor": 0, "info": 0},
@@ -388,12 +388,13 @@ class IngestLedgerTests(unittest.TestCase):
             "completed_at": G.now_iso(),
         }
 
-    def test_sol_ingest_populates_ledger_as_advisory(self):
+    def test_cognition_ingest_populates_ledger_as_advisory(self):
         path = self._state()
         entry = self._record([{
             "id": "F1", "severity": "major", "file": "src/a.py", "line": 1,
             "summary": "问题", "root_cause": "rc", "evidence": "证据"}])
-        G.record_sol_review(path, entry, materials_sha256="m" * 64)
+        G.record_cognition_call(path, entry, mode="REVIEW",
+                               materials_sha256="m" * 64)
         state = G.load_state(path)
         self.assertEqual(len(state["finding_ledger"]["items"]), 1)
         item = state["finding_ledger"]["items"][0]
@@ -402,17 +403,19 @@ class IngestLedgerTests(unittest.TestCase):
         # SOL 是 advisory：不产生停止标记。
         self.assertEqual(state.get("review_stops") or [], [])
 
-    def test_duplicate_sol_record_does_not_double_count(self):
+    def test_duplicate_cognition_record_does_not_double_count(self):
         path = self._state()
         entry = self._record([{
             "severity": "major", "file": "src/a.py", "line": 1,
             "summary": "问题", "root_cause": "rc", "evidence": "证据"}])
-        G.record_sol_review(path, entry, materials_sha256="m" * 64)
-        G.record_sol_review(path, entry, materials_sha256="m" * 64)
+        G.record_cognition_call(path, entry, mode="REVIEW",
+                               materials_sha256="m" * 64)
+        G.record_cognition_call(path, entry, mode="REVIEW",
+                               materials_sha256="m" * 64)
         state = G.load_state(path)
         self.assertEqual(state["finding_ledger"]["items"][0]["occurrences"], 1)
 
-    def test_second_sol_review_reuses_finding_id(self):
+    def test_second_cognition_call_reuses_finding_id(self):
         path = self._state()
         first = self._record([{
             "severity": "major", "file": "src/a.py", "line": 1,
@@ -422,8 +425,10 @@ class IngestLedgerTests(unittest.TestCase):
             "id": "F9", "severity": "major", "file": "src/a.py", "line": 1,
             "summary": "问题 A（换表述）", "root_cause": "rc",
             "evidence": "新证据"}], sha="2" * 64)
-        G.record_sol_review(path, first, materials_sha256="m" * 64)
-        G.record_sol_review(path, second, materials_sha256="n" * 64)
+        G.record_cognition_call(path, first, mode="REVIEW",
+                               materials_sha256="m" * 64)
+        G.record_cognition_call(path, second, mode="REVIEW",
+                               materials_sha256="n" * 64)
         state = G.load_state(path)
         self.assertEqual(len(state["finding_ledger"]["items"]), 1)
         self.assertEqual(state["finding_ledger"]["items"][0]["finding_id"], "F1")
@@ -465,7 +470,7 @@ class CliEfficiencyTests(unittest.TestCase):
             G.start_state(path, goal="目标", contract=F.CONTRACT, risk=risk)
             self.assertEqual(G.load_state(path)["risk"], risk)
 
-    def test_admission_cli_recommends_sol_for_security_trigger(self):
+    def test_admission_cli_recommends_cognition_for_security_trigger(self):
         proc = F.run_cli("copilot_dispatch.py", "review-admission",
                          "--state", self.state, "--trigger", "security",
                          "--reason", "凭据处理", "--json")
@@ -574,8 +579,8 @@ class MetricsEfficiencyTests(unittest.TestCase):
         self.assertEqual(metrics["review_admission_tiers"], {"high": 1})
         self.assertEqual(metrics["review_stops_total"], 1)
         self.assertEqual(metrics["rereported_findings"], 1)
-        self.assertEqual(metrics["sol"]["completed"], 1)
-        self.assertEqual(metrics["sol"]["verdicts"]["partial"], 1)
+        self.assertEqual(metrics["cognition_reviews"]["completed"], 1)
+        self.assertEqual(metrics["cognition_reviews"]["verdicts"]["partial"], 1)
         self.assertTrue(metrics["g4"]["retired"])
         self.assertEqual(metrics["g4"]["historical_native_reviews"], 1)
         self.assertNotIn("mean_review_seconds", metrics)

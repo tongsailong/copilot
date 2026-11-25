@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""SOL 生命周期调度：调度义务、窗口事实、自动材料与覆盖率统计。
+"""认知生命周期调度：调度义务、窗口事实、自动材料与覆盖率统计。
 
 本模块只做**确定性策略与投影**，三件事绝对不做：
 
-- 不发网络请求、不导入任何网络客户端（SOL 通道只存在于 `sol_review.py`）；
+- 不发网络请求、不导入任何网络客户端（认知通道只存在于 `cognition_call.py`）；
 - 不读写状态文件（调用方传入 dict，调用方负责落盘）；
 - 不判定工程完成、不改变阶段、不影响 G1–G3。
 
-设计要点（与 SOL CONSULT/PLAN 的结论一致）：
+设计要点（与认知 CONSULT/PLAN 的结论一致）：
 
 1. **义务 vs 复用是两把键**。义务键标识“在哪个生命周期窗口欠了一次认知判断”
-   （任务、合同指纹、family、事件、发生实例）；复用键仍由 `sol_review` 的
+   （任务、合同指纹、family、事件、发生实例）；复用键仍由 `cognition_call` 的
    subject 摘要决定“同一份材料与问题是否可以不再付费”。一个义务可以被真实调用
    满足、被复用满足、被显式跳过，或因为窗口关闭而成为漏调。
 2. **窗口只按已持久化的事实关闭**。窗口在任务收口、或被更晚窗口的“已满足”取代时
@@ -28,13 +28,13 @@ import shlex
 
 import review_policy as RP
 
-OBLIGATION_SCHEMA = "copilot-sol-obligation/v1"
-SCHEDULE_SCHEMA = "copilot-sol-schedule/v1"
-STATS_SCHEMA = "copilot-sol-stats/v2"
+OBLIGATION_SCHEMA = "copilot-cognition-obligation/v1"
+SCHEDULE_SCHEMA = "copilot-cognition-schedule/v1"
+STATS_SCHEMA = "copilot-cognition-stats/v2"
 # 材料口径版本。v2：合同正文改读 `contract["done_criteria_text"]`（`body` 兼容回退），
 # 正文缺失时显式标注“（未登记）”。该版本参与 `closure_verification_digest`，所以
 # 材料内容变化会让旧收口判断停止覆盖新结果，而不是靠“代码改过了”想当然。
-MATERIALS_SCHEMA = "copilot-sol-schedule-materials/v3"
+MATERIALS_SCHEMA = "copilot-cognition-schedule-materials/v3"
 
 # 义务状态：due 未执行 / claimed 已被本进程领取 / in_flight 已发出请求未落盘 /
 # satisfied 已满足（含复用）/ failed 真实失败 / skipped 显式跳过（须有理由）。
@@ -47,14 +47,14 @@ MISSED_STATUSES = ("due", "claimed")
 # 只说“不需要独立调用”并带可查理由，not-executed 只说“关闭时仍未执行”。
 DISPOSITION_KINDS = ("completed", "covered", "skipped", "failed",
                      "not-executed", "unsettled")
-FAMILY_INDEX = {name: index for index, name in enumerate(RP.SOL_FAMILIES)}
+FAMILY_INDEX = {name: index for index, name in enumerate(RP.COGNITION_FAMILIES)}
 DEFAULT_MATERIALS_CHARS = 24_000
 # 每周期保留的策略变更历史条数上限：只用于解释“窗口打开时是什么策略”，
 # 不参与调度判定，超出上限丢弃最旧记录（不是审计台账）。
 POLICY_HISTORY_LIMIT = 50
-# 自动调度路径等待任务 SOL 锁的上限（秒）：拿不到锁说明另一个进程正在调用，
+# 自动调度路径等待任务认知锁的上限（秒）：拿不到锁说明另一个进程正在调用，
 # 本次放弃执行、义务保持 due，而不是无限阻塞工程命令。手动调用不设默认上限；
-# `COPILOT_SOL_LOCK_TIMEOUT` 可覆盖。自动路径的“有界”是双重的：1 条义务、
+# `COPILOT_COGNITION_LOCK_TIMEOUT` 可覆盖。自动路径的“有界”是双重的：1 条义务、
 # 1 次请求，以及这条锁等待上限（不是请求本身的时长上限）。
 AUTO_LOCK_WAIT_S = 120.0
 
@@ -83,16 +83,33 @@ def family_index(family: str) -> int:
 
 
 # ── 义务模型 ───────────────────────────────────────────────────────────────
+# v9.10.0 之前的任务只有 `sol_schedule`：只读回退，不迁移、不回写。
+LEGACY_SCHEDULE_KEY = "sol_schedule"
+
+
+def schedule_raw(state: dict) -> dict | None:
+    """只读取调度结构：当前键优先，旧任务回退到 `sol_schedule`。
+
+    两个键同时存在时以 `cognition_schedule` 为准（v9.10.0 起新写入只落在该键；
+    旧键里的同名义务是历史快照，不参与当前判定，也不删除）。
+    """
+    for key in ("cognition_schedule", LEGACY_SCHEDULE_KEY):
+        raw = state.get(key)
+        if isinstance(raw, dict):
+            return raw
+    return None
+
+
 def empty_schedule() -> dict:
     return {"schema": SCHEDULE_SCHEMA, "next_id": 1, "obligations": []}
 
 
 def ensure_schedule(state: dict) -> dict:
     """返回可写的调度结构；旧状态没有该字段时按空调度处理（不落盘）。"""
-    raw = state.get("sol_schedule")
+    raw = state.get("cognition_schedule")
     if not isinstance(raw, dict):
         raw = empty_schedule()
-        state["sol_schedule"] = raw
+        state["cognition_schedule"] = raw
     raw.setdefault("schema", SCHEDULE_SCHEMA)
     if not isinstance(raw.get("obligations"), list):
         raw["obligations"] = []
@@ -106,7 +123,7 @@ def ensure_schedule(state: dict) -> dict:
 
 def obligations(state: dict) -> list[dict]:
     """只读视图：旧状态没有调度字段时返回空列表，不在查询路径创建字段。"""
-    raw = state.get("sol_schedule")
+    raw = schedule_raw(state)
     if not isinstance(raw, dict):
         return []
     items = raw.get("obligations")
@@ -115,8 +132,7 @@ def obligations(state: dict) -> list[dict]:
 
 def schedule_view(state: dict) -> dict | None:
     """只读调度结构（不创建）：用于读取策略快照等旁证。"""
-    raw = state.get("sol_schedule")
-    return raw if isinstance(raw, dict) else None
+    return schedule_raw(state)
 
 
 def obligation_key(state: dict, family: str, event: str, instance: str) -> str:
@@ -303,7 +319,7 @@ def note_policy(schedule: dict, *, policy: str, auto_execution: bool | None,
 
 
 def note_deferral(obligation: dict, *, now: str, reason: str) -> None:
-    """记录“条件成立但本次未能调度”（例如 SOL 锁被占用、参数前置不成立）。
+    """记录“条件成立但本次未能调度”（例如认知锁被占用、参数前置不成立）。
 
     只计数并留因：义务仍保持 due（调度失败不等于不该调用），也不结算成失败；
     窗口关闭时这条事实会写进终态处置，不会被静默清除。
@@ -370,7 +386,7 @@ def _disposition_facts(obligation: dict, schedule: dict | None) -> tuple[str, st
             return "completed", ("同一认知对象的既有结论复用满足（"
                                  + (_text(obligation.get("reuse_of"))
                                     or "subject-reuse") + "）")
-        mode = _text(obligation.get("mode")) or "SOL"
+        mode = _text(obligation.get("mode")) or "认知"
         call_id = _text(obligation.get("call_id"))
         return "completed", (f"已执行 {mode} 调用"
                              + (f"（{call_id}）" if call_id else "（未记 call_id）"))
@@ -631,7 +647,7 @@ def sync(schedule: dict, state: dict, advice: dict, *, now: str,
     cycle = current_cycle(state)
     if note_policy(schedule, policy=policy, auto_execution=auto_execution,
                    now=now, cycle=cycle):
-        changes.append(f"SOL 调度策略（周期 {cycle}）："
+        changes.append(f"认知调度策略（周期 {cycle}）："
                        f"{_text(policy).lower()}"
                        + ("，允许自动执行" if auto_execution else
                           "，不自动执行" if auto_execution is False else ""))
@@ -641,7 +657,7 @@ def sync(schedule: dict, state: dict, advice: dict, *, now: str,
     family = _text(advice.get("family"))
     event = _text(advice.get("event"))
     instance = _text(advice.get("instance"))
-    if action in ("consult", "plan") and family in RP.SOL_FAMILIES and event:
+    if action in ("consult", "plan") and family in RP.COGNITION_FAMILIES and event:
         existing = find_obligation(state, family=family, event=event,
                                    instance=instance)
         if existing is None or existing.get("contract_sha256") != \
@@ -714,7 +730,7 @@ def sync(schedule: dict, state: dict, advice: dict, *, now: str,
 def summary(state: dict) -> dict:
     """给 evaluate/status 的只读摘要：未闭合义务与下一条可执行项。"""
     rows = obligations(state)
-    raw = state.get("sol_schedule") if isinstance(state.get("sol_schedule"), dict) else None
+    raw = schedule_raw(state)
     pending = [item for item in rows
                if isinstance(item, dict) and item.get("window") == "open"
                and _text(item.get("status")) in ("due", "claimed", "in_flight")]
@@ -774,17 +790,17 @@ def dispatch_path() -> str:
 
 def runnable_command(state_path: str, obligation: dict, *, round_two: bool,
                      reason: str = "") -> str:
-    """生成可直接粘贴执行的 SOL 命令：无占位符、材料缺省自动生成。"""
+    """生成可直接粘贴执行的认知命令：无占位符、材料缺省自动生成。"""
     mode = _text(obligation.get("mode")).upper() or "CONSULT"
     stage = _text(obligation.get("stage")) or "development"
     question = _text(obligation.get("question")) or RP.question_for(
         _text(obligation.get("event")) or stage)
-    sub = {"PLAN": "sol-plan", "REVIEW": "sol-review"}.get(mode, "sol-consult")
+    sub = {"PLAN": "cognition-plan", "REVIEW": "cognition-review"}.get(mode, "cognition-consult")
     parts = ["python3", "-B", dispatch_path(), sub,
              "--state", state_path, "--stage", stage,
              "--question", question]
     if round_two:
-        trigger = RP.SOL_EVENT_TRIGGERS.get(
+        trigger = RP.COGNITION_EVENT_TRIGGERS.get(
             _text(obligation.get("event")), "new-evidence")
         parts += ["--force", "--trigger", trigger,
                   "--reason", reason or _text(obligation.get("reason"))
@@ -828,14 +844,14 @@ def _criteria_rows(state: dict) -> list[str]:
 
 def _delta_rows(state: dict, obligation: dict) -> list[str]:
     """本次相对最后一次认知调用的实质变化（只列可归因事实）。"""
-    calls = [item for item in state.get("sol_calls") or []
+    calls = [item for item in state.get("cognition_calls") or []
              if isinstance(item, dict) and item.get("status") == "completed"]
     if not calls:
-        return ["- 本任务尚无已完成的 SOL 调用：这是该窗口的首次判断。"]
+        return ["- 本任务尚无已完成的认知调用：这是该窗口的首次判断。"]
     last = max(calls, key=lambda item: _text(item.get("created_at")))
     rows = []
-    current = RP.sol_event_snapshot(state)
-    previous = last.get("sol_event_snapshot") or {}
+    current = RP.cognition_event_snapshot(state)
+    previous = last.get("cognition_event_snapshot") or {}
     if previous:
         new_regressed = [x for x in current["regressed"]
                          if x not in set(previous.get("regressed") or [])]
@@ -882,7 +898,7 @@ def _delta_rows(state: dict, obligation: dict) -> list[str]:
 def build_materials(state: dict, obligation: dict, *,
                     max_chars: int = DEFAULT_MATERIALS_CHARS,
                     readiness: dict | None = None) -> str:
-    """从状态生成 SOL 材料：结构化、确定性排序、限长、不含敏感载荷。
+    """从状态生成认知材料：结构化、确定性排序、限长、不含敏感载荷。
 
     材料不是状态转储：它必须回答“本次需要判断什么、相对上次变了什么”。信息不足
     时显式标注，而不是用套话制造形式化覆盖。`readiness`（最终工程验证准入事实）
@@ -890,13 +906,13 @@ def build_materials(state: dict, obligation: dict, *,
     """
     event = _text(obligation.get("event")) or "startup"
     family = _text(obligation.get("family")) or "C"
-    # 历史判断与未处理议程：让 SOL 做增量判断，而不是从零重问同一问题。只取
+    # 历史判断与未处理议程：让认知判断做增量，而不是从零重问同一问题。只取
     # 最近三次判断的核心结论与采纳状态，不注入完整回复。
-    prior = RP.prior_cognition(state.get("sol_calls"), limit=3)
-    agenda = RP.open_agenda(state.get("sol_calls"))
+    prior = RP.prior_cognition(state.get("cognition_calls"), limit=3)
+    agenda = RP.open_agenda(state.get("cognition_calls"))
     prior_lines: list[str] = []
     if prior:
-        prior_lines = ["", "## 上次 SOL 判断与采纳", ""]
+        prior_lines = ["", "## 上次认知判断与采纳", ""]
         for item in prior:
             line = (f"- {item['call_id']}（{item['mode']}/{item['stage']}，采纳："
                     f"{item['acceptance']}"
@@ -907,11 +923,11 @@ def build_materials(state: dict, obligation: dict, *,
             prior_lines.append(line)
     agenda_lines: list[str] = []
     if agenda:
-        agenda_lines = ["", "## 未处理议程（上次 SOL 提出，仍相关才继续判断）", ""]
+        agenda_lines = ["", "## 未处理议程（上次认知提出，仍相关才继续判断）", ""]
         agenda_lines += [f"- [{entry['kind']}] {entry['text']}"
                          for entry in agenda]
     lines = [
-        f"# SOL {family} 阶段材料（{_text(obligation.get('mode'))} / "
+        f"# 认知{family} 阶段材料（{_text(obligation.get('mode'))} / "
         f"{_text(obligation.get('stage'))}）",
         "",
         f"- 材料口径：{MATERIALS_SCHEMA}",
@@ -923,7 +939,7 @@ def build_materials(state: dict, obligation: dict, *,
         "## 触发事实与前后变化",
         "",
         f"- 生命周期窗口：{family}（{event}）",
-        f"- 触发原因：{_text(obligation.get('reason')) or RP.SOL_EVENTS.get(event, '-')}",
+        f"- 触发原因：{_text(obligation.get('reason')) or RP.COGNITION_EVENTS.get(event, '-')}",
         *_delta_rows(state, obligation),
         *prior_lines,
         *agenda_lines,
@@ -934,7 +950,7 @@ def build_materials(state: dict, obligation: dict, *,
         f"- 类型：{_text(state.get('task_kind')) or RP.DEFAULT_TASK_KIND}"
         f" · 风险：{_text(state.get('risk')) or '-'}",
         # 合同正文存放在 `done_criteria_text`（与合同指纹同源）；`body` 是不存在的
-        # 键，读取它会让每份材料都印出 “None”，SOL 因此看不到合同正文。
+        # 键，读取它会让每份材料都印出 “None”，认知因此看不到合同正文。
         "- 合同正文摘要：" + (_contract_body(state)[:800] or "（未登记）"),
         "- 声明触发：" + ("、".join(
             _text(item.get("name"))
@@ -1074,7 +1090,7 @@ def task_stats(state: dict) -> dict:
     0/1；事件窗口（C）的分母是适用义务条数，合理跳过的窗口不进入分母。
     """
     rows = [item for item in obligations(state) if isinstance(item, dict)]
-    calls = [item for item in state.get("sol_calls") or []
+    calls = [item for item in state.get("cognition_calls") or []
              if isinstance(item, dict)]
     completed = [item for item in calls if item.get("status") == "completed"]
     failed_calls = [item for item in calls if item.get("status") == "failed"]
@@ -1102,7 +1118,7 @@ def task_stats(state: dict) -> dict:
              or admission["level"] in ("medium", "high")))
 
     by_family: dict[str, dict] = {}
-    for family in RP.SOL_FAMILIES:
+    for family in RP.COGNITION_FAMILIES:
         subset = [item for item in rows
                   if _text(item.get("family")) == family]
         by_family[family] = {
@@ -1130,8 +1146,7 @@ def task_stats(state: dict) -> dict:
 
     # 终态处置与周期分布：只做观测，不进入 coverage 的分子分母，也不改变 missed
     # 口径。历史义务没有持久化处置时按窗口事实现算（只读，不回写历史状态）。
-    raw_schedule = state.get("sol_schedule") if isinstance(
-        state.get("sol_schedule"), dict) else None
+    raw_schedule = schedule_raw(state)
     dispositions = {kind: 0 for kind in DISPOSITION_KINDS}
     by_cycle: dict[int, dict] = {}
     for item in rows:
@@ -1232,7 +1247,7 @@ def task_stats(state: dict) -> dict:
         post_closure_calls.append(item)
     # 模型级调用指标：模型只是观测维度，不是门禁。同一任务可能先后使用不同模型，
     # 因此按 model_key 分别汇总耗时/Token；历史记录没有 model 字段时归到 "-"，
-    # 不把旧 SOL 记录冒充成当前默认模型的调用证据。重复调用用同一模型下重复的
+    # 不把旧认知记录冒充成当前默认模型的调用证据。重复调用用同一模型下重复的
     # subject 计：completed − 去重 subject，>0 即存在同材料重复付费。
     by_model: dict[str, dict] = {}
     latency_by_model: dict[str, list[float]] = {}
@@ -1276,9 +1291,11 @@ def task_stats(state: dict) -> dict:
         latencies = sorted(int(value) for value in latency_by_model.get(key) or [])
         row["latency_ms_p50"] = _percentile(latencies, 0.50)
         row["latency_ms_p95"] = _percentile(latencies, 0.95)
-    # 复用命中：只登记“未重复付费”的事实，命中的条目来自 state["sol_reuses"]，
+    # 复用命中：只登记“未重复付费”的事实，命中的条目来自 state["cognition_reuses"]，
     # 与 by_family[*]["reused"] 同一口径（义务级复用），两者都不是价值证明。
-    reuse_rows = [item for item in state.get("sol_reuses") or []
+    # 历史 `sol_reuses` 键只读合并，不迁移、不回写。
+    reuse_rows = [item for key in ("cognition_reuses", "sol_reuses")
+                  for item in state.get(key) or []
                   if isinstance(item, dict)]
     reuse_by_model: dict[str, int] = {}
     for item in reuse_rows:
@@ -1288,7 +1305,7 @@ def task_stats(state: dict) -> dict:
     reuse = {
         "hits": len(reuse_rows),
         "by_family": {family: by_family[family]["reused"]
-                      for family in RP.SOL_FAMILIES},
+                      for family in RP.COGNITION_FAMILIES},
         "by_model": [{"model_key": key, "hits": reuse_by_model[key]}
                      for key in sorted(reuse_by_model)],
     }
@@ -1383,7 +1400,7 @@ def stats(states: list[dict], *, scope: str = "") -> dict:
     # 的平均”掩盖长尾；复用命中同样按模型合并，历史无 model 的记录归 "-"。
     model_rows: dict[str, dict] = {}
     for state in states:
-        for item in state.get("sol_calls") or []:
+        for item in state.get("cognition_calls") or []:
             if not isinstance(item, dict):
                 continue
             key = (_text(item.get("model_key")) or _text(item.get("model"))
@@ -1409,7 +1426,7 @@ def stats(states: list[dict], *, scope: str = "") -> dict:
                 row["failed"] += 1
     reuse_by_model: dict[str, int] = {}
     for state in states:
-        for item in state.get("sol_reuses") or []:
+        for item in state.get("cognition_reuses") or []:
             if not isinstance(item, dict):
                 continue
             key = (_text(item.get("model_key")) or _text(item.get("model"))
@@ -1458,13 +1475,13 @@ def stats(states: list[dict], *, scope: str = "") -> dict:
             "latency_ms_p50": _percentile([
                 int(item.get("latency_ms") or 0)
                 for state in states
-                for item in state.get("sol_calls") or []
+                for item in state.get("cognition_calls") or []
                 if isinstance(item, dict) and item.get("status") == "completed"
                 and item.get("latency_ms")], 0.50),
             "latency_ms_p95": _percentile([
                 int(item.get("latency_ms") or 0)
                 for state in states
-                for item in state.get("sol_calls") or []
+                for item in state.get("cognition_calls") or []
                 if isinstance(item, dict) and item.get("status") == "completed"
                 and item.get("latency_ms")], 0.95),
         },
