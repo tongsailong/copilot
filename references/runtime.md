@@ -6,12 +6,12 @@
 ## 1. 设计原则
 
 - **本地判定**：阶段判定、工作项派生、门禁检查只读状态文件与证据文件，不调用网络、模型或
-  子进程（命令采集只在 CLI 显式请求时执行）。`sol-consult` / `sol-plan` / `sol-review`
-  是仅有的例外：结果统一写入 `sol_calls`（历史 `sol_reviews` / `sol_advisories` 只读
+  子进程（命令采集只在 CLI 显式请求时执行）。`cognition-consult` / `cognition-plan` / `cognition-review`
+  是仅有的例外：结果统一写入 `cognition_calls`（历史 `sol_reviews` / `sol_advisories` 只读
   兼容），不自动改变阶段、不参与 PARTIAL 派生；CONSULT / PLAN 也不进入 Finding 台账或
-  G1–G3。SOL 调用失败只登记真实原因，不产生阻塞或派生工作项。
-- **SOL 由生命周期调度，不靠文案提醒**：v9.6 起 CONSULT / PLAN 按阶段物化为**调度义务**
-  并持久化在 `state.sol_schedule`；生命周期命令在自身事务内**有界执行**（每条命令最多
+  G1–G3。认知调用失败只登记真实原因，不产生阻塞或派生工作项。
+- **认知由生命周期调度，不靠文案提醒**：v9.6 起 CONSULT / PLAN 按阶段物化为**调度义务**
+  并持久化在 `state.cognition_schedule`；生命周期命令在自身事务内**有界执行**（每条命令最多
   1 个义务、1 次请求），而不是只打印命令等主代理记得执行。义务执行与否都不改变阶段、
   门禁、BLOCKED 判定或 `continuation`，详见 §5。
 - **PARTIAL 不是终点**：PARTIAL 表示还有工作可做，运行时必须派生下一步，而不是停止或
@@ -126,7 +126,7 @@
 3. BLOCKED → 打印原因与 `needs`；若 `continuation.required` 为真（口径不一致）抛出内部
    错误，否则退出 11；
 4. PASS → 先查最终验证准入（`closure_readiness`）：有缺口就打印缺口并退出 10，既不执行
-   E 也不收口；准入通过才按 §5 消费 family E 的收口认知窗口（`--sol auto` 时真的执行一次
+   E 也不收口；准入通过才按 §5 消费 family E 的收口认知窗口（`--cognition auto` 时真的执行一次
    CONSULT），再 `close_task`，退出 0；
 5. RUNNING → 先按 §5 有界消费 1 个到期义务（每次 `drive` 最多一次，只展示或执行，
    不改变阶段），再取前 `--max-actions` 个 ready 项，写入调度领取并把工作单打印出来；
@@ -229,14 +229,18 @@ BLOCKED/PASS 规避上限、以及新回合先 `status --json` 核实再继续�
 `closure-check` 的退出码与结论一致：PASS=0、FAIL=1（`--json` 同样），避免“检查过”被误当
 “通过”。
 
-## 5. SOL 生命周期调度（v9.6）
-
-SOL 仍是 advisory：调度只决定**什么时候该有一次认知判断**，不决定阶段、门禁或技术方案。
-实现分两层——`scripts/sol_schedule.py` 是纯策略/投影层（无网络、无文件 I/O、无门禁），
-`governance.py` 把义务落盘到 `state.sol_schedule`，`copilot_dispatch.py` 在生命周期命令内
+## 5. 认知生命周期调度（v9.6）认知仍是 advisory：调度只决定**什么时候该有一次认知判断**，不决定阶段、门禁或技术方案。
+实现分两层——`scripts/cognition_schedule.py` 是纯策略/投影层（无网络、无文件 I/O、无门禁），
+`governance.py` 把义务落盘到 `state.cognition_schedule`，`copilot_dispatch.py` 在生命周期命令内
 有界执行。
 
-**五个认知窗口（family A–E，与 `review_policy.sol_advice` 同一口径）**
+**历史调度只读兼容（v9.10）**：v9.10.0 之前的任务只有 `state.sol_schedule`。读取路径
+（`obligations` / `schedule_view` / `summary` / `task_stats`）在两键并存时以
+`cognition_schedule` 为准，只有旧键时回退到它；旧义务的 `copilot-sol-obligation/v1`
+schema 按普通字段读取。写入路径只创建/更新 `cognition_schedule`，旧键不迁移、不改写、
+不删除；因此旧任务重开时会得到一份新的调度结构，历史义务仍是 raw 状态里的审计事实。
+
+**五个认知窗口（family A–E，与 `review_policy.cognition_advice` 同一口径）**
 
 | 窗口 | 时机 | 模式 |
 |---|---|---|
@@ -280,54 +284,54 @@ instance、`contract_sha256`、`level`、`status`、`window`。`status` 取值 `
   附 `disposition_reason` 与 `disposition_at`；已有处置不覆盖（只增不改），也不改变
   `status`、`window` 与 `missed` 口径。
 - **`due` 不等于强制调用**：`schedule.policy_snapshots[<cycle>]` 记录本周期实际生效的
-  `off` / `advise` / `auto` 与是否允许自动执行（由生命周期命令的 `--sol` /
-  `COPILOT_SOL_AUTO` 写入）。`not-executed` 的理由引用这份快照；**没有快照的历史义务一律
+  `off` / `advise` / `auto` 与是否允许自动执行（由生命周期命令的 `--cognition` /
+  `COPILOT_COGNITION_AUTO` 写入）。`not-executed` 的理由引用这份快照；**没有快照的历史义务一律
   记 `unknown`**，不拿当前配置倒推“当时为什么没调用”。
-- **未能调度要留痕**：条件成立但本次没能执行（SOL 锁被占用等）只累加 `deferrals` 与
+- **未能调度要留痕**：条件成立但本次没能执行（认知锁被占用等）只累加 `deferrals` 与
   `last_deferral_reason`，义务仍保持 `due`；窗口关闭时这条事实现身在 `not-executed` 的
   理由里，不被静默清除，也不冒充失败（真实请求失败仍由 `failed` 表示）。
 - **收口周期隔离**：新义务带 `cycle`（1 + `closure.reopen_history` 条数）。窗口比较
   （`_advance_windows` 的“更晚窗口已满足”）只在同一周期内进行：重开后的收口判断覆盖的是
   重开后的认知对象，不能追溯宣布上一周期的窗口已被覆盖。旧周期的义务保持原周期与原事实
   （合同修订/被更新窗口取代的既有语义不变）；`summary.by_cycle` 与
-  `sol-stats.totals.reopened_tasks` 只是观测值。
+  `cognition-stats.totals.reopened_tasks` 只是观测值。
 - **历史义务只读推导**：`obligation_disposition()` 对没有持久化处置的旧义务按窗口事实现算，
   不写回历史状态；历史任务无需重跑命令也能看到终态与 `unknown` 理由。
-- **不阻断**：处置与周期分布只进 `summary.dispositions` / `by_cycle` 与 `sol-stats`，
-  不改 `pending` / `missed`、不改 coverage 分母、不阻止收口；`sol_schedule_warnings` 仍是
+- **不阻断**：处置与周期分布只进 `summary.dispositions` / `by_cycle` 与 `cognition-stats`，
+  不改 `pending` / `missed`、不改 coverage 分母、不阻止收口；`cognition_schedule_warnings` 仍是
   非阻断提醒。
 
 **有界执行**
 
 - 执行点：`start` / `plan` / `record` / `rerun` / `criterion` / `judgment` / `evidence` /
   `report` / `accept` / `decide` / `block` / `unblock` 与 `drive` 的调度步
-  （`_sol_schedule_step`），以及 `closure --close` 与 `sol-schedule --execute`。
+  （`_cognition_schedule_step`），以及 `closure --close` 与 `cognition-schedule --execute`。
 - **上限 1 个义务 / 1 次请求 per 命令**：不存在每任务固定次数上限，也不自动重试；剩余
   窗口留给下一条命令（`continuation` 仍要求继续，因此驱动链会自然走到）。
-- 策略 `--sol auto|advise|off`（默认 `auto`）：`auto` 直接经既有 SOL 通道执行到期义务；
-  `advise` 只打印可直接执行的命令与义务 id；`off` 静默。环境变量 `COPILOT_SOL_AUTO`
+- 策略 `--cognition auto|advise|off`（默认 `auto`）：`auto` 直接经既有认知通道执行到期义务；
+  `advise` 只打印可直接执行的命令与义务 id；`off` 静默。环境变量 `COPILOT_COGNITION_AUTO`
   可覆盖：`off` 强制离线，`on` 允许执行；测试进程（`unittest` 已加载）默认不执行，只有
   显式 `on` 的调度测试才走真实通道。
-- **只读命令永不执行**：`next` / `status` / `sol-schedule` / `sol-stats` / `closure-check`
+- **只读命令永不执行**：`next` / `status` / `cognition-schedule` / `cognition-stats` / `closure-check`
   只物化并展示义务，不写 state、不发请求。
-- **可执行命令只有一个来源**：`sol-schedule` 与调度步输出的命令带真实状态路径与
-  `--obligation`，可原样执行；`evaluate` / `review-admission` 里的 `sol.command` 仍是
+- **可执行命令只有一个来源**：`cognition-schedule` 与调度步输出的命令带真实状态路径与
+  `--obligation`，可原样执行；`evaluate` / `review-admission` 里的 `cognition.command` 仍是
   含 `<>` 占位的**模板**，只用于说明意图，不能当作已执行或可直接执行。
-- **收口顺序固定**：最终工程验证完成（收口准入通过）→ SOL 收口综合判断（family E，
-  `prefer_family="E"`）→ ZCode 最终验收（`sol-accept`，accepted / modified / rejected 任一）
+- **收口顺序固定**：最终工程验证完成（收口准入通过）→ 认知收口综合判断（family E，
+  `prefer_family="E"`）→ ZCode 最终验收（`cognition-accept`，accepted / modified / rejected 任一）
   → `close_task` 的 G1–G3 收口。E 窗口不占用 `drive` RUNNING 分支的那个额度，
-  `close_task` 记录的 `closure.sol_entry`（`drive` / `closure-command`）标明本次收口由哪个
+  `close_task` 记录的 `closure.cognition_entry`（`drive` / `closure-command`）标明本次收口由哪个
   入口完成；收口时仍 open 的窗口记为 `pending_before_close`，未满足的记
   `missed_before_close`。验收这一步是强制的顺序事实：`governance.closure_acceptance_pending()`
   在当前摘要的收口 CONSULT 尚无裁决记录时让 `close_task` 失败关闭、`continuation` 给
   `action="accept"`、`drive` / `closure --close` 停在 `EXIT_EXECUTE` / `EXIT_CONTINUE`。
-  裁决不是 SOL 批准权：三种结论都可继续，验收也不替代用户对质量报告的接受。
+  裁决不是认知批准权：三种结论都可继续，验收也不替代用户对质量报告的接受。
 - **收口准入唯一口径（v9.6.1）**：`governance.closure_readiness(state)` 是 E 窗口与收口
   的唯一准入，返回 `ready` / `digest` / `all_actions_terminal` / `criteria_satisfied` /
   `final_evidence_recorded` / `required_tests_completed` / `no_pending_required_work` /
   `verification_passed` / `blockers`。先查便宜事实（工作项终态、完成条件、证据、必要
   测试、重开后无进展、开放 finding），全部通过才算确定性门禁（不含质量报告的**用户
-  接受**——那是 ZCode 验收之后的用户一步，不能把 SOL 挡在它后面）。工作项全部关闭、
+  接受**——那是 ZCode 验收之后的用户一步，不能把认知挡在它后面）。工作项全部关闭、
   G1–G3 通过都**不等于**最终验证完成：合同 `test_policy.required=true` 时必须存在带
   `capture_cmd` 的采集证据（词元按序匹配声明命令，允许插入 `-B` 等运行器参数）或结构化
   质量报告给出 `required_tests_executed=true`。
@@ -339,38 +343,38 @@ instance、`contract_sha256`、`level`、`status`、`window`。`status` 取值 `
   审计能看出这份结论是按哪套材料规则得出的。
 - **入口一致**：`record` / `rerun` / `criterion` / `evidence` 等回填命令只更新义务，
   `drive` 在验证缺口时返回 `EXIT_EXECUTE` 并拒绝执行 E，`closure --close` 在验证缺口时
-  直接失败（退出码 1）而不收口，`sol-consult --stage closure` 在缺口或摘要不符时拒绝调用，
+  直接失败（退出码 1）而不收口，`cognition-consult --stage closure` 在缺口或摘要不符时拒绝调用，
   `close_task` 对缺测试证据的任务拒绝收口、对等待验收的收口 CONSULT 同样拒绝收口。
   任何入口都不能绕过验证、E 调度或 ZCode 验收。
 - **E 是 advisory**：收口 CONSULT 返回的风险与遗漏由 ZCode 独立核实、修复并定向验证；
-  它不是门禁，不需要 SOL PASS 才能收口，失败只降级。
-- **失败降级**：请求失败（配额、网络、超时、截断、模型身份不符等）按 `record_sol_obligation_error`
+  它不是门禁，不需要认知 PASS 才能收口，失败只降级。
+- **失败降级**：请求失败（配额、网络、超时、截断、模型身份不符等）按 `record_cognition_obligation_error`
   记录真实原因，`max_attempts=3` 后把义务置 `failed` 并继续工程推进；失败不冻结工作项、
-  不改变阶段、退出码仍为 0，只是 `sol_schedule_warnings` 里可见。
-- **失败分类与退避窗口（v9.8）**：`sol_review.py` 把上游失败归入十类 `error_class`
+  不改变阶段、退出码仍为 0，只是 `cognition_schedule_warnings` 里可见。
+- **失败分类与退避窗口（v9.8）**：`cognition_call.py` 把上游失败归入十类 `error_class`
   （`upstream_overloaded` / `upstream_stream_timeout` / `upstream_credential_cooling` /
   `upstream_auth` / `upstream_rate_limit` / `upstream_server_error` /
   `upstream_client_error` / `client_timeout` / `network_error` / `response_incomplete`），
   并把原始 `http_status`、`upstream_code`、`retry_after`（秒数）与 `retry_after_raw`
-  （原始文本，可能是 HTTP-date）、`request_id`、`trace_id` 原样写入 `sol-audit.jsonl` 与
-  `sol_calls` 失败记录；上游过载与本地凭据冷却期 503 都**不**记作认证失败。重试语义不变：
+  （原始文本，可能是 HTTP-date）、`request_id`、`trace_id` 原样写入 `cognition-audit.jsonl` 与
+  `cognition_calls` 失败记录；上游过载与本地凭据冷却期 503 都**不**记作认证失败。重试语义不变：
   一次调用只发一次请求，不自动重试、不换 Provider。
   `state["model_backoff"]`（`copilot-model-backoff/v2`，键 `codex:<model>`）按
   `provider + model + error_class` 记录到期时间：**服务端 Retry-After 是
   最短等待时间**（秒、毫秒、HTTP-date 均支持，HTTP-date 按 UTC 换算，过期或不可解析则不用），
   原样遵守、不被本地上限或环境变量缩短；只有在没有有效服务端值时才按 `error_class` 取默认
-  窗口（60 秒），此时才受 `COPILOT_SOL_BACKOFF_MAX`（只能下调）与 1800 秒上限约束。
-  窗口期调度步与 `sol-schedule --execute` 只登记 deferral（不消耗 `max_attempts`、不发请求），
-  手动 `sol-consult` / `sol-plan` / `sol-review` 直接拒绝，`--ignore-backoff` 仅在确认上游
+  窗口（60 秒），此时才受 `COPILOT_COGNITION_BACKOFF_MAX`（只能下调）与 1800 秒上限约束。
+  窗口期调度步与 `cognition-schedule --execute` 只登记 deferral（不消耗 `max_attempts`、不发请求），
+  手动 `cognition-consult` / `cognition-plan` / `cognition-review` 直接拒绝，`--ignore-backoff` 仅在确认上游
   恢复后显式覆盖；成功调用只清除本模型的窗口。窗口写在任务状态里，跨阶段、跨进程、跨会话
-  同样生效，到期后恢复既有调度频率。**按模型隔离**：SOL 过载不冻结 Astra，Astra 过载不阻塞
-  显式 SOL 调用；旧 `state["sol_backoff"]` 单例只读兼容，不继承给新默认模型。它是失败后的
+  同样生效，到期后恢复既有调度频率。**按模型隔离**：认知过载不冻结 Astra，Astra 过载不阻塞
+  显式认知调用；旧 `state["sol_backoff"]` 单例只读兼容，不继承给新默认模型。它是失败后的
   节流记录，**不是门禁**：不改变阶段、条件、G1–G3，也不派生工作项。
-- **并发**：SOL 通道由 `.sol-review.lock` 独占；拿不到锁抛 `LockBusyError`，命令回退为
-  “本轮不执行”，不排队重试、不重复付费。`sol-consult` / `sol-plan` 支持
+- **并发**：认知通道由 `.cognition-review.lock` 独占；拿不到锁抛 `LockBusyError`，命令回退为
+  “本轮不执行”，不排队重试、不重复付费。`cognition-consult` / `cognition-plan` 支持
   `--lock-timeout <秒>`。
 
-**覆盖率统计（观测，不是门禁）**：`sol-stats --state <path>` 或 `--workspace <dir>` 按
+**覆盖率统计（观测，不是门禁）**：`cognition-stats --state <path>` 或 `--workspace <dir>` 按
 合同口径输出应调/实际执行/失败/复用/合理跳过/应调未执行与原因、CONSULT 与 PLAN 的阶段
 分布、六类事件分布、采纳（accepted/modified/rejected）、tokens 与延迟。分母只统计当前
 合同下的适用窗口：启动＝非简单任务、规划＝`plan_admission().required`、收口＝非简单、有实质进展且
@@ -387,9 +391,9 @@ instance、`contract_sha256`、`level`、`status`、`window`。`status` 取值 `
 - `closure_check` 依次检查 G1–G3（工作项终态、合同/条件/证据/台账、无停摆），全部通过才
   `passed=true`；G4 已退役，不再参与。
 - `closure --close` 需要 G1–G3 通过，写入 `closure`（时间、`by`、`iteration_id`、门禁快照、
-  `sol_entry`）并把阶段固定为 CLOSED；未结束的迭代同时标记为 `CLOSED` 并补 `ended`，
+  `cognition_entry`）并把阶段固定为 CLOSED；未结束的迭代同时标记为 `CLOSED` 并补 `ended`，
   之后的修改一律拒绝。收口前先消费 family E 的收口认知窗口（§5）：成功则是收口前的
-  最后一条认知记录，未执行则把仍 open 的窗口记入 `closure.sol_schedule.at_close`，
+  最后一条认知记录，未执行则把仍 open 的窗口记入 `closure.cognition_schedule.at_close`，
   两者都不影响 CLOSED 的成立。
 - `reopen --reason ... --authorized-by user` 需要显式用户授权声明；它保存旧 closure 快照到
   `reopen_history`（含授权声明），清理收口状态，任务回到 RUNNING/PARTIAL，并开一条新迭代
@@ -406,7 +410,7 @@ instance、`contract_sha256`、`level`、`status`、`window`。`status` 取值 `
 - **并发安全**：`.lock` 文件 + `fcntl.flock` 串行化写者；`save_state(..., expect=...)` 用
   `save_seq` 做 CAS，识别“读到旧状态再写”的竞争并拒绝本次写入（提示 `save_seq` 变化，
   需重新读取后重做）。
-- **schema 守卫**：只接受 `copilot-governance/v1` + `version=1`；v1/v2 SOL 状态不被驱动，
+- **schema 守卫**：只接受 `copilot-governance/v1` + `version=1`；v1/v2 认知状态不被驱动，
   只能用 `legacy-status` 只读查看。
 - **上下文恢复**：状态里保留目标、合同、条件、工作项与结果、证据与摘要、判断、报告、决策、
   阻塞、调度领取、复核记录、迭代与完整 `history`。中断后从状态继续，不重建任务、不覆盖

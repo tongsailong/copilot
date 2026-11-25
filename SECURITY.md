@@ -23,7 +23,7 @@ Security → Advisories → Report a vulnerability 入口目前不可用。在�
 - Copilot 命令**不构成授权**：commit、push、发布、部署、付费、生产数据变更、Provider 与安全策略
   修改都必须由用户显式授权。
 - 门禁 **fail-closed**：证据缺失、绑定不符、门禁未过时一律失败关闭，不接受“看起来合理”。
-- SOL 结论是 advisory，不构成证据、门禁或授权；采纳与否由主 Agent 记录并负责。
+- 认知结论是 advisory，不构成证据、门禁或授权；采纳与否由主 Agent 记录并负责。
 
 若你发现某个命令能绕过上述边界（例如未经授权的写入、门禁可被空值/伪造输入放行、
 历史记录可被静默改写），请按上面流程报告——这类问题优先级最高。
@@ -32,14 +32,14 @@ Security → Advisories → Report a vulnerability 入口目前不可用。在�
 
 - 仓库与分发包中**不保存**任何凭据、Token、私钥或审计日志；`.env*`、`*.pem`、`*.key`、
   `.audit/`、`.copilot-tasks/`、`*.sqlite` 等均在 `.gitignore` 中排除。
-- 唯一的远程调用是 SOL（`scripts/sol_review.py`）：只允许 **本机回环** 出口
+- 唯一的远程调用是认知（`scripts/cognition_call.py`）：只允许 **本机回环** 出口
   （`127.0.0.1` / `localhost` / `::1`，默认端口 `8317`），拒绝带 userinfo、query 或额外路径的端点；
   凭据只从本机既有 ZCode Provider 配置读取，不落盘、不回显、不进入日志。
 - 失败不重试、不切换 Provider、不静默降级模型或推理强度；上游回显与请求不一致即拒绝消费。
 
 ### 3. 本机数据
 
-- 任务状态、证据与 SOL 原始输出写在项目工作区的 `.copilot-tasks/`，不写入仓库。
+- 任务状态、证据与认知原始输出写在项目工作区的 `.copilot-tasks/`，不写入仓库。
 - 证据采集会脱敏与截断，并在文件型证据消费时重读校验 SHA-256。
 - 图片证据需要 `Pillow` 做完整性校验；缺失时**拒绝**该证据，而不是放行未校验内容。
 
@@ -53,7 +53,7 @@ Security → Advisories → Report a vulnerability 入口目前不可用。在�
 
 - 工作流 `.github/workflows/ci.yml` 使用普通 `pull_request` 事件（**不用** `pull_request_target`），
   顶层权限只有 `contents: read`，`actions/checkout` 关闭凭据持久化。
-- 不引用任何 Secrets，不调用 SOL，不访问本机 Provider、知识库、运行时目录或私有 runner；
+- 不引用任何 Secrets，不调用认知，不访问本机 Provider、知识库、运行时目录或私有 runner；
   fork PR 的代码与主仓库 PR 在同一套无特权托管 runner 上运行。
 - Action 固定到完整 commit SHA；CI 只做编译、活动测试与 baseline 只读校验，不执行
   `sync_runtime.py --apply`，不提交、不推送、不发布。

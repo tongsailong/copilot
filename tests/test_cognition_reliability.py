@@ -30,8 +30,8 @@ from unittest import mock
 import v6_support as F
 
 G = F.G
-import sol_review as SR  # noqa: E402  v6_support 已把 scripts/ 加入 sys.path
-import sol_schedule as SS  # noqa: E402
+import cognition_call as CC  # noqa: E402  v6_support 已把 scripts/ 加入 sys.path
+import cognition_schedule as SCH  # noqa: E402
 import copilot_dispatch as CD  # noqa: E402
 
 URL = "http://127.0.0.1:8317/v1/responses"
@@ -49,7 +49,7 @@ def _http_error(status: int, body: bytes = b"", headers: dict | None = None):
 
 def think_text() -> str:
     return json.dumps({
-        "schema": SR.THINK_SCHEMA,
+        "schema": CC.THINK_SCHEMA,
         "judgment": "先补定向测试再合并",
         "essence": "真正的风险在缺少验证",
         "strategy": "先用定向测试锁定行为",
@@ -66,7 +66,7 @@ def think_payload(*, status: str = "completed", http_status: int = 200,
                   text: str | None = None, incomplete: dict | None = None,
                   request_id: str = "", trace_id: str = "") -> dict:
     payload = {
-        "model": SR.MODEL,
+        "model": CC.MODEL,
         "status": status,
         "output": [{"type": "message", "status": "completed",
                     "content": [{"type": "output_text",
@@ -83,10 +83,10 @@ def think_payload(*, status: str = "completed", http_status: int = 200,
 
 
 def think_result(mode: str = "CONSULT") -> dict:
-    """通道替身返回的成功结果（结构与真实 run_sol 一致，不联网）。"""
+    """通道替身返回的成功结果（结构与真实 run_cognition 一致，不联网）。"""
     return {
-        "schema": SR.THINK_SCHEMA, "mode": mode,
-        "model": SR.MODEL, "model_resolved": SR.MODEL,
+        "schema": CC.THINK_SCHEMA, "mode": mode,
+        "model": CC.MODEL, "model_resolved": CC.MODEL,
         "reasoning_effort": "high", "reasoning_mode": "standard",
         "reasoning_resolved": {"effort": "high"}, "reasoning_verified": True,
         "zero_tool": True, "attempts": 1, "request_id": "req-1",
@@ -109,8 +109,8 @@ class ClassificationTests(unittest.TestCase):
         error = _http_error(status, body, headers)
         with mock.patch("urllib.request.build_opener") as build:
             build.return_value.open.side_effect = error
-            with self.assertRaises(SR.SolError) as ctx:
-                SR._post_once(URL, "k", {"model": "m"}, 5)
+            with self.assertRaises(CC.CognitionError) as ctx:
+                CC._post_once(URL, "k", {"model": "m"}, 5)
             # 单次请求：失败不重试、不换 Provider。
             self.assertEqual(build.return_value.open.call_count, 1)
         return ctx.exception
@@ -120,10 +120,10 @@ class ClassificationTests(unittest.TestCase):
             "request_timeout",
             "stream disconnected before completion: "
             "stream closed before response.completed"))
-        self.assertIsInstance(exc, SR.SolStreamTimeoutError)
-        self.assertEqual(exc.error_class, SR.UPSTREAM_STREAM_TIMEOUT)
+        self.assertIsInstance(exc, CC.CognitionStreamTimeoutError)
+        self.assertEqual(exc.error_class, CC.UPSTREAM_STREAM_TIMEOUT)
         self.assertEqual(exc.http_status, 408)
-        self.assertEqual(exc.exit_code, SR.EXIT_UPSTREAM)
+        self.assertEqual(exc.exit_code, CC.EXIT_UPSTREAM)
         self.assertIsNone(exc.retry_after)
         self.assertIn("HTTP 408", exc.detail)
         self.assertIn("upstream_code=request_timeout", exc.detail)
@@ -133,14 +133,14 @@ class ClassificationTests(unittest.TestCase):
                                     "The server is overloaded",),
                          {"Retry-After": "322", "X-Request-Id": "req-9",
                           "X-Cpa-Trace-Id": "trace-9"})
-        self.assertIsInstance(exc, SR.SolOverloadedError)
-        self.assertEqual(exc.error_class, SR.UPSTREAM_OVERLOADED)
+        self.assertIsInstance(exc, CC.CognitionOverloadedError)
+        self.assertEqual(exc.error_class, CC.UPSTREAM_OVERLOADED)
         self.assertEqual(exc.http_status, 502)
         self.assertEqual(exc.retry_after, 322)
         self.assertEqual(exc.upstream_code, "server_is_overloaded")
         self.assertEqual((exc.request_id, exc.trace_id), ("req-9", "trace-9"))
         self.assertIn("Retry-After=322s", exc.detail)
-        self.assertNotEqual(exc.error_class, SR.UPSTREAM_AUTH)
+        self.assertNotEqual(exc.error_class, CC.UPSTREAM_AUTH)
 
     def test_502_retry_after_header_is_case_insensitive(self):
         headers = Message()
@@ -174,7 +174,7 @@ class ClassificationTests(unittest.TestCase):
         self.assertIsNone(exc.retry_after)
         self.assertEqual(exc.retry_after_raw, raw)
         # 过期的服务端时间不当作“可以立刻重试”，由本地退避策略兜底。
-        self.assertEqual(exc.error_class, SR.UPSTREAM_STREAM_TIMEOUT)
+        self.assertEqual(exc.error_class, CC.UPSTREAM_STREAM_TIMEOUT)
 
     def test_unparseable_retry_after_falls_back(self):
         exc = self._post(502, _body("server_is_overloaded", "overloaded"),
@@ -187,9 +187,9 @@ class ClassificationTests(unittest.TestCase):
             "auth_unavailable",
             "no auth available; last upstream error: server_is_overloaded"),
             {"Retry-After": "194"})
-        self.assertIsInstance(exc, SR.SolCredentialCoolingError)
-        self.assertEqual(exc.error_class, SR.UPSTREAM_CREDENTIAL_COOLING)
-        self.assertNotEqual(exc.error_class, SR.UPSTREAM_AUTH)
+        self.assertIsInstance(exc, CC.CognitionCredentialCoolingError)
+        self.assertEqual(exc.error_class, CC.UPSTREAM_CREDENTIAL_COOLING)
+        self.assertNotEqual(exc.error_class, CC.UPSTREAM_AUTH)
         self.assertEqual(exc.retry_after, 194)
         self.assertIn("不是认证失效", exc.detail)
 
@@ -197,23 +197,23 @@ class ClassificationTests(unittest.TestCase):
         for status in (401, 403):
             with self.subTest(status=status):
                 exc = self._post(status, _body("unauthorized", "bad key"))
-                self.assertIsInstance(exc, SR.SolAuthError)
-                self.assertEqual(exc.error_class, SR.UPSTREAM_AUTH)
+                self.assertIsInstance(exc, CC.CognitionAuthError)
+                self.assertEqual(exc.error_class, CC.UPSTREAM_AUTH)
 
     def test_4xx_request_errors_are_client_side(self):
         exc = self._post(400, _body("invalid_request", "bad payload"))
-        self.assertIsInstance(exc, SR.SolUpstreamClientError)
-        self.assertEqual(exc.error_class, SR.UPSTREAM_CLIENT)
+        self.assertIsInstance(exc, CC.CognitionUpstreamClientError)
+        self.assertEqual(exc.error_class, CC.UPSTREAM_CLIENT)
 
     def test_plain_5xx_is_server_error(self):
         exc = self._post(500, _body("server_error", "boom"))
-        self.assertIsInstance(exc, SR.SolUpstreamError)
-        self.assertEqual(exc.error_class, SR.UPSTREAM_SERVER)
+        self.assertIsInstance(exc, CC.CognitionUpstreamError)
+        self.assertEqual(exc.error_class, CC.UPSTREAM_SERVER)
 
     def test_429_stays_quota(self):
         exc = self._post(429, _body("usage_limit_reached", "quota"))
-        self.assertIsInstance(exc, SR.SolQuotaError)
-        self.assertEqual(exc.error_class, SR.UPSTREAM_RATE_LIMIT)
+        self.assertIsInstance(exc, CC.CognitionQuotaError)
+        self.assertEqual(exc.error_class, CC.UPSTREAM_RATE_LIMIT)
 
     def test_received_error_response_means_request_was_sent(self):
         exc = self._post(502, _body("server_is_overloaded", "overloaded"))
@@ -221,7 +221,7 @@ class ClassificationTests(unittest.TestCase):
 
 
 # ── 2. 真实调用路径：单次请求、审计事实、不伪造成功 ────────────────────────
-class RunSolAuditTests(unittest.TestCase):
+class RunCognitionAuditTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -244,17 +244,17 @@ class RunSolAuditTests(unittest.TestCase):
                 handle.__enter__.return_value.status = 200
                 handle.__enter__.return_value.headers = {}
                 build.return_value.open.return_value = handle
-            return SR.run_consult("材料", api_key="k", audit_log=self.audit)
+            return CC.run_consult("材料", api_key="k", audit_log=self.audit)
 
     def test_408_audit_keeps_class_status_and_ids(self):
         error = _http_error(408, _body("request_timeout", "stream disconnected "
                                        "before completion"),
                             {"X-Request-Id": "req-1", "X-Cpa-Trace-Id": "t-1"})
-        with self.assertRaises(SR.SolStreamTimeoutError):
+        with self.assertRaises(CC.CognitionStreamTimeoutError):
             self._run(side_effect=error)
         record = self._audit()
         self.assertFalse(record["ok"])
-        self.assertEqual(record["error_class"], SR.UPSTREAM_STREAM_TIMEOUT)
+        self.assertEqual(record["error_class"], CC.UPSTREAM_STREAM_TIMEOUT)
         self.assertEqual(record["http_status"], 408)
         self.assertIsNone(record["retry_after"])
         self.assertEqual(record["upstream_code"], "request_timeout")
@@ -265,40 +265,40 @@ class RunSolAuditTests(unittest.TestCase):
         self.assertEqual(record["attempts"], 1)
 
     def test_client_timeout_is_recorded_as_sent_with_unknown_result(self):
-        with self.assertRaises(SR.SolTimeoutError) as ctx:
+        with self.assertRaises(CC.CognitionTimeoutError) as ctx:
             self._run(side_effect=TimeoutError("boom"))
-        self.assertEqual(ctx.exception.exit_code, SR.EXIT_TIMEOUT)
-        self.assertEqual(ctx.exception.error_class, SR.CLIENT_TIMEOUT)
+        self.assertEqual(ctx.exception.exit_code, CC.EXIT_TIMEOUT)
+        self.assertEqual(ctx.exception.error_class, CC.CLIENT_TIMEOUT)
         record = self._audit()
-        self.assertEqual(record["error_class"], SR.CLIENT_TIMEOUT)
+        self.assertEqual(record["error_class"], CC.CLIENT_TIMEOUT)
         self.assertIsNone(record["http_status"])
         self.assertTrue(record["request_attempted"])
         # 客户端超时无法证明上游是否已生成回复：保持 unknown，不当作未发送。
         self.assertEqual(record["send_observed"], "unknown")
 
     def test_incomplete_response_is_rejected_not_registered(self):
-        with self.assertRaises(SR.SolResponseError) as ctx:
+        with self.assertRaises(CC.CognitionResponseError) as ctx:
             self._run(return_value=think_payload(
                 status="incomplete",
                 incomplete={"reason": "max_output_tokens"}))
-        self.assertEqual(ctx.exception.code, "sol_response_incomplete")
-        self.assertEqual(ctx.exception.error_class, SR.RESPONSE_INCOMPLETE)
+        self.assertEqual(ctx.exception.code, "cognition_response_incomplete")
+        self.assertEqual(ctx.exception.error_class, CC.RESPONSE_INCOMPLETE)
         self.assertIn("max_output_tokens", ctx.exception.detail)
         record = self._audit()
-        self.assertEqual(record["error_class"], SR.RESPONSE_INCOMPLETE)
+        self.assertEqual(record["error_class"], CC.RESPONSE_INCOMPLETE)
 
     def test_empty_text_is_not_a_success(self):
-        with self.assertRaises(SR.SolResponseError) as ctx:
+        with self.assertRaises(CC.CognitionResponseError) as ctx:
             self._run(return_value=think_payload(text="   "))
-        self.assertEqual(ctx.exception.code, "sol_output_empty")
+        self.assertEqual(ctx.exception.code, "cognition_output_empty")
 
     def test_default_output_budget_is_unchanged(self):
         # 24000 是 v7.0.0 起的既定值；历史 8192 截断修复没有回退。
-        self.assertEqual(SR.DEFAULT_MAX_OUTPUT_TOKENS, 24000)
-        self.assertEqual(SR.build_payload("材料")["max_output_tokens"], 24000)
+        self.assertEqual(CC.DEFAULT_MAX_OUTPUT_TOKENS, 24000)
+        self.assertEqual(CC.build_payload("材料")["max_output_tokens"], 24000)
 
     def test_timeout_budget_is_unchanged(self):
-        self.assertEqual(SR.DEFAULT_TIMEOUT, 300.0)
+        self.assertEqual(CC.DEFAULT_TIMEOUT, 300.0)
 
 
 # ── 3. 失败登记与退避窗口 ───────────────────────────────────────────────────
@@ -316,132 +316,163 @@ class FailureRecordTests(unittest.TestCase):
         return G.load_state(self.state_path)
 
     def _fail(self, **kwargs) -> dict:
-        defaults = dict(mode="CONSULT", error_code="sol_upstream_overloaded",
-                        detail="HTTP 502")
+        defaults = dict(mode="CONSULT", error_code="cognition_upstream_overloaded",
+                        detail="HTTP 502",
+                        model=CC.DEFAULT_MODEL, provider=CC.PROVIDER)
         defaults.update(kwargs)
-        return G.record_sol_call_failure(self.state_path, **defaults)
+        return G.record_cognition_call_failure(self.state_path, **defaults)
+
+    def window(self, error_class: str = CC.UPSTREAM_OVERLOADED) -> dict:
+        state = self.state()
+        slots = ((state.get(G.MODEL_BACKOFF_KEY) or {}).get("windows") or {}) \
+            .get(CC.model_key(), {})
+        return slots.get(error_class, {}) if isinstance(slots, dict) else {}
+
+    def backoff(self, include_model: bool = True) -> dict:
+        return G.cognition_backoff_status(
+            self.state(),
+            model=CC.model_key() if include_model else "")
 
     def test_failure_record_keeps_raw_upstream_facts(self):
         record = self._fail(http_status=502, retry_after=322,
                             upstream_code="server_is_overloaded",
-                            error_class=SR.UPSTREAM_OVERLOADED,
+                            error_class=CC.UPSTREAM_OVERLOADED,
                             request_id="req-1", trace_id="trace-1",
                             stage="planning")
-        self.assertEqual(record["error_class"], SR.UPSTREAM_OVERLOADED)
+        self.assertEqual(record["error_class"], CC.UPSTREAM_OVERLOADED)
         self.assertEqual(record["http_status"], 502)
         self.assertEqual(record["retry_after"], 322)
         self.assertEqual(record["upstream_code"], "server_is_overloaded")
         self.assertEqual((record["request_id"], record["trace_id"]),
                          ("req-1", "trace-1"))
-        stored = self.state()["sol_calls"][-1]
+        stored = self.state()["cognition_calls"][-1]
         self.assertEqual(stored["status"], "failed")
-        self.assertEqual(stored["error_class"], SR.UPSTREAM_OVERLOADED)
+        self.assertEqual(stored["error_class"], CC.UPSTREAM_OVERLOADED)
         self.assertEqual(stored["stage"], "planning")
 
     def test_historical_failure_infers_error_class(self):
         for code, expected in (
-                ("sol_quota", SR.UPSTREAM_RATE_LIMIT),
-                ("sol_timeout", SR.CLIENT_TIMEOUT),
-                ("sol_transport_error", SR.NETWORK_ERROR),
-                ("sol_response_incomplete", SR.RESPONSE_INCOMPLETE)):
+                ("cognition_quota", CC.UPSTREAM_RATE_LIMIT),
+                ("cognition_timeout", CC.CLIENT_TIMEOUT),
+                ("cognition_transport_error", CC.NETWORK_ERROR),
+                ("cognition_response_incomplete", CC.RESPONSE_INCOMPLETE)):
             with self.subTest(code=code):
                 self.assertEqual(G._infer_error_class(code), expected)
-        record = self._fail(error_code="sol_quota", http_status=429,
+        record = self._fail(error_code="cognition_quota", http_status=429,
                             retry_after=60)
-        self.assertEqual(record["error_class"], SR.UPSTREAM_RATE_LIMIT)
+        self.assertEqual(record["error_class"], CC.UPSTREAM_RATE_LIMIT)
 
     def test_retry_after_sets_backoff_window(self):
         record = self._fail(http_status=502, retry_after=322,
-                            error_class=SR.UPSTREAM_OVERLOADED)
+                            error_class=CC.UPSTREAM_OVERLOADED)
         self.assertEqual(record["backoff"]["seconds"], 322)
-        status = G.sol_backoff_status(self.state())
+        self.assertEqual(record["backoff"]["model_key"], CC.model_key())
+        status = self.backoff()
         self.assertTrue(status["active"])
         self.assertEqual(status["reason"], "retry-after")
-        self.assertEqual(status["error_class"], SR.UPSTREAM_OVERLOADED)
+        self.assertEqual(status["error_class"], CC.UPSTREAM_OVERLOADED)
 
     def test_server_retry_after_is_never_truncated(self):
         # 服务端 Retry-After 是最短等待时间：3600s 必须原样保留，不被 1800s 上限截断。
         record = self._fail(http_status=502, retry_after=3600,
-                            error_class=SR.UPSTREAM_OVERLOADED)
+                            error_class=CC.UPSTREAM_OVERLOADED)
         self.assertEqual(record["backoff"]["seconds"], 3600)
-        state = self.state()
-        self.assertEqual(state[G.SOL_BACKOFF_KEY]["seconds"], 3600)
-        remaining = G.sol_backoff_status(state)["remaining_seconds"]
-        self.assertGreater(remaining, G.SOL_BACKOFF_MAX_SECONDS)
+        self.assertEqual(self.window()["seconds"], 3600)
+        remaining = self.backoff()["remaining_seconds"]
+        self.assertGreater(remaining, G.COGNITION_BACKOFF_MAX_SECONDS)
 
     def test_env_cap_cannot_shrink_server_wait(self):
-        with mock.patch.dict(os.environ, {"COPILOT_SOL_BACKOFF_MAX": "60"}):
+        with mock.patch.dict(os.environ, {"COPILOT_COGNITION_BACKOFF_MAX": "60"}):
             self._fail(http_status=502, retry_after=3600,
-                       error_class=SR.UPSTREAM_OVERLOADED)
-            self.assertEqual(
-                self.state()[G.SOL_BACKOFF_KEY]["seconds"], 3600)
+                       error_class=CC.UPSTREAM_OVERLOADED)
+            self.assertEqual(self.window()["seconds"], 3600)
 
     def test_env_cap_still_bounds_local_fallback(self):
-        with mock.patch.dict(os.environ, {"COPILOT_SOL_BACKOFF_MAX": "10"}):
+        with mock.patch.dict(os.environ, {"COPILOT_COGNITION_BACKOFF_MAX": "10"}):
             self._fail(http_status=408,
-                       error_class=SR.UPSTREAM_STREAM_TIMEOUT)
-            self.assertEqual(self.state()[G.SOL_BACKOFF_KEY]["seconds"], 10)
+                       error_class=CC.UPSTREAM_STREAM_TIMEOUT)
+            self.assertEqual(
+                self.window(CC.UPSTREAM_STREAM_TIMEOUT)["seconds"], 10)
 
     def test_backoff_record_keeps_raw_retry_after(self):
         raw = "Wed, 25 Nov 2026 20:00:00 GMT"
         self._fail(http_status=502, retry_after=900, retry_after_raw=raw,
-                   error_class=SR.UPSTREAM_OVERLOADED)
-        state = self.state()
-        self.assertEqual(state[G.SOL_BACKOFF_KEY]["retry_after_raw"], raw)
-        self.assertEqual(state["sol_calls"][-1]["retry_after_raw"], raw)
+                   error_class=CC.UPSTREAM_OVERLOADED)
+        self.assertEqual(self.window()["retry_after_raw"], raw)
+        self.assertEqual(self.state()["cognition_calls"][-1]["retry_after_raw"],
+                         raw)
 
     def test_retryable_class_without_hint_gets_default_window(self):
-        self._fail(http_status=408, error_class=SR.UPSTREAM_STREAM_TIMEOUT)
-        status = G.sol_backoff_status(self.state())
+        self._fail(http_status=408, error_class=CC.UPSTREAM_STREAM_TIMEOUT)
+        status = self.backoff()
         self.assertTrue(status["active"])
         self.assertEqual(status["reason"], "error-class")
 
     def test_auth_and_client_errors_do_not_create_backoff(self):
-        self._fail(http_status=401, error_class=SR.UPSTREAM_AUTH)
-        self.assertFalse(G.sol_backoff_status(self.state())["active"])
-        self._fail(http_status=400, error_class=SR.UPSTREAM_CLIENT)
-        self.assertFalse(G.sol_backoff_status(self.state())["active"])
+        self._fail(http_status=401, error_class=CC.UPSTREAM_AUTH)
+        self.assertFalse(self.backoff()["active"])
+        self._fail(http_status=400, error_class=CC.UPSTREAM_CLIENT)
+        self.assertFalse(self.backoff()["active"])
+
+    def test_failure_without_model_identity_writes_no_legacy_window(self):
+        # v9.10：没有模型身份的失败只记失败事实，不再写 `sol_backoff`
+        # （历史单例只读保留，新写入不得产生旧格式数据）。
+        record = self._fail(model="", provider="", http_status=502,
+                            retry_after=300,
+                            error_class=CC.UPSTREAM_OVERLOADED)
+        self.assertEqual(record["backoff_skipped"], "missing-model-identity")
+        self.assertNotIn("backoff", record)
+        state = self.state()
+        self.assertNotIn(G.LEGACY_BACKOFF_KEY, state)
+        self.assertFalse(G.cognition_backoff_status(state)["active"])
+        self.assertEqual(state["cognition_calls"][-1]["status"], "failed")
 
     def test_backoff_expires_without_state_change(self):
+        # 只读兼容：v9.8 及更早的历史单例仍可读，过期即失效，不改历史状态。
         state = self.state()
-        state[G.SOL_BACKOFF_KEY] = {
-            "schema": G.SOL_BACKOFF_SCHEMA,
+        state[G.LEGACY_BACKOFF_KEY] = {
+            "schema": G.COGNITION_BACKOFF_SCHEMA,
             "until": (datetime.now().astimezone()
                       - timedelta(seconds=1)).isoformat(timespec="seconds"),
-            "reason": "retry-after", "error_class": SR.UPSTREAM_OVERLOADED,
+            "reason": "retry-after", "error_class": CC.UPSTREAM_OVERLOADED,
         }
         G.save_state(self.state_path, state)
-        status = G.sol_backoff_status(self.state())
+        status = G.cognition_backoff_status(self.state())
         self.assertFalse(status["active"])
         self.assertEqual(status["remaining_seconds"], 0.0)
 
     def test_corrupt_backoff_record_does_not_block_forever(self):
         state = self.state()
-        state[G.SOL_BACKOFF_KEY] = {"until": "not-a-time"}
+        state[G.LEGACY_BACKOFF_KEY] = {"until": "not-a-time"}
         G.save_state(self.state_path, state)
-        status = G.sol_backoff_status(self.state())
+        status = G.cognition_backoff_status(self.state())
         self.assertFalse(status["active"])
         self.assertTrue(status["invalid"])
 
     def test_successful_call_clears_backoff(self):
         self._fail(http_status=502, retry_after=300,
-                   error_class=SR.UPSTREAM_OVERLOADED)
-        self.assertTrue(G.sol_backoff_status(self.state())["active"])
-        G.record_sol_call(self.state_path, {
+                   error_class=CC.UPSTREAM_OVERLOADED)
+        self.assertTrue(self.backoff()["active"])
+        G.record_cognition_call(self.state_path, {
             "call_id": "SCok", "mode": "CONSULT", "summary": "ok",
             "materials_sha256": "m" * 64,
+            "model": CC.DEFAULT_MODEL, "model_key": CC.model_key(),
+            "provider": CC.PROVIDER,
             "completed_at": G.now_iso()},
             mode="CONSULT", materials_sha256="m" * 64)
         state = self.state()
-        self.assertNotIn(G.SOL_BACKOFF_KEY, state)
-        self.assertFalse(G.sol_backoff_status(state)["active"])
+        self.assertNotIn(CC.model_key(),
+                         ((state.get(G.MODEL_BACKOFF_KEY) or {})
+                          .get("windows") or {}))
+        self.assertNotIn(G.LEGACY_BACKOFF_KEY, state)
+        self.assertFalse(G.cognition_backoff_status(state)["active"])
         events = [item.get("event") for item in state.get("history") or []]
-        self.assertIn("sol_backoff_cleared", events)
+        self.assertIn("cognition_backoff_cleared", events)
 
     def test_failure_does_not_change_stage_or_criteria(self):
         before = self.state()
         self._fail(http_status=502, retry_after=300,
-                   error_class=SR.UPSTREAM_OVERLOADED)
+                   error_class=CC.UPSTREAM_OVERLOADED)
         after = self.state()
         self.assertEqual(before["mode"], after["mode"])
         self.assertEqual(before["schema"], after["schema"])
@@ -449,10 +480,10 @@ class FailureRecordTests(unittest.TestCase):
         self.assertEqual(len(after["contract"]["criteria"]),
                          len(before["contract"]["criteria"]))
 
-    def test_backoff_classes_match_sol_channels(self):
+    def test_backoff_classes_match_cognition_channels(self):
         # 一致性：调用侧认为"上游不可用"的分类必须是被调度层推迟的同一集合。
-        self.assertTrue(SR.UPSTREAM_RETRYABLE_CLASSES
-                        <= G.SOL_BACKOFF_CLASSES)
+        self.assertTrue(CC.UPSTREAM_RETRYABLE_CLASSES
+                        <= G.COGNITION_BACKOFF_CLASSES)
 
 
 # ── 4. 调度与手动路径：窗口内不发请求，窗口关闭后继续 ──────────────────────
@@ -476,49 +507,49 @@ class BackoffDispatchTests(unittest.TestCase):
 
     def _set_backoff(self, seconds: float = 322) -> None:
         # 退避窗口按 provider+model+error_class 隔离：只写当前默认模型的窗口，
-        # 与真实失败路径（record_sol_call_failure 带 model）保持一致。
+        # 与真实失败路径（record_cognition_call_failure 带 model）保持一致。
         state = self.state()
-        window = G._sol_backoff_from_failure({
-            "error_class": SR.UPSTREAM_OVERLOADED, "retry_after": seconds,
+        window = G._cognition_backoff_from_failure({
+            "error_class": CC.UPSTREAM_OVERLOADED, "retry_after": seconds,
             "http_status": 502, "call_id": "SCfail"})
-        G.store_model_backoff(state, {**window, "model": SR.DEFAULT_MODEL,
-                                      "provider": SR.PROVIDER,
-                                      "model_key": SR.model_key()})
+        G.store_model_backoff(state, {**window, "model": CC.DEFAULT_MODEL,
+                                      "provider": CC.PROVIDER,
+                                      "model_key": CC.model_key()})
         G.save_state(self.state_path, state)
 
     def _consult(self, *extra: str) -> int:
         with contextlib.redirect_stdout(io.StringIO()), \
                 contextlib.redirect_stderr(io.StringIO()):
-            return CD.main(["sol-consult", "--state", self.state_path,
+            return CD.main(["cognition-consult", "--state", self.state_path,
                             "--materials", self.materials,
                             "--question", "本次要判断什么", *extra])
 
     def _sync(self) -> None:
         state = self.state()
-        synced = G.sync_sol_schedule(state, advice=G.sol_advice_summary(state))
+        synced = G.sync_cognition_schedule(state, advice=G.cognition_advice_summary(state))
         if synced["changes"]:
             G.save_state(self.state_path, state)
 
     def test_schedule_step_defers_inside_window_without_request(self):
         self._sync()
-        self.assertTrue(SS.due_obligations(self.state()))
+        self.assertTrue(SCH.due_obligations(self.state()))
         self._set_backoff()
-        args = mock.Mock(state=self.state_path, sol="auto")
+        args = mock.Mock(state=self.state_path, cognition="auto")
         calls = {"count": 0}
 
         def fake(*_a, **_k):
             calls["count"] += 1
             return think_result()
 
-        with mock.patch.dict(os.environ, {"COPILOT_SOL_AUTO": "on"}), \
-                mock.patch.object(SR, "run_consult", side_effect=fake), \
+        with mock.patch.dict(os.environ, {"COPILOT_COGNITION_AUTO": "on"}), \
+                mock.patch.object(CC, "run_consult", side_effect=fake), \
                 contextlib.redirect_stdout(io.StringIO()), \
                 contextlib.redirect_stderr(io.StringIO()):
-            result = CD._sol_schedule_step(self.state_path, args)
+            result = CD._cognition_schedule_step(self.state_path, args)
         self.assertEqual(calls["count"], 0)
         self.assertEqual(result["executed"], "")
         self.assertTrue(result["deferred"]["obligation"])
-        row = SS.obligations(self.state())[0]
+        row = SCH.obligations(self.state())[0]
         self.assertEqual(row["status"], "due")
         self.assertEqual(row["deferrals"], 1)
         self.assertIn("upstream-backoff", row["last_deferral_reason"])
@@ -527,95 +558,95 @@ class BackoffDispatchTests(unittest.TestCase):
         self._sync()
         self._set_backoff(1)
         state = self.state()
-        window = state[G.MODEL_BACKOFF_KEY]["windows"][SR.model_key()][
-            SR.UPSTREAM_OVERLOADED]
+        window = state[G.MODEL_BACKOFF_KEY]["windows"][CC.model_key()][
+            CC.UPSTREAM_OVERLOADED]
         window["until"] = (datetime.now().astimezone()
                            - timedelta(seconds=1)).isoformat(timespec="seconds")
         G.save_state(self.state_path, state)
-        args = mock.Mock(state=self.state_path, sol="auto")
+        args = mock.Mock(state=self.state_path, cognition="auto")
         calls = {"count": 0}
 
         def fake(*_a, **_k):
             calls["count"] += 1
             return think_result()
 
-        with mock.patch.dict(os.environ, {"COPILOT_SOL_AUTO": "on"}), \
-                mock.patch.object(SR, "run_consult", side_effect=fake), \
+        with mock.patch.dict(os.environ, {"COPILOT_COGNITION_AUTO": "on"}), \
+                mock.patch.object(CC, "run_consult", side_effect=fake), \
                 contextlib.redirect_stdout(io.StringIO()), \
                 contextlib.redirect_stderr(io.StringIO()):
-            result = CD._sol_schedule_step(self.state_path, args)
+            result = CD._cognition_schedule_step(self.state_path, args)
         self.assertEqual(calls["count"], 1)
         self.assertTrue(result["executed"])
 
     def test_manual_call_is_refused_inside_window(self):
         self._set_backoff()
-        with mock.patch.object(SR, "run_consult",
+        with mock.patch.object(CC, "run_consult",
                                side_effect=AssertionError("不应发起请求")):
             code = self._consult()
         self.assertEqual(code, 2)
-        failed = [item for item in self.state().get("sol_calls") or []
+        failed = [item for item in self.state().get("cognition_calls") or []
                   if item.get("status") == "failed"]
         self.assertEqual(failed, [])
 
     def test_ignore_backoff_override_sends_exactly_one_request(self):
         self._set_backoff()
-        with mock.patch.object(SR, "run_consult",
+        with mock.patch.object(CC, "run_consult",
                                return_value=think_result()) as run:
             code = self._consult("--ignore-backoff")
         self.assertEqual(code, 0)
         self.assertEqual(run.call_count, 1)
         state = self.state()
-        self.assertEqual(state["sol_calls"][-1]["status"], "completed")
+        self.assertEqual(state["cognition_calls"][-1]["status"], "completed")
         events = [item.get("event") for item in state.get("history") or []]
-        self.assertIn("sol_backoff_overridden", events)
-        self.assertFalse(G.sol_backoff_status(
-            state, model=SR.model_key())["active"])
+        self.assertIn("cognition_backoff_overridden", events)
+        self.assertFalse(G.cognition_backoff_status(
+            state, model=CC.model_key())["active"])
 
     def test_consult_failure_degrades_and_stays_traceable(self):
-        error = SR.SolOverloadedError(
-            "sol_upstream_overloaded", "上游瞬时容量不足",
+        error = CC.CognitionOverloadedError(
+            "cognition_upstream_overloaded", "上游瞬时容量不足",
             http_status=502, retry_after=300,
             upstream_code="server_is_overloaded",
-            error_class=SR.UPSTREAM_OVERLOADED, response_received=True)
+            error_class=CC.UPSTREAM_OVERLOADED, response_received=True)
         error.request_attempted = True
         error.send_observed = "response_received"
         out = io.StringIO()
-        with mock.patch.object(SR, "run_consult", side_effect=error), \
+        with mock.patch.object(CC, "run_consult", side_effect=error), \
                 contextlib.redirect_stdout(out), \
                 contextlib.redirect_stderr(io.StringIO()):
-            code = CD.main(["sol-consult", "--state", self.state_path,
+            code = CD.main(["cognition-consult", "--state", self.state_path,
                             "--materials", self.materials,
                             "--question", "本次要判断什么", "--json"])
         # CONSULT 失败只降级：不阻断工程、不返回非零。
         self.assertEqual(code, 0)
-        record = self.state()["sol_calls"][-1]
+        record = self.state()["cognition_calls"][-1]
         self.assertEqual(record["status"], "failed")
-        self.assertEqual(record["error_class"], SR.UPSTREAM_OVERLOADED)
+        self.assertEqual(record["error_class"], CC.UPSTREAM_OVERLOADED)
         self.assertEqual(record["http_status"], 502)
         self.assertEqual(record["retry_after"], 300)
         self.assertEqual(record["upstream_code"], "server_is_overloaded")
         degraded = json.loads(out.getvalue())
         self.assertEqual(degraded["status"], "unavailable")
         self.assertEqual(degraded["action"], "continue")
-        self.assertEqual(degraded["error_class"], SR.UPSTREAM_OVERLOADED)
-        self.assertTrue(G.sol_backoff_status(
-            self.state(), model=SR.model_key())["active"])
+        self.assertEqual(degraded["error_class"], CC.UPSTREAM_OVERLOADED)
+        self.assertTrue(G.cognition_backoff_status(
+            self.state(), model=CC.model_key())["active"])
 
     def test_review_failure_returns_real_exit_code(self):
-        error = SR.SolAuthError("sol_upstream_auth", "认证失败",
+        error = CC.CognitionAuthError("cognition_upstream_auth", "认证失败",
                                 http_status=401,
-                                error_class=SR.UPSTREAM_AUTH,
+                                error_class=CC.UPSTREAM_AUTH,
                                 response_received=True)
         error.request_attempted = True
         error.send_observed = "response_received"
-        with mock.patch.object(SR, "run_review", side_effect=error), \
+        with mock.patch.object(CC, "run_review", side_effect=error), \
                 contextlib.redirect_stdout(io.StringIO()), \
                 contextlib.redirect_stderr(io.StringIO()):
-            code = CD.main(["sol-review", "--state", self.state_path,
+            code = CD.main(["cognition-review", "--state", self.state_path,
                             "--materials", self.materials])
         self.assertEqual(code, error.exit_code)
-        self.assertEqual(self.state()["sol_calls"][-1]["error_class"],
-                         SR.UPSTREAM_AUTH)
+        self.assertEqual(self.state()["cognition_calls"][-1]["error_class"],
+                         CC.UPSTREAM_AUTH)
 
 
 # ── 5. 恢复与幂等：不重复付费、同阶段去重、不同阶段独立 ────────────────────
@@ -640,56 +671,56 @@ class RecoveryTests(unittest.TestCase):
     def _consult(self, *extra: str) -> int:
         with contextlib.redirect_stdout(io.StringIO()), \
                 contextlib.redirect_stderr(io.StringIO()):
-            return CD.main(["sol-consult", "--state", self.state_path,
+            return CD.main(["cognition-consult", "--state", self.state_path,
                             "--materials", self.materials,
                             "--question", "本次要判断什么", *extra])
 
     def test_remote_success_with_registration_failure_is_recovered(self):
-        with mock.patch.object(SR, "run_consult",
+        with mock.patch.object(CC, "run_consult",
                                return_value=think_result()) as run, \
-                mock.patch.object(G, "record_sol_call",
+                mock.patch.object(G, "record_cognition_call",
                                   side_effect=G.GovernanceError("磁盘失败")):
             code = self._consult()
         self.assertEqual(code, 2)
         self.assertEqual(run.call_count, 1)
-        pending_dir = os.path.join(self.dir, "sol-consult")
+        pending_dir = os.path.join(self.dir, "cognition-consult")
         pendings = [name for name in os.listdir(pending_dir)
                     if name.startswith("pending-")]
         self.assertEqual(len(pendings), 1)
         # 第二次同材料调用直接恢复，不再发起请求（不重复计费）。
-        with mock.patch.object(SR, "run_consult",
+        with mock.patch.object(CC, "run_consult",
                                side_effect=AssertionError("不应再次请求")):
             code = self._consult()
         self.assertEqual(code, 0)
-        record = self.state()["sol_calls"][-1]
+        record = self.state()["cognition_calls"][-1]
         self.assertEqual(record["status"], "completed")
         self.assertTrue(record["recovered_from_pending"])
         self.assertFalse(os.path.exists(
             os.path.join(pending_dir, pendings[0])))
 
     def test_same_subject_reuses_without_second_request(self):
-        with mock.patch.object(SR, "run_consult",
+        with mock.patch.object(CC, "run_consult",
                                return_value=think_result()) as run:
             self.assertEqual(self._consult(), 0)
             self.assertEqual(self._consult(), 0)
         self.assertEqual(run.call_count, 1)
-        self.assertEqual(len(self.state()["sol_calls"]), 1)
+        self.assertEqual(len(self.state()["cognition_calls"]), 1)
 
     def test_different_stage_is_an_independent_call(self):
-        trigger = sorted(SR.RETRY_TRIGGERS)[0]
-        with mock.patch.object(SR, "run_consult",
+        trigger = sorted(CC.RETRY_TRIGGERS)[0]
+        with mock.patch.object(CC, "run_consult",
                                return_value=think_result()) as run:
             self.assertEqual(self._consult("--stage", "understanding"), 0)
             self.assertEqual(self._consult(
                 "--stage", "planning", "--force", "--trigger", trigger,
                 "--reason", "阶段目标已变化"), 0)
         self.assertEqual(run.call_count, 2)
-        calls = self.state()["sol_calls"]
+        calls = self.state()["cognition_calls"]
         self.assertEqual(len(calls), 2)
         self.assertNotEqual(calls[0]["stage"], calls[1]["stage"])
 
     def test_same_subject_without_reason_is_refused(self):
-        with mock.patch.object(SR, "run_consult",
+        with mock.patch.object(CC, "run_consult",
                                return_value=think_result()) as run:
             self.assertEqual(self._consult("--stage", "understanding"), 0)
             code = self._consult("--stage", "planning")
@@ -698,28 +729,28 @@ class RecoveryTests(unittest.TestCase):
 
     def test_failure_keeps_obligation_due_instead_of_satisfied(self):
         state = self.state()
-        synced = G.sync_sol_schedule(state, advice=G.sol_advice_summary(state))
+        synced = G.sync_cognition_schedule(state, advice=G.cognition_advice_summary(state))
         if synced["changes"]:
             G.save_state(self.state_path, state)
-        due = SS.due_obligations(self.state())
+        due = SCH.due_obligations(self.state())
         self.assertTrue(due)
         target = due[0]
-        error = SR.SolOverloadedError(
-            "sol_upstream_overloaded", "上游过载", http_status=502,
+        error = CC.CognitionOverloadedError(
+            "cognition_upstream_overloaded", "上游过载", http_status=502,
             retry_after=300, upstream_code="server_is_overloaded",
-            error_class=SR.UPSTREAM_OVERLOADED, response_received=True)
+            error_class=CC.UPSTREAM_OVERLOADED, response_received=True)
         error.request_attempted = True
         error.send_observed = "response_received"
-        with mock.patch.object(SR, "run_consult", side_effect=error), \
+        with mock.patch.object(CC, "run_consult", side_effect=error), \
                 contextlib.redirect_stdout(io.StringIO()), \
                 contextlib.redirect_stderr(io.StringIO()):
-            code = CD.main(["sol-consult", "--state", self.state_path,
+            code = CD.main(["cognition-consult", "--state", self.state_path,
                             "--obligation", target["obligation_id"],
                             "--lock-timeout", "1"])
         self.assertEqual(code, 0)
-        row = SS.find_obligation(self.state(), obligation_id=target["obligation_id"])
+        row = SCH.find_obligation(self.state(), obligation_id=target["obligation_id"])
         self.assertEqual(row["status"], "failed")
-        self.assertEqual(row["failure"], "sol_upstream_overloaded")
+        self.assertEqual(row["failure"], "cognition_upstream_overloaded")
 
 
 # ── 5. 408 跨阶段 / 跨会话退避（follow-up 2026-11-25）───────────────────────
@@ -746,35 +777,35 @@ class StreamTimeoutCrossStageTests(unittest.TestCase):
     def _window(self, state: dict | None = None) -> dict:
         state = state if state is not None else self.state()
         return ((state.get(G.MODEL_BACKOFF_KEY) or {}).get("windows", {})
-                .get(SR.model_key(), {}).get(SR.UPSTREAM_STREAM_TIMEOUT, {}))
+                .get(CC.model_key(), {}).get(CC.UPSTREAM_STREAM_TIMEOUT, {}))
 
     def _fail_408(self, retry_after=None, raw: str = "") -> dict:
-        return G.record_sol_call_failure(
+        return G.record_cognition_call_failure(
             self.state_path, mode="CONSULT",
-            model=SR.DEFAULT_MODEL, provider=SR.PROVIDER,
-            error_code="sol_upstream_stream_timeout",
+            model=CC.DEFAULT_MODEL, provider=CC.PROVIDER,
+            error_code="cognition_upstream_stream_timeout",
             detail="stream closed before response.completed",
             http_status=408, retry_after=retry_after,
             retry_after_raw=raw,
             upstream_code="request_timeout",
-            error_class=SR.UPSTREAM_STREAM_TIMEOUT,
+            error_class=CC.UPSTREAM_STREAM_TIMEOUT,
             send_observed="response_received")
 
     def _add_obligation(self, family: str, event: str, mode: str,
                         stage: str, instance: str) -> str:
         state = self.state()
-        schedule = SS.ensure_schedule(state)
-        obligation = SS._new_obligation(state, {
+        schedule = SCH.ensure_schedule(state)
+        obligation = SCH._new_obligation(state, {
             "family": family, "event": event, "instance": instance,
             "mode": mode, "stage": stage, "level": "recommended",
             "question": "本次要判断什么"}, now=G.now_iso())
-        obligation["obligation_id"] = SS._next_obligation_id(schedule)
+        obligation["obligation_id"] = SCH._next_obligation_id(schedule)
         schedule["obligations"].append(obligation)
         G.save_state(self.state_path, state)
         return obligation["obligation_id"]
 
     def _execute(self, obligation_id: str) -> tuple[int, int]:
-        obligation = SS.find_obligation(self.state(),
+        obligation = SCH.find_obligation(self.state(),
                                         obligation_id=obligation_id)
         calls = {"count": 0}
 
@@ -782,8 +813,8 @@ class StreamTimeoutCrossStageTests(unittest.TestCase):
             calls["count"] += 1
             return think_result()
 
-        with mock.patch.object(SR, "run_consult", side_effect=fake), \
-                mock.patch.object(SR, "run_plan", side_effect=fake), \
+        with mock.patch.object(CC, "run_consult", side_effect=fake), \
+                mock.patch.object(CC, "run_plan", side_effect=fake), \
                 contextlib.redirect_stdout(io.StringIO()), \
                 contextlib.redirect_stderr(io.StringIO()):
             code = CD._execute_obligation(self.state_path, dict(obligation))
@@ -794,12 +825,12 @@ class StreamTimeoutCrossStageTests(unittest.TestCase):
         backoff = self._window()
         self.assertEqual(record["backoff"]["reason"], "error-class")
         self.assertEqual(backoff["reason"], "error-class")
-        self.assertEqual(backoff["error_class"], SR.UPSTREAM_STREAM_TIMEOUT)
-        self.assertEqual(backoff["seconds"], G.SOL_BACKOFF_FALLBACK_SECONDS)
-        self.assertNotEqual(backoff["error_class"], SR.UPSTREAM_AUTH)
-        self.assertNotIn(G.SOL_BACKOFF_KEY, self.state())
-        self.assertTrue(G.sol_backoff_status(
-            self.state(), model=SR.model_key())["active"])
+        self.assertEqual(backoff["error_class"], CC.UPSTREAM_STREAM_TIMEOUT)
+        self.assertEqual(backoff["seconds"], G.COGNITION_BACKOFF_FALLBACK_SECONDS)
+        self.assertNotEqual(backoff["error_class"], CC.UPSTREAM_AUTH)
+        self.assertNotIn(G.LEGACY_BACKOFF_KEY, self.state())
+        self.assertTrue(G.cognition_backoff_status(
+            self.state(), model=CC.model_key())["active"])
 
     def test_408_with_retry_after_uses_server_wait(self):
         self._fail_408(600, raw="600")
@@ -815,7 +846,7 @@ class StreamTimeoutCrossStageTests(unittest.TestCase):
         code, calls = self._execute(plan_id)
         self.assertEqual(code, 0)
         self.assertEqual(calls, 0)
-        row = SS.find_obligation(self.state(), obligation_id=plan_id)
+        row = SCH.find_obligation(self.state(), obligation_id=plan_id)
         self.assertEqual(row["status"], "due")
         self.assertEqual(row["deferrals"], 1)
         self.assertIn("upstream-backoff", row["last_deferral_reason"])
@@ -827,7 +858,7 @@ class StreamTimeoutCrossStageTests(unittest.TestCase):
         code, calls = self._execute(closure_id)
         self.assertEqual(code, 0)
         self.assertEqual(calls, 0)
-        row = SS.find_obligation(self.state(), obligation_id=closure_id)
+        row = SCH.find_obligation(self.state(), obligation_id=closure_id)
         self.assertEqual(row["status"], "due")
         self.assertEqual(row["deferrals"], 1)
 
@@ -835,7 +866,7 @@ class StreamTimeoutCrossStageTests(unittest.TestCase):
         self._fail_408(900)
         # 新进程/新会话只读同一 state.json：退避状态不依赖内存、会话绑定或锁。
         fresh = G.load_state(self.state_path)
-        status = G.sol_backoff_status(fresh, model=SR.model_key())
+        status = G.cognition_backoff_status(fresh, model=CC.model_key())
         self.assertTrue(status["active"])
         self.assertGreater(status["remaining_seconds"], 0)
         plan_id = self._add_obligation("B", "plan", "PLAN", "planning", "p2")
@@ -849,8 +880,8 @@ class StreamTimeoutCrossStageTests(unittest.TestCase):
             datetime.now().astimezone()
             - timedelta(seconds=1)).isoformat(timespec="seconds")
         G.save_state(self.state_path, state)
-        self.assertFalse(G.sol_backoff_status(
-            self.state(), model=SR.model_key())["active"])
+        self.assertFalse(G.cognition_backoff_status(
+            self.state(), model=CC.model_key())["active"])
         plan_id = self._add_obligation("B", "plan", "PLAN", "planning", "p3")
         code, calls = self._execute(plan_id)
         self.assertEqual(code, 0)
@@ -864,19 +895,19 @@ class StreamTimeoutCrossStageTests(unittest.TestCase):
             calls["count"] += 1
             return think_result()
 
-        with mock.patch.object(SR, "run_consult", side_effect=fake), \
+        with mock.patch.object(CC, "run_consult", side_effect=fake), \
                 contextlib.redirect_stdout(io.StringIO()), \
                 contextlib.redirect_stderr(io.StringIO()):
-            code = CD.main(["sol-consult", "--state", self.state_path,
+            code = CD.main(["cognition-consult", "--state", self.state_path,
                             "--materials", self.materials,
                             "--question", "本次要判断什么",
                             "--ignore-backoff"])
         self.assertEqual(code, 0)
         self.assertEqual(calls["count"], 1)
         state = self.state()
-        self.assertNotIn(G.SOL_BACKOFF_KEY, state)
+        self.assertNotIn(G.LEGACY_BACKOFF_KEY, state)
         events = [item.get("event") for item in state.get("history") or []]
-        self.assertIn("sol_backoff_overridden", events)
+        self.assertIn("cognition_backoff_overridden", events)
 
 
 # ── 6. CPA 408 来源分类（模拟响应，不触碰真实 CPA 配置）─────────────────────
@@ -886,8 +917,8 @@ class Cpa408ClassificationTests(unittest.TestCase):
         error = _http_error(status, body, headers)
         with mock.patch("urllib.request.build_opener") as build:
             build.return_value.open.side_effect = error
-            with self.assertRaises(SR.SolError) as ctx:
-                SR._post_once(URL, "k", {"model": "m"}, 5)
+            with self.assertRaises(CC.CognitionError) as ctx:
+                CC._post_once(URL, "k", {"model": "m"}, 5)
         return ctx.exception
 
     def test_upstream_codex_timeout_is_stream_timeout(self):
@@ -895,29 +926,29 @@ class Cpa408ClassificationTests(unittest.TestCase):
             "request_timeout",
             "stream disconnected before completion: "
             "stream closed before response.completed"))
-        self.assertEqual(exc.error_class, SR.UPSTREAM_STREAM_TIMEOUT)
-        self.assertNotEqual(exc.error_class, SR.UPSTREAM_AUTH)
-        self.assertNotEqual(exc.error_class, SR.UPSTREAM_OVERLOADED)
+        self.assertEqual(exc.error_class, CC.UPSTREAM_STREAM_TIMEOUT)
+        self.assertNotEqual(exc.error_class, CC.UPSTREAM_AUTH)
+        self.assertNotEqual(exc.error_class, CC.UPSTREAM_OVERLOADED)
 
     def test_bare_408_without_payload_is_still_stream_timeout(self):
         # CPA 代理层/上游在无 body 时透传 408：归类为上游瞬时，不猜成认证问题。
         exc = self._post(408)
-        self.assertEqual(exc.error_class, SR.UPSTREAM_STREAM_TIMEOUT)
+        self.assertEqual(exc.error_class, CC.UPSTREAM_STREAM_TIMEOUT)
         self.assertIsNone(exc.retry_after)
 
     def test_client_deadline_exceeded_code_is_stream_timeout(self):
         exc = self._post(408, _body("deadline_exceeded", "deadline exceeded"))
-        self.assertIn(exc.error_class, (SR.UPSTREAM_STREAM_TIMEOUT,
-                                        SR.UPSTREAM_SERVER))
+        self.assertIn(exc.error_class, (CC.UPSTREAM_STREAM_TIMEOUT,
+                                        CC.UPSTREAM_SERVER))
 
     def test_local_client_timeout_has_no_http_status(self):
         with mock.patch("urllib.request.build_opener") as build:
             build.return_value.open.side_effect = __import__("socket").timeout(
                 "read timed out")
-            with self.assertRaises(SR.SolError) as ctx:
-                SR._post_once(URL, "k", {"model": "m"}, 5)
+            with self.assertRaises(CC.CognitionError) as ctx:
+                CC._post_once(URL, "k", {"model": "m"}, 5)
         exc = ctx.exception
-        self.assertEqual(exc.error_class, SR.CLIENT_TIMEOUT)
+        self.assertEqual(exc.error_class, CC.CLIENT_TIMEOUT)
         self.assertIsNone(exc.http_status)
         self.assertEqual(exc.send_observed, "not_attempted")
 
@@ -925,7 +956,7 @@ class Cpa408ClassificationTests(unittest.TestCase):
         exc = self._post(503, _body(
             "auth_unavailable", "no auth available; last upstream error: "
             "server_is_overloaded"), {"Retry-After": "194"})
-        self.assertEqual(exc.error_class, SR.UPSTREAM_CREDENTIAL_COOLING)
+        self.assertEqual(exc.error_class, CC.UPSTREAM_CREDENTIAL_COOLING)
         self.assertEqual(exc.retry_after, 194)
 
 

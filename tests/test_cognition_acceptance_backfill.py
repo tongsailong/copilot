@@ -4,7 +4,7 @@
 覆盖 v9.7.1 的最小改进：
 
 1. 已收口任务**只能**走历史通道：正常入口仍拒绝 CLOSED，不放开原有约束。
-2. 历史通道只写 `sol_calls[*].acceptance` 与历史事件，不改 verdict / closure /
+2. 历史通道只写 `cognition_calls[*].acceptance` 与历史事件，不改 verdict / closure /
    条件 / 门禁。
 3. `pending` 只在此通道可用且必须写明原因：用于“复核过但无法用任务记录证明
    采纳”的调用，不为了消除 pending 而降低证据要求。
@@ -44,7 +44,7 @@ class BackfillBase(unittest.TestCase):
     def record(self, mode: str, *, stage: str = "") -> str:
         state = G.load_state(self.state_path)
         call = {
-            "call_id": f"SC{mode.lower()}{len(state.get('sol_calls') or [])}",
+            "call_id": f"SC{mode.lower()}{len(state.get('cognition_calls') or [])}",
             "mode": mode,
             "status": "completed",
             "stage": stage,
@@ -56,7 +56,7 @@ class BackfillBase(unittest.TestCase):
             "findings_count": {},
             "completed_at": G.now_iso(),
         }
-        G.record_sol_call(self.state_path, call, mode=mode,
+        G.record_cognition_call(self.state_path, call, mode=mode,
                           materials_sha256="m" * 64)
         return call["call_id"]
 
@@ -74,7 +74,7 @@ class BackfillBase(unittest.TestCase):
         return G.load_state(self.state_path)
 
     def accept(self, call_id: str, **kwargs) -> dict:
-        return G.record_sol_acceptance(self.state_path, call_id, **kwargs)
+        return G.record_cognition_acceptance(self.state_path, call_id, **kwargs)
 
     def pending_review(self, call_id: str | None = None) -> dict:
         return self.accept(
@@ -122,9 +122,9 @@ class PendingReviewTests(BackfillBase):
         self.assertFalse(result.get("duplicate"))
         self.assertIn(self.call_id, [row["call_id"] for row in
                                      RP.pending_acceptance(
-                                         G.load_state(self.state_path)["sol_calls"])])
+                                         G.load_state(self.state_path)["cognition_calls"])])
         self.assertEqual(
-            RP.prior_cognition(G.load_state(self.state_path)["sol_calls"])[-1][
+            RP.prior_cognition(G.load_state(self.state_path)["cognition_calls"])[-1][
                 "acceptance"], "pending")
 
     def test_pending_review_does_not_touch_closure_or_criteria(self):
@@ -139,8 +139,8 @@ class PendingReviewTests(BackfillBase):
                          before["contract"]["criteria"])
         self.assertEqual(after["mode"], "CLOSED")
         events = [h["event"] for h in after["history"]]
-        self.assertEqual(events.count("sol_call_acceptance_review"), 1)
-        self.assertEqual(events.count("sol_call_acceptance"), 0)
+        self.assertEqual(events.count("cognition_call_acceptance_review"), 1)
+        self.assertEqual(events.count("cognition_call_acceptance"), 0)
         self.assertEqual(events.count("task_reopened"), 0)
 
     def test_pending_review_is_idempotent(self):
@@ -156,7 +156,7 @@ class PendingReviewTests(BackfillBase):
         self.assertEqual(len(state["history"]), history_before)
         self.assertEqual(
             [h["event"] for h in state["history"]].count(
-                "sol_call_acceptance_review"), 1)
+                "cognition_call_acceptance_review"), 1)
 
     def test_pending_review_reason_change_appends_history(self):
         self.close_task()
@@ -169,13 +169,13 @@ class PendingReviewTests(BackfillBase):
                          "covered-by-other-acceptance")
         self.assertEqual(
             [h["event"] for h in G.load_state(self.state_path)["history"]].count(
-                "sol_call_acceptance_review"), 2)
+                "cognition_call_acceptance_review"), 2)
 
     def test_pending_review_does_not_count_as_decided(self):
         self.close_task()
         self.pending_review()
         quality = G.review_metrics(G.load_state(self.state_path))[
-            "sol_cognitive"]["acceptance_quality"]
+            "cognition"]["acceptance_quality"]
         self.assertEqual(quality["records"], 0)
         self.assertEqual(quality["legacy_records"], 0)
 
@@ -192,7 +192,7 @@ class DecidedBackfillTests(BackfillBase):
         self.assertEqual(entry["decision"], "按该判断先调查再修复")
         self.assertEqual(entry["registration_count"], 1)
         event = [h for h in G.load_state(self.state_path)["history"]
-                 if h["event"] == "sol_call_acceptance"][-1]
+                 if h["event"] == "cognition_call_acceptance"][-1]
         self.assertTrue(event["detail"]["historical"])
         self.assertEqual(event["detail"]["status"], "accepted")
 
@@ -209,7 +209,7 @@ class DecidedBackfillTests(BackfillBase):
         self.assertEqual(second["acceptance"], first["acceptance"])
         state = G.load_state(self.state_path)
         self.assertEqual(len(state["history"]), history_before)
-        self.assertEqual(state["sol_calls"][0]["acceptance"]["registration_count"], 1)
+        self.assertEqual(state["cognition_calls"][0]["acceptance"]["registration_count"], 1)
 
     def test_decided_backfill_never_overwrites(self):
         self.close_task()
@@ -221,7 +221,7 @@ class DecidedBackfillTests(BackfillBase):
                         decision="改为直接修复", rationale="事后判断")
         self.assertIn("不覆盖既有结论", str(ctx.exception))
         state = G.load_state(self.state_path)
-        self.assertEqual(state["sol_calls"][0]["acceptance"], original)
+        self.assertEqual(state["cognition_calls"][0]["acceptance"], original)
 
     def test_pending_cannot_downgrade_decided_record(self):
         self.close_task()
@@ -231,7 +231,7 @@ class DecidedBackfillTests(BackfillBase):
         with self.assertRaises(G.GovernanceError) as ctx:
             self.pending_review()
         self.assertIn("不把它改写成 pending", str(ctx.exception))
-        self.assertEqual(G.load_state(self.state_path)["sol_calls"][0]["acceptance"],
+        self.assertEqual(G.load_state(self.state_path)["cognition_calls"][0]["acceptance"],
                          original)
 
     def test_decided_backfill_from_pending_review_is_allowed(self):
@@ -250,7 +250,7 @@ class DecidedBackfillTests(BackfillBase):
 class CliTests(BackfillBase):
     def test_cli_accepts_historical_pending_and_reports_duplicate(self):
         self.close_task()
-        args = ("sol-accept", "--state", self.state_path, "--call-id",
+        args = ("cognition-accept", "--state", self.state_path, "--call-id",
                 self.call_id, "--status", "pending", "--historical",
                 "--reason-code", "no-attribution", "--reason", MARKER)
         first = F.run_cli("copilot_dispatch.py", *args)

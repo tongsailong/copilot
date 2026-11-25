@@ -1,4 +1,4 @@
-# review：SOL CONSULT / PLAN / REVIEW、正式 REVIEW 与已退役的 G4
+# review：认知 CONSULT / PLAN / REVIEW、正式 REVIEW 与已退役的 G4
 
 本文说明当前几类“认知与复核”，以及各自的触发条件、证据要求与失败处理；G4 历史记录
 只读保留。
@@ -6,30 +6,30 @@
 **一句话区分：**
 
 - **普通自检**：ZCode 自己做，不登记为复核，不构成任何门禁依据。
-- **SOL CONSULT（默认认知入口）**：非简单任务在启动、执行期新证据、阶段边界与收口前
+- **认知 CONSULT（默认认知入口）**：非简单任务在启动、执行期新证据、阶段边界与收口前
   一次性调用 `gpt-6.2-astra`（零工具、单轮、high），输出目标理解、问题本质、路线与取舍、
   风险、调查方向与再咨询条件；结论是认知输入，不是门禁。
-- **SOL PLAN（调查后的规划判断）**：多步骤 / 多方案 / 重要决策任务在形成现场事实后调用，
+- **认知 PLAN（调查后的规划判断）**：多步骤 / 多方案 / 重要决策任务在形成现场事实后调用，
   输出方案比较、优先级、阶段目标与验收关注点；最终技术方案仍由 ZCode 决定。
-- **SOL REVIEW（用户要求）**：用户明确要求时一次性独立复核，输出结构化 findings；结论是
+- **认知 REVIEW（用户要求）**：用户明确要求时一次性独立复核，输出结构化 findings；结论是
   建议，不是门禁。
 - **正式 REVIEW**：用户明确授权时才做，是一个治理记录，**不是普通开发的强制前置门**。
 - ~~**G4 复核**~~：v8.0.0 已正式退役，不再是门禁；历史记录只读保留用于审计。
 
-## 0. SOL 零工具单轮调用（v9.0：CONSULT / PLAN / REVIEW）
+## 0. 认知零工具单轮调用（v9.0：CONSULT / PLAN / REVIEW）
 
 ### 统一入口与共享上下文
 
-- 三种模式共用一条管线：`copilot_dispatch.py` 的 `_run_sol_channel` → `sol_review.run_sol`
-  → `governance.record_sol_call`；模式差异只在提示词、阶段语义、结果结构与失败语义。
-- 提示词由 `sol_review.build_prompt` 统一构造，自动注入同一份任务目标、合同正文（
+- 三种模式共用一条管线：`copilot_dispatch.py` 的 `_run_cognition_channel` → `cognition_call.run_cognition`
+  → `governance.record_cognition_call`；模式差异只在提示词、阶段语义、结果结构与失败语义。
+- 提示词由 `cognition_call.build_prompt` 统一构造，自动注入同一份任务目标、合同正文（
   `done_criteria_text` 与边界）、完成条件、工作项状态与证据登记摘要（ID、类型、摘要前缀、
   大小、支持的条件、归档标记，上限 80 条 / 6000 字符）。主代理只需提供本次增量的材料与
   具体问题，不必重复粘贴门禁已有事实。
-- `review-admission` / `evaluate` / `drive` / `status` 是“要不要调用 SOL”的确定性入口：
+- `review-admission` / `evaluate` / `drive` / `status` 是“要不要调用认知”的确定性入口：
   先算任务类型与本地复杂度（只用状态事实），再结合已有覆盖给出建议；不写状态、不派生
   工作项、不改变阶段。
-- 简单/机械任务默认不调用 SOL；非简单任务按生命周期建议，没有硬性次数或 Token 上限。
+- 简单/机械任务默认不调用认知；非简单任务按生命周期建议，没有硬性次数或 Token 上限。
 
 ### 任务类型与生命周期（v9）
 
@@ -37,15 +37,15 @@
 
 - 简单/机械类型：`trivial` / `mechanical` / `docs` / `format` —— 默认 0 调用，除非出现
   `risk-high` / `replan-history` / `reopened` 或用户明确要求；
-- 其余类型默认进入 SOL 生命周期。
+- 其余类型默认进入认知生命周期。
 
 | 阶段 | 建议 | 入口 |
 |---|---|---|
-| A 启动 | 非简单任务默认一次 CONSULT：目标与隐含需求、问题本质、关键矛盾、初步策略、风险、调查方向 | `sol-consult --stage understanding` |
-| B 调查后 | 多步骤 / 多方案 / 重要决策建议一次 PLAN：方案比较、取舍、优先级、阶段目标 | `sol-plan --stage planning` |
-| C 执行期 | 升级型新信号（风险升级/方案失败重规划/任务重开）或合同实质修订时追加 CONSULT | `sol-consult --stage development --force --trigger ...` |
-| D 阶段复盘 | 中高复杂任务在重要阶段完成后做一次成果复盘（recommended，同一进度不重复） | `sol-consult --stage stage` |
-| E 收口前 | 最终工程验证完成后（工作项终态、条件核销、证据与必要测试齐备）一次综合判断：目标达成、遗漏与剩余风险 | `sol-consult --stage closure` |
+| A 启动 | 非简单任务默认一次 CONSULT：目标与隐含需求、问题本质、关键矛盾、初步策略、风险、调查方向 | `cognition-consult --stage understanding` |
+| B 调查后 | 多步骤 / 多方案 / 重要决策建议一次 PLAN：方案比较、取舍、优先级、阶段目标 | `cognition-plan --stage planning` |
+| C 执行期 | 升级型新信号（风险升级/方案失败重规划/任务重开）或合同实质修订时追加 CONSULT | `cognition-consult --stage development --force --trigger ...` |
+| D 阶段复盘 | 中高复杂任务在重要阶段完成后做一次成果复盘（recommended，同一进度不重复） | `cognition-consult --stage stage` |
+| E 收口前 | 最终工程验证完成后（工作项终态、条件核销、证据与必要测试齐备）一次综合判断：目标达成、遗漏与剩余风险 | `cognition-consult --stage closure` |
 
 - **E 的时机不是“最后一项关闭”**：收口 CONSULT 以 `closure_readiness` 为唯一准入——工作项
   终态、条件核销、证据登记、合同必要测试的执行痕迹全部满足后才执行；G1–G3 通过本身不等于
@@ -57,15 +57,15 @@
 - **覆盖**：同一合同（`contract_sha256` 相同）内 CONSULT 与 PLAN 分别判断覆盖；没有升级型
   新信号时返回 `reuse`，直接复用结论。合同实质修订后旧结论不再覆盖，先重新 CONSULT。
 - **不触发的情形**：普通测试失败、普通步骤推进、证据目录增加、工作项增减等结构变化不算
-  新的认知对象；任务级 BLOCKED 或已 CLOSED 时不建议新的 SOL 调用（项级阻塞只冻结该项）。
+  新的认知对象；任务级 BLOCKED 或已 CLOSED 时不建议新的认知调用（项级阻塞只冻结该项）。
 - **REVIEW**：只由 `review-admission --review-request`（用户明确要求）给出，不由阶段、风险
   或调用次数自动派生。
 
 ### 模型与推理强度
 
 - 默认统一 `gpt-6.2-astra`（Responses API `/v1/responses`，既有本机 CPA `127` 出口）；
-  `gpt-6.2-sol` 只通过 `--model gpt-6.2-sol` 显式选择（历史兼容），不是默认、不是失败回退。
-- 请求、回显校验、审计与 `sol_calls` 记录都带 `provider` 与 `model_key`（`codex:<model>`）；
+  通道只有这一个模型：没有 `--model` 开关、没有别名、没有失败回退或自动切换。
+- 请求、回显校验、审计与 `cognition_calls` 记录都带 `provider` 与 `model_key`（`codex:<model>`）；
   复用只命中同模型记录，缺模型归属的历史记录不被当成新模型响应。
 - 所有模式统一 `reasoning.effort="high"`、`reasoning.mode="standard"`：不按角色降级，
   不接受 `low`/`medium`/`xhigh`/`max`，也不允许配置缺失时静默回退。
@@ -80,16 +80,16 @@
 ### 调用（CONSULT / PLAN）
 
 ```bash
-python3 -B scripts/copilot_dispatch.py sol-consult --state <state.json> \
+python3 -B scripts/copilot_dispatch.py cognition-consult --state <state.json> \
   --materials <materials.md> --stage understanding \
   --question "本次真正需要判断的事项"
 
-python3 -B scripts/copilot_dispatch.py sol-plan --state <state.json> \
+python3 -B scripts/copilot_dispatch.py cognition-plan --state <state.json> \
   --materials <materials.md> --stage planning \
   --question "需要在哪些方案之间取舍"
 ```
 
-- `--question` 必填：没有明确问题时不要调用 SOL。`--stage` 省略时 CONSULT 默认
+- `--question` 必填：没有明确问题时不要调用认知。`--stage` 省略时 CONSULT 默认
   `development`、PLAN 默认 `planning`；显式阶段必须是
   `understanding|planning|development|stage|closure` 之一。
 - 材料只包含目标、当前基线、已确认事实、关键问题与约束、已尝试方案及结果、证据摘要；
@@ -100,22 +100,22 @@ python3 -B scripts/copilot_dispatch.py sol-plan --state <state.json> \
 
 ### 输出（CONSULT / PLAN）
 
-- `copilot-sol-think/v2` 超集：`judgment`、`goal_understanding`、`essence`、`strategy`
+- `copilot-cognition-consult/v2` 超集：`judgment`、`goal_understanding`、`essence`、`strategy`
   为字符串；`alternatives`、`tradeoffs`、`risks`、`priority`、`investigation`、
   `phase_goals`、`assumptions`、`omissions`、`decisions`、`verify`、`reconsult`、
   `unverified` 为字符串数组。schema 不一致、字段类型不符或没有判断内容时拒绝消费。
-- 结果写入状态 `sol_calls`（`mode=CONSULT|PLAN`，含 `stage` / `question` /
-  `progress_digest` / `complexity_signals` / `acceptance`），原始输出存 `sol-consult/` 或
-  `sol-plans/`，审计写同一份 `sol-audit.jsonl`（仅脱敏元数据）。
+- 结果写入状态 `cognition_calls`（`mode=CONSULT|PLAN`，含 `stage` / `question` /
+  `progress_digest` / `complexity_signals` / `acceptance`），原始输出存 `cognition-consult/` 或
+  `cognition-plans/`，审计写同一份 `cognition-audit.jsonl`（仅脱敏元数据）。
 - **治理边界**：不进入 Finding 台账、不改变完成条件、不影响 G1–G3、不阻断任务；是否采纳、
   如何实施由 ZCode 主代理决定。采纳结论用
-  `sol-accept --state <state> --call-id <SC...> --status accepted|modified|rejected` 登记
+  `cognition-accept --state <state> --call-id <SC...> --status accepted|modified|rejected` 登记
   （事实记录，不是用户授权，不改变门禁）。
 
-### 采纳记录（v9.1，`copilot-sol-acceptance/v2`）
+### 采纳记录（v9.1，`copilot-cognition-acceptance/v2`）
 
 ```bash
-python3 -B scripts/copilot_dispatch.py sol-accept --state <state> \
+python3 -B scripts/copilot_dispatch.py cognition-accept --state <state> \
   --call-id SC... --status modified \
   --decision "先补定向测试再改实现" \
   --rationale "现场缺少回归覆盖，直接改风险更高" \
@@ -123,7 +123,7 @@ python3 -B scripts/copilot_dispatch.py sol-accept --state <state> \
   --evidence-ref E1,E3 --source-ref "报告 §3 差异分析"
 ```
 
-- **字段**：`decision`（ZCode 实际做法，不是 SOL 原建议）、`rationale`（省略时回落
+- **字段**：`decision`（ZCode 实际做法，不是认知原建议）、`rationale`（省略时回落
   `--reason`）、`delta`（modified 与原建议的差异）、`evidence_refs`、`source_refs`、
   `evidence_note`；保留 `status`/`note`/`reason`/`decided_by`/`at`/`basis`。
   `advice_ref` 只存 `call_id`/`mode`/`stage`/判断摘要/`reply_path`/`reply_sha256`，
@@ -138,11 +138,11 @@ python3 -B scripts/copilot_dispatch.py sol-accept --state <state> \
   `evidence_archived` 写入记录并在 CLI 打印中文提示；登记始终成功、退出码 0，不改变任务
   阶段、证据表或 G1–G3。E 编号格式错误是输入错误，直接拒绝。
 - **重复登记**：以最近一次为准，旧字段不隐式继承；每次登记的完整快照追加到
-  `history` 的 `sol_call_acceptance` 事件（只增不改）。`first_registered_at` 保留最初
+  `history` 的 `cognition_call_acceptance` 事件（只增不改）。`first_registered_at` 保留最初
   时间；`registration_count` 只计 v2 登记次数，不冒充历史全量。
 - **历史兼容**：无 `schema` 的旧采纳记录保持只读可读，`reason` 作为历史理由展示，
   `note` 不被当成实际决策；不迁移、不重写、不重放已 CLOSED 任务。
-- **指标**：`review-metrics` 的 `sol_cognitive.acceptance_quality` 以 v2 已决记录
+- **指标**：`review-metrics` 的 `cognition.acceptance_quality` 以 v2 已决记录
   （accepted/modified/rejected）为分母，输出 `complete_rate`（决策+理由+modified 差异）、
   `evidence_link_rate`（至少一条 linked E）、`source_only`、`no_evidence`、
   `unresolved_records`、`archived_records`、`modified_with_delta` 与 `legacy_records`；
@@ -157,7 +157,7 @@ python3 -B scripts/copilot_dispatch.py sol-accept --state <state> \
 `optional` / `recommended`），不写状态、不阻塞。
 
 ```bash
-python3 -B scripts/copilot_dispatch.py sol-review --state <state.json> \
+python3 -B scripts/copilot_dispatch.py cognition-review --state <state.json> \
   --materials <materials.md>
 ```
 
@@ -185,25 +185,23 @@ python3 -B scripts/copilot_dispatch.py sol-review --state <state.json> \
 - 再次调用必须 `--force --trigger <user-request|scope-changed|new-risk|materials-omitted|
   strategy-failed|major-uncertainty|stage-result> --reason <说明>`，并换新材料或新阶段。
 - 超时、429/5xx、网络、截断、响应格式、模型身份、推理强度/模式回显不符：记录真实原因与
-  `sol_calls` 失败记录（历史状态仍读 `sol_reviews` / `sol_advisories`），不自动重试、不换
+  `cognition_calls` 失败记录（历史状态仍读 `sol_reviews` / `sol_advisories`），不自动重试、不换
   Provider、不派原生 Reviewer 顶替。CONSULT / PLAN 失败只登记并返回“可继续”（退出码 0），
   主代理按已有信息推进；REVIEW 失败返回真实非零退出码，如实报告，不伪造结论。
-- 失败不产生阻塞、不派生 SOL 工作项。
+- 失败不产生阻塞、不派生认知工作项。
 
 ### 输出（REVIEW）
 
-- `copilot-sol-review/v1`：`verdict`（pass/partial/blocked）、`findings`
+- `copilot-cognition-review/v1`：`verdict`（pass/partial/blocked）、`findings`
   （blocking/major/minor/info，含文件/行/依据/建议）、`unverified`、
   `materials_reviewed`。PASS 与 blocking/major 或未验证项冲突时降级 PARTIAL。
 - findings 以 `advisory` 进入 Finding 台账：主代理修复后 `finding --status fixed`，
   运行定向测试后 `--status verified`；确认误报时 `--status dropped --note <反证>`。
-- 原始输出存任务目录 `sol-reviews/`，审计 `sol-audit.jsonl` 仅脱敏元数据（三模式共用）。
+- 原始输出存任务目录 `cognition-reviews/`，审计 `cognition-audit.jsonl` 仅脱敏元数据（三模式共用）。
 
-### 与门禁的关系
-
-SOL 没有工具、不能核验宿主权限，也不证明文件读取；SOL 的 PASS 不会写入
-`native_reviews`，不会产生 `g4_eligible`，不改变 G1–G3 的结果。SOL 未执行、失败或给出
-partial 都不阻断主代理继续推进（用户明确要求必须完成独立复核而 SOL 不可用时除外）。
+### 与门禁的关系认知没有工具、不能核验宿主权限，也不证明文件读取；认知的 PASS 不会写入
+`native_reviews`，不会产生 `g4_eligible`，不改变 G1–G3 的结果。认知未执行、失败或给出
+partial 都不阻断主代理继续推进（用户明确要求必须完成独立复核而认知不可用时除外）。
 
 ## 1. 正式 REVIEW（opt-in）
 
@@ -269,12 +267,12 @@ copilot_dispatch.py formal-review --state <state> --verdict pass \
 
 v8 起原生 Reviewer 已退役，正式 REVIEW 的独立意见只能来自 SOL 零工具单轮复核：材料由主
 代理一次性准备，请求体不含工具定义（`tool_choice="none"`），一次调用只发一次请求，模型
-回显必须与请求一致。无法真实调用 SOL 时，如实说明是“主代理自检”或“同一上下文复核”，
-不得标记为正式 REVIEW，也不得伪造 SOL 结论。历史原生 Reviewer 结论只读保留，不参与新任务。
+回显必须与请求一致。无法真实调用认知时，如实说明是“主代理自检”或“同一上下文复核”，
+不得标记为正式 REVIEW，也不得伪造认知结论。历史原生 Reviewer 结论只读保留，不参与新任务。
 
-## 2. 独立复核流程（SOL）
+## 2. 独立复核流程（认知）
 
-### 调用建议（SOL）
+### 调用建议（认知）
 
 | 场景 | 建议 |
 |---|---|
@@ -285,7 +283,7 @@ v8 起原生 Reviewer 已退役，正式 REVIEW 的独立意见只能来自 SOL 
 | 中高复杂任务重要阶段完成 | 一次阶段复盘 CONSULT（stage，同一进度只一次） |
 | 收口前（最终工程验证已完成，含 medium） | 一次收口 CONSULT（closure）；验证缺口未补齐时不执行 |
 | 用户明确要求独立复核（`--review-request`） | 一次 REVIEW |
-| 用户明确要求 SOL 判断（`--user-request`） | 直接一次 CONSULT |
+| 用户明确要求认知判断（`--user-request`） | 直接一次 CONSULT |
 
 `review-admission` 只返回建议（`none` / `reuse` / `consult` / `plan` / `review`），不写
 状态、不是门禁。`recommended_action` 由任务类型、确定性复杂度与合同覆盖判断给出，不再
@@ -301,21 +299,21 @@ v8 起原生 Reviewer 已退役，正式 REVIEW 的独立意见只能来自 SOL 
   被定向验证。`fixed`/`verified` 必须有证据，`closed` 只能从 `verified` 进入。
 - 未闭合 blocking/major 阻断 G2（所有风险等级）；minor/info 不阻断。已修复未验证派生
   `AUTO-VERIFY-<F>`：只跑定向测试并登记证据，不重新派发完整复核。
-- SOL findings 是 advisory：主代理修复并定向验证，误报可用
+- 认知 findings 是 advisory：主代理修复并定向验证，误报可用
   `finding --status dropped --note <反证>` 驳回；v7 及更早的 authoritative 记录仍只能
   修复并定向验证。
 
 ### 复核收敛流程
 
 充分自检 → 稳定最终执行结果与证据 → 按生命周期做一次收口 CONSULT（如建议）→ 集中修复 →
-定向验证 → 收口。SOL 不是收口前提；主代理判断材料是否具备、意见是否有增量价值。
+定向验证 → 收口。认知不是收口前提；主代理判断材料是否具备、意见是否有增量价值。
 目标 1–2 轮收敛是性能目标，不是硬上限；不得为减少轮次而漏报或降低标准。
 
 ### 首轮完整性协议
 
 - 一次看全：枚举变更面、读取受影响调用方与测试、按根因归组、检查同类缺陷的其他位置；
   finding 使用稳定 ID（`F1..Fn`）与可选 `root_cause`/`category`/`related`。
-- 材料必须真实完整并对应最终代码；材料缺失时 SOL 应标记 `unverified`，不能推测已检查
+- 材料必须真实完整并对应最终代码；材料缺失时认知应标记 `unverified`，不能推测已检查
   未提供的代码。主代理不得为了让评测结果好看而删减材料。
 - PASS 即停止：合同与条件满足、无 blocking、`unverified` 为空即停；minor/info 记录为
   findings，不驱动重开。
@@ -332,12 +330,12 @@ v8 起原生 Reviewer 已退役，正式 REVIEW 的独立意见只能来自 SOL 
 
 ### 记录与边界
 
-- 成功结果统一写入 `sol_calls`（历史任务状态中的 `sol_reviews` / `sol_advisories` 继续
-  只读兼容，不迁移、不改写、不重复计数），原始输出存 `sol-consult/`、`sol-plans/` 或
-  `sol-reviews/`，审计统一写 `sol-audit.jsonl`，只记脱敏元数据。
-- 失败把真实错误码与材料摘要写入 `sol_calls`（`status=failed`）与 `history`；不自动
+- 成功结果统一写入 `cognition_calls`（历史任务状态中的 `sol_reviews` / `sol_advisories` 继续
+  只读兼容，不迁移、不改写、不重复计数），原始输出存 `cognition-consult/`、`cognition-plans/` 或
+  `cognition-reviews/`，审计统一写 `cognition-audit.jsonl`，只记脱敏元数据。
+- 失败把真实错误码与材料摘要写入 `cognition_calls`（`status=failed`）与 `history`；不自动
   重试、不换 Provider、不派原生 Reviewer 顶替。
-- SOL 结论不改变阶段判定；阶段只由 `evaluate` 按合同、工作项、证据与门禁计算。
+- 认知结论不改变阶段判定；阶段只由 `evaluate` 按合同、工作项、证据与门禁计算。
 
 ## 3. G4：已退役的历史机制（v8.0.0）
 
@@ -368,7 +366,7 @@ v8 起原生 Reviewer 已退役，正式 REVIEW 的独立意见只能来自 SOL 
 
 ## 5. 与状态机的关系
 
-- 正式 REVIEW 与 SOL 复核都不改变阶段判定；阶段只由 `evaluate` 按合同、工作项、证据与
+- 正式 REVIEW 与认知复核都不改变阶段判定；阶段只由 `evaluate` 按合同、工作项、证据与
   门禁计算。
 - 门禁是 G1 工作项终态、G2 合同/条件/证据/台账、G3 无停摆；G4 已退役，不再参与。
 - `closure --close` 在任一门失败时拒绝并列出原因码；不存在“强制收口”开关。

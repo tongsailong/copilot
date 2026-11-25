@@ -21,9 +21,9 @@ ACTIVE = ("governance.py", "copilot_dispatch.py", "copilot_auto.py",
           "agent_policy.py", "native_bridge.py", "native_agent.py",
           "bridge_evidence.py", "lib_common.py", "review_policy.py",
           "host_records.py", "code_scope.py", "code_scope_capture.py",
-          "sol_review.py")
+          "cognition_call.py")
 # v8.1 唯一允许访问网络与凭据的活动模块。其他模块只能通过它间接调用 SOL。
-NETWORK_MODULE = "sol_review.py"
+NETWORK_MODULE = "cognition_call.py"
 # v8 起 G4 活动机制已退役；这些模块不得重新出现在活动 scripts/。
 RETIRED_MODULES = ("g4_attest.py", "g4_shadow.py", "test_execution.py",
                    "review_output.py")
@@ -52,14 +52,14 @@ def _imports(name: str) -> set[str]:
 
 
 class RemoteReviewBoundaryTests(unittest.TestCase):
-    def test_active_scripts_do_not_import_legacy_sol_modules(self):
+    def test_active_scripts_do_not_import_legacy_cognition_modules(self):
         for name in ACTIVE:
             imported = _imports(name)
             for banned in ("call_gpt", "review_ledger", "reply_protocol"):
                 self.assertNotIn(banned, imported,
                                  f"{name} 仍导入已退役的 SOL 模块 {banned}")
 
-    def test_only_sol_review_has_network_clients(self):
+    def test_only_cognition_call_has_network_clients(self):
         # urllib.parse 不是网络客户端；真正发起请求的是 urllib.request / socket。
         banned = ("urllib.request", "urllib.error", "http.client",
                   "requests", "aiohttp", "httpx", "socket")
@@ -73,8 +73,8 @@ class RemoteReviewBoundaryTests(unittest.TestCase):
                         for item in imported),
                     f"{name} 不应包含网络客户端 {module}")
 
-    def test_only_sol_review_has_model_endpoint_and_credentials(self):
-        # 除 sol_review.py 外，活动模块不得出现模型 ID、上游端点或凭据读取；
+    def test_only_cognition_call_has_model_endpoint_and_credentials(self):
+        # 除 cognition_call.py 外，活动模块不得出现模型 ID、上游端点或凭据读取；
         # 历史实测事实只保留在 references/history.md 与 legacy/。
         for name in ACTIVE:
             if name == NETWORK_MODULE:
@@ -85,28 +85,29 @@ class RemoteReviewBoundaryTests(unittest.TestCase):
                            "read_zcode_provider_key"):
                 self.assertNotIn(needle, text, f"{name} 不应包含 {needle}")
 
-    def test_sol_is_advisory_only_with_three_modes(self):
+    def test_cognition_is_advisory_only_with_three_modes(self):
         text = source(NETWORK_MODULE)
         self.assertIn("tool_choice", text)
-        self.assertIn("gpt-6.2-sol", text)
-        # 模型升级必须真正切换，不得保留旧模型名或静默回退。
+        # 认知通道只有一个模型：Astra。旧模型名不得出现在活动模块里。
+        self.assertIn('DEFAULT_MODEL = "gpt-6.2-astra"', text)
+        self.assertNotIn("gpt-6.2-sol", text)
         self.assertNotIn("gpt-6.1-sol", text)
-        self.assertIn('SOL_MODES = ("CONSULT", "PLAN", "REVIEW")', text)
+        self.assertIn('CALL_MODES = ("CONSULT", "PLAN", "REVIEW")', text)
         # THINK 只作为历史别名读取，不再出现在活动模式集合里。
-        self.assertIn('LEGACY_SOL_MODES = ("THINK",)', text)
+        self.assertIn('LEGACY_MODES = ("THINK",)', text)
         self.assertIn('COGNITIVE_MODES = ("CONSULT", "PLAN")', text)
         self.assertIn('REASONING_EFFORT = "high"', text)
-        self.assertIn("sol_effort_not_pinned", text)
+        self.assertIn("cognition_effort_not_pinned", text)
         # DECIDE 不恢复；SOL 不接管工程执行或决策（文案可提退役，但不得成为模式）。
         self.assertNotIn('"DECIDE"', text)
         self.assertNotIn("'DECIDE'", text)
         for banned in ("subprocess", "os.system", "os.exec", "eval(",
                        "exec("):
-            self.assertNotIn(banned, text, f"sol_review.py 不应包含 {banned}")
+            self.assertNotIn(banned, text, f"cognition_call.py 不应包含 {banned}")
         # 没有工具定义键被写入 payload：只允许出现在拒绝名单里。
         self.assertIn('TOOL_KEYS = ("tools", "functions"', text)
 
-    def test_retired_sol_implementations_are_archived(self):
+    def test_retired_cognition_implementations_are_archived(self):
         for name in ("call_gpt.py", "review_ledger.py", "reply_protocol.py"):
             self.assertFalse(os.path.exists(os.path.join(SCRIPTS, name)),
                              f"{name} 不应继续出现在活动 scripts/")
@@ -123,7 +124,7 @@ class RemoteReviewBoundaryTests(unittest.TestCase):
         for needle in ("subprocess", "urlopen", "request(", "socket"):
             self.assertNotIn(needle, text)
 
-    def test_sol_review_import_stays_off_the_network_stack(self):
+    def test_cognition_call_import_stays_off_the_network_stack(self):
         """SOL 网络栈只在请求路径内导入：不调 SOL 的命令不付 urllib/ssl 成本。
 
         实测 `import urllib.request` 连带 `ssl`/`http.client`/`email` 约 40–45 ms，
@@ -131,10 +132,10 @@ class RemoteReviewBoundaryTests(unittest.TestCase):
         不触发这些模块；`_NoRedirect` 仍可延迟取得（历史调用方直接构造它）。
         """
         code = (
-            "import sys; sys.path.insert(0, %r); import sol_review;"
+            "import sys; sys.path.insert(0, %r); import cognition_call;"
             "loaded = [m for m in ('http.client', 'ssl', 'urllib.request',"
             " 'urllib.error') if m in sys.modules];"
-            "assert sol_review._NoRedirect.__name__ == '_NoRedirect';"
+            "assert cognition_call._NoRedirect.__name__ == '_NoRedirect';"
             "print(loaded)" % SCRIPTS)
         proc = subprocess.run([sys.executable, "-B", "-c", code],
                               capture_output=True, text=True)

@@ -20,7 +20,7 @@ SHA-256 或计划绑定写错/编造。这里把这些字段从实际记录中�
 
 v8 起 G4 原生只读复核已退役：本脚本不再生成 `copilot-native-review/v2` 复核
 信封，也不提供 `review` / `review-context` / `capability` 子命令。独立模型复核
-由 SOL 零工具单轮复核（`sol_review.py`）承担。
+由认知零工具单轮复核（`cognition_call.py`）承担。
 
 仍然不是密码学证明
 ------------------

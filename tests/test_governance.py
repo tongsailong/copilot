@@ -391,20 +391,20 @@ class HighRiskRetirementTests(unittest.TestCase):
         evaluate = G.evaluate(state)
         self.assertEqual(evaluate["phase"], "PASS")
         hints = "\n".join(evaluate.get("next_commands") or [])
-        self.assertIn("sol-consult", hints)
+        self.assertIn("cognition-consult", hints)
         self.assertIn("--stage closure", hints)
-        self.assertNotIn("sol-review", hints)
+        self.assertNotIn("cognition-review", hints)
         self.assertIn("advisory", hints)
         # 已有收口认知结论后不再重复提示。
-        state["sol_calls"] = [{
+        state["cognition_calls"] = [{
             "call_id": "SC1", "status": "completed", "mode": "CONSULT",
             "stage": "closure",
             "contract_sha256": state.get("contract_sha256") or "",
             "complexity_signals": ["risk-high"]}]
         evaluate = G.evaluate(state)
         hints = "\n".join(evaluate.get("next_commands") or [])
-        self.assertNotIn("sol-consult", hints)
-        self.assertNotIn("sol-plan", hints)
+        self.assertNotIn("cognition-consult", hints)
+        self.assertNotIn("cognition-plan", hints)
 
     def test_review_metrics_marks_g4_retired(self):
         metrics = G.review_metrics(G.load_state(self.state))

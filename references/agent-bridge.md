@@ -1,15 +1,15 @@
 # agent-bridge：原生执行信封（v2）
 
 本文件说明 Native Bridge：**ZCode 原生 Agent 执行 → Copilot 校验回填**。
-v1 信封（SOL 通道时代）已退役，出现即 `schema_retired`。
+v1 信封（认知通道时代）已退役，出现即 `schema_retired`。
 
 > **v8.0.0 起 G4 原生只读复核正式退役**：`copilot-native-review/*` 信封、
 > `native_agent.py review` / `review-context` / `capability`、review attempt 与
 > `g4_attest`/`g4_shadow`/`test_execution` 已删除。独立复核请使用
-> `copilot_dispatch.py sol-review`（零工具、单轮、advisory）；历史复核记录只读保留。
-> v9.0.0 起 SOL 是默认认知引擎：`copilot_dispatch.py sol-consult` / `sol-plan` 按生命周期
+> `copilot_dispatch.py cognition-review`（零工具、单轮、advisory）；历史复核记录只读保留。
+> v9.0.0 起认知是默认认知引擎：`copilot_dispatch.py cognition-consult` / `cognition-plan` 按生命周期
 > 建议（起点理解、调查后规划、新证据动态咨询、阶段复盘、收口判断）；**REVIEW** 只在用户
-> 明确要求时执行。`THINK` 只作读取别名归一到 CONSULT，历史记录只读兼容。SOL 仍零工具、
+> 明确要求时执行。`THINK` 只作读取别名归一到 CONSULT，历史记录只读兼容。认知仍零工具、
 > 单轮、advisory。
 
 ## 1. 角色与边界
@@ -17,7 +17,7 @@ v1 信封（SOL 通道时代）已退役，出现即 `schema_retired`。
 | 角色 | 职责 | 约束 |
 |---|---|---|
 | Executor | 执行单个工作项，产出结果与原始证据 | 必须是原生子代理（`kind=subagent`），带 Agent/Child Session 身份与 profile 快照 |
-| SOL（CONSULT / PLAN / REVIEW） | 默认认知判断与用户要求的独立复核（advisory） | 由 `sol_review.py` 零工具单轮调用；不读写文件、不证明宿主权限、不构成收口门禁 |
+| 认知（CONSULT / PLAN / REVIEW） | 默认认知判断与用户要求的独立复核（advisory） | 由 `cognition_call.py` 零工具单轮调用；不读写文件、不证明宿主权限、不构成收口门禁 |
 
 Copilot 不派发 Agent、不调用模型、不写别人的会话。它只校验宿主已产生的记录并回填状态。
 `native_agent.py` 从真实 `metadata.json`、宿主 SQLite（`tool_usage`/`part`/`session_entry`）
@@ -109,7 +109,7 @@ plan）下 Profile 白名单仍生效：真实子会话请求 `Bash` 返回 `too
 
 **v8.0.0 决策**：不再为这一能力缺口维护 G4 体系。G4 的宿主只读载体要求、权限快照准入、
 plan 模式校验、独立取证与 `capability` 诊断全部退役；普通子代理（含 `Explore` 的 Bash）
-只按普通能力使用。独立质量审查只在用户明确要求时由 SOL 零工具单轮 REVIEW 提供（风险
+只按普通能力使用。独立质量审查只在用户明确要求时由认知零工具单轮 REVIEW 提供（风险
 等级只影响 CONSULT 认知准入建议），它是 advisory，不声称宿主只读权限。
 
 ## 2. 信封 v2
@@ -250,7 +250,7 @@ python3 -B scripts/copilot_auto.py ingest --state T/state.json --result-file A1.
 
 - 执行回填：校验通过后把工作项置为信封 `status`、写 `result` 与 `evidence_ids`，并把规范化
   信封加入 `native_results`。
-- 复核不再经 `ingest`：独立复核使用 `sol-review`；`--review-file` 参数已移除。
+- 复核不再经 `ingest`：独立复核使用 `cognition-review`；`--review-file` 参数已移除。
 - 同一 `result_sha256` 重复回填幂等跳过；不同结果覆盖已终态工作项被拒绝。
 - 被拒绝时退出码 12，stderr 含错误码，状态不被部分写入。
 

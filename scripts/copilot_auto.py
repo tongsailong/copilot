@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """Copilot 持续推进器：本地阶段机 + 工作单 + 原生执行信封回填。
 
-它不做远程判断，也不等待外部裁决；唯一可能发起模型调用的是 SOL 生命周期
-调度：默认 `--sol auto` 下每条命令最多消费 1 条 recommended 义务（1 次请求，
-失败只记录、不阻断），`--sol off|advise` 或测试进程不调用。
+它不做远程判断，也不等待外部裁决；唯一可能发起模型调用的是认知生命周期
+调度：默认 `--cognition auto` 下每条命令最多消费 1 条 recommended 义务（1 次请求，
+失败只记录、不阻断），`--cognition off|advise` 或测试进程不调用。
 
 * `drive`：读取状态 → 本地求值 → 命中 PASS 就收口；命中 BLOCKED/CLOSED 就停下
   报告；有可领取工作项就输出工作单并以 EXIT_EXECUTE 退出；PARTIAL 则本地派生
   下一步工作项后继续（不是任务终点）。
-* `ingest`：把 `native_agent.py` 生成的执行信封校验后回填状态。SOL 认知与用户要求的
-  独立复核由 `sol_review.py` 承担；G4 原生复核信封已随 G4 退役，本模块不再接受。
+* `ingest`：把 `native_agent.py` 生成的执行信封校验后回填状态。认知与用户要求的
+  独立复核由 `cognition_call.py` 承担；G4 原生复核信封已随 G4 退役，本模块不再接受。
 
 退出码
 ------
@@ -200,29 +200,29 @@ def _write_dispatch(state: dict, ready: list[dict], path: str,
 
 # ── drive ──────────────────────────────────────────────────────────────────
 def _dispatch_module():
-    """惰性导入调度执行器：模块级不引入网络客户端（sol_review）。
+    """惰性导入调度执行器：模块级不引入网络客户端（cognition_call）。
 
-    `copilot_dispatch` 会导入 `sol_review`（唯一允许访问网络与凭据的模块）；
+    `copilot_dispatch` 会导入 `cognition_call`（唯一允许访问网络与凭据的模块）；
     `copilot_auto` 的模块级依赖必须保持零网络，所以只在真正调度时才导入。
     """
     import copilot_dispatch as D
     return D
 
 
-def _drive_sol_step(path: str, args, *, gates_passed: bool = False,
+def _drive_cognition_step(path: str, args, *, gates_passed: bool = False,
                     prefer_family: str = "",
                     closure_ready: dict | None = None,
                     cache: dict | None = None) -> dict:
     """drive 内的有界调度步：失败只打印，不改变 drive 的退出码与阶段。"""
     try:
         D = _dispatch_module()
-        return D._sol_schedule_step(
+        return D._cognition_schedule_step(
             path, args, gates_passed=gates_passed,
-            execute=(D._sol_policy(args) == "auto"),
+            execute=(D._cognition_policy(args) == "auto"),
             prefer_family=prefer_family,
             closure_ready=closure_ready, cache=cache)
-    except Exception as exc:  # noqa: BLE001 — SOL 不可用不阻断工程推进
-        print(f"SOL 调度未完成（{exc}）；按本地证据继续，不阻断。", file=sys.stderr)
+    except Exception as exc:  # noqa: BLE001 — 认知不可用不阻断工程推进
+        print(f"认知调度未完成（{exc}）；按本地证据继续，不阻断。", file=sys.stderr)
         return {"executed": "", "error": str(exc)}
 
 
@@ -233,22 +233,22 @@ def drive(args) -> int:
     cache: dict = {}
     # 生命周期调度（v9.6）：drive 是有界消费点，每条命令最多执行 1 个义务。
     # 收口前的窗口（family E）在 PASS 分支单独处理，不占用这个额度。
-    sol_used = False
+    cognition_used = False
     for step in range(MAX_DRIVE_STEPS):
         state = G.load_state(path)
         evaluation = G.evaluate(state, cache=cache)
         phase = evaluation.get("phase")
         print(f"[{step}] {state.get('task_id')} → {phase}：{evaluation.get('reason')}")
-        sol = evaluation.get("sol") or {}
+        cognition_advice = evaluation.get("cognition") or {}
         # 非 PASS 阶段：把建议显示为调度义务（auto 时由调度步真正执行）。
-        if phase != "PASS" and sol.get("action") in ("consult", "plan", "review"):
-            print(f"SOL {sol.get('mode')} 建议（{sol.get('recommended_action')}，"
-                  f"阶段 {sol.get('stage') or '-'}，"
-                  f"复杂度 {(sol.get('complexity') or {}).get('level') or '-'}）："
-                  f"{sol.get('reason')}")
-            if sol.get("command"):
-                print(f"  可选调用：{sol['command']}")
-            print("  说明：SOL 只是 advisory；不影响阶段、门禁与收口判定。")
+        if phase != "PASS" and cognition_advice.get("action") in ("consult", "plan", "review"):
+            print(f"认知 {cognition_advice.get('mode')} 建议（{cognition_advice.get('recommended_action')}，"
+                  f"阶段 {cognition_advice.get('stage') or '-'}，"
+                  f"复杂度 {(cognition_advice.get('complexity') or {}).get('level') or '-'}）："
+                  f"{cognition_advice.get('reason')}")
+            if cognition_advice.get("command"):
+                print(f"  可选调用：{cognition_advice['command']}")
+            print("  说明：认知只是 advisory；不影响阶段、门禁与收口判定。")
         if phase == "CLOSED":
             print(G.render_status(state, evaluation, cache=cache))
             return EXIT_DONE
@@ -262,7 +262,7 @@ def drive(args) -> int:
                     "请检查阻塞范围（--work-item）与完成条件归属。")
             return EXIT_WAIT
         if phase == "PASS":
-            # 收口顺序固定：最终工程验证（PASS + 验证完成）→ SOL 收口综合判断 →
+            # 收口顺序固定：最终工程验证（PASS + 验证完成）→ 认知收口综合判断 →
             # 收口。验证缺口（合同要求的测试没有执行痕迹）时两步都不做：交给
             # continuation 的 verify 动作，由主代理先补齐验证。
             readiness = evaluation.get("closure_readiness")
@@ -270,29 +270,29 @@ def drive(args) -> int:
                 readiness = G.closure_readiness(state, cache=cache)
             if not readiness.get("ready"):
                 print("G1–G3 已通过，但最终工程验证尚未完成："
-                      "暂不执行 SOL 收口判断、暂不收口。")
+                      "暂不执行认知收口判断、暂不收口。")
                 for blocker in G.closure_blockers_text(readiness):
                     print(f"- {blocker}")
                 print("先执行合同要求的必要测试并登记验证结果，再重新 drive。")
                 return EXIT_EXECUTE
             # 这里必须消费调度，否则收口 CONSULT 在 drive 路径上永远不可达。
-            _drive_sol_step(path, args, gates_passed=True, prefer_family="E",
+            _drive_cognition_step(path, args, gates_passed=True, prefer_family="E",
                             closure_ready=readiness, cache=cache)
-            # 顺序：最终验证 → SOL 收口判断 → ZCode 独立验收 → G1–G3 收口。刚执行完
+            # 顺序：最终验证 → 认知收口判断 → ZCode 独立验收 → G1–G3 收口。刚执行完
             # E 就收口会跳过 ZCode 的判断（收口后又不能再登记，已被 CLOSED 拒绝），
             # 所以这里停下来把判断交回主代理；采纳/修改/否决任一条都能继续。
             pending_acceptance = G.closure_acceptance_pending(G.load_state(path))
             if pending_acceptance:
-                print("SOL 收口判断已完成，等待 ZCode 独立验收后再收口：")
+                print("认知收口判断已完成，等待 ZCode 独立验收后再收口：")
                 print(f"- 调用：{pending_acceptance['call_id']}"
                       f"（stage=closure，最终验证摘要 "
                       f"{pending_acceptance['digest']}）")
-                print("下一步：copilot_dispatch.py sol-accept --state <state> "
+                print("下一步：copilot_dispatch.py cognition-accept --state <state> "
                       f"--call-id {pending_acceptance['call_id']} "
                       "--status accepted|modified|rejected --rationale <依据>")
                 print("登记判断后再 drive：此时才执行 G1–G3 收口。")
                 return EXIT_EXECUTE
-            closure = G.close_task(path, cache=cache, sol_entry="drive")
+            closure = G.close_task(path, cache=cache, cognition_entry="drive")
             print(f"G1–G3 通过，任务已收口：verdict={closure.get('verdict')} "
                   f"iteration={closure['iteration_id']} by={closure['closed_by']}")
             quality = closure.get("quality") or {}
@@ -305,12 +305,12 @@ def drive(args) -> int:
             cont = evaluation.get("continuation") or {}
             if cont.get("required"):
                 print(f"续跑：{cont.get('action')} —— {cont.get('reason')}")
-            if not sol_used:
+            if not cognition_used:
                 # 有界消费：先兑现当前的认知窗口（最多 1 次），再交付工作单，
-                # 这样 SOL 的判断能影响本次执行而不是事后补记。
-                sol_used = True
+                # 这样认知判断能影响本次执行而不是事后补记。
+                cognition_used = True
                 before_seq = state.get("save_seq")
-                _drive_sol_step(path, args)
+                _drive_cognition_step(path, args)
                 if G.load_state(path).get("save_seq") != before_seq:
                     # 调度步可能已写入调用记录：重新读取，避免领取被 CAS 拒绝。
                     state = G.load_state(path)
@@ -483,7 +483,7 @@ def ingest(args) -> int:
     path = _state_path(args)
     if not args.result_file:
         raise AutoError("请提供 --result-file（执行信封）。原生复核信封已随 G4 "
-                        "退役；独立复核请用 copilot_dispatch.py sol-review。")
+                        "退役；独立复核请用 copilot_dispatch.py cognition-review。")
     envelope = _load_json(args.result_file)
     kind = NB.classify_native_result(envelope)
     if kind != "execution":
@@ -496,15 +496,15 @@ def ingest(args) -> int:
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         prog="copilot_auto.py",
-        description="Copilot 持续推进器（--sol auto 时每条命令最多 1 次建议性调用）")
+        description="Copilot 持续推进器（--cognition auto 时每条命令最多 1 次建议性调用）")
     sub = ap.add_subparsers(dest="command", required=True)
     p = sub.add_parser("drive", help="推进任务：收口 / 输出工作单 / 派生下一步")
     p.add_argument("--state", required=True)
     p.add_argument("--dispatch-out", default="",
                    help="native 后端的 dispatch 输出路径")
-    p.add_argument("--sol", default="",
+    p.add_argument("--cognition", default="",
                    choices=("", "off", "advise", "auto"),
-                   help="SOL 生命周期调度：auto（默认，有界执行 1 个义务）/ "
+                   help="认知生命周期调度：auto（默认，有界执行 1 个义务）/ "
                         "advise（只给命令）/ off（只记录义务）")
     p.add_argument("--max-actions", type=int, default=1,
                    help="一次输出的工作单数量（默认 1，避免并行改写冲突）")

@@ -1,5 +1,11 @@
 # GPT REVIEW 台账与审计日志：机制细则（历史文档，已退役）
 
+> **术语说明（v9.10.0，2026-11-25）**：本文件保留历史原文。SOL 术语与 `sol_*` 文件名、`sol-*`
+> 命令名、`sol_calls`/`sol_reuses`/`sol_schedule` 状态键已统一为“认知 / cognition”，
+> `gpt-6.2-sol` 与 `--model` 已移除，认知只剩 `gpt-6.2-astra` 单一模型。历史段落里的
+> 旧名只作事实与审计记录，不代表当前角色、模型、命令或默认配置。
+
+
 > **历史文档（v5 SOL 时代，已退役）**：本文件描述 `review_ledger.py` 的台账/审计机制，该脚本
 > 已于 v6.0.0 移入仓库 `legacy/` 并不再分发。历史台账与审计日志原样保留，只读查看用
 > `copilot_dispatch.py legacy-status --ledger/--audit-log`。当前证据与审计规则见

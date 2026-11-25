@@ -24,8 +24,8 @@ CONTRACT = """## 完成条件
 
 
 #: 测试子进程默认不自动发起付费 SOL 调用：调度仍会登记义务，但执行改为
-#: 只给命令。需要验证「自动执行」的用例显式设 COPILOT_SOL_AUTO=on 并替换通道。
-TEST_ENV = {**os.environ, "COPILOT_SOL_AUTO": "off"}
+#: 只给命令。需要验证「自动执行」的用例显式设 COPILOT_COGNITION_AUTO=on 并替换通道。
+TEST_ENV = {**os.environ, "COPILOT_COGNITION_AUTO": "off"}
 
 
 def run_cli(script: str, *args: str, cwd: str | None = None,

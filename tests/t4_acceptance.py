@@ -83,14 +83,14 @@ SCENARIOS = {
         "test_native_review_envelope_is_retired",
         "tests.test_review_efficiency.NativeReviewRetiredTests."
         "test_legacy_review_envelope_is_retired"],
-    "sol_review_is_advisory": [
-        "tests.test_sol_review_v7.StateIntegrationTests."
-        "test_sol_review_is_advisory_not_a_closure_gate",
-        "tests.test_sol_review_v7.AdmissionTests.test_tiers"],
-    "sol_zero_tool_single_round": [
-        "tests.test_sol_review_v7.ZeroToolTests."
+    "cognition_call_is_advisory": [
+        "tests.test_cognition_review.StateIntegrationTests."
+        "test_cognition_call_is_advisory_not_a_closure_gate",
+        "tests.test_cognition_review.AdmissionTests.test_tiers"],
+    "cognition_zero_tool_single_round": [
+        "tests.test_cognition_review.ZeroToolTests."
         "test_run_review_sends_exactly_one_zero_tool_request",
-        "tests.test_sol_review_v7.SingleRoundTests."
+        "tests.test_cognition_review.SingleRoundTests."
         "test_same_materials_reuse_existing_review"],
     "reviewer_profile_retired": [
         "tests.test_profile_policy.WorkspaceProfileTests."

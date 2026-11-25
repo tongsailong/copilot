@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""SOL 一次性调用客户端：CONSULT / PLAN（默认认知引擎）/ REVIEW（用户明确要求的独立复核）。
+"""认知一次性调用客户端：CONSULT / PLAN（默认认知引擎）/ REVIEW（用户明确要求的独立复核）。
 
-Copilot 的 SOL 通道只承担**认知**，不承担决策或执行：
+Copilot 的认知通道只承担**认知**，不承担决策或执行：
 
 * **零工具是能力级约束**，不靠提示词自律：出站请求体**永不包含** `tools` /
   `functions` / `parallel_tool_calls` 等工具定义，并显式 `tool_choice="none"`；
@@ -9,14 +9,13 @@ Copilot 的 SOL 通道只承担**认知**，不承担决策或执行：
   事件、拒绝消费（退出码 5），绝不代执行。
 * **单轮**：一次调用只发一次 HTTP 请求。超时、429、网络错误、截断、身份不符、
   格式异常都不自动重试、不换 Provider、不降级到其他链路；失败原因如实记录。
-  CONSULT / PLAN 失败按可降级处理（`copilot_dispatch.py sol-consult|sol-plan`
+  CONSULT / PLAN 失败按可降级处理（`copilot_dispatch.py cognition-consult|cognition-plan`
   记录后返回 0，主代理继续），REVIEW 失败仍显式失败，因为它是用户明确要求的
   独立结论。
 * **模型与推理强度是硬门**：默认 `gpt-6.2-astra` + `reasoning.effort="high"`；
   上游 `model` 回显必须与本次请求完全一致，`reasoning.effort` / `reasoning.mode`
   回显也必须与请求一致（`standard`）；任何不一致都拒绝消费（退出码 9），
-  不允许静默降级到 `medium`/`low` 或其他模型。`gpt-6.2-sol` 只在显式
-  `--model gpt-6.2-sol` 时使用，失败不自动切换模型。
+  不允许静默降级到 `medium`/`low` 或其他模型；模型名不在注册表内时拒绝发送。
 * **三种模式**：CONSULT 是默认认知引擎，任务启动、执行期新证据、阶段复盘与
   收口都能按需发出一次判断；PLAN 在调查之后给出方案比较与规划判断；REVIEW
   只在用户明确要求时做独立复核，输出结构化 findings。三者都是 advisory：
@@ -27,9 +26,9 @@ Copilot 的 SOL 通道只承担**认知**，不承担决策或执行：
   没有硬性调用次数或 Token 上限，也不执行按阶段的机械重复流程。
 
 本模块不写任务状态：状态登记、单轮判定与 finding 合并由
-`copilot_dispatch.py sol-consult` / `sol-plan` / `sol-review` 编排；这里只构建
-请求、发一次请求、解析与审计。单轮判定需要读取统一 SOL 记录时，通过
-`governance.iter_sol_calls` 只读复用，合并逻辑只有一份。
+`copilot_dispatch.py cognition-consult` / `cognition-plan` / `cognition-review` 编排；这里只构建
+请求、发一次请求、解析与审计。单轮判定需要读取统一认知记录时，通过
+`governance.iter_cognition_calls` 只读复用，合并逻辑只有一份。
 """
 from __future__ import annotations
 
@@ -46,33 +45,30 @@ from email.utils import parsedate_to_datetime
 from lib_common import redact as _redact_text
 import review_policy as _RP
 
-REVIEW_SCHEMA = "copilot-sol-review/v1"
+REVIEW_SCHEMA = "copilot-cognition-review/v1"
 # v9 认知输出是单一超集结构：同时覆盖启动理解、方案规划、执行期动态咨询、
 # 阶段复盘与收口判断；v1 记录继续只读兼容。
-THINK_SCHEMA = "copilot-sol-think/v2"
-ADMISSION_SCHEMA = "copilot-sol-admission/v1"
-# 模型身份只在本文档定义的单一注册表里出现：默认认知模型是 Astra；SOL 只作为
-# **显式兼容**保留（`--model gpt-6.2-sol`），任何路径都不会自动回退到它。
+THINK_SCHEMA = "copilot-cognition-think/v2"
+ADMISSION_SCHEMA = "copilot-cognition-admission/v1"
+# 模型身份只在这里定义：认知通道只有一个模型（Astra），没有任何回退或别名。
 PROVIDER = "codex"
 DEFAULT_MODEL = "gpt-6.2-astra"
-LEGACY_MODEL = "gpt-6.2-sol"
-SUPPORTED_MODELS = (DEFAULT_MODEL, LEGACY_MODEL)
-# 兼容历史调用方与测试：`MODEL` 现在指向默认模型，不再是“唯一模型”。
+SUPPORTED_MODELS = (DEFAULT_MODEL,)
 MODEL = DEFAULT_MODEL
 BASE_URL = "http://127.0.0.1:8317/v1"
 ENDPOINT = "/responses"
 REASONING_EFFORT = "high"
 REASONING_MODE = "standard"
-# 所有 SOL 模式统一 high：不允许按角色降级，也不允许缺失时回退。
+# 所有认知模式统一 high：不允许按角色降级，也不允许缺失时回退。
 # 实际校验在 validate_effort()；这里不再保留未被引用的常量副本。
 # CONSULT / PLAN 是默认认知生命周期的两种一等模式；REVIEW 只用于用户明确
 # 要求的独立复核。THINK 是 v8.4-v8.5 的旧名称，只读兼容并归一到 CONSULT。
-SOL_MODES = ("CONSULT", "PLAN", "REVIEW")
+CALL_MODES = ("CONSULT", "PLAN", "REVIEW")
 COGNITIVE_MODES = ("CONSULT", "PLAN")
-LEGACY_SOL_MODES = ("THINK",)
+LEGACY_MODES = ("THINK",)
 LEGACY_MODE_ALIASES = {"THINK": "CONSULT"}
 # 认知调用所处的生命周期阶段：只影响提示词重点与推荐命令，不是门禁。
-SOL_STAGES = ("understanding", "planning", "development", "stage", "closure")
+COGNITION_STAGES = ("understanding", "planning", "development", "stage", "closure")
 DEFAULT_STAGE = "development"
 API_KEY_ENV = "CUSTOM_127_API_KEY"
 ZCODE_PROVIDER_FILE = os.path.expanduser("~/.zcode/v2/provider_config.json")
@@ -93,7 +89,7 @@ MATERIALS_WARN = {"CONSULT": THINK_WARN_MATERIALS_CHARS,
                   "PLAN": THINK_WARN_MATERIALS_CHARS,
                   "REVIEW": WARN_MATERIALS_CHARS}
 
-# 图像材料：SOL 只能通过 Responses API 的 `input_image` 内容块看到真实像素。
+# 图像材料：认知只能通过 Responses API 的 `input_image` 内容块看到真实像素。
 # 这里只做本地文件读取、编码与上限校验；不解码像素、不做 OCR、不把图片文字化。
 # 上限偏保守：一次设计审美咨询通常 2–6 张代表性截图，不需要整包截图。
 IMAGE_MAX_COUNT = 6
@@ -104,13 +100,13 @@ IMAGE_MIMES = ("image/png", "image/jpeg", "image/webp")
 BENIGN_OUTPUT_TYPES = {"message", "reasoning"}
 TOOL_KEYS = ("tools", "functions", "parallel_tool_calls", "tool_resources",
              "tool_config")
-# GPT-6.2 Responses API 对推理模型不接受采样参数；SOL 从不发送这些字段。
+# GPT-6.2 Responses API 对推理模型不接受采样参数；认知从不发送这些字段。
 UNSUPPORTED_PARAMS = ("temperature", "top_p", "top_logprobs", "logprobs",
                       "frequency_penalty", "presence_penalty")
 SEVERITIES = ("blocking", "major", "minor", "info")
 VERDICTS = ("pass", "partial", "blocked")
 
-# 允许再次发起 SOL 调用的实质原因（同一生命周期阶段的首次调用不需要）。
+# 允许再次发起认知调用的实质原因（同一生命周期阶段的首次调用不需要）。
 # 没有新的决策价值时，同一问题与材料直接复用已有结论，不重复付费。这里没有
 # 次数上限：只要出现新的认知对象或升级型证据，就可以按对应原因继续调用。
 RETRY_TRIGGERS = {
@@ -154,8 +150,8 @@ def _safe_url(raw: object) -> str:
     return f"{parsed.scheme}://{parsed.hostname or ''}{port}"
 
 
-class SolError(Exception):
-    """SOL 调用错误基类；`exit_code` 是调用方应返回的进程退出码。
+class CognitionError(Exception):
+    """认知调用错误基类；`exit_code` 是调用方应返回的进程退出码。
 
     除错误码与详情外，错误对象还携带可机器判读的上游事实：HTTP 状态、上游错误码、
     Retry-After、请求/追踪 ID 与稳定分类 `error_class`。这些字段只用于诊断与退避
@@ -193,39 +189,39 @@ class SolError(Exception):
                               else "not_attempted")
 
 
-class SolUsageError(SolError):
+class CognitionUsageError(CognitionError):
     exit_code = EXIT_USAGE
 
 
-class SolUpstreamError(SolError):
+class CognitionUpstreamError(CognitionError):
     exit_code = EXIT_UPSTREAM
 
 
-class SolTimeoutError(SolError):
+class CognitionTimeoutError(CognitionError):
     exit_code = EXIT_TIMEOUT
 
 
-class SolToolCallError(SolError):
+class CognitionToolCallError(CognitionError):
     exit_code = EXIT_TOOLCALL
 
 
-class SolResponseError(SolError):
+class CognitionResponseError(CognitionError):
     exit_code = EXIT_SHAPE
 
 
-class SolAuditError(SolError):
+class CognitionAuditError(CognitionError):
     exit_code = EXIT_AUDIT
 
 
-class SolQuotaError(SolError):
+class CognitionQuotaError(CognitionError):
     exit_code = EXIT_QUOTA
 
 
-class SolIdentityError(SolError):
+class CognitionIdentityError(CognitionError):
     exit_code = EXIT_IDENTITY
 
 
-class SolReasoningError(SolError):
+class CognitionReasoningError(CognitionError):
     """上游回显的推理强度/模式与请求不一致：Provider 覆盖参数，拒绝消费。"""
 
     exit_code = EXIT_IDENTITY
@@ -247,13 +243,13 @@ NETWORK_ERROR = "network_error"
 RESPONSE_INCOMPLETE = "response_incomplete"
 
 ERROR_CLASS_CODE = {
-    UPSTREAM_OVERLOADED: "sol_upstream_overloaded",
-    UPSTREAM_STREAM_TIMEOUT: "sol_upstream_stream_timeout",
-    UPSTREAM_CREDENTIAL_COOLING: "sol_upstream_credential_cooling",
-    UPSTREAM_AUTH: "sol_upstream_auth",
-    UPSTREAM_RATE_LIMIT: "sol_quota",
-    UPSTREAM_SERVER: "sol_upstream_server_error",
-    UPSTREAM_CLIENT: "sol_upstream_client_error",
+    UPSTREAM_OVERLOADED: "cognition_upstream_overloaded",
+    UPSTREAM_STREAM_TIMEOUT: "cognition_upstream_stream_timeout",
+    UPSTREAM_CREDENTIAL_COOLING: "cognition_upstream_credential_cooling",
+    UPSTREAM_AUTH: "cognition_upstream_auth",
+    UPSTREAM_RATE_LIMIT: "cognition_quota",
+    UPSTREAM_SERVER: "cognition_upstream_server_error",
+    UPSTREAM_CLIENT: "cognition_upstream_client_error",
 }
 
 ERROR_CLASS_LABEL = {
@@ -276,15 +272,15 @@ UPSTREAM_RETRYABLE_CLASSES = frozenset({
 })
 
 
-class SolOverloadedError(SolUpstreamError):
+class CognitionOverloadedError(CognitionUpstreamError):
     """上游容量过载（`server_is_overloaded` / 529 / 503 过载）。"""
 
 
-class SolStreamTimeoutError(SolUpstreamError):
+class CognitionStreamTimeoutError(CognitionUpstreamError):
     """上游流在 `response.completed` 之前断开（HTTP 408 / `request_timeout`）。"""
 
 
-class SolCredentialCoolingError(SolUpstreamError):
+class CognitionCredentialCoolingError(CognitionUpstreamError):
     """CPA 凭据冷却导致的本地 503（`auth_unavailable`）。
 
     这是调度结果而不是认证失效：不得据此轮换凭据、更换 Provider 或判定账号
@@ -292,22 +288,22 @@ class SolCredentialCoolingError(SolUpstreamError):
     """
 
 
-class SolAuthError(SolUpstreamError):
+class CognitionAuthError(CognitionUpstreamError):
     """上游认证失败（401/403）；需人工核实，不自动重试、不切换 Provider。"""
 
 
-class SolUpstreamClientError(SolUpstreamError):
+class CognitionUpstreamClientError(CognitionUpstreamError):
     """上游拒绝了请求本身（4xx，非认证/限流）；请求构造需要检查。"""
 
 
 _UPSTREAM_ERROR_CLASSES = {
-    UPSTREAM_OVERLOADED: SolOverloadedError,
-    UPSTREAM_STREAM_TIMEOUT: SolStreamTimeoutError,
-    UPSTREAM_CREDENTIAL_COOLING: SolCredentialCoolingError,
-    UPSTREAM_AUTH: SolAuthError,
-    UPSTREAM_RATE_LIMIT: SolQuotaError,
-    UPSTREAM_SERVER: SolUpstreamError,
-    UPSTREAM_CLIENT: SolUpstreamClientError,
+    UPSTREAM_OVERLOADED: CognitionOverloadedError,
+    UPSTREAM_STREAM_TIMEOUT: CognitionStreamTimeoutError,
+    UPSTREAM_CREDENTIAL_COOLING: CognitionCredentialCoolingError,
+    UPSTREAM_AUTH: CognitionAuthError,
+    UPSTREAM_RATE_LIMIT: CognitionQuotaError,
+    UPSTREAM_SERVER: CognitionUpstreamError,
+    UPSTREAM_CLIENT: CognitionUpstreamClientError,
 }
 
 
@@ -388,8 +384,8 @@ def resolve_api_key(env_name: str = API_KEY_ENV) -> str:
            or _read_env_value(REASONIX_ENV_FILE, env_name)
            or _read_zcode_provider_key())
     if not key:
-        raise SolUsageError(
-            "sol_credentials_missing",
+        raise CognitionUsageError(
+            "cognition_credentials_missing",
             f"没有找到本机 CPA 的 {env_name} 凭据（环境变量 / "
             f"{REASONIX_ENV_FILE} / {ZCODE_PROVIDER_FILE} 均为空）。"
             "不新增 Provider、账户或密钥；请先在既有授权配置中补齐。")
@@ -398,11 +394,11 @@ def resolve_api_key(env_name: str = API_KEY_ENV) -> str:
 
 def resolve_base_url() -> str:
     """只使用既有本机 CPA 出口；不提供任何外部 Provider 回退。"""
-    raw = str(os.environ.get("COPILOT_SOL_BASE_URL") or BASE_URL).strip()
+    raw = str(os.environ.get("COPILOT_COGNITION_BASE_URL") or BASE_URL).strip()
     if not _is_local_cpa_url(raw):
-        raise SolUsageError(
-            "sol_route_not_local",
-            f"SOL 只允许本机 CPA 出口（http(s)://127.0.0.1:8317，"
+        raise CognitionUsageError(
+            "cognition_route_not_local",
+            f"认知只允许本机 CPA 出口（http(s)://127.0.0.1:8317，"
             f"无 userinfo），拒绝 {_safe_url(raw)}；不新增或切换 Provider。")
     return raw.rstrip("/")
 
@@ -414,12 +410,12 @@ _COMMON_RULES = """- 你没有、也不能使用任何工具；不能读取文�
 - 你的输出只是建议：ZCode 主代理负责工程执行与技术决策，不要要求或代替它执行。
 - 只输出一个 JSON 对象（可放在单个 ```json 围栏内），不要输出其他文字。"""
 
-REVIEW_INSTRUCTIONS = """你是 Copilot 的独立复核者（SOL REVIEW）。你只能基于本轮材料做一次性审查：
+REVIEW_INSTRUCTIONS = """你是 Copilot 的独立复核者（认知 REVIEW）。你只能基于本轮材料做一次性审查：
 """ + _COMMON_RULES + """
 
 JSON 结构：
 {
-  "schema": "copilot-sol-review/v1",
+  "schema": "copilot-cognition-review/v1",
   "verdict": "pass" | "partial" | "blocked",
   "summary": "总体结论",
   "findings": [
@@ -443,12 +439,12 @@ _COGNITIVE_RULES = """- 你不承担工程工作：不写代码、不阅读仓�
 - 你的建议是认知输入：ZCode 主代理决定是否采纳、如何实现、如何验证。
 - 不要要求 ZCode 必须服从；也不要把“建议调用更多工具/模型”当作结论。"""
 
-CONSULT_INSTRUCTIONS = """你是 Copilot 的默认认知引擎（SOL CONSULT）。你只做一次性高价值判断：
+CONSULT_INSTRUCTIONS = """你是 Copilot 的默认认知引擎（认知 CONSULT）。你只做一次性高价值判断：
 """ + _COMMON_RULES + "\n" + _COGNITIVE_RULES + """
 
 JSON 结构（所有字段都必须出现；不适用的数组用空数组）：
 {
-  "schema": "copilot-sol-think/v2",
+  "schema": "copilot-cognition-think/v2",
   "judgment": "核心判断（一句话结论）",
   "goal_understanding": "对用户真实目标与隐含需求的理解",
   "essence": "问题本质、现状与关键矛盾",
@@ -481,14 +477,14 @@ JSON 结构（所有字段都必须出现；不适用的数组用空数组）：
 - stage（阶段成果）：判断是否偏离目标、还有哪些未解决问题、下一阶段方向；
 - closure（收口）：判断目标达成情况、重要遗漏与剩余风险，不替代工程验收。"""
 
-PLAN_INSTRUCTIONS = """你是 Copilot 的默认规划认知引擎（SOL PLAN）。你只做一次性方案与规划判断：
+PLAN_INSTRUCTIONS = """你是 Copilot 的默认规划认知引擎（认知 PLAN）。你只做一次性方案与规划判断：
 """ + _COMMON_RULES + "\n" + _COGNITIVE_RULES + """
 - 你提供战略与规划建议，不规定全部具体代码操作；ZCode 负责最终技术方案与执行计划。
 - 只使用已核实的现场事实；材料不足时明确写入 assumptions / unverified，不猜测。
 
 JSON 结构（所有字段都必须出现；不适用的数组用空数组）：
 {
-  "schema": "copilot-sol-think/v2",
+  "schema": "copilot-cognition-think/v2",
   "judgment": "核心判断（推荐哪条路线，一句话）",
   "goal_understanding": "对目标与完成条件的理解",
   "essence": "问题本质、约束与关键矛盾",
@@ -531,7 +527,7 @@ STAGE_FOCUS = {
               "下一阶段应优先做什么。"),
     "closure": ("本次是收口前综合判断：判断真实目标是否达成（测试与自检通过不等于"
                 "业务成功）、是否还有未解决的关键风险或能推翻结论的反例、证据是否"
-                "支持结论、此前的 SOL 判断哪些已不再成立；工程验收仍由 ZCode 依据"
+                "支持结论、此前的认知判断哪些已不再成立；工程验收仍由 ZCode 依据"
                 "真实证据完成。"),
 }
 
@@ -542,10 +538,10 @@ def normalize_stage(stage: str, *, mode: str = "") -> str:
     if not value:
         return "planning" if str(mode).strip().upper() == "PLAN" \
             else DEFAULT_STAGE
-    if value not in SOL_STAGES:
-        raise SolUsageError(
-            "sol_stage_invalid",
-            f"未知 SOL 阶段 {stage!r}；只接受 " + " / ".join(SOL_STAGES) + "。")
+    if value not in COGNITION_STAGES:
+        raise CognitionUsageError(
+            "cognition_stage_invalid",
+            f"未知认知阶段 {stage!r}；只接受 " + " / ".join(COGNITION_STAGES) + "。")
     return value
 
 
@@ -556,13 +552,13 @@ def normalize_mode(mode: str) -> str:
     CONSULT；新流程只产生 CONSULT / PLAN / REVIEW。
     """
     value = str(mode or "").strip().upper()
-    if value in SOL_MODES:
+    if value in CALL_MODES:
         return value
     if value in LEGACY_MODE_ALIASES:
         return LEGACY_MODE_ALIASES[value]
-    raise SolUsageError(
-        "sol_mode_invalid",
-        f"未知 SOL 模式 {mode!r}；只接受 " + " / ".join(SOL_MODES)
+    raise CognitionUsageError(
+        "cognition_mode_invalid",
+        f"未知认知模式 {mode!r}；只接受 " + " / ".join(CALL_MODES)
         + "（THINK 是历史别名；DECIDE 已退役）。")
 
 
@@ -570,27 +566,27 @@ def validate_effort(effort: str) -> str:
     """统一 high：拒绝缺失、xhigh/max 与任何静默降级。"""
     value = str(effort or "").strip().lower()
     if not value:
-        raise SolUsageError(
-            "sol_effort_missing",
-            "未指定推理强度；SOL 统一使用 high，不允许缺失时回退到 medium。")
+        raise CognitionUsageError(
+            "cognition_effort_missing",
+            "未指定推理强度；认知统一使用 high，不允许缺失时回退到 medium。")
     if value == "high":
         return value
-    raise SolUsageError(
-        "sol_effort_not_pinned",
-        f"推理强度 {effort!r} 被拒绝：SOL 统一 high，"
+    raise CognitionUsageError(
+        "cognition_effort_not_pinned",
+        f"推理强度 {effort!r} 被拒绝：认知统一 high，"
         "不允许降级到 low/medium，也不使用 xhigh/max。")
 
 
 def resolve_model(model: str = "") -> str:
-    """模型解析：空值 → 默认 Astra；只接受注册表内的模型。
+    """模型解析：空值 → 默认 Astra；拒绝注册表外的任何模型名。
 
-    未知模型名一律拒绝，避免把默认路由意外改到别的 Provider/模型；显式传入
-    `gpt-6.2-sol` 是唯一的兼容路径，且不会因为失败而自动回退。
+    未知或历史模型名一律拒绝，避免把默认路由意外改到别的 Provider/模型；
+    认知通道只有一个模型，不存在兼容别名、回退或静默切换。
     """
     value = str(model or "").strip() or DEFAULT_MODEL
     if value not in SUPPORTED_MODELS:
-        raise SolUsageError(
-            "sol_model_unsupported",
+        raise CognitionUsageError(
+            "cognition_model_unsupported",
             f"模型 {model!r} 不在支持列表（{', '.join(SUPPORTED_MODELS)}）；"
             f"默认模型是 {DEFAULT_MODEL}，未发送请求。")
     return value
@@ -623,11 +619,11 @@ def validate_materials(materials: object, mode: str = "CONSULT") -> str:
     resolved = normalize_mode(mode)
     limit = MATERIALS_LIMITS[resolved]
     if not isinstance(materials, str) or not materials.strip():
-        raise SolUsageError("sol_materials_empty", "SOL 材料为空。")
+        raise CognitionUsageError("cognition_materials_empty", "认知材料为空。")
     if len(materials) > limit:
-        raise SolUsageError(
-            "sol_materials_too_large",
-            f"SOL {resolved} 材料 {len(materials)} 字符超过上限 {limit}；"
+        raise CognitionUsageError(
+            "cognition_materials_too_large",
+            f"认知{resolved} 材料 {len(materials)} 字符超过上限 {limit}；"
             + ("请精简为目标/基线/已确认事实/已尝试方案/证据摘要/本次问题后重试，"
                "不静默截断。" if resolved in COGNITIVE_MODES else
                "请主代理整理必要材料后重试，不静默截断。"))
@@ -678,8 +674,8 @@ def probe_image_bytes(data: bytes) -> tuple[str, int | None, int | None]:
             height = ((bits >> 14) & 0x3FFF) + 1
             return "image/webp", width, height
         return "image/webp", None, None
-    raise SolUsageError(
-        "sol_image_format_unsupported",
+    raise CognitionUsageError(
+        "cognition_image_format_unsupported",
         "只接受真实 PNG / JPEG / WebP 文件；不按扩展名猜测，也不用 OCR 或文字描述代替像素。")
 
 
@@ -692,13 +688,13 @@ def load_images(paths: list[str], *, labels: list[str] | None = None) -> list[di
     if not paths:
         return []
     if len(paths) > IMAGE_MAX_COUNT:
-        raise SolUsageError(
-            "sol_image_count_exceeded",
+        raise CognitionUsageError(
+            "cognition_image_count_exceeded",
             f"一次最多 {IMAGE_MAX_COUNT} 张图片，收到 {len(paths)} 张；"
             "请只给代表性页面/状态，不整包上传。")
     if labels is not None and len(labels) != len(paths):
-        raise SolUsageError(
-            "sol_image_label_mismatch",
+        raise CognitionUsageError(
+            "cognition_image_label_mismatch",
             f"--image 有 {len(paths)} 个，--image-note 有 {len(labels)} 个；"
             "两者必须一一对应。")
     images = []
@@ -706,30 +702,30 @@ def load_images(paths: list[str], *, labels: list[str] | None = None) -> list[di
     for index, path in enumerate(paths, start=1):
         resolved = os.path.abspath(os.path.expanduser(str(path)))
         if not os.path.isfile(resolved):
-            raise SolUsageError(
-                "sol_image_missing",
+            raise CognitionUsageError(
+                "cognition_image_missing",
                 f"第 {index} 张图片不存在：{resolved}")
         size = os.path.getsize(resolved)
         if size <= 0:
-            raise SolUsageError(
-                "sol_image_empty", f"第 {index} 张图片为空文件：{resolved}")
+            raise CognitionUsageError(
+                "cognition_image_empty", f"第 {index} 张图片为空文件：{resolved}")
         if size > IMAGE_MAX_BYTES:
-            raise SolUsageError(
-                "sol_image_too_large",
+            raise CognitionUsageError(
+                "cognition_image_too_large",
                 f"第 {index} 张图片 {size} 字节，超过单张上限 "
                 f"{IMAGE_MAX_BYTES}；请先导出适合评审的尺寸，不静默压缩。")
         total += size
         if total > IMAGE_MAX_TOTAL_BYTES:
-            raise SolUsageError(
-                "sol_image_total_too_large",
+            raise CognitionUsageError(
+                "cognition_image_total_too_large",
                 f"图片总量 {total} 字节超过上限 {IMAGE_MAX_TOTAL_BYTES}；"
                 "请减少数量或尺寸。")
         with open(resolved, "rb") as fh:
             data = fh.read()
         mime, width, height = probe_image_bytes(data)
         if mime not in IMAGE_MIMES:
-            raise SolUsageError(
-                "sol_image_format_unsupported",
+            raise CognitionUsageError(
+                "cognition_image_format_unsupported",
                 f"第 {index} 张图片格式 {mime!r} 不在允许范围 {IMAGE_MIMES}。")
         import base64
         images.append({
@@ -752,24 +748,24 @@ def validate_images(images: object) -> list[dict]:
     if images in (None, []):
         return []
     if not isinstance(images, list):
-        raise SolUsageError("sol_image_invalid", "images 必须是列表。")
+        raise CognitionUsageError("cognition_image_invalid", "images 必须是列表。")
     if len(images) > IMAGE_MAX_COUNT:
-        raise SolUsageError(
-            "sol_image_count_exceeded",
+        raise CognitionUsageError(
+            "cognition_image_count_exceeded",
             f"一次最多 {IMAGE_MAX_COUNT} 张图片，收到 {len(images)} 张。")
     checked = []
     for index, item in enumerate(images, start=1):
         if not isinstance(item, dict):
-            raise SolUsageError(
-                "sol_image_invalid", f"第 {index} 张图片元数据不是对象。")
+            raise CognitionUsageError(
+                "cognition_image_invalid", f"第 {index} 张图片元数据不是对象。")
         data_url = item.get("data_url")
         mime = str(item.get("mime") or "")
         if not isinstance(data_url, str) or not data_url.startswith("data:"):
-            raise SolUsageError(
-                "sol_image_invalid", f"第 {index} 张图片缺少 data_url。")
+            raise CognitionUsageError(
+                "cognition_image_invalid", f"第 {index} 张图片缺少 data_url。")
         if mime not in IMAGE_MIMES:
-            raise SolUsageError(
-                "sol_image_format_unsupported",
+            raise CognitionUsageError(
+                "cognition_image_format_unsupported",
                 f"第 {index} 张图片格式 {mime!r} 不在允许范围。")
         checked.append(item)
     return checked
@@ -847,14 +843,14 @@ def assert_responses_api_compat(payload: dict) -> None:
     """GPT-6.2 推理模型不接受采样参数；出现即视为请求构造错误。"""
     for key in UNSUPPORTED_PARAMS:
         if key in payload:
-            raise SolUsageError(
-                "sol_unsupported_param",
+            raise CognitionUsageError(
+                "cognition_unsupported_param",
                 f"请求体包含推理模型不支持的参数 {key}；不要发送采样参数。")
     include = payload.get("include")
     if isinstance(include, list) and any("logprobs" in str(item) for item in include):
-        raise SolUsageError(
-            "sol_unsupported_param",
-            "请求体 include 含 logprobs；SOL 不请求 token 概率。")
+        raise CognitionUsageError(
+            "cognition_unsupported_param",
+            "请求体 include 含 logprobs；认知不请求 token 概率。")
 
 
 def assert_zero_tool(payload: object, _path: str = "payload") -> None:
@@ -862,16 +858,16 @@ def assert_zero_tool(payload: object, _path: str = "payload") -> None:
     if isinstance(payload, dict):
         for key, value in payload.items():
             if str(key) in TOOL_KEYS:
-                raise SolUsageError(
-                    "sol_tools_in_payload",
+                raise CognitionUsageError(
+                    "cognition_tools_in_payload",
                     f"请求体 {_path}.{key} 含工具定义；零工具不变量被破坏。")
             assert_zero_tool(value, f"{_path}.{key}")
     elif isinstance(payload, list):
         for index, value in enumerate(payload):
             assert_zero_tool(value, f"{_path}[{index}]")
     if _path == "payload" and payload.get("tool_choice") != "none":
-        raise SolUsageError(
-            "sol_tool_choice_invalid",
+        raise CognitionUsageError(
+            "cognition_tool_choice_invalid",
             "请求体必须显式 tool_choice=\"none\"。")
 
 
@@ -1171,9 +1167,9 @@ def _loads(text: str) -> dict:
     try:
         value = json.loads(text, object_pairs_hook=_no_duplicates)
     except ValueError as exc:
-        raise SolResponseError("sol_output_unparseable", str(exc)) from None
+        raise CognitionResponseError("cognition_output_unparseable", str(exc)) from None
     if not isinstance(value, dict):
-        raise SolResponseError("sol_output_not_object",
+        raise CognitionResponseError("cognition_output_not_object",
                                f"top level is {type(value).__name__}")
     return value
 
@@ -1212,8 +1208,8 @@ def _balanced_objects(text: str) -> list[str]:
 def _parse_json_text(cleaned: str, schema: str = REVIEW_SCHEMA) -> dict:
     try:
         return _loads(cleaned)
-    except SolResponseError as direct:
-        if direct.code == "sol_output_not_object":
+    except CognitionResponseError as direct:
+        if direct.code == "cognition_output_not_object":
             raise
         first_error = direct
     fences = list(_FENCE.finditer(cleaned))
@@ -1226,16 +1222,16 @@ def _parse_json_text(cleaned: str, schema: str = REVIEW_SCHEMA) -> dict:
     for blob in _balanced_objects(cleaned):
         try:
             value = _loads(blob)
-        except SolResponseError:
+        except CognitionResponseError:
             continue
         if value.get("schema") == schema:
             candidates.append(value)
     if len(candidates) == 1:
         return candidates[0]
     if len(candidates) > 1:
-        raise SolResponseError("sol_output_ambiguous",
+        raise CognitionResponseError("cognition_output_ambiguous",
                                f"{len(candidates)} 个符合契约的对象")
-    raise SolResponseError("sol_output_unparseable", first_error.detail)
+    raise CognitionResponseError("cognition_output_unparseable", first_error.detail)
 
 
 def _text(value: object) -> str:
@@ -1259,13 +1255,13 @@ def _string_list(value: object, name: str) -> list[str]:
     if value is None:
         return []
     if not isinstance(value, list):
-        raise SolResponseError(f"sol_{name}_invalid",
+        raise CognitionResponseError(f"cognition_{name}_invalid",
                                f"{name} 必须是字符串数组")
     out: list[str] = []
     for item in value:
         if not isinstance(item, str):
-            raise SolResponseError(
-                f"sol_{name}_invalid",
+            raise CognitionResponseError(
+                f"cognition_{name}_invalid",
                 f"{name} 含非字符串元素：{type(item).__name__}")
         if item.strip():
             out.append(item.strip())
@@ -1277,37 +1273,37 @@ def _optional_string(item: dict, key: str, finding_id: str) -> str:
     if value is None:
         return ""
     if not isinstance(value, str):
-        raise SolResponseError(
-            "sol_finding_field_invalid",
+        raise CognitionResponseError(
+            "cognition_finding_field_invalid",
             f"{finding_id}: {key} 必须是字符串")
     return value.strip()
 
 
 def normalize_review(data: dict) -> dict:
-    """校验并归一化 SOL 输出；PASS 与 blocking/major/unverified 冲突时降级。"""
+    """校验并归一化认知输出；PASS 与 blocking/major/unverified 冲突时降级。"""
     if data.get("schema") != REVIEW_SCHEMA:
-        raise SolResponseError("sol_schema_mismatch",
+        raise CognitionResponseError("cognition_schema_mismatch",
                                f"schema={data.get('schema')!r}")
     verdict = _text(data.get("verdict")).lower()
     if verdict not in VERDICTS:
-        raise SolResponseError("sol_verdict_invalid", repr(data.get("verdict")))
+        raise CognitionResponseError("cognition_verdict_invalid", repr(data.get("verdict")))
     findings = data.get("findings")
     if findings is None:
         findings = []
     if not isinstance(findings, list) or any(
             not isinstance(item, dict) for item in findings):
-        raise SolResponseError("sol_findings_invalid", "findings 必须是对象数组")
+        raise CognitionResponseError("cognition_findings_invalid", "findings 必须是对象数组")
     normalized: list[dict] = []
     used_ids: set[str] = set()
     for index, item in enumerate(findings, start=1):
         raw_id = item.get("id")
         if raw_id is not None and not isinstance(raw_id, str):
-            raise SolResponseError(
-                "sol_finding_field_invalid", f"第 {index} 项 id 必须是字符串")
+            raise CognitionResponseError(
+                "cognition_finding_field_invalid", f"第 {index} 项 id 必须是字符串")
         severity = _text(item.get("severity")).lower()
         if severity not in SEVERITIES:
-            raise SolResponseError(
-                "sol_severity_invalid",
+            raise CognitionResponseError(
+                "cognition_severity_invalid",
                 f"{item.get('id') or index}: {item.get('severity')!r}")
         finding_id = _text(raw_id).upper() or f"F{index}"
         if finding_id in used_ids:
@@ -1355,7 +1351,7 @@ def normalize_review(data: dict) -> dict:
 def parse_review_output(text: str) -> dict:
     cleaned = str(text or "").lstrip("\ufeff").strip()
     if not cleaned:
-        raise SolResponseError("sol_output_empty", "输出为空")
+        raise CognitionResponseError("cognition_output_empty", "输出为空")
     return normalize_review(_parse_json_text(cleaned, REVIEW_SCHEMA))
 
 
@@ -1373,7 +1369,7 @@ def normalize_think(data: dict) -> dict:
     内容时拒绝消费。
     """
     if data.get("schema") != THINK_SCHEMA:
-        raise SolResponseError("sol_schema_mismatch",
+        raise CognitionResponseError("cognition_schema_mismatch",
                                f"schema={data.get('schema')!r}")
     result: dict = {}
     for key in THINK_TEXT_FIELDS:
@@ -1383,26 +1379,26 @@ def normalize_think(data: dict) -> dict:
         elif isinstance(value, str):
             result[key] = value.strip()
         else:
-            raise SolResponseError(
-                "sol_think_field_invalid", f"{key} 必须是字符串")
+            raise CognitionResponseError(
+                "cognition_think_field_invalid", f"{key} 必须是字符串")
     for key in THINK_LIST_FIELDS:
         result[key] = _string_list(data.get(key), key)
     # 议程是可选增量：缺失视为空（旧调用方与旧材料继续有效），出现时只做确定性
     # 归一（固定类型、短文本、去重、限长），不把自由格式带进状态。
     agenda_raw = data.get("agenda")
     if agenda_raw is not None and not isinstance(agenda_raw, list):
-        raise SolResponseError("sol_agenda_invalid", "agenda 必须是数组")
+        raise CognitionResponseError("cognition_agenda_invalid", "agenda 必须是数组")
     result["agenda"] = _RP.normalize_agenda(agenda_raw)
     if not result["judgment"] and not result["strategy"]:
-        raise SolResponseError(
-            "sol_think_empty", "judgment 与 strategy 均为空：回复没有认知内容。")
+        raise CognitionResponseError(
+            "cognition_think_empty", "judgment 与 strategy 均为空：回复没有认知内容。")
     return result
 
 
 def parse_think_output(text: str) -> dict:
     cleaned = str(text or "").lstrip("\ufeff").strip()
     if not cleaned:
-        raise SolResponseError("sol_output_empty", "输出为空")
+        raise CognitionResponseError("cognition_output_empty", "输出为空")
     return normalize_think(_parse_json_text(cleaned, THINK_SCHEMA))
 
 
@@ -1412,8 +1408,8 @@ def _network():
 
     `urllib.request` 会连带 `ssl`、`http.client`、`email`（实测约 40–45 ms）。
     生命周期命令（`start`/`drive`/`record`/`closure` 等）和 Stop/SessionStart
-    钩子每次都要启动进程，但绝大多数不调用 SOL；把这些导入放在请求路径内，
-    只读/回填命令少付一次网络栈开销，而 SOL 调用本身的行为与异常语义不变。
+    钩子每次都要启动进程，但绝大多数不调用认知；把这些导入放在请求路径内，
+    只读/回填命令少付一次网络栈开销，而认知调用本身的行为与异常语义不变。
     """
     import http.client
     import socket
@@ -1482,8 +1478,8 @@ def _post_once(url: str, key: str, body: dict, timeout: float) -> dict:
         upstream_code = _payload_error_code(payload)
         quota = _quota_signal(exc.code, payload)
         if quota:
-            raise SolQuotaError(
-                "sol_quota",
+            raise CognitionQuotaError(
+                "cognition_quota",
                 f"上游限流/冷却（HTTP {exc.code}，code={quota['code']}"
                 + (f"，Retry-After={retry_after}s" if retry_after else "")
                 + "）；未自动重试、未切换 Provider。",
@@ -1504,34 +1500,34 @@ def _post_once(url: str, key: str, body: dict, timeout: float) -> dict:
             request_id=request_id, trace_id=trace_id,
             response_received=True) from None
     except (socket.timeout, TimeoutError):
-        raise SolTimeoutError(
-            "sol_timeout",
+        raise CognitionTimeoutError(
+            "cognition_timeout",
             f"请求在 {timeout:g}s 内未完成；结果未知，未自动重试。",
             error_class=CLIENT_TIMEOUT) from None
     except urllib_error.URLError as exc:
         reason = getattr(exc, "reason", exc)
         if isinstance(reason, (socket.timeout, TimeoutError)):
-            raise SolTimeoutError(
-                "sol_timeout",
+            raise CognitionTimeoutError(
+                "cognition_timeout",
                 f"请求在 {timeout:g}s 内未完成；结果未知，未自动重试。",
                 error_class=CLIENT_TIMEOUT) from None
-        raise SolUpstreamError("sol_transport_error",
+        raise CognitionUpstreamError("cognition_transport_error",
                                _safe_detail(reason),
                                error_class=NETWORK_ERROR) from None
     except (http_client.HTTPException, OSError) as exc:
         # 响应读到一半中断、连接重置、Content-Length 不足等：请求已发出，
-        # 结果未知。显式映射为 SolError，确保进入失败审计与状态登记。
-        raise SolUpstreamError(
-            "sol_transport_error",
+        # 结果未知。显式映射为 CognitionError，确保进入失败审计与状态登记。
+        raise CognitionUpstreamError(
+            "cognition_transport_error",
             _safe_detail(f"{type(exc).__name__}: {exc}"),
             error_class=NETWORK_ERROR) from None
     try:
         payload = json.loads(raw.decode("utf-8", errors="replace"))
     except ValueError as exc:
-        raise SolResponseError("sol_response_json_invalid", str(exc),
+        raise CognitionResponseError("cognition_response_json_invalid", str(exc),
                                error_class=RESPONSE_INCOMPLETE) from None
     if not isinstance(payload, dict):
-        raise SolResponseError("sol_response_not_object",
+        raise CognitionResponseError("cognition_response_not_object",
                                type(payload).__name__,
                                error_class=RESPONSE_INCOMPLETE)
     payload["_http_status"] = status
@@ -1559,14 +1555,14 @@ def _usage_summary(usage: object) -> dict | None:
     return summary
 
 
-def run_sol(materials: str, *, mode: str = "CONSULT", audit_log: str = "",
+def run_cognition(materials: str, *, mode: str = "CONSULT", audit_log: str = "",
             model: str = MODEL, effort: str = REASONING_EFFORT,
             max_output_tokens: int | None = DEFAULT_MAX_OUTPUT_TOKENS,
             timeout: float = DEFAULT_TIMEOUT,
             transport=None, api_key: str | None = None,
             base_url: str | None = None, instructions: str = "",
             images: list[dict] | None = None) -> dict:
-    """发起一次 SOL 调用（CONSULT / PLAN / REVIEW）；任何异常都显式失败。"""
+    """发起一次认知调用（CONSULT / PLAN / REVIEW）；任何异常都显式失败。"""
     resolved_mode = normalize_mode(mode)
     # 模型在一次调用内只解析一次：请求体、身份校验、审计与记录共用同一值。
     model = resolve_model(model)
@@ -1578,9 +1574,9 @@ def run_sol(materials: str, *, mode: str = "CONSULT", audit_log: str = "",
     # 无论 URL 来自环境还是显式参数，都在解析凭据与发送前做同一本机出口校验。
     base = (base_url or resolve_base_url()).rstrip("/")
     if not _is_local_cpa_url(base):
-        raise SolUsageError(
-            "sol_route_not_local",
-            f"SOL 只允许本机 CPA 出口（http(s)://127.0.0.1:8317，"
+        raise CognitionUsageError(
+            "cognition_route_not_local",
+            f"认知只允许本机 CPA 出口（http(s)://127.0.0.1:8317，"
             f"无 userinfo），拒绝 {_safe_url(base)}；未解析凭据、未发送请求。")
     url = base + ENDPOINT
     key = api_key if api_key is not None else resolve_api_key()
@@ -1620,7 +1616,7 @@ def run_sol(materials: str, *, mode: str = "CONSULT", audit_log: str = "",
         if isinstance(response, dict):
             response.setdefault("_request_attempted", True)
             response.setdefault("_send_observed", "response_received")
-    except SolError as exc:
+    except CognitionError as exc:
         attempted = transport_entered
         # 收到过 HTTP 响应（含错误响应）时发送事实是确定的；客户端超时/网络
         # 异常才保持 unknown。
@@ -1652,8 +1648,8 @@ def run_sol(materials: str, *, mode: str = "CONSULT", audit_log: str = "",
     trace_id = str(response.pop("_trace_id", "") or "")
     quota = _quota_signal(int(status or 0), response)
     if quota:
-        exc = SolQuotaError(
-            "sol_quota",
+        exc = CognitionQuotaError(
+            "cognition_quota",
             f"HTTP 200 携带限流/冷却（code={quota['code']}）；未自动重试。",
             http_status=int(status or 0), error_class=UPSTREAM_RATE_LIMIT,
             upstream_code=str(quota["code"]), request_id=request_id,
@@ -1669,11 +1665,11 @@ def run_sol(materials: str, *, mode: str = "CONSULT", audit_log: str = "",
         text = extract_text(response) if not problem else ""
     except (AttributeError, TypeError, ValueError, KeyError) as exc:
         _audit_safe(audit_log, {**audit_base, "ok": False,
-                           "error": "sol_malformed_response",
+                           "error": "cognition_malformed_response",
                            "error_class": RESPONSE_INCOMPLETE,
                            "detail": f"{type(exc).__name__}: {exc}",
                            "http_status": status, "elapsed_ms": elapsed_ms})
-        raise SolResponseError("sol_malformed_response", str(exc),
+        raise CognitionResponseError("cognition_malformed_response", str(exc),
                                http_status=int(status or 0),
                                error_class=RESPONSE_INCOMPLETE,
                                response_received=True) from None
@@ -1700,39 +1696,39 @@ def run_sol(materials: str, *, mode: str = "CONSULT", audit_log: str = "",
                     "response_id": result_id,
                     "usage": usage, "elapsed_ms": elapsed_ms}
     if unexpected:
-        exc = SolToolCallError(
-            "sol_unexpected_output_item",
+        exc = CognitionToolCallError(
+            "cognition_unexpected_output_item",
             f"上游返回非良性条目 {unexpected}；已拒绝处理且未执行。")
         _audit_safe(audit_log, {**audit_base, **common_audit, "ok": False,
                            "error": exc.code,
                            "detail": json.dumps(unexpected, ensure_ascii=False)})
         raise exc
     if not identity_ok:
-        exc = SolIdentityError(
-            "sol_model_identity_mismatch",
+        exc = CognitionIdentityError(
+            "cognition_model_identity_mismatch",
             f"请求模型 {model!r}，上游回显 "
             f"{_safe_detail(model_resolved, 200)!r}；该回复不得被消费。")
         _audit_safe(audit_log, {**audit_base, **common_audit, "ok": False,
                            "error": exc.code})
         raise exc
     if echoed_effort and echoed_effort != resolved_effort:
-        exc = SolReasoningError(
-            "sol_reasoning_effort_mismatch",
+        exc = CognitionReasoningError(
+            "cognition_reasoning_effort_mismatch",
             f"请求 reasoning.effort={resolved_effort!r}，上游回显 "
             f"{echoed_effort!r}；推理强度被覆盖，该回复不得被消费。")
         _audit_safe(audit_log, {**audit_base, **common_audit, "ok": False,
                            "error": exc.code})
         raise exc
     if echoed_mode and echoed_mode != REASONING_MODE:
-        exc = SolReasoningError(
-            "sol_reasoning_mode_mismatch",
+        exc = CognitionReasoningError(
+            "cognition_reasoning_mode_mismatch",
             f"请求 reasoning.mode={REASONING_MODE!r}（默认 standard），上游回显 "
             f"{echoed_mode!r}；该回复不得被消费。")
         _audit_safe(audit_log, {**audit_base, **common_audit, "ok": False,
                            "error": exc.code})
         raise exc
     if problem:
-        exc = SolResponseError("sol_response_incomplete", problem,
+        exc = CognitionResponseError("cognition_response_incomplete", problem,
                                http_status=int(status or 0),
                                error_class=RESPONSE_INCOMPLETE,
                                request_id=request_id, trace_id=trace_id,
@@ -1747,12 +1743,12 @@ def run_sol(materials: str, *, mode: str = "CONSULT", audit_log: str = "",
             parsed = parse_review_output(text)
         else:
             parsed = parse_think_output(text)
-    except SolResponseError as exc:
+    except CognitionResponseError as exc:
         _audit_safe(audit_log, {**audit_base, **common_audit, "ok": False,
                            "error": exc.code, "detail": exc.detail,
                            "reply_sha256": text_sha,
                            "reply_chars": len(text)})
-        raise SolResponseError(exc.code, exc.detail) from None
+        raise CognitionResponseError(exc.code, exc.detail) from None
     result = {
         "schema": (REVIEW_SCHEMA if resolved_mode == "REVIEW"
                    else THINK_SCHEMA),
@@ -1839,23 +1835,23 @@ def run_sol(materials: str, *, mode: str = "CONSULT", audit_log: str = "",
 
 
 def run_review(materials: str, **kwargs) -> dict:
-    """一次 SOL REVIEW（用户明确要求的独立复核）。"""
-    return run_sol(materials, mode="REVIEW", **kwargs)
+    """一次认知 REVIEW（用户明确要求的独立复核）。"""
+    return run_cognition(materials, mode="REVIEW", **kwargs)
 
 
 def run_consult(materials: str, **kwargs) -> dict:
-    """一次 SOL CONSULT（默认认知引擎：理解/判断/风险/策略调整）。"""
-    return run_sol(materials, mode="CONSULT", **kwargs)
+    """一次认知 CONSULT（默认认知引擎：理解/判断/风险/策略调整）。"""
+    return run_cognition(materials, mode="CONSULT", **kwargs)
 
 
 def run_plan(materials: str, **kwargs) -> dict:
-    """一次 SOL PLAN（调查之后的方案比较与规划判断）。"""
-    return run_sol(materials, mode="PLAN", **kwargs)
+    """一次认知 PLAN（调查之后的方案比较与规划判断）。"""
+    return run_cognition(materials, mode="PLAN", **kwargs)
 
 
 def run_think(materials: str, **kwargs) -> dict:
     """历史名称：等同 `run_consult`，保留给既有调用方。"""
-    return run_sol(materials, mode="CONSULT", **kwargs)
+    return run_cognition(materials, mode="CONSULT", **kwargs)
 
 
 # ── 审计（只写脱敏元数据；正文由调用方存入任务目录） ──────────────────────
@@ -1875,7 +1871,7 @@ def _audit(path: str, record: dict) -> None:
             fh.flush()
             os.fsync(fh.fileno())
     except OSError as exc:
-        raise SolAuditError("sol_audit_write_failed",
+        raise CognitionAuditError("cognition_audit_write_failed",
                             f"无法写入审计日志 {path}：{exc}") from None
 
 
@@ -1883,7 +1879,7 @@ def _audit_safe(path: str, record: dict) -> str | None:
     """审计写入失败不掩盖已经发生的远程结果；返回错误码供调用方记录。"""
     try:
         _audit(path, record)
-    except SolAuditError as exc:
+    except CognitionAuditError as exc:
         return exc.code
     return None
 
@@ -1891,7 +1887,7 @@ def _audit_safe(path: str, record: dict) -> str | None:
 # ── 材料、单轮判定与准入 ───────────────────────────────────────────────────
 # 提示词/策略版本：进入单轮判定键。提示词、共享上下文或判定规则实质变化时，
 # 旧结论不再被当成同一审查对象复用（缓存失效条件见 review_subject_sha256）。
-PROMPT_VERSION = "sol-prompt-v6"
+PROMPT_VERSION = "cognition-prompt-v6"
 
 _EVIDENCE_LIMIT = 80
 _EVIDENCE_MAX_CHARS = 6000
@@ -1915,7 +1911,7 @@ def _evidence_lines(state: dict, *, limit: int = _EVIDENCE_LIMIT,
     """把任务证据登记压缩成可审查清单（自动注入，主代理不必重复粘贴）。
 
     只列事实：ID、类型、摘要前缀、大小、被哪些完成条件引用、是否已归档。它让
-    SOL 与 G2 使用同一份证据来源；完整证据内容仍由主代理放在材料里。
+    认知与 G2 使用同一份证据来源；完整证据内容仍由主代理放在材料里。
     """
     evidence = [item for item in state.get("evidence") or []
                 if isinstance(item, dict)]
@@ -1967,18 +1963,18 @@ def _action_lines(state: dict, *, limit: int = _ACTION_LIMIT) -> list[str]:
 
 
 def _prior_lines(state: dict) -> list[str]:
-    """历史 SOL 判断与未处理议程：让新一轮判断做增量，而不是从零重问。
+    """历史认知判断与未处理议程：让新一轮判断做增量，而不是从零重问。
 
     只注入最近两次判断的核心结论与采纳状态，以及最近一次仍有效的议程；不含完整
     回复。旧结论失效条件（合同修订、重开、新事件）由生命周期与 `reconsult` 决定，
-    这里不替 SOL 判断“是否仍然成立”。
+    这里不替认知判断“是否仍然成立”。
     """
-    calls = state.get("sol_calls") or []
+    calls = state.get("cognition_calls") or []
     prior = _RP.prior_cognition(calls, limit=2)
     agenda = _RP.open_agenda(calls)
     if not prior and not agenda:
         return []
-    lines = ["## 历史 SOL 认知（只读事实，不是本轮结论）", ""]
+    lines = ["## 历史认知判断（只读事实，不是本轮结论）", ""]
     for item in prior:
         lines.append(f"- {item['call_id']} {item['mode']}/{item['stage']} "
                      f"采纳={item['acceptance']}："
@@ -2013,7 +2009,7 @@ def _context_lines(state: dict, model: str = "") -> list[str]:
         "## 合同正文",
         "",
         # 合同正文存放在 `done_criteria_text`（与合同指纹同源）；旧实现误读了
-        # 不存在的 `text` 键，导致 SOL 从未看到合同全文。
+        # 不存在的 `text` 键，导致认知从未看到合同全文。
         str(contract.get("done_criteria_text") or "").strip() or "(未登记)",
         "",
         *(["## 合同边界", "", boundaries, ""] if boundaries else []),
@@ -2035,7 +2031,7 @@ def build_prompt(state: dict, materials: str, *, mode: str = "CONSULT",
     """把共享任务上下文与主代理材料拼成一次完整上下文（三模式共用）。"""
     resolved = normalize_mode(mode)
     if resolved == "REVIEW":
-        lines = [f"# Copilot SOL {resolved} 材料", "",
+        lines = [f"# Copilot 认知{resolved} 材料", "",
                  *_context_lines(state, model)]
         lines += [
             "## 主代理提供的审查材料",
@@ -2050,7 +2046,7 @@ def build_prompt(state: dict, materials: str, *, mode: str = "CONSULT",
         ]
         return "\n".join(lines)
     resolved_stage = normalize_stage(stage, mode=resolved)
-    lines = [f"# Copilot SOL {resolved} 材料"
+    lines = [f"# Copilot 认知{resolved} 材料"
              f"（阶段：{resolved_stage}）", "", *_context_lines(state, model)]
     lines += [
         "## 本次需要判断的事项",
@@ -2171,19 +2167,19 @@ def record_mode(record: dict) -> str:
         return "REVIEW"
     if mode == "PLAN":
         return "PLAN"
-    if mode == "CONSULT" or mode in LEGACY_SOL_MODES:
+    if mode == "CONSULT" or mode in LEGACY_MODES:
         return "CONSULT"
     return "CONSULT" if record.get("advisory_id") else "REVIEW"
 
 
-def completed_reviews(state: dict, records_key: str = "sol_calls") -> list[dict]:
-    """已完成记录：默认读取统一 `sol_calls` 流（含历史只读兼容）。
+def completed_reviews(state: dict, records_key: str = "cognition_calls") -> list[dict]:
+    """已完成记录：默认读取统一 `cognition_calls` 流（含历史只读兼容）。
 
     显式传入 `sol_reviews` / `sol_advisories` 时只读该历史键，供兼容调用方使用。
     """
-    if records_key == "sol_calls":
+    if records_key == "cognition_calls":
         import governance as G  # 延迟导入：状态合并逻辑只有一份
-        rows = G.iter_sol_calls(state)
+        rows = G.iter_cognition_calls(state)
     else:
         rows = [item for item in state.get(records_key) or []
                 if isinstance(item, dict)]
@@ -2193,13 +2189,13 @@ def completed_reviews(state: dict, records_key: str = "sol_calls") -> list[dict]
 def single_round_decision(state: dict, materials_sha256: str, *,
                           force: bool = False, reason: str = "",
                           trigger: str = "",
-                          records_key: str = "sol_calls",
+                          records_key: str = "cognition_calls",
                           mode: str = "CONSULT", model: str = "") -> dict:
     """单轮判定：同一认知对象直接复用；同模式再次调用必须有实质原因。
 
     CONSULT / PLAN / REVIEW 各自独立判定，不会互相复用；记录统一存放在
-    `sol_calls`，历史 `sol_reviews` / `sol_advisories` 仍可只读复用。
-    **模型门**：只复用同一模型的已完成记录；历史 SOL 结论不会被当成 Astra 的
+    `cognition_calls`，历史 `sol_reviews` / `sol_advisories` 仍可只读复用。
+    **模型门**：只复用同一模型的已完成记录；历史旧模型结论不会被当成 Astra 的
     新响应（旧记录缺少 `model` 字段时一律视为不可复用）。
     “单轮”约束的是同一认知对象只付一次费，不是调用次数上限：只要问题、阶段
     或材料构成新的认知对象，就可以按对应 trigger 继续调用。
@@ -2215,21 +2211,21 @@ def single_round_decision(state: dict, materials_sha256: str, *,
     # 证据绑定等不进键），复用分支不能把“明确要求重新咨询”的调用挡回去。
     if same and not force:
         return {"action": "reuse", "review": same[-1],
-                "note": "相同材料已完成同模式 SOL 调用；直接复用结论，不重复调用。"}
+                "note": "相同材料已完成同模式认知调用；直接复用结论，不重复调用。"}
     if not records:
-        return {"action": "call", "note": f"首次 SOL {resolved_mode} 调用。"}
+        return {"action": "call", "note": f"首次认知{resolved_mode} 调用。"}
     trigger_value = str(trigger or "").strip().lower()
     reason_value = str(reason or "").strip()
     if not force:
-        return {"action": "refuse", "code": "sol_review_requires_reason",
-                "note": ("本任务已有同模式 SOL 结论。单轮原则要求再次调用必须有明确原因；"
+        return {"action": "refuse", "code": "cognition_review_requires_reason",
+                "note": ("本任务已有同模式认知结论。单轮原则要求再次调用必须有明确原因；"
                          "使用 --force --trigger <原因类型> --reason <说明>。")}
     if trigger_value not in RETRY_TRIGGERS:
-        return {"action": "refuse", "code": "sol_review_trigger_invalid",
+        return {"action": "refuse", "code": "cognition_call_trigger_invalid",
                 "note": ("--trigger 只能是 "
                          + ", ".join(RETRY_TRIGGERS) + "。")}
     if not reason_value:
-        return {"action": "refuse", "code": "sol_review_reason_missing",
+        return {"action": "refuse", "code": "cognition_call_reason_missing",
                 "note": "再次调用必须用 --reason 说明具体原因。"}
     return {"action": "call", "trigger": trigger_value, "reason": reason_value,
             "note": f"允许再次调用：{RETRY_TRIGGERS[trigger_value]}。"}
@@ -2238,16 +2234,16 @@ def single_round_decision(state: dict, materials_sha256: str, *,
 
 def admission(*, risk: str, triggers: list[str] | None = None,
               reason: str = "") -> dict:
-    """SOL 介入的准入建议（只读建议，不是门禁）。
+    """认知介入的准入建议（只读建议，不是门禁）。
 
     简单/普通任务由主代理自检闭环；多模块改造、数据链路、安全与生产高风险、
-    用户明确要求时建议调用一次认知判断。SOL 是 advisory，不构成收口门禁。
+    用户明确要求时建议调用一次认知判断。认知是 advisory，不构成收口门禁。
     """
     import review_policy as RP
 
     risk_value = str(risk or "").strip().lower()
     if risk_value not in ("low", "medium", "normal", "high"):
-        raise SolUsageError("sol_risk_invalid", f"风险等级 {risk_value!r} 非法。")
+        raise CognitionUsageError("cognition_risk_invalid", f"风险等级 {risk_value!r} 非法。")
     tier = "medium" if risk_value == "normal" else risk_value
     requested = []
     for item in triggers or []:
@@ -2255,8 +2251,8 @@ def admission(*, risk: str, triggers: list[str] | None = None,
         if not value:
             continue
         if value not in RP.ADMISSION_TRIGGERS and value not in RETRY_TRIGGERS:
-            raise SolUsageError(
-                "sol_trigger_invalid",
+            raise CognitionUsageError(
+                "cognition_trigger_invalid",
                 "未知触发因素：" + value + "；可选："
                 + ", ".join(sorted(set(RP.ADMISSION_TRIGGERS) | set(RETRY_TRIGGERS)))
                 + "。")
@@ -2264,17 +2260,17 @@ def admission(*, risk: str, triggers: list[str] | None = None,
             requested.append(value)
     if tier == "high":
         decision, scope = "recommended", "high-risk"
-        detail = ("高风险/安全/生产变更建议在形成判断后调用一次 SOL 认知评估；"
-                  "SOL 只提供判断与风险意见，不证明宿主权限，也不构成收口门禁。")
+        detail = ("高风险/安全/生产变更建议在形成判断后调用一次认知评估；"
+                  "认知只提供判断与风险意见，不证明宿主权限，也不构成收口门禁。")
     elif requested:
         decision, scope = "recommended", "triggered"
-        detail = "声明了实质风险因素，建议调用一次 SOL 认知判断；主代理自行决定。"
+        detail = "声明了实质风险因素，建议调用一次认知判断；主代理自行决定。"
     elif tier == "low":
         decision, scope = "not_needed", "none"
-        detail = "低风险改动（文案/样式/简单修复/小范围既有模式）：主代理自检闭环，无需 SOL。"
+        detail = "低风险改动（文案/样式/简单修复/小范围既有模式）：主代理自检闭环，无需认知。"
     else:
         decision, scope = "optional", "normal"
-        detail = "普通功能开发：按需调用一次 SOL；不强制、不设自动第二轮。"
+        detail = "普通功能开发：按需调用一次认知；不强制、不设自动第二轮。"
     return {
         "schema": ADMISSION_SCHEMA,
         "risk": risk_value,

@@ -65,7 +65,7 @@ class SkillEntryTests(unittest.TestCase):
         self.assertLessEqual(len(re.search(r"when_to_use: >\n(.*?)\n---", self.doc, re.S)
                                  .group(1)), 1024)
 
-    def test_version_and_sol_review_only(self):
+    def test_version_and_cognition_call_only(self):
         self.assertIn(f"v{current_version()}", self.doc)
         self.assertIn(f"# copilot：轻量协作治理（v{current_version()}）", self.doc)
         # 单轮复核仍是入口规则；完整的版本沿革迁到 references/history.md，
@@ -76,20 +76,21 @@ class SkillEntryTests(unittest.TestCase):
         self.assertIn("SOL 零工具单轮复核", history)
         self.assertIn("legacy-status", self.doc)
         self.assertNotIn("唯一正式 GPT/SOL 入口", self.doc)
-        # SOL 只是建议：不得恢复决策通道或 DECIDE。
+        # 认知只是建议：不得恢复决策通道或 DECIDE。
         self.assertNotIn("SOL 决策通道已退役。", self.doc)
         self.assertNotIn('"DECIDE"', self.doc)
-        for line in self.doc.splitlines():
-            if "gpt-6.2-sol" in line:
-                self.assertNotIn("决策通道", line)
+        # v9.10.0 起只剩一个认知模型：旧模型名只允许出现在“已移除”说明里，
         # 模型升级必须写进当前版本说明，并且不得残留旧模型为现行默认配置。
         self.assertIn("gpt-6.2-astra", self.doc)
-        self.assertIn("gpt-6.2-sol", self.doc)
+        for line in self.doc.splitlines():
+            if "gpt-6.2-sol" in line:
+                self.assertIn("已移除", line)
+        self.assertNotIn("仅显式兼容", self.doc)
         self.assertIn("reasoning.effort=\"high\"", self.doc)
         self.assertIn("--cognition", self.doc)
-        # 当前命令面是 sol-consult / sol-plan；THINK 只作读取别名，sol-advisory 只允许作为历史说明。
-        self.assertIn("sol-consult", self.doc)
-        self.assertIn("sol-plan", self.doc)
+        # 当前命令面是 cognition-consult / cognition-plan；THINK 只作读取别名，sol-advisory 只允许作为历史说明。
+        self.assertIn("cognition-consult", self.doc)
+        self.assertIn("cognition-plan", self.doc)
         self.assertIn("THINK 保留为只读别名", self.doc)
         self.assertIn("THINK 只作读取别名", history)
 
@@ -123,14 +124,14 @@ class SkillEntryTests(unittest.TestCase):
         self.assertIn("不会解除阻塞", self.doc)
         self.assertIn("evidence --drop", self.doc)
 
-    def test_gates_and_sol_review(self):
+    def test_gates_and_cognition_call(self):
         for gate in ("G1", "G2", "G3"):
             self.assertIn(gate, self.doc)
         self.assertIn("G4", self.doc)
         self.assertIn("已正式退役", self.doc)
         self.assertIn("fail-closed", self.doc)
         # SOL 单轮复核必须写进入口，并明确是 advisory。
-        self.assertIn("sol-review", self.doc)
+        self.assertIn("cognition-review", self.doc)
         self.assertIn("单轮", self.doc)
         self.assertIn("零工具", self.doc)
         self.assertIn("advisory", self.doc)
@@ -148,12 +149,13 @@ class ReferenceTests(unittest.TestCase):
         o = {name: text(os.path.join(REFERENCES, name)) for name in ACTIVE_REFS}
         self.assertIn("legacy-status", o["workflow.md"])
         self.assertIn("evidence_tampered", o["workflow.md"])
-        self.assertIn("sol-review", o["workflow.md"])
-        self.assertIn("sol-think", o["workflow.md"])
+        self.assertIn("cognition-review", o["workflow.md"])
+        self.assertIn("cognition-consult", o["workflow.md"])
         self.assertIn("sol_reviews", o["review.md"])
         self.assertIn("sol_advisories", o["review.md"])
         self.assertIn("gpt-6.2-astra", o["review.md"])
-        self.assertIn("gpt-6.2-sol", o["review.md"])
+        # v9.10.0 只剩单一认知模型；旧模型不得再出现在当前参考文档里。
+        self.assertNotIn("gpt-6.2-sol", o["review.md"])
         self.assertIn("单轮", o["review.md"])
         self.assertIn("零工具", o["review.md"])
         self.assertIn("已正式退役", o["review.md"])
@@ -233,9 +235,10 @@ class ReadonlyProfileTests(unittest.TestCase):
 class ProjectDocTests(unittest.TestCase):
     def test_agents_md_points_to_v8_architecture(self):
         doc = text(os.path.join(ROOT, "AGENTS.md"))
-        self.assertIn("唯一远程调用是 SOL（CONSULT / PLAN / REVIEW）", doc)
+        self.assertIn("唯一远程调用是认知（CONSULT / PLAN / REVIEW）", doc)
         self.assertIn("gpt-6.2-astra", doc)
-        self.assertIn("gpt-6.2-sol", doc)
+        # v9.10.0 只剩一个认知模型：AGENTS.md 不得再写旧模型或模型切换。
+        self.assertNotIn("gpt-6.2-sol", doc)
         self.assertIn("PARTIAL 不是终点", doc)
         self.assertIn("legacy/tests", doc)
         self.assertIn("native_review_retired", doc)
@@ -244,7 +247,7 @@ class ProjectDocTests(unittest.TestCase):
         self.assertNotIn("SOL 固定", doc)
         self.assertNotIn("唯一正式 GPT/SOL 入口", doc)
 
-    def test_charter_and_roadmap_mark_sol_advisory_only(self):
+    def test_charter_and_roadmap_mark_cognition_advisory_only(self):
         charter = text(os.path.join(ROOT, "docs", "PROJECT-CHARTER.md"))
         roadmap = text(os.path.join(ROOT, "docs", "ROADMAP.md"))
         self.assertIn("v9.0.0 按生命周期恢复 CONSULT / PLAN", charter)
@@ -268,9 +271,10 @@ class ProjectDocTests(unittest.TestCase):
         self.assertIn("gpt-6.2-sol", decisions)
         self.assertIn("G4", decisions)
 
-    def test_readme_presents_sol_review_as_active(self):
+    def test_readme_presents_cognition_call_as_active(self):
         doc = text(os.path.join(ROOT, "README.md"))
-        self.assertIn("SOL 零工具单轮复核", doc)
+        self.assertIn("认知", doc)
+        self.assertIn("cognition_call.py", doc)
         self.assertIn("governance.py", doc)
         self.assertIn("legacy/", doc)
 

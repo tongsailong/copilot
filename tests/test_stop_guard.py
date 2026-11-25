@@ -76,7 +76,7 @@ class StopGuardBase(unittest.TestCase):
                   env: dict | None = None, text: str | None = None,
                   session: str | None = SESSION):
         environment = dict(os.environ)
-        environment.setdefault("COPILOT_SOL_AUTO", "off")
+        environment.setdefault("COPILOT_COGNITION_AUTO", "off")
         for key in ("COPILOT_STOP_GUARD", "COPILOT_STOP_GUARD_LOG",
                     "ZCODE_SESSION_ID", "CLAUDE_SESSION_ID",
                     "CLAUDE_CODE_SESSION_ID"):
@@ -410,7 +410,7 @@ class SessionBindingTests(StopGuardBase):
     def test_dispatch_cli_records_session_binding(self):
         os.unlink(os.path.join(self.task_dir, "session.json"))
         environment = dict(os.environ)
-        environment.setdefault("COPILOT_SOL_AUTO", "off")
+        environment.setdefault("COPILOT_COGNITION_AUTO", "off")
         environment["ZCODE_SESSION_ID"] = SESSION
         proc = subprocess.run(
             [sys.executable, "-B", DISPATCH, "record", "--state", self.state_path,
@@ -428,7 +428,7 @@ class SessionBindingTests(StopGuardBase):
         # 只读命令的契约是“只看不改”（handoff 回归覆盖写工作区），同一口径。
         os.unlink(os.path.join(self.task_dir, "session.json"))
         environment = dict(os.environ)
-        environment.setdefault("COPILOT_SOL_AUTO", "off")
+        environment.setdefault("COPILOT_COGNITION_AUTO", "off")
         environment["ZCODE_SESSION_ID"] = SESSION
         proc = subprocess.run(
             [sys.executable, "-B", DISPATCH, "status", "--state", self.state_path],
@@ -442,7 +442,7 @@ class SessionBindingTests(StopGuardBase):
         # 接手（也没改动）的任务变成“本会话负责”，Stop 时误拦。
         os.unlink(os.path.join(self.task_dir, "session.json"))
         environment = dict(os.environ)
-        environment.setdefault("COPILOT_SOL_AUTO", "off")
+        environment.setdefault("COPILOT_COGNITION_AUTO", "off")
         environment["ZCODE_SESSION_ID"] = SESSION
         proc = subprocess.run(
             [sys.executable, "-B", DISPATCH, "criterion", "--state",
@@ -465,7 +465,7 @@ class SessionBindingTests(StopGuardBase):
                 if os.path.exists(binding):
                     os.unlink(binding)
                 environment = dict(os.environ)
-                environment.setdefault("COPILOT_SOL_AUTO", "off")
+                environment.setdefault("COPILOT_COGNITION_AUTO", "off")
                 environment["ZCODE_SESSION_ID"] = SESSION
                 proc = subprocess.run(
                     [sys.executable, "-B", DISPATCH, *argv],
@@ -512,7 +512,7 @@ class HookInstallTests(unittest.TestCase):
 
     def run_cli(self, *args: str, env: dict | None = None):
         environment = dict(os.environ)
-        environment.setdefault("COPILOT_SOL_AUTO", "off")
+        environment.setdefault("COPILOT_COGNITION_AUTO", "off")
         environment.pop("ZCODE_USER_CONFIG", None)
         if env:
             environment.update(env)

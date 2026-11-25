@@ -8,7 +8,7 @@
    高复杂任务阶段复盘 → 收口综合判断。
 3. 同一合同内无新信息不重复；计划/合同实质变化或用户明确要求才追加。
 4. 输出交回 ZCode：建议进入 evaluate/next_commands，不派生工作项、不改门禁；
-   采纳结论由主代理用 sol-accept 显式登记。
+   采纳结论由主代理用 cognition-accept 显式登记。
 5. 失败只降级：真实失败被记录，任务继续推进，不伪造完成。
 6. PARTIAL 恢复复用既有结论；项级阻塞不冻结其余工作；正式 REVIEW 仅用户授权。
 """
@@ -27,7 +27,7 @@ import v6_support as F
 
 G = F.G
 import review_policy as RP  # noqa: E402  v6_support 已把 scripts/ 加入 sys.path
-import sol_review as SR  # noqa: E402
+import cognition_call as CC  # noqa: E402
 import copilot_dispatch as CD  # noqa: E402
 
 CONTRACT = """## 完成条件
@@ -35,7 +35,7 @@ CONTRACT = """## 完成条件
 """
 
 
-class SolFirstBase(unittest.TestCase):
+class CognitionLifecycleBase(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -106,7 +106,7 @@ class SolFirstBase(unittest.TestCase):
                status: str = "completed") -> dict:
         state = G.load_state(self.state_path)
         call = {
-            "call_id": f"SC{mode.lower()}{len(state.get('sol_calls') or [])}",
+            "call_id": f"SC{mode.lower()}{len(state.get('cognition_calls') or [])}",
             "mode": mode,
             "status": status,
             "stage": stage,
@@ -129,11 +129,11 @@ class SolFirstBase(unittest.TestCase):
             call["usage"] = usage
         if latency_ms is not None:
             call["latency_ms"] = latency_ms
-        return G.record_sol_call(self.state_path, call, mode=mode,
+        return G.record_cognition_call(self.state_path, call, mode=mode,
                                  materials_sha256="m" * 64, trigger=trigger)
 
     def advice(self, **kwargs) -> dict:
-        return G.sol_advice_summary(G.load_state(self.state_path), **kwargs)
+        return G.cognition_advice_summary(G.load_state(self.state_path), **kwargs)
 
     def inject_replan(self) -> None:
         """模拟主代理登记重规划：AUTO-REPLAN 是升级型信号，但不属于计划项。"""
@@ -144,7 +144,7 @@ class SolFirstBase(unittest.TestCase):
         G.save_state(self.state_path, state)
 
     def run_consult(self, *, result=None, error=None, json_output: bool = True):
-        """在本进程内执行 sol-consult，可注入成功结果或真实失败。"""
+        """在本进程内执行 cognition-consult，可注入成功结果或真实失败。"""
         args = argparse.Namespace(
             state=self.state_path, materials=self.materials,
             question="该方案是否可行？", stage="", reason="", trigger="",
@@ -152,16 +152,16 @@ class SolFirstBase(unittest.TestCase):
             timeout=5, max_output_tokens=100, audit_log="", output_dir="",
             knowledge_file="")
         out, err = io.StringIO(), io.StringIO()
-        patch = (mock.patch("sol_review.run_consult", return_value=dict(result))
+        patch = (mock.patch("cognition_call.run_consult", return_value=dict(result))
                  if result is not None else
-                 mock.patch("sol_review.run_consult", side_effect=error))
+                 mock.patch("cognition_call.run_consult", side_effect=error))
         with patch, contextlib.redirect_stdout(out), \
                 contextlib.redirect_stderr(err):
-            code = CD.cmd_sol_consult(args)
+            code = CD.cmd_cognition_consult(args)
         return code, out.getvalue(), err.getvalue()
 
 
-class RoutingTests(SolFirstBase):
+class RoutingTests(CognitionLifecycleBase):
     def test_simple_mechanical_task_gets_zero_calls(self):
         self.start(risk="low", kind="trivial")
         self.plan(1)
@@ -181,7 +181,7 @@ class RoutingTests(SolFirstBase):
         self.assertEqual(advice["mode"], "CONSULT")
         self.assertEqual(advice["stage"], "understanding")
         self.assertFalse(advice["second_round"])
-        self.assertIn("sol-consult", advice["command"])
+        self.assertIn("cognition-consult", advice["command"])
 
     def test_plan_is_suggested_after_investigation(self):
         self.start(kind="feature")
@@ -192,7 +192,7 @@ class RoutingTests(SolFirstBase):
         self.assertEqual(advice["action"], "plan")
         self.assertEqual(advice["mode"], "PLAN")
         self.assertEqual(advice["stage"], "planning")
-        self.assertIn("sol-plan", advice["command"])
+        self.assertIn("cognition-plan", advice["command"])
         self.assertIn("--question", advice["command"])
 
     def test_product_design_gets_default_consult(self):
@@ -286,13 +286,13 @@ class RoutingTests(SolFirstBase):
         self.assertIn("user-request", advice["trigger"])
 
 
-class HandoffTests(SolFirstBase):
+class HandoffTests(CognitionLifecycleBase):
     def test_advice_is_handed_back_to_zcode_without_creating_work(self):
         self.start(kind="standard")
         state = G.load_state(self.state_path)
         evaluation = G.evaluate(state)
-        self.assertEqual(evaluation["sol"]["action"], "consult")
-        self.assertTrue(any("sol-consult" in cmd
+        self.assertEqual(evaluation["cognition"]["action"], "consult")
+        self.assertTrue(any("cognition-consult" in cmd
                             for cmd in evaluation.get("next_commands") or []))
         # 建议不派生工作项：derive_work 只处理真实缺口。
         G.derive_work(state)
@@ -305,19 +305,19 @@ class HandoffTests(SolFirstBase):
         first = self.record("CONSULT")
         second = self.record("PLAN")
         third = self.record("CONSULT")
-        G.record_sol_acceptance(self.state_path, G.sol_call_id(first),
+        G.record_cognition_acceptance(self.state_path, G.cognition_call_id(first),
                                 status="accepted", note="采纳目标理解")
-        G.record_sol_acceptance(self.state_path, G.sol_call_id(second),
+        G.record_cognition_acceptance(self.state_path, G.cognition_call_id(second),
                                 status="modified", note="只采纳优先级",
                                 reason="原方案范围过大")
-        G.record_sol_acceptance(self.state_path, G.sol_call_id(third),
+        G.record_cognition_acceptance(self.state_path, G.cognition_call_id(third),
                                 status="rejected", reason="与现场证据冲突")
         state = G.load_state(self.state_path)
         self.assertEqual([item["acceptance"]["status"]
-                          for item in state["sol_calls"]],
+                          for item in state["cognition_calls"]],
                          ["accepted", "modified", "rejected"])
         self.assertEqual(G.evaluate(state)["phase"], "PARTIAL")
-        metrics = G.review_metrics(state)["sol_cognitive"]
+        metrics = G.review_metrics(state)["cognition"]
         self.assertEqual(metrics["acceptance"],
                          {"accepted": 1, "modified": 1, "rejected": 1,
                           "pending": 0})
@@ -327,8 +327,8 @@ class HandoffTests(SolFirstBase):
         self.start(kind="feature")
         self.plan(1)
         call = self.record("CONSULT")
-        result = G.record_sol_acceptance(
-            self.state_path, G.sol_call_id(call), status="accepted",
+        result = G.record_cognition_acceptance(
+            self.state_path, G.cognition_call_id(call), status="accepted",
             decision="先实现 A1", rationale="与调查结论一致",
             work_item_refs=["A1", "A-missing"])
         entry = result["acceptance"]
@@ -338,29 +338,29 @@ class HandoffTests(SolFirstBase):
         self.assertNotEqual(G.evaluate(G.load_state(self.state_path))["phase"],
                             "BLOCKED")
         self.assertEqual(G.review_metrics(G.load_state(self.state_path))
-                         ["sol_cognitive"]["acceptance"]["accepted"], 1)
+                         ["cognition"]["acceptance"]["accepted"], 1)
 
     def test_acceptance_requires_completed_call(self):
         self.start(kind="feature")
-        failed = G.record_sol_call_failure(
-            self.state_path, mode="CONSULT", error_code="sol_timeout")
+        failed = G.record_cognition_call_failure(
+            self.state_path, mode="CONSULT", error_code="cognition_timeout")
         with self.assertRaises(G.GovernanceError):
-            G.record_sol_acceptance(self.state_path, failed["call_id"],
+            G.record_cognition_acceptance(self.state_path, failed["call_id"],
                                     status="accepted")
 
     def test_zero_tool_for_every_mode(self):
-        for mode in SR.SOL_MODES:
+        for mode in CC.CALL_MODES:
             with self.subTest(mode=mode):
-                payload = SR.build_payload("材料", mode=mode)
+                payload = CC.build_payload("材料", mode=mode)
                 self.assertNotIn("tools", payload)
                 self.assertNotIn("functions", payload)
                 self.assertEqual(payload["tool_choice"], "none")
                 self.assertEqual(payload["reasoning"], {"effort": "high"})
-                SR.assert_zero_tool(payload)
+                CC.assert_zero_tool(payload)
 
     def test_consult_reply_contains_cognitive_superset(self):
-        parsed = SR.parse_think_output(
-            json.dumps({"schema": SR.THINK_SCHEMA, "judgment": "先验证",
+        parsed = CC.parse_think_output(
+            json.dumps({"schema": CC.THINK_SCHEMA, "judgment": "先验证",
                         "goal_understanding": "交付可靠结果",
                         "essence": "缺少端到端验证", "strategy": "先补测试",
                         "alternatives": ["直接合并"],
@@ -379,16 +379,16 @@ class HandoffTests(SolFirstBase):
         self.assertEqual(parsed["alternatives"], ["直接合并"])
 
 
-class AcceptanceEvidenceTests(SolFirstBase):
+class AcceptanceEvidenceTests(CognitionLifecycleBase):
     """采纳记录 v2：实际决策/理由/多证据关联、非阻断提示与历史兼容。"""
 
     def accept(self, call, **kwargs) -> dict:
-        return G.record_sol_acceptance(
-            self.state_path, G.sol_call_id(call), **kwargs)
+        return G.record_cognition_acceptance(
+            self.state_path, G.cognition_call_id(call), **kwargs)
 
     def quality(self) -> dict:
         return G.review_metrics(
-            G.load_state(self.state_path))["sol_cognitive"]["acceptance_quality"]
+            G.load_state(self.state_path))["cognition"]["acceptance_quality"]
 
     def test_v2_record_links_registered_evidence_and_tracks_advice(self):
         self.start(kind="feature")
@@ -409,11 +409,11 @@ class AcceptanceEvidenceTests(SolFirstBase):
         self.assertEqual(result["hints"], [])
         self.assertTrue(G.acceptance_is_complete(entry))
         # 原建议沿 call_id 引用，不复制正文。
-        self.assertEqual(entry["advice_ref"]["call_id"], G.sol_call_id(call))
+        self.assertEqual(entry["advice_ref"]["call_id"], G.cognition_call_id(call))
         self.assertEqual(entry["advice_ref"]["judgment"], "建议")
         self.assertNotIn("summary", entry)
         event = [h for h in G.load_state(self.state_path)["history"]
-                 if h["event"] == "sol_call_acceptance"][-1]
+                 if h["event"] == "cognition_call_acceptance"][-1]
         self.assertEqual(event["detail"]["evidence_refs"], [first, second])
         self.assertEqual(event["detail"]["evidence_status"], "linked")
         self.assertTrue(event["detail"]["decision_recorded"])
@@ -452,7 +452,7 @@ class AcceptanceEvidenceTests(SolFirstBase):
         self.assertTrue(result["hints"])
         self.assertTrue(G.acceptance_is_complete(result["acceptance"]))
         state = G.load_state(self.state_path)
-        self.assertEqual(state["sol_calls"][0]["acceptance"]["status"],
+        self.assertEqual(state["cognition_calls"][0]["acceptance"]["status"],
                          "rejected")
         quality = self.quality()
         self.assertEqual(quality["no_evidence"], 1)
@@ -539,15 +539,15 @@ class AcceptanceEvidenceTests(SolFirstBase):
         self.assertEqual(entry["decision"], "暂不执行")
         state = G.load_state(self.state_path)
         events = [h for h in state["history"]
-                  if h["event"] == "sol_call_acceptance"]
+                  if h["event"] == "cognition_call_acceptance"]
         self.assertEqual([e["detail"]["status"] for e in events],
                          ["accepted", "rejected"])
         # 第一次登记快照未被改写：历史里仍可还原上一版决定。
         self.assertEqual(events[0]["detail"]["acceptance"]["decision"],
                          "按建议执行")
-        self.assertEqual(state["sol_calls"][0]["acceptance"]["status"],
+        self.assertEqual(state["cognition_calls"][0]["acceptance"]["status"],
                          "rejected")
-        metrics = G.review_metrics(state)["sol_cognitive"]
+        metrics = G.review_metrics(state)["cognition"]
         self.assertEqual(metrics["acceptance"],
                          {"accepted": 0, "modified": 0, "rejected": 1,
                           "pending": 0})
@@ -558,7 +558,7 @@ class AcceptanceEvidenceTests(SolFirstBase):
         call = self.record("CONSULT")
         state = G.load_state(self.state_path)
         legacy_at = G.now_iso()
-        state["sol_calls"][0]["acceptance"] = {
+        state["cognition_calls"][0]["acceptance"] = {
             "status": "accepted", "note": "旧记录", "reason": "",
             "decided_by": "zcode", "at": legacy_at,
             "basis": "zcode-judgment"}
@@ -568,14 +568,14 @@ class AcceptanceEvidenceTests(SolFirstBase):
         self.assertEqual(quality["legacy_records"], 1)
         self.assertIsNone(quality["complete_rate"])
         self.assertIsNone(quality["evidence_link_rate"])
-        metrics = G.review_metrics(state)["sol_cognitive"]
+        metrics = G.review_metrics(state)["cognition"]
         self.assertEqual(metrics["acceptance"]["accepted"], 1)
         self.assertEqual(metrics["adopted"], 1)
         self.assertEqual(
             G.acceptance_evidence_status(
-                state["sol_calls"][0]["acceptance"]), "unrecorded")
+                state["cognition_calls"][0]["acceptance"]), "unrecorded")
         self.assertFalse(G.acceptance_is_complete(
-            state["sol_calls"][0]["acceptance"]))
+            state["cognition_calls"][0]["acceptance"]))
         # 历史记录仍可重新登记为 v2（当前为准，旧值不被隐式继承）。
         result = self.accept(call, status="accepted", decision="采纳",
                              rationale="复核后确认")
@@ -589,9 +589,9 @@ class AcceptanceEvidenceTests(SolFirstBase):
     def test_cli_accept_prints_hints_and_exits_zero(self):
         self.start(kind="feature")
         call = self.record("CONSULT")
-        proc = F.run_cli("copilot_dispatch.py", "sol-accept",
+        proc = F.run_cli("copilot_dispatch.py", "cognition-accept",
                          "--state", self.state_path,
-                         "--call-id", G.sol_call_id(call),
+                         "--call-id", G.cognition_call_id(call),
                          "--status", "accepted",
                          "--decision", "按建议先调查",
                          "--rationale", "现场一致",
@@ -601,32 +601,32 @@ class AcceptanceEvidenceTests(SolFirstBase):
         self.assertIn("待核 E7", proc.stdout)
         self.assertIn("提示（非阻断", proc.stdout)
         self.assertIn("E7", proc.stdout)
-        entry = G.load_state(self.state_path)["sol_calls"][0]["acceptance"]
+        entry = G.load_state(self.state_path)["cognition_calls"][0]["acceptance"]
         self.assertEqual(entry["evidence_resolution"]["unresolved"], ["E7"])
         self.assertEqual(entry["source_refs"], ["报告 §2"])
         self.assertEqual(entry["decision"], "按建议先调查")
 
 
-class FailureTests(SolFirstBase):
+class FailureTests(CognitionLifecycleBase):
     def test_failed_consult_is_recorded_and_task_continues(self):
         self.start(kind="feature")
         code, _out, err = self.run_consult(
-            error=SR.SolTimeoutError("sol_timeout", "上游超时"))
+            error=CC.CognitionTimeoutError("cognition_timeout", "上游超时"))
         self.assertEqual(code, 0)  # CONSULT 失败只降级
-        self.assertIn("sol_timeout", err)
+        self.assertIn("cognition_timeout", err)
         state = G.load_state(self.state_path)
-        self.assertEqual(state["sol_calls"][-1]["status"], "failed")
-        self.assertEqual(state["sol_calls"][-1]["mode"], "CONSULT")
+        self.assertEqual(state["cognition_calls"][-1]["status"], "failed")
+        self.assertEqual(state["cognition_calls"][-1]["mode"], "CONSULT")
         self.assertNotEqual(G.evaluate(state)["phase"], "BLOCKED")
 
     def test_provider_unavailable_is_not_faked_as_completed(self):
         self.start(kind="feature")
-        self.run_consult(error=SR.SolUpstreamError("sol_network",
+        self.run_consult(error=CC.CognitionUpstreamError("cognition_network",
                                                    "无法连接 Provider"))
         state = G.load_state(self.state_path)
-        self.assertFalse([item for item in state["sol_calls"]
+        self.assertFalse([item for item in state["cognition_calls"]
                           if item.get("status") == "completed"])
-        metrics = G.review_metrics(state)["sol_cognitive"]
+        metrics = G.review_metrics(state)["cognition"]
         self.assertEqual(metrics["failed"], 1)
         self.assertEqual(metrics["consult_completed"], 0)
         self.assertFalse(metrics["default_covered"])
@@ -658,7 +658,7 @@ class FailureTests(SolFirstBase):
                     latency_ms=1200)
         metrics = G.review_metrics(G.load_state(self.state_path))
         self.assertEqual(metrics["schema"], "copilot-review-metrics/v2")
-        cognitive = metrics["sol_cognitive"]
+        cognitive = metrics["cognition"]
         self.assertTrue(cognitive["non_simple"])
         self.assertTrue(cognitive["default_covered"])
         self.assertEqual(cognitive["usage"],
@@ -670,12 +670,12 @@ class FailureTests(SolFirstBase):
         self.start(kind="feature")
         self.record("CONSULT", signals=[])
         cognitive = G.review_metrics(
-            G.load_state(self.state_path))["sol_cognitive"]
+            G.load_state(self.state_path))["cognition"]
         self.assertTrue(cognitive["latency_unavailable"])
         self.assertIsNone(cognitive["latency_ms_avg"])
 
 
-class BoundaryTests(SolFirstBase):
+class BoundaryTests(CognitionLifecycleBase):
     def test_work_item_block_does_not_freeze_other_work(self):
         self.start(kind="feature")
         self.record("CONSULT")
@@ -688,7 +688,7 @@ class BoundaryTests(SolFirstBase):
         self.assertIn(advice["action"], ("reuse", "consult"))
         self.assertNotIn("BLOCKED", advice["reason"])
 
-    def test_task_level_block_stops_new_sol_calls(self):
+    def test_task_level_block_stops_new_cognition_calls(self):
         self.start(kind="feature")
         G.add_block(self.state_path, "缺少用户决策", "用户确认范围")
         advice = self.advice()
@@ -705,7 +705,7 @@ class BoundaryTests(SolFirstBase):
         first = self.advice()
         self.assertEqual(first["stage"], "stage")
         self.assertEqual(first["recommended_action"], "recommended")
-        digest = RP.sol_progress_key(G.load_state(self.state_path))
+        digest = RP.cognition_progress_key(G.load_state(self.state_path))
         self.record("CONSULT", signals=["risk-high", "multi-action"],
                     stage="stage", progress_digest=digest)
         second = self.advice()
@@ -718,8 +718,8 @@ class BoundaryTests(SolFirstBase):
         advice = self.advice(gates_passed=True)
         self.assertEqual(advice["action"], "consult")
         self.assertEqual(advice["stage"], "closure")
-        self.assertIn("sol-consult", advice["command"])
-        self.assertNotIn("sol-review", advice["command"])
+        self.assertIn("cognition-consult", advice["command"])
+        self.assertNotIn("cognition-review", advice["command"])
 
     def test_formal_review_requires_user_request(self):
         self.start(kind="feature")
@@ -731,20 +731,20 @@ class BoundaryTests(SolFirstBase):
         requested = self.advice(review_requested=True)
         self.assertEqual(requested["action"], "review")
         self.assertEqual(requested["mode"], "REVIEW")
-        self.assertIn("sol-review", requested["command"])
+        self.assertIn("cognition-review", requested["command"])
         self.assertIn("用户明确要求", requested["reason"])
 
-    def test_run_sol_marks_received_response_but_does_not_claim_wire_bytes(self):
+    def test_run_cognition_marks_received_response_but_does_not_claim_wire_bytes(self):
         reply = {
-            "id": "resp-test", "status": "completed", "model": SR.MODEL,
+            "id": "resp-test", "status": "completed", "model": CC.MODEL,
             "reasoning": {"effort": "high", "mode": "standard"},
             "usage": {"total_tokens": 3},
             "output": [{"type": "message", "content": [
                 {"type": "output_text", "text": json.dumps({
-                    "schema": SR.THINK_SCHEMA, "judgment": "保留最小改动",
+                    "schema": CC.THINK_SCHEMA, "judgment": "保留最小改动",
                     "goal_understanding": "完成调用闭环"}, ensure_ascii=False)}]}],
         }
-        result = SR.run_sol(
+        result = CC.run_cognition(
             "材料", mode="CONSULT", api_key="dummy",
             base_url="http://127.0.0.1:8317/v1",
             transport=lambda *_args: dict(reply))
@@ -767,7 +767,7 @@ class BoundaryTests(SolFirstBase):
 
     def test_consult_requires_explicit_question(self):
         self.start(kind="feature")
-        proc = F.run_cli("copilot_dispatch.py", "sol-consult",
+        proc = F.run_cli("copilot_dispatch.py", "cognition-consult",
                          "--state", self.state_path,
                          "--materials", self.materials,
                          "--dry-run", "--json")
@@ -775,17 +775,17 @@ class BoundaryTests(SolFirstBase):
         self.assertIn("--question", proc.stderr)
 
     def test_plan_defaults_to_planning_stage_and_consult_to_development(self):
-        self.assertEqual(SR.normalize_stage("", mode="PLAN"), "planning")
-        self.assertEqual(SR.normalize_stage("", mode="CONSULT"), "development")
-        with self.assertRaises(SR.SolUsageError):
-            SR.normalize_stage("invented", mode="CONSULT")
+        self.assertEqual(CC.normalize_stage("", mode="PLAN"), "planning")
+        self.assertEqual(CC.normalize_stage("", mode="CONSULT"), "development")
+        with self.assertRaises(CC.CognitionUsageError):
+            CC.normalize_stage("invented", mode="CONSULT")
 
     def test_dry_run_is_mode_aware_and_zero_tool(self):
         self.start(kind="feature")
         cases = {
-            "sol-consult": ("copilot-sol-consult-dry-run/v1", "CONSULT",
+            "cognition-consult": ("copilot-cognition-consult-dry-run/v1", "CONSULT",
                             "development"),
-            "sol-plan": ("copilot-sol-plan-dry-run/v1", "PLAN", "planning"),
+            "cognition-plan": ("copilot-cognition-plan-dry-run/v1", "PLAN", "planning"),
         }
         before = open(self.state_path, "rb").read()
         for command, (schema, mode, stage) in cases.items():
@@ -802,7 +802,7 @@ class BoundaryTests(SolFirstBase):
                 self.assertEqual(payload["stage"], stage)
                 self.assertTrue(payload["zero_tool"])
                 self.assertEqual(payload["tool_keys_present"], [])
-                self.assertEqual(payload["model"], SR.DEFAULT_MODEL)
+                self.assertEqual(payload["model"], CC.DEFAULT_MODEL)
         self.assertEqual(open(self.state_path, "rb").read(), before)
 
     def test_review_is_not_auto_derived_from_complexity(self):

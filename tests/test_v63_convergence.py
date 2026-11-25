@@ -59,7 +59,7 @@ class ReviewMetricsV63Tests(unittest.TestCase):
                     {"status": "completed", "verdict": "pass",
                      "findings_count": {"blocking": 0, "major": 0,
                                         "minor": 1, "info": 0}},
-                    {"status": "failed", "error": "sol_timeout"},
+                    {"status": "failed", "error": "cognition_timeout"},
                 ],
                 "review_admissions": [
                     {"tier": "high", "triggers": ["security"]},
@@ -75,11 +75,11 @@ class ReviewMetricsV63Tests(unittest.TestCase):
                 fh.write(json.dumps({"kind": "execution",
                                      "code": "evidence_sha_mismatch"}) + "\n")
             metrics = G.review_metrics(state, task_dir=tmp)
-        self.assertEqual(metrics["sol"]["total"], 2)
-        self.assertEqual(metrics["sol"]["completed"], 1)
-        self.assertEqual(metrics["sol"]["failed"], 1)
-        self.assertEqual(metrics["sol"]["verdicts"]["pass"], 1)
-        self.assertEqual(metrics["sol"]["findings"]["minor"], 1)
+        self.assertEqual(metrics["cognition_reviews"]["total"], 2)
+        self.assertEqual(metrics["cognition_reviews"]["completed"], 1)
+        self.assertEqual(metrics["cognition_reviews"]["failed"], 1)
+        self.assertEqual(metrics["cognition_reviews"]["verdicts"]["pass"], 1)
+        self.assertEqual(metrics["cognition_reviews"]["findings"]["minor"], 1)
         self.assertEqual(metrics["review_admissions_total"], 1)
         self.assertEqual(metrics["review_stops_total"], 1)
         self.assertEqual(metrics["formal_reviews_total"], 1)
