@@ -11,7 +11,7 @@ v9.7.1 及更早的治理记录见下。基线以本次交付的最终提交与�
 main 三方（本地 / `origin/main` / `ls-remote`）同为 `b83cf33`（0/0），工作区干净；
 运行时 `--check` 缺失 0 / 不同 0，27 个受管理文件源码与运行时 SHA-256 全部一致。
 
-## Astra 默认认知引擎迁移与调用效率优化（2026-11-25，v9.9.0，源码已改未提交）
+## Astra 默认认知引擎迁移与调用效率优化（2026-11-25，v9.9.0，已交付 `main`）
 
 任务 `copilot-astra-default-brain-optimization-20261125`，仓库 HEAD `1499bb0`，改动在工作树
 （授权不含 commit / push / 发布）；21 个文件已改（+759/−183）+ 新增 `tests/test_astra_migration.py`
@@ -46,7 +46,10 @@ main 三方（本地 / `origin/main` / `ls-remote`）同为 `b83cf33`（0/0）�
   （`sol-audit.jsonl` 仅 1 条）、延迟 76.0 s、tokens in 4244 / out 2118 / total 6362，
   已写入 `sol_calls` 并结算义务 SO1；采纳结论 `sol-accept → accepted`（E1–E4 证据关联）。
   `reasoning_tokens` 记为 0：上游本次未返回 reasoning token 明细，按实记录，未推断。
-- **未提交**：本次未执行 commit / push / release；CPA 配置、Provider、OAuth 凭据未改动。
+- **交付（2026-11-25）**：提交 `6ac011b`（23 文件，+1284/−185）经 PR #12（Python 3.10 / 3.12
+  必需检查通过）merge commit 合并为 `5a4c8c4`；本地 / `origin/main` / `ls-remote` 三方一致
+  （0/0），工作区 clean；运行时 `--apply` 写入 0 个文件、`--check` 缺失 0 / 不同 0、27 个分发
+  文件与 manifest 逐文件 SHA-256 一致；未建 Tag / Release。CPA 配置、Provider、OAuth 凭据未改动。
 - **任务状态**：`copilot-astra-default-brain-optimization-20261125` 已 **CLOSED / PASS**
   （12 项完成条件全部 met，G1–G3 PASS，证据 E1–E6 属本任务）；SO2/SO3 两个调度义务未执行
   并如实计入覆盖率（SOL 不是门禁，不为收口追加付费调用）。合同 test-policy 第 1 条写作
