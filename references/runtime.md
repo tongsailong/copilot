@@ -355,15 +355,17 @@ instance、`contract_sha256`、`level`、`status`、`window`。`status` 取值 `
   （原始文本，可能是 HTTP-date）、`request_id`、`trace_id` 原样写入 `sol-audit.jsonl` 与
   `sol_calls` 失败记录；上游过载与本地凭据冷却期 503 都**不**记作认证失败。重试语义不变：
   一次调用只发一次请求，不自动重试、不换 Provider。
-  `state["sol_backoff"]`（`copilot-sol-backoff/v1`）记录到期时间：**服务端 Retry-After 是
+  `state["model_backoff"]`（`copilot-model-backoff/v2`，键 `codex:<model>`）按
+  `provider + model + error_class` 记录到期时间：**服务端 Retry-After 是
   最短等待时间**（秒、毫秒、HTTP-date 均支持，HTTP-date 按 UTC 换算，过期或不可解析则不用），
   原样遵守、不被本地上限或环境变量缩短；只有在没有有效服务端值时才按 `error_class` 取默认
   窗口（60 秒），此时才受 `COPILOT_SOL_BACKOFF_MAX`（只能下调）与 1800 秒上限约束。
   窗口期调度步与 `sol-schedule --execute` 只登记 deferral（不消耗 `max_attempts`、不发请求），
   手动 `sol-consult` / `sol-plan` / `sol-review` 直接拒绝，`--ignore-backoff` 仅在确认上游
-  恢复后显式覆盖；成功调用自动清除窗口。窗口写在任务状态里，跨阶段、跨进程、跨会话同样生效，
-  到期后恢复既有调度频率。它是失败后的节流记录，**不是门禁**：不改变阶段、条件、G1–G3，
-  也不派生工作项。
+  恢复后显式覆盖；成功调用只清除本模型的窗口。窗口写在任务状态里，跨阶段、跨进程、跨会话
+  同样生效，到期后恢复既有调度频率。**按模型隔离**：SOL 过载不冻结 Astra，Astra 过载不阻塞
+  显式 SOL 调用；旧 `state["sol_backoff"]` 单例只读兼容，不继承给新默认模型。它是失败后的
+  节流记录，**不是门禁**：不改变阶段、条件、G1–G3，也不派生工作项。
 - **并发**：SOL 通道由 `.sol-review.lock` 独占；拿不到锁抛 `LockBusyError`，命令回退为
   “本轮不执行”，不排队重试、不重复付费。`sol-consult` / `sol-plan` 支持
   `--lock-timeout <秒>`。

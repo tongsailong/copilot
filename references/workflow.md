@@ -2,11 +2,12 @@
 
 本文是 Copilot 的**操作层**权威说明：命令、参数、退出码与标准回合流程。
 语义（阶段判定、派生规则、门禁细节）见 `runtime.md`、`review.md`、`agent-bridge.md`。
-`sol-consult` / `sol-plan` / `sol-review` 是显式模型调用入口；其余生命周期命令与
-`drive` 在默认 `--sol auto` 下会顺带执行至多 1 条 recommended 调度义务（1 次请求），
-所以“不调用模型”只对 `--sol off|advise`、读命令与测试进程成立。其余工作只读写本地
-任务状态文件。每次 SOL 调用只发一次请求，不自动重试、不自动二审；CONSULT / PLAN
-失败只记录并降级，不阻断工程推进。
+`sol-consult` / `sol-plan` / `sol-review` 是显式模型调用入口；生命周期命令
+（`start` / `closure` / `drive`）在默认 `--cognition auto`（`--sol` 兼容）下会顺带执行
+至多 1 条 recommended 调度义务（1 次请求）。纯登记/报告/合同命令默认 `advise`：只物化
+义务并打印命令，只有命令行显式 `auto` 才付费执行——所以“不调用模型”对读命令、纯登记
+命令默认行为与测试进程成立。其余工作只读写本地任务状态文件。每次 SOL 调用只发一次请求，
+不自动重试、不自动二审；CONSULT / PLAN 失败只记录并降级，不阻断工程推进。
 
 ## 1. 状态文件
 
@@ -34,11 +35,13 @@
 python3 -B scripts/copilot_dispatch.py <子命令> --state <state.json> [参数]
 ```
 
-生命周期命令（`start` / `plan` / `record` / `rerun` / `criterion` / `judgment` / `evidence` /
-`report` / `accept` / `decide` / `block` / `unblock` / `finding` / `contract` / `reopen` /
-`closure`）与 `copilot_auto.py drive` 都接受 `--sol auto|advise|off`（默认 `auto`）：回填后做
-一次有界调度步，最多执行 1 条义务、1 次请求；`optional` 级只提示；读命令永不执行。
-`COPILOT_SOL_AUTO=off` 可整体关闭自动执行。
+生命周期命令（`start` / `closure`）与 `copilot_auto.py drive` 接受
+`--cognition auto|advise|off`（`--sol` 兼容，默认 `auto`）：做一次有界调度步，最多执行
+1 条义务、1 次请求；`optional` 级只提示；读命令永不执行。纯登记/报告/合同命令
+（`plan` / `record` / `rerun` / `criterion` / `judgment` / `evidence` / `report` / `accept` /
+`decide` / `block` / `unblock` / `finding` / `contract` / `reopen`）默认 `advise`：回填后
+只物化义务、给出可粘贴命令，不隐式调用模型；确需顺带执行时必须在该条命令上显式写
+`--cognition auto`。`COPILOT_SOL_AUTO=off` 可整体关闭自动执行。
 
 | 子命令 | 用途 | 关键参数 |
 |---|---|---|
@@ -57,12 +60,12 @@ python3 -B scripts/copilot_dispatch.py <子命令> --state <state.json> [参数]
 | `block` / `unblock` | 记录/解除真实阻塞 | `block --reason ... --needs ... (--work-item A2 [--work-item A3] [--criterion C2] | --scope task [--force])`；`unblock --reason ... [--block-id B...] [--by user --quote "<原话>"]`（多条未解除时必须指定）；解除后被冻结工作项自动恢复 `pending`。仍有可执行项时任务级 `--scope task` 被拒绝，必须显式 `--force`，状态记录 `ready_at_creation`/`forced_scope`；`--by user` 必须带原话，记录 `resolved_by` 与 `authorization_source=caller-declared` |
 | `closure-check` | 只读检查 G1–G3 | `--json` |
 | `review-admission` | SOL-first 生命周期建议的单一确定性入口（只读、不写状态、不是门禁）：先算任务类型、复杂度与已有 SOL 覆盖，再给出 `advice.action`（`none`/`reuse`/`consult`/`plan`/`review`）、建议模式、阶段与命令 | `--trigger security`（可重复）、`--reason`、`--user-request`、`--review-request`、`--json`；返回 `decision`、`advice`、`task_kind`、`complexity`、`recommended_action`/`recommended_mode`/`recommended_stage`、`sol_calls_total` |
-| `sol-consult` | SOL 默认认知入口：材料 + 问题 → 一次请求 → 目标理解/问题本质/路线与取舍/风险/调查方向/再咨询条件；建议写入统一 `sol_calls`（`mode=CONSULT`），不入门禁；失败只登记并降级 | `--materials <file>`（调度执行时可省略）、`--question`（必填，`--obligation` 时回落到义务问题）、`--stage <understanding\|planning\|development\|stage\|closure>`、`--obligation SO<n>`（按调度义务执行，材料由状态确定性生成）、`--lock-timeout <秒>`、`--knowledge-file`、`--dry-run`、`--list`、`--json`、`--timeout`、`--max-output-tokens`、`--audit-log`（默认 `sol-audit.jsonl`）、`--output-dir`、`--ignore-backoff`（默认在上游退避窗口内不发请求；仅在上游已确认恢复时显式使用，仍然只发一次、不重试）；再次调用：`--force --trigger <user-request\|scope-changed\|new-risk\|materials-omitted\|strategy-failed\|major-uncertainty\|stage-result> --reason` |
+| `sol-consult` | SOL 默认认知入口：材料 + 问题 → 一次请求 → 目标理解/问题本质/路线与取舍/风险/调查方向/再咨询条件；建议写入统一 `sol_calls`（`mode=CONSULT`），不入门禁；失败只登记并降级 | `--materials <file>`（调度执行时可省略）、`--question`（必填，`--obligation` 时回落到义务问题）、`--stage <understanding\|planning\|development\|stage\|closure>`、`--obligation SO<n>`（按调度义务执行，材料由状态确定性生成）、`--lock-timeout <秒>`、`--knowledge-file`、`--dry-run`、`--list`、`--json`、`--timeout`、`--max-output-tokens`、`--audit-log`（默认 `sol-audit.jsonl`）、`--output-dir`、`--ignore-backoff`（默认在上游退避窗口内不发请求；仅在上游已确认恢复时显式使用，仍然只发一次、不重试）、`--model`（省略为 `gpt-6.2-astra`；`gpt-6.2-sol` 仅显式兼容，不回退）；再次调用：`--force --trigger <user-request\|scope-changed\|new-risk\|materials-omitted\|strategy-failed\|major-uncertainty\|stage-result> --reason` |
 | `sol-plan` | SOL 调查后规划判断：方案比较、取舍、优先级、阶段目标与验收关注点；记录写入统一 `sol_calls`（`mode=PLAN`） | 参数同 `sol-consult`；省略 `--stage` 时默认 `planning` |
 | `sol-think` | 历史别名：等同 `sol-consult`（`mode=CONSULT`），保留给既有调用方 | 参数同 `sol-consult` |
 | `sol-accept` | 回填主代理对 SOL 建议的采纳结论（事实记录，不改变阶段、G1–G3 或授权）。v2 记录含实际决策、理由、modified 差异、证据引用与 `advice_ref`；缺项只给非阻断提示。`--historical` 只用于**已收口**任务的历史复核：`--status pending` 必须配 `--reason`（可加 `--reason-code`），重复执行幂等、不覆盖既有已决结论、不把已决结论降级为 `pending`；不因代码已改、测试通过或任务 PASS 推断采纳 | `--call-id SC...`、`--status accepted\|modified\|rejected\|pending`、`--decision`、`--rationale`（省略回落 `--reason`）、`--delta`、`--evidence-ref E1,E3`（可重复/逗号分隔，指向本任务已登记证据）、`--source-ref`（报告章节/文件路径，只定位不核验）、`--evidence-note`、`--note`、`--reason`、`--reason-code`、`--historical`、`--decided-by`（默认 `zcode`）、`--json` |
 | `sol-schedule` | SOL 生命周期调度视图（只读）：义务清单、漏调、终态处置与所属周期、下一条可执行项与可直接粘贴的命令；`--execute` 时有界执行 1 条 `recommended` 义务（1 次请求，失败只记录）；同时显示当前上游退避窗口（窗口内不发起新请求） | `--state`、`--execute`、`--json`、`--sol auto\|advise\|off`；不带 `--execute` 不写状态 |
-| `sol-stats` | SOL 调度覆盖率（显式分母）：建议/执行/复用/跳过/失败/漏调/未登记分开统计，含事件分布、采纳分布、义务终态处置与周期分布、tokens 与延迟 | `--state` 或 `--workspace <根>`（聚合 `.copilot-tasks/*/state.json`）、`--json` |
+| `sol-stats` | SOL 调度覆盖率（显式分母）：建议/执行/复用/跳过/失败/漏调/未登记分开统计，含事件分布、采纳分布、义务终态处置与周期分布、tokens（输入/输出/reasoning/总）与延迟、`by_model`（请求数/完成/失败/Token/p50/p95/重复调用）与 `reuse`（命中数、按模型） | `--state` 或 `--workspace <根>`（聚合 `.copilot-tasks/*/state.json`）、`--json` |
 | `agent-policy` | Agent 调度建议：主代理默认，Explore/general-purpose 按需（只读、不派发）。判定顺序：子代理不可用 → 主代理；写入冲突 → 主代理；`--research-only` → Explore（绝不交给全工具代理）；独立交付物需并发且有收益才建议 general-purpose；其余 → 主代理 | `--needs-independent-context`、`--parallel`、`--independent-deliverable`、`--write-conflict`、`--saves-time`、`--research-only`、`--subagent-unavailable`、`--json` |
 | `finding` | 查看 / 更新 Finding 台账（不触发复核） | `--list`；`--id F1 --status open\|fixed\|verified\|closed\|regressed\|dropped --evidence E1[,E2] --note`；`fixed`/`verified` 必须有证据，多个证据可用逗号分隔；回填成功后按续跑判定返回 10 |
 | `review-metrics` | 统计统一 SOL 调用流（`sol.calls_total` / `sol.by_mode`）、准入门槛、停止标记与 Finding 计数 | `--state`；历史 G4 数据标记 `g4.retired` |
@@ -280,7 +283,9 @@ PARTIAL 时不需要额外命令：直接再次 `drive`，由本地派生工作�
 | `client_timeout` | 本地 socket 读超时 | 记录；`send_observed=unknown`（不假设上游是否已处理） |
 | `network_error` / `response_incomplete` | 传输异常 / 响应体不可解析、流被截断、`status=incomplete`、空文本 | 记录为失败，**绝不登记为成功认知** |
 
-退避窗口（`state["sol_backoff"]`，schema `copilot-sol-backoff/v1`）：
+退避窗口（`state["model_backoff"]`，schema `copilot-model-backoff/v2`；键为
+`provider + model + error_class` 的 `codex:<model>` 槽位，旧 `state["sol_backoff"]`
+单例只读兼容且不冻结 Astra）：
 
 - **服务端 `Retry-After` 是最短等待时间**：有效值（秒、毫秒、HTTP-date）原样遵守，
   **不被** 1800 秒上限、也不被 `COPILOT_SOL_BACKOFF_MAX` 缩短。HTTP-date 按 UTC（缺失时区
@@ -291,6 +296,8 @@ PARTIAL 时不需要额外命令：直接再次 `drive`，由本地派生工作�
   原始 `retry_after_raw` 与 `call_id`，失败记录同时保留同样字段供审计追溯。
 - **不是门禁**：不改变阶段、条件、G1–G3，也不派生工作项；窗口期内 `sol-schedule --execute`
   与自动调度只登记义务 deferral，不发请求。
+- **按模型隔离**：SOL 过载不冻结 Astra，Astra 过载不阻塞显式 SOL 调用；`Retry-After` 逐模型
+  独立遵守；成功调用只清除本模型的窗口。
 - 成功调用自动清除；手动 `sol-consult` / `sol-plan` / `sol-review` 在窗口内直接拒绝并说明剩余时间，
   确需立即重试必须在确认上游已恢复后显式加 `--ignore-backoff`（仍然只发一次、不重试）。
 - **跨阶段、跨进程、跨会话一致**：窗口写在任务 `state.json`，不依赖内存、会话绑定或锁；

@@ -7,7 +7,7 @@
 
 - **普通自检**：ZCode 自己做，不登记为复核，不构成任何门禁依据。
 - **SOL CONSULT（默认认知入口）**：非简单任务在启动、执行期新证据、阶段边界与收口前
-  一次性调用 `gpt-6.2-sol`（零工具、单轮、high），输出目标理解、问题本质、路线与取舍、
+  一次性调用 `gpt-6.2-astra`（零工具、单轮、high），输出目标理解、问题本质、路线与取舍、
   风险、调查方向与再咨询条件；结论是认知输入，不是门禁。
 - **SOL PLAN（调查后的规划判断）**：多步骤 / 多方案 / 重要决策任务在形成现场事实后调用，
   输出方案比较、优先级、阶段目标与验收关注点；最终技术方案仍由 ZCode 决定。
@@ -63,7 +63,10 @@
 
 ### 模型与推理强度
 
-- 统一 `gpt-6.2-sol`（Responses API `/v1/responses`，既有本机 CPA `127` 出口）。
+- 默认统一 `gpt-6.2-astra`（Responses API `/v1/responses`，既有本机 CPA `127` 出口）；
+  `gpt-6.2-sol` 只通过 `--model gpt-6.2-sol` 显式选择（历史兼容），不是默认、不是失败回退。
+- 请求、回显校验、审计与 `sol_calls` 记录都带 `provider` 与 `model_key`（`codex:<model>`）；
+  复用只命中同模型记录，缺模型归属的历史记录不被当成新模型响应。
 - 所有模式统一 `reasoning.effort="high"`、`reasoning.mode="standard"`：不按角色降级，
   不接受 `low`/`medium`/`xhigh`/`max`，也不允许配置缺失时静默回退。
 - 不发送 GPT-6.2 推理模型不支持的采样参数（`temperature`/`top_p`/`top_logprobs`/
@@ -91,7 +94,7 @@ python3 -B scripts/copilot_dispatch.py sol-plan --state <state.json> \
   `understanding|planning|development|stage|closure` 之一。
 - 材料只包含目标、当前基线、已确认事实、关键问题与约束、已尝试方案及结果、证据摘要；
   上限 120,000 字符（提示阈值 60,000），超限拒绝而不是静默截断。
-- 零工具、单轮、`gpt-6.2-sol` + `high`，与 REVIEW 使用同一通道与同一安全约束。
+- 零工具、单轮、默认 `gpt-6.2-astra` + `high`，与 REVIEW 使用同一通道与同一安全约束。
 - `--dry-run` 校验请求（模式、阶段、模型、推理强度、零工具、材料预算）；
   `--list` 只读查看记录；`--knowledge-file handoff.json` 追加知识交接块。
 

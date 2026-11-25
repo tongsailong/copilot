@@ -80,8 +80,11 @@ class ZeroToolTests(unittest.TestCase):
         self.assertNotIn("functions", payload)
         self.assertEqual(payload["tool_choice"], "none")
         self.assertEqual(payload["reasoning"], {"effort": "high"})
-        self.assertEqual(payload["model"], "gpt-6.2-sol")
-        self.assertEqual(SR.MODEL, "gpt-6.2-sol")
+        self.assertEqual(payload["model"], "gpt-6.2-astra")
+        # 默认认知模型是 Astra；SOL 只作为显式兼容模型保留，不再是默认。
+        self.assertEqual(SR.DEFAULT_MODEL, "gpt-6.2-astra")
+        self.assertEqual(SR.MODEL, SR.DEFAULT_MODEL)
+        self.assertEqual(SR.LEGACY_MODEL, "gpt-6.2-sol")
 
     def test_payload_omits_unsupported_sampling_params(self):
         payload = SR.build_payload("材料")
@@ -97,7 +100,7 @@ class ZeroToolTests(unittest.TestCase):
             with self.subTest(mode=mode):
                 payload = SR.build_payload("材料", mode=mode)
                 self.assertEqual(payload["reasoning"], {"effort": "high"})
-                self.assertEqual(payload["model"], "gpt-6.2-sol")
+                self.assertEqual(payload["model"], SR.DEFAULT_MODEL)
                 self.assertEqual(payload["tool_choice"], "none")
                 self.assertNotIn("tools", payload)
         for effort in ("medium", "low", "xhigh", "max", ""):
@@ -164,7 +167,7 @@ class ZeroToolTests(unittest.TestCase):
         # THINK 是历史别名：请求仍是 CONSULT 语义，结果模式归一为 CONSULT。
         result = SR.run_think("材料", transport=fake, api_key="k")
         self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0]["model"], "gpt-6.2-sol")
+        self.assertEqual(calls[0]["model"], SR.DEFAULT_MODEL)
         self.assertEqual(calls[0]["reasoning"], {"effort": "high"})
         self.assertNotIn("tools", calls[0])
         self.assertEqual(calls[0]["tool_choice"], "none")
@@ -389,6 +392,7 @@ class FailureTests(unittest.TestCase):
 class SingleRoundTests(unittest.TestCase):
     def test_same_materials_reuse_existing_review(self):
         state = {"sol_reviews": [{"status": "completed",
+                                  "model": SR.DEFAULT_MODEL,
                                   "materials_sha256": "a" * 64,
                                   "review_id": "SR1"}]}
         decision = SR.single_round_decision(state, "a" * 64, mode="REVIEW")
@@ -401,6 +405,7 @@ class SingleRoundTests(unittest.TestCase):
 
     def test_second_review_requires_explicit_reason(self):
         state = {"sol_reviews": [{"status": "completed",
+                                  "model": SR.DEFAULT_MODEL,
                                   "materials_sha256": "a" * 64}]}
         refused = SR.single_round_decision(state, "b" * 64, mode="REVIEW")
         self.assertEqual(refused["action"], "refuse")
@@ -421,6 +426,7 @@ class SingleRoundTests(unittest.TestCase):
     def test_modes_do_not_share_or_reuse_records(self):
         review_only = {
             "sol_reviews": [{"status": "completed", "mode": "REVIEW",
+                             "model": SR.DEFAULT_MODEL,
                              "materials_sha256": "a" * 64,
                              "review_id": "SR1"}],
             "sol_advisories": [],
@@ -432,6 +438,7 @@ class SingleRoundTests(unittest.TestCase):
         state = {
             **review_only,
             "sol_advisories": [{"status": "completed", "mode": "CONSULT",
+                                "model": SR.DEFAULT_MODEL,
                                 "materials_sha256": "b" * 64,
                                 "advisory_id": "SA1"}],
         }
@@ -719,7 +726,7 @@ class CliTests(unittest.TestCase):
         payload = json.loads(proc.stdout)
         self.assertTrue(payload["zero_tool"])
         self.assertEqual(payload["tool_keys_present"], [])
-        self.assertEqual(payload["model"], "gpt-6.2-sol")
+        self.assertEqual(payload["model"], SR.DEFAULT_MODEL)
         self.assertEqual(payload["reasoning_effort"], "high")
         self.assertEqual(payload["unsupported_params_present"], [])
         self.assertEqual(open(self.state, "rb").read(), before)
@@ -735,7 +742,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         payload = json.loads(proc.stdout)
         self.assertEqual(payload["mode"], "CONSULT")
-        self.assertEqual(payload["model"], "gpt-6.2-sol")
+        self.assertEqual(payload["model"], SR.DEFAULT_MODEL)
         self.assertEqual(payload["reasoning_effort"], "high")
         self.assertTrue(payload["zero_tool"])
         self.assertEqual(payload["tool_keys_present"], [])
@@ -801,6 +808,8 @@ class CliTests(unittest.TestCase):
         digest = SR.review_subject_sha256(state, materials_text, mode="REVIEW")
         G.record_sol_review(self.state, {
             "schema": SR.REVIEW_SCHEMA, "review_id": "SR" + "b" * 24,
+            "model": SR.DEFAULT_MODEL, "model_key": SR.model_key(),
+            "provider": SR.PROVIDER,
             "verdict": "pass", "summary": "ok", "findings": [],
             "unverified": [], "findings_count": {}, "completed_at": G.now_iso(),
         }, materials_sha256=digest)

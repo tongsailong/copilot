@@ -2215,3 +2215,36 @@
     - **不变量**：G1–G3、`closure_readiness` 收口准入、PARTIAL 续跑、SOL advisory 与零工具
       单轮、REVIEW 仅用户明确要求、Provider/模型/凭据与授权边界全部不变；本轮无 commit /
       push / PR / Tag / Release，未修改其他项目代码、生产数据或系统配置。
+
+83. **Astra 默认认知引擎迁移与调用效率优化（2026-11-25，用户任务）。**
+    - **模型迁移（已确认）**：所有认知入口的默认模型统一为 `gpt-6.2-astra`（Provider
+      `codex`、`reasoning.effort=high`、`mode=standard`、Responses API、零工具、单轮）。
+      `gpt-6.2-sol` 只保留为**显式兼容**（`sol-consult --model gpt-6.2-sol`），禁止自动回退、
+      禁止失败后切换、禁止把历史 SOL 结论当作 Astra 的新响应。模型 ID 仍只存在于
+      `scripts/sol_review.py`（`DEFAULT_MODEL` / `LEGACY_MODEL` / `SUPPORTED_MODELS` /
+      `resolve_model` / `model_key`），`governance.py` 与 dispatch 不持有模型常量。历史 SOL
+      记录、审计与历史文档只读保留，不做批量改写。
+    - **模型身份入账**：`sol_calls` 成功/失败记录、`sol-audit.jsonl`、请求摘要与复用键都带
+      `provider` 与 `model_key`（`codex:<model>`）；复用判定要求同模型，历史记录缺模型归属时
+      一律不可复用。
+    - **退避按模型隔离（已确认）**：窗口改为 `state["model_backoff"]`
+      （`copilot-model-backoff/v2`），键为 `provider + model + error_class`；`Retry-After`
+      逐模型独立遵守，成功只清本模型。旧 `state["sol_backoff"]` 单例只读兼容（v9.8 调用方
+      语义不变），但不继承给 Astra：SOL 过载不冻结 Astra，Astra 过载也不阻塞显式 SOL 调用。
+      这是“模型容量错误不得升级为 Provider 全局不可用”的最小实现，未新增 Provider、未改 CPA。
+    - **调用语义分离（缺陷修复）**：纯登记/报告/合同命令（`plan` / `record` / `rerun` /
+      `criterion` / `judgment` / `evidence` / `report` / `accept` / `decide` / `block` /
+      `unblock` / `finding` / `reopen` / `contract`）默认策略从 `auto` 改为 `advise`，并且
+      自动执行只认命令行显式 `--cognition auto` / `--sol auto`：环境变量或默认值只能影响
+      建议展示。修的是 `judgment` 在无 `--sol` 时默认发起真实 CONSULT 的事故路径。
+      `start` / `closure` / `drive` 保持默认 `auto`，必要调用频率不降低。
+    - **复用与指标（已确认）**：复用键包含 `task_id` + `prompt_version` + 模型 + 归一化上下文
+      + 模式/阶段/问题；命中登记 `state["sol_reuses"]`（上限 200），`sol-stats` 增加
+      `by_model`（请求数、完成/失败、输入/输出/reasoning/总 Token、p50/p95、重复调用）与
+      `reuse`（命中数与按模型），都是观测值，不是门禁，也不证明结论质量。
+    - **响应完整性**：`incomplete` / `max_output_tokens` / 空文本仍一律记为失败，不重试、
+      不伪造成功；`DEFAULT_MAX_OUTPUT_TOKENS=24000` 与 300 s 超时保持不变（历史截断修复不回退）。
+    - **边界与不变量**：不修改 CPA 配置、OAuth 凭据、Provider 或模型路由，不新增服务、不重启
+      CPA；G1–G3、`closure_readiness`、PARTIAL 续跑、REVIEW 仅用户明确要求、G4 退役、
+      Provider/凭据与授权边界全部不变。本轮只做源码、测试与运行时同步，未 commit / push /
+      Tag / Release。

@@ -2,7 +2,7 @@
 """v8.4 文档契约：Skill 入口、references、SOL THINK/REVIEW 与项目文档与代码一致。
 
 这些断言保护“SOL 只提供认知输入、不是决策通道”，以及 v8.4 的关键运行契约
-（本地治理、PARTIAL 持续推进、正式 REVIEW opt-in、gpt-6.2-sol + high、零工具单轮、
+（本地治理、PARTIAL 持续推进、正式 REVIEW opt-in、默认 gpt-6.2-astra + high、零工具单轮、
 THINK advisory 不入门禁、REVIEW 仅用户要求、G4 退役）。
 """
 from __future__ import annotations
@@ -82,9 +82,11 @@ class SkillEntryTests(unittest.TestCase):
         for line in self.doc.splitlines():
             if "gpt-6.2-sol" in line:
                 self.assertNotIn("决策通道", line)
-        # 模型升级必须写进当前版本说明，并且不得残留旧模型为现行配置。
+        # 模型升级必须写进当前版本说明，并且不得残留旧模型为现行默认配置。
+        self.assertIn("gpt-6.2-astra", self.doc)
         self.assertIn("gpt-6.2-sol", self.doc)
         self.assertIn("reasoning.effort=\"high\"", self.doc)
+        self.assertIn("--cognition", self.doc)
         # 当前命令面是 sol-consult / sol-plan；THINK 只作读取别名，sol-advisory 只允许作为历史说明。
         self.assertIn("sol-consult", self.doc)
         self.assertIn("sol-plan", self.doc)
@@ -150,6 +152,7 @@ class ReferenceTests(unittest.TestCase):
         self.assertIn("sol-think", o["workflow.md"])
         self.assertIn("sol_reviews", o["review.md"])
         self.assertIn("sol_advisories", o["review.md"])
+        self.assertIn("gpt-6.2-astra", o["review.md"])
         self.assertIn("gpt-6.2-sol", o["review.md"])
         self.assertIn("单轮", o["review.md"])
         self.assertIn("零工具", o["review.md"])
@@ -231,6 +234,7 @@ class ProjectDocTests(unittest.TestCase):
     def test_agents_md_points_to_v8_architecture(self):
         doc = text(os.path.join(ROOT, "AGENTS.md"))
         self.assertIn("唯一远程调用是 SOL（CONSULT / PLAN / REVIEW）", doc)
+        self.assertIn("gpt-6.2-astra", doc)
         self.assertIn("gpt-6.2-sol", doc)
         self.assertIn("PARTIAL 不是终点", doc)
         self.assertIn("legacy/tests", doc)
@@ -260,6 +264,7 @@ class ProjectDocTests(unittest.TestCase):
         self.assertIn("SOL 零工具单轮", decisions)
         self.assertIn("v8.0.0", decisions)
         self.assertIn("v8.1.0", decisions)
+        self.assertIn("gpt-6.2-astra", decisions)
         self.assertIn("gpt-6.2-sol", decisions)
         self.assertIn("G4", decisions)
 

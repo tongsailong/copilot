@@ -1029,6 +1029,24 @@ def _usage(record: dict) -> dict:
         return {"tokens": 0, "input_tokens": 0, "output_tokens": 0}
 
 
+def _call_subject(record: dict) -> str:
+    """重复调用判定用的认知对象键：优先显式 subject，退化到上下文/材料摘要。"""
+    for name in ("subject", "subject_sha256", "context_sha256",
+                 "materials_sha256"):
+        value = _text(record.get(name))
+        if value:
+            return value
+    return ""
+
+
+def _reasoning_tokens(record: dict) -> int:
+    usage = record.get("usage") or {}
+    try:
+        return int(usage.get("reasoning_tokens") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def _percentile(values: list[int], fraction: float) -> int | None:
     if not values:
         return None
@@ -1212,6 +1230,68 @@ def task_stats(state: dict) -> dict:
         if any(last_closure < value <= created for value in reopen_times):
             continue
         post_closure_calls.append(item)
+    # 模型级调用指标：模型只是观测维度，不是门禁。同一任务可能先后使用不同模型，
+    # 因此按 model_key 分别汇总耗时/Token；历史记录没有 model 字段时归到 "-"，
+    # 不把旧 SOL 记录冒充成当前默认模型的调用证据。重复调用用同一模型下重复的
+    # subject 计：completed − 去重 subject，>0 即存在同材料重复付费。
+    by_model: dict[str, dict] = {}
+    latency_by_model: dict[str, list[float]] = {}
+    subjects_by_model: dict[str, set[str]] = {}
+    for item in calls:
+        key = (_text(item.get("model_key")) or _text(item.get("model"))
+               or "-")
+        row = by_model.setdefault(key, {
+            "model_key": key,
+            "model": _text(item.get("model")),
+            "provider": _text(item.get("provider")),
+            "calls": 0,
+            "completed": 0,
+            "failed": 0,
+            "total_tokens": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "reasoning_tokens": 0,
+            "subjects": 0,
+            "repeat_calls": 0,
+        })
+        row["calls"] += 1
+        if item.get("status") == "completed":
+            row["completed"] += 1
+            usage = _usage(item)
+            row["total_tokens"] += usage["tokens"]
+            row["input_tokens"] += usage["input_tokens"]
+            row["output_tokens"] += usage["output_tokens"]
+            row["reasoning_tokens"] += _reasoning_tokens(item)
+            subject = _call_subject(item)
+            if subject:
+                subjects_by_model.setdefault(key, set()).add(subject)
+            if item.get("latency_ms"):
+                latency_by_model.setdefault(key, []).append(
+                    float(item.get("latency_ms") or 0))
+        elif item.get("status") == "failed":
+            row["failed"] += 1
+    for key, row in by_model.items():
+        row["subjects"] = len(subjects_by_model.get(key) or ())
+        row["repeat_calls"] = max(0, row["completed"] - row["subjects"])
+        latencies = sorted(int(value) for value in latency_by_model.get(key) or [])
+        row["latency_ms_p50"] = _percentile(latencies, 0.50)
+        row["latency_ms_p95"] = _percentile(latencies, 0.95)
+    # 复用命中：只登记“未重复付费”的事实，命中的条目来自 state["sol_reuses"]，
+    # 与 by_family[*]["reused"] 同一口径（义务级复用），两者都不是价值证明。
+    reuse_rows = [item for item in state.get("sol_reuses") or []
+                  if isinstance(item, dict)]
+    reuse_by_model: dict[str, int] = {}
+    for item in reuse_rows:
+        key = (_text(item.get("model_key")) or _text(item.get("model"))
+               or "-")
+        reuse_by_model[key] = reuse_by_model.get(key, 0) + 1
+    reuse = {
+        "hits": len(reuse_rows),
+        "by_family": {family: by_family[family]["reused"]
+                      for family in RP.SOL_FAMILIES},
+        "by_model": [{"model_key": key, "hits": reuse_by_model[key]}
+                     for key in sorted(reuse_by_model)],
+    }
     return {
         "task_id": _text(state.get("task_id")),
         "eligible": bool(non_simple),
@@ -1243,6 +1323,12 @@ def task_stats(state: dict) -> dict:
         "pending_acceptance": len(RP.pending_acceptance(completed, limit=10000)),
         "post_closure_calls": len(post_closure_calls),
         "usage": {"total_tokens": tokens,
+                  "input_tokens": sum(_usage(i)["input_tokens"]
+                                      for i in completed),
+                  "output_tokens": sum(_usage(i)["output_tokens"]
+                                       for i in completed),
+                  "reasoning_tokens": sum(_reasoning_tokens(i)
+                                          for i in completed),
                   "recorded_calls": len([i for i in completed
                                          if _usage(i)["tokens"]]),
                   "latency_ms_recorded": len(ordered_latency),
@@ -1250,6 +1336,8 @@ def task_stats(state: dict) -> dict:
                       [int(value) for value in ordered_latency], 0.50),
                   "latency_ms_p95": _percentile(
                       [int(value) for value in ordered_latency], 0.95)},
+        "by_model": [by_model[key] for key in sorted(by_model)],
+        "reuse": reuse,
     }
 
 
@@ -1291,6 +1379,49 @@ def stats(states: list[dict], *, scope: str = "") -> dict:
     for detail in details:
         for code, count in detail["by_event"].items():
             by_event[code] = by_event.get(code, 0) + count
+    # 模型级聚合：跨任务按 model_key 合并，耗时用全量样本重算分位，避免“平均值
+    # 的平均”掩盖长尾；复用命中同样按模型合并，历史无 model 的记录归 "-"。
+    model_rows: dict[str, dict] = {}
+    for state in states:
+        for item in state.get("sol_calls") or []:
+            if not isinstance(item, dict):
+                continue
+            key = (_text(item.get("model_key")) or _text(item.get("model"))
+                   or "-")
+            row = model_rows.setdefault(key, {
+                "model_key": key, "model": _text(item.get("model")),
+                "provider": _text(item.get("provider")),
+                "calls": 0, "completed": 0, "failed": 0,
+                "total_tokens": 0, "input_tokens": 0, "output_tokens": 0,
+                "reasoning_tokens": 0, "_latency": [],
+            })
+            row["calls"] += 1
+            if item.get("status") == "completed":
+                row["completed"] += 1
+                usage = _usage(item)
+                row["total_tokens"] += usage["tokens"]
+                row["input_tokens"] += usage["input_tokens"]
+                row["output_tokens"] += usage["output_tokens"]
+                row["reasoning_tokens"] += _reasoning_tokens(item)
+                if item.get("latency_ms"):
+                    row["_latency"].append(int(float(item["latency_ms"])))
+            elif item.get("status") == "failed":
+                row["failed"] += 1
+    reuse_by_model: dict[str, int] = {}
+    for state in states:
+        for item in state.get("sol_reuses") or []:
+            if not isinstance(item, dict):
+                continue
+            key = (_text(item.get("model_key")) or _text(item.get("model"))
+                   or "-")
+            reuse_by_model[key] = reuse_by_model.get(key, 0) + 1
+    by_model = []
+    for key in sorted(model_rows):
+        row = model_rows[key]
+        latencies = sorted(row.pop("_latency"))
+        row["latency_ms_p50"] = _percentile(latencies, 0.50)
+        row["latency_ms_p95"] = _percentile(latencies, 0.95)
+        by_model.append(row)
     call_keys = ("completed", "failed", "total", "request_attempted",
                  "response_received", "send_unknown", "not_attempted",
                  "transport_observation_missing")
@@ -1316,6 +1447,10 @@ def stats(states: list[dict], *, scope: str = "") -> dict:
         "post_closure_calls": sum(d["post_closure_calls"] for d in details),
         "usage": {
             "total_tokens": sum(d["usage"]["total_tokens"] for d in details),
+            "input_tokens": sum(d["usage"]["input_tokens"] for d in details),
+            "output_tokens": sum(d["usage"]["output_tokens"] for d in details),
+            "reasoning_tokens": sum(d["usage"]["reasoning_tokens"]
+                                    for d in details),
             "recorded_calls": sum(d["usage"]["recorded_calls"]
                                   for d in details),
             "latency_ms_recorded": sum(d["usage"]["latency_ms_recorded"]
@@ -1334,6 +1469,10 @@ def stats(states: list[dict], *, scope: str = "") -> dict:
                 and item.get("latency_ms")], 0.95),
         },
         "tasks": details,
+        "by_model": by_model,
+        "reuse": {"hits": sum(d["reuse"]["hits"] for d in details),
+                  "by_model": [{"model_key": key, "hits": reuse_by_model[key]}
+                               for key in sorted(reuse_by_model)]},
         "notes": [
             "覆盖率分母只含适用任务/窗口：简单任务、无实质方案决策的 PLAN、"
             "未发生的事件、无合格里程碑、尚无实质进展的收口都不进入分母。",

@@ -50,7 +50,8 @@ Copilot 是运行在 ZCode 内的**轻量协作治理 Skill**。它把多步骤�
 - **ZCode 宿主**：Skill 发现、子 Agent 派发与 `Stop` / `SessionStart` / `UserPromptSubmit` 钩子
   需要 ZCode；纯 CLI 部分（`copilot_dispatch.py` / `copilot_auto.py`）不依赖宿主。
 - **SOL（可选）**：需要本机存在 OpenAI 兼容端点 `http(s)://127.0.0.1:8317`（Responses API），
-  提供 `gpt-6.2-sol`，且 `~/.zcode/v2/provider_config.json` 中有对应凭据。非本机地址一律拒绝。
+  提供 `gpt-6.2-astra`（默认）与 `gpt-6.2-sol`（显式兼容），且
+  `~/.zcode/v2/provider_config.json` 中有对应凭据。非本机地址一律拒绝。
   没有该环境时用 `--sol off` 完全离线运行，任务照样可以推进到 PASS/BLOCKED。
 
 ## 安装
@@ -142,7 +143,8 @@ python3 .../copilot_dispatch.py closure --state ... --close
 
 ## 已知限制
 
-- **SOL 模型固定**为 `gpt-6.2-sol`（`reasoning.effort=high`、零工具、单轮），不做别名回退；
+- **认知模型默认**为 `gpt-6.2-astra`（`reasoning.effort=high`、零工具、单轮）；
+  `gpt-6.2-sol` 只能 `--model gpt-6.2-sol` 显式选择（历史兼容），不做失败回退、不自动切换；
   上游回显不一致即拒绝消费。公共环境没有该模型时应显式 `--sol off`。
 - **知识库路径是作者本机默认值**：`context_engine.py` 可用 `--vault-root` 改；
   `knowledge_handoff.py` 的白名单根目录（`ALLOWED_ROOTS`）写死在源码中，换目录需自行调整该常量
@@ -194,6 +196,7 @@ python3 -B scripts-sync/sync_runtime.py --baseline --verify-baseline
 
 | 版本 | 要点 |
 |---|---|
+| **v9.9.0** | Astra 默认认知引擎迁移与调用效率优化：默认 `gpt-6.2-astra`（`gpt-6.2-sol` 仅显式兼容、不回退）；记录/审计/复用键带 `provider`+`model_key`；退避按 `provider+model+error_class` 隔离（SOL 过载不冻结 Astra）；纯登记/报告/合同命令默认 `advise`，`judgment` 等不再隐式付费调用；`--cognition` 为模型无关别名；复用命中登记 `sol_reuses`，`sol-stats` 增加 `by_model` 与 `reuse` 指标 |
 | **v9.8.0** | 多模态设计认知：SOL `--image` 真实图片输入（最多 6 张、单张 ≤8 MB、合计 ≤24 MB，PNG/JPEG/WebP），审计仅存名称/类型/字节/尺寸/sha256/说明，图片指纹进入请求摘要；无图认知咨询与有图视觉咨询双模式；设计协作协议、创造性候选、采纳台账与知识复用边界；沿用现有 Memory/知识通道，不新建审美记忆系统 |
 | **v9.7.1** | 认知记录闭环：`sol-accept --historical` 只为已收口任务补记复核（`pending` 必须写原因；重复执行幂等、不覆盖既有结论、不据结果一致推断采纳）；调度义务写终态处置（`completed`/`covered`/`skipped`/`failed`/`not-executed`/`unsettled`）与当时策略快照，`not-executed` 无快照即 `unknown`；义务带收口周期编号，重开前后严格分离；锁等待失败留痕但不算失败 |
 | **v9.7.0** | SOL 主动认知：CONSULT/PLAN 可选议程（`agenda`，只读呈现）；材料带历史判断、采纳与未处理议程；收口周期后不再追加 B/D 窗口；`blockage-change` 只由未解除阻塞触发；采纳待回填可见；`sol-stats` 增加议程/采纳/收口后调用观察值；capture 草稿带 SOL 认知溯源 |
