@@ -670,16 +670,25 @@ class MilestoneAndClosureTests(SchedulingBase):
         self.start(risk="high", kind="feature")
         self.plan(1)
         self.close_all()
+        # 任务级 off 必须经受控入口设置（单次 `--cognition off` 只影响当次命令），
+        # 之后 closure 继承任务级 off：窗口按事实关闭、不计漏调。
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(CD.cmd_cognition_policy(argparse.Namespace(
+                state=self.state_path, policy="off", by="zcode",
+                reason="高风险任务按用户要求关闭认知自动执行", json=False)), 0)
         args = argparse.Namespace(state=self.state_path, close=True,
-                                  by="zcode-native", cognition="off")
+                                  by="zcode-native", cognition="")
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(CD.cmd_closure(args), 0)
         state = self.state()
         self.assertEqual(state["closure"]["cognition_entry"], "closure-command")
-        # off 策略不执行，但窗口按事实关闭并计为漏调。
+        # off 策略不执行，但窗口按事实关闭；窗口打开时任务级策略已是 off，义务从未
+        # 被要求执行，因此落 not-executed 终态但不计漏调（依据里写明策略）。
         self.assertEqual(state["closure"]["cognition_schedule"]
                          ["at_close"]["pending_before_close"], 1)
-        self.assertEqual(state["closure"]["cognition_schedule"]["missed"], 1)
+        self.assertEqual(state["closure"]["cognition_schedule"]["missed"], 0)
+        self.assertEqual(
+            state["closure"]["cognition_schedule"]["dispositions"]["not-executed"], 1)
         warnings = G.closure_check(state)["warnings"]
         self.assertTrue(any("认知调度" in line for line in warnings), warnings)
 
@@ -1574,7 +1583,12 @@ class ClosureAdmissionTests(SchedulingBase):
         self.assertEqual(closure["final_verification_digest"], digest)
         self.assertEqual(
             closure["cognition_schedule"]["at_close"]["pending_before_close"], 1)
+        # 单次 `--cognition off` 不改变任务级策略（仍为 auto）：新窗口如实关闭并
+        # 记为漏调——这正是“命令级覆盖不等于任务级策略”的可审计后果；要“按策略
+        # 跳过且不计漏调”，必须用 cognition-policy 显式把任务级策略设为 off。
         self.assertEqual(closure["cognition_schedule"]["missed"], 1)
+        self.assertEqual(
+            closure["cognition_schedule"]["dispositions"]["not-executed"], 1)
         self.assertEqual(self.closure_calls()[0]["final_verification_digest"],
                          first["final_verification_digest"])
 

@@ -1,6 +1,6 @@
 ---
 name: copilot
-description: "Copilot v9.12.0 轻量协作治理：任务承接、合同与完成条件、状态与证据登记、PARTIAL 强制续跑与调度领取、认知咨询（默认 gpt-6.2-astra，high，零工具单轮）。Copilot 只做治理，不实施工程、不替代技术决策；ZCode 原生 Agent 是唯一执行与技术决策主体，子代理按需。PARTIAL 是连续执行状态而不是终点：只要仍有原始授权内的可执行工作，就必须派生、领取并继续；阻塞按工作项成立，单项缺授权不冻结整个任务。drive 把工作项领取落盘（短租约）避免并发重复，回填/阻塞自动释放；SessionStart 与 UserPromptSubmit 只读提示未闭合任务。认知仅 advisory：按 T0–T3 认知等级与用户原始意图决定窗口——T0（显式简单类型且无信号/无高影响范围）0 调用；T1 只在启动 CONSULT；T2/T3 在启动 A、调查后 B、收口前 E 自动真实执行，重大事件追加 C；默认 risk=medium 不构成信号，docs/mechanical 不掩盖真实治理意图，意图缺失或无法分类时至少 T1；策略随任务生效（start 记录、默认 auto，任务级 off 对整条任务有效），每条命令最多执行 1 条义务（--cognition auto|advise|off），纯记录命令不隐式付费；认知采纳只是可选审计记录、不阻止收口；REVIEW 仅在用户明确要求时执行。G4 原生只读复核已退役，历史台账只读保留。"
+description: "Copilot v9.13.1 轻量协作治理：任务承接、合同与完成条件、状态与证据登记、用户输入落地（inbox/`input`）、PARTIAL 强制续跑与调度领取、认知咨询（默认 gpt-6.2-astra，high，零工具单轮）。Copilot 只做治理，不实施工程、不替代技术决策；ZCode 原生 Agent 是唯一执行与技术决策主体，子代理按需。用户批准、授权与阻断解除必须经 `input --consume` 落到原任务（`U<n>` 输入事件 → decision + 对应 block 解除），钩子只记录不推断授权；Stop 在有待处置输入时强制先处置。PARTIAL 是连续执行状态而不是终点：只要仍有原始授权内的可执行工作，就必须派生、领取并继续；阻塞按工作项成立，单项缺授权不冻结整个任务。drive 把工作项领取落盘（短租约、按父会话归属）避免并发重复，回填/阻塞自动释放，并发下不重复派发同一工作项；drive 把下一步写入状态（`next_step`），SessionStart 与 UserPromptSubmit 只读提示未闭合任务。认知仅 advisory：按 T0–T3 认知等级与用户原始意图决定窗口——T0（显式简单类型且无信号/无高影响范围）0 调用；T1 只在启动 CONSULT；T2/T3 在启动 A、调查后 B、收口前 E 自动真实执行，重大事件追加 C；默认 risk=medium 不构成信号，docs/mechanical 不掩盖真实治理意图，意图缺失或无法分类时至少 T1；认知策略分两个作用域：命令行 --cognition / 环境变量只影响当次调用（不写任务级策略、不影响后续窗口），任务级策略只由 start 与 cognition-policy 持久化（默认 auto，每条命令最多执行 1 条义务），纯记录命令不隐式付费；认知采纳只是可选审计记录、不阻止收口；REVIEW 仅在用户明确要求时执行。G4 原生只读复核已退役，历史台账只读保留。"
 when_to_use: >
   需要把多步骤工程任务纳入可追踪治理时：合同/完成条件需要固定、证据与审计需要绑定、
   长任务需要 PARTIAL 持续推进与上下文恢复、存在真实认知价值信号（架构取舍、多方案
@@ -8,7 +8,7 @@ when_to_use: >
   或只读查看历史调用与台账。简单、单步、低风险任务直接由 ZCode 原生完成，不进入本 Skill。
 ---
 
-# copilot：轻量协作治理（v9.12.0）
+# copilot：轻量协作治理（v9.13.1）
 
 Copilot 是运行在 ZCode 内的**协作治理层**，不是决策模型，也不是执行体。它负责把任务变成可
 追踪的合同、状态、证据与收口条件，并在任务没有真正完成时继续推进。
@@ -69,7 +69,7 @@ Copilot 是运行在 ZCode 内的**协作治理层**，不是决策模型，也�
 ## 核心循环
 
 ```
-start（合同 + 完成条件 + 风险 + 任务类型 + 后端 + 原始意图）
+start（合同 + 完成条件 + 风险 + 任务类型 + 后端 + 原始意图；同 task_id 拒绝重复建任务）
   → 分级 T0–T3（用户原始意图是第一输入；文件类型/默认风险值不能单独决定不调用）
   → [T1/T2/T3，启动] cognition-consult A（understanding：目标理解/问题/风险/调查方向；自动执行）
   → plan（ZCode 本地计划）或 PARTIAL 自动派生工作项
@@ -80,16 +80,25 @@ start（合同 + 完成条件 + 风险 + 任务类型 + 后端 + 原始意图）
   → [重大事件] cognition-consult C 动态追加；主代理自主采纳/调整/否决
   → [T2/T3，最终工程验证完成后、收口前] cognition-consult E（综合判断）→ ZCode 最终验收 → 收口
   → [仅用户明确要求] cognition-review 一次（REVIEW 独立复核）
+  → 用户回合（批准/授权/解除阻塞）→ input --consume（落到原任务）→ drive 继续
 ```
+
+**用户回合必须落地到状态**：Stop / UserPromptSubmit 钩子把用户原文写入任务目录
+`.user-inputs.jsonl`（`U<n>`，只记录、不解释、不推断授权）；主代理用
+`input --consume <U> --block-id <B> --reason ...` 把其中真实授权写成 decision 并解除**对应**
+阻塞，或 `--dismiss` 说明为何不构成任务事实。`drive` 在存在可处置输入时返回续跑码 10，
+Stop 守卫优先要求处置输入而不是继续 drive。
 
 `cognition-consult` / `cognition-plan` / `cognition-review` 是显式模型调用入口；**生命周期命令**
 （`start` / `plan` / `record` / `rerun` / `criterion` / `unblock` / `reopen` / `closure` / `drive`）
 按任务的有效策略（默认 `auto`）顺带执行**至多 1 条** recommended 调度义务（1 次请求，失败只
 记录、不阻断）。**纯记录命令**（`judgment` / `evidence` / `report` / `accept` / `decide` /
 `block` / `finding` / `contract`）只物化义务并给命令，**绝不隐式付费**：写日志不产生费用，
-只有命令行显式 `--cognition auto` 才执行。**策略随任务生效**：`start` 记录的有效策略对后续
-命令持续有效（命令行显式 > 环境变量 > 任务策略 > 命令默认），所以自动调度不需要在每条命令
-上重复 `--cognition auto`，而任务级 `off` 对整条任务（含 `drive`）都成立。读命令与 `unittest`
+只有命令行显式 `--cognition auto` 才执行。**策略分两个作用域**：命令行 `--cognition` /
+`COPILOT_COGNITION` 只决定**本次调用**（覆盖记入 `policy_overrides`，不写任务级策略与快照，
+后续 A/B/C/E 仍按任务策略调度）；任务级策略由 `start --cognition`（默认 `auto`）或
+`cognition-policy --policy … --reason …` 持久化，对整条任务（含 `drive`）有效。求值顺序：
+命令行显式 > 环境变量 > 任务级策略 > 历史周期快照 > 命令默认。读命令与 `unittest`
 进程永不自动调用。所有命令其余工作只读写任务
 状态与本地证据/派发文件；其中 `evidence --capture-cmd` 会执行调用方给出的本地命令，
 `handoff` 会做只读 Git 查询。每次认知调用只发一次请求，不自动重试、不自动二审；
@@ -227,7 +236,12 @@ PASS 才表示目标达成、证据充分、可以结束；BLOCKED 只在剩余�
   静默续跑。`progress_digest` 没有变化时应调整方案而不是机械重复。
 - **授权按动作判断**：缺 commit 授权只阻塞 commit，缺 push 授权只阻塞 push，缺部署/生产
   数据/付费授权只阻塞对应动作；代码调查、已授权修改、测试与修复继续。不得把单项授权缺口
-  扩大成整任务 BLOCKED。用户补充授权后用 `unblock` 精确解除对应阻塞并立即恢复该项。
+  扩大成整任务 BLOCKED。用户补充授权后用 `unblock` 精确解除对应阻塞并立即恢复该项；
+  用户原话已在 inbox 时用 `unblock --from-input U<n>`，授权引用直接取自该事件。
+- **用户回合不是终点**：用户说“批准/同意/继续/按方案 A 执行”后，必须经 `input --consume`
+  写入 decision 并解除对应阻塞，再 `drive` 继续；只口头复述或只写 report 不算承接。
+  一条输入只解除它真正覆盖的阻塞，其余阻塞、工作项与合同范围不变；无法判断是否覆盖时
+  先列候选阻塞，不猜授权。
 - **禁止**因下列原因停止或宣布 BLOCKED：人为轮次上限、Token 预算、内部费用阈值、等待
   远程模型、重复评审、内部状态流转、子 Agent 返回 PARTIAL、首次方案失败、普通测试失败、
   可自行补齐的证据不足。
@@ -244,7 +258,9 @@ fail-closed exit 2），**零模型调用、不派生第二个执行体系**。
   放在别处时 CLI 仍可手工推进，但没有自动续跑与恢复。
 - **Stop**：仍有 `continuation.required=true` 且绑定本会话的任务时以 exit 2 让宿主续跑；
   CLOSED、真实 BLOCKED、剩余工作全部项级阻塞时放行。归属按会话绑定（`session.json`），
-  不按“多久没更新”过期；旧任务需在本会话跑一次会写状态的命令才会绑定。
+  不按“多久没更新”过期；旧任务需在本会话跑一次会写状态的命令才会绑定。若绑定任务存在
+  未处置且可处置的用户输入（`U<n>`），Stop 先把输入列出来并要求 `input --consume|--dismiss`，
+  处置完成后才恢复常规续跑提示——不靠模型“记得”处理用户批准。
 - **SessionStart**（`startup|resume|compact`）：`resume`/`compact` 且绑定本会话时注入只读
   快照（阶段、未闭合条件、续接命令）与本会话已召回结论；`startup` 只给未闭合任务的只读
   指针，不注入正文、不自动绑定、不强制续跑。全部只读，异常静默 exit 0。
@@ -310,10 +326,13 @@ BLOCKED 表示**不能正常收口或继续受阻动作**，不表示无法记�
 - 用户已明确授权的正式 REVIEW 结论及后续 amendment（`authorize-review` / `formal-review`）。
 
 这些登记**不会解除阻塞**，也不改变合同、授权或验收条件；`closure --close` 仍拒绝未解除的
-阻塞，G1–G3 仍按原规则重算。可能扩大范围或具破坏性的操作继续拒绝：`plan`、`decide`、
-`evidence --drop`。允许多个真实阻塞并存；存在多条未解除阻塞时，`unblock` 必须用
-`--block-id` 逐条解除，不能用一条理由把不同阻塞一起清除；被项级阻塞冻结的工作项在解除后
-自动回到 `pending`，立即重新进入可执行（`continuation.action=execute`）。合同修订走单独的
+阻塞，G1–G3 仍按原规则重算。可能扩大范围或具破坏性的操作继续拒绝：`plan`、
+`evidence --drop`。用户在阻塞期间的明确决议用 `decide` 或 `input --consume` 登记
+（`add_decision(allow_blocked=True)`），它们只记录事实、不自动解除任何阻塞；解除仍须
+`unblock`（可带 `--from-input`）逐条说明条件已满足。允许多个真实阻塞并存；存在多条未解除
+阻塞时，`unblock` 必须用 `--block-id` 逐条解除，不能用一条理由把不同阻塞一起清除；被项级
+阻塞冻结的工作项在解除后自动回到 `pending`，立即重新进入可执行
+（`continuation.action=execute`）。合同修订走单独的
 `contract --amend`：BLOCKED 下允许，但会更新合同指纹并使旧正式 REVIEW 授权失效，
 不属于上述普通写入白名单。
 
@@ -567,11 +586,25 @@ verify 的结构化质量报告（`copilot-verify-result/v1`）走报告接入�
 
 - **有界执行**：每条命令最多 1 条义务、1 次请求；`drive` 在 RUNNING 阶段消费一次，PASS
   分支的 E 窗口单独一次。不循环、不重试，失败只记录。
-- **策略**（模型无关，随任务生效）：`--cognition auto|advise|off`（或 `COPILOT_COGNITION`）。
-  优先级为**命令行显式 > 环境变量 > 任务策略 > 命令默认**；`start` 记录的有效策略（默认
-  `auto`）对同一任务后续命令持续有效，因此不需要逐条重复开关，任务级 `off` 也让 `drive`
-  不付费。生命周期命令是调度点；纯记录命令只在命令行显式 `auto` 时付费；读命令与
-  `unittest` 进程永不自动调用。
+- **策略**（模型无关）：`--cognition auto|advise|off`（或 `COPILOT_COGNITION`）。
+  优先级为**命令行显式 > 环境变量 > 任务级策略 > 历史周期快照 > 命令默认**。生命周期命令是
+  调度点；纯记录命令只在命令行显式 `auto` 时付费；读命令与 `unittest` 进程永不自动调用。
+
+#### 策略的两个作用域（v9.13.1）
+
+| 作用域 | 载体 | 谁能写 | 影响范围 |
+|---|---|---|---|
+| 命令级 | `--cognition` / `COPILOT_COGNITION` | 任何命令的一次调用 | 仅当次命令是否执行义务；覆盖写入 `policy_overrides`（环 20 条） |
+| 任务级 | `state["cognition_policy"]` | 只有 `start --cognition` 与 `cognition-policy` | 该任务后续所有生命周期命令（含 `drive`、收口 E） |
+
+- **单次 `--cognition off` 不改变任务级策略**：不写快照、不写 `policy_at_open`、不影响后续
+  A/B/C/E。v9.13.0 的真实缺陷是一次 `evidence --cognition off` 把 `off` 写进周期快照，整条
+  任务后续认知全部静默。
+- **要关掉整条任务**：`cognition-policy --state <state> --policy off --reason "<原因>"`
+  （必填原因；记录操作者/时间/原值/原因并写历史；收口后拒绝）。省略 `--policy` 为**只读**
+  查看，不迁移、不补字段。
+- **漏调口径按任务级策略**：任务级 `off` 下窗口关闭记 `not-executed` + `missed=false` +
+  责任方/解除条件/处置依据；任务级 `auto` 下的一次性命令级 `off` 不豁免漏调。
 - **结算**：成功 `source=executed`＋`call_id`；同一认知对象已有有效结论时 `source=reuse`
   （不重复付费）；失败 `status=failed`＋真实原因，工程继续；合同修订后旧义务记
   `skipped/contract-amended`，不进入新分母。
@@ -593,6 +626,31 @@ verify 的结构化质量报告（`copilot-verify-result/v1`）走报告接入�
   `record` / `drive`）归因；采纳与覆盖率**不改变阶段、G1–G3 或收口结论**。
 - **采纳记录**：`cognition-accept --status accepted|modified|rejected` 是可选的审计事实，
   不是收口门禁；不因代码已改、测试通过或任务 PASS 推断采纳。
+
+#### 义务终态与审计（v9.13.0）
+
+每条义务都必须可被单独审计，而不是“任务 PASS 了所以义务消失了”：
+
+- **可识别**：`obligation_id` ＋ `family`/`event`/`stage`/`cycle` ＋ `status`（`due` /
+  `claimed` / `satisfied` / `failed` / `skipped` / `deferred`）＋ 打开者（`opened_by`）＋
+  窗口开合时间 ＋ `disposition`（`completed` / `covered` / `failed` / `skipped` /
+  `not-executed` / `unsettled`）＋ 原因 ＋ 责任方（`responsible`，默认 `zcode`）＋
+  解除/闭合条件（`resolution_condition`）＋ 关联 `call_id` 或 `work_item`。
+- **合法终态只有四类**：已完成（`completed`/`covered`）、被新计划或新合同取代
+  （`skipped/superseded-by-newer`、`contract-amended`）、用户明确批准放弃
+  （`cognition-skip --kind waiver --by user --quote ...` → `skipped/user-waived`）、
+  真实外部阻塞（`skipped/external-block`）。窗口关闭仍 `due` 即 `not-executed`：这是
+  **可审计的未执行事实**，不等于“已解决”，也不阻断收口。只有窗口打开时策略允许自动
+  执行（`auto`）才同时写 `missed=true`；窗口打开时已是 `off`（显式关闭自动认知）时仍
+  如实记录终态与依据，但 `missed=false`——调用方主动关认知不是 agent 漏做，这些窗口
+  仍会出现在收口提醒与 `cognition-audit` 里。
+- **审计入口**：`cognition-audit --state S [--obligation-id O…] [--json]` 只读列出每条义务的
+  上述字段与 `disposition_basis`，并汇总 `total/open/dangling/missed/missing_audit`；
+  `closure-check` 同时打印未执行/漏调摘要（非阻断提醒）。
+- **不自动消解**：任务 PASS、G1–G3 通过、工作项关闭都不改写义务终态；`cognition-skip`
+  只登记处置事实与授权原文，不把它记成 `satisfied`，也不影响阶段、门禁或收口。
+- **失败不是终态**：`status=failed` 保留真实错误与 `call_id`，义务仍可被后续有界调度
+  重试（同一认知对象不重复付费）；上游恢复后重试仍只发一次请求。
 
 完整义务/窗口/周期/统计口径见 `references/runtime.md` §5。
 
@@ -833,7 +891,24 @@ python3 -B scripts/efficiency_report.py --workspace <ws> [--workspace <ws2>] \
 
 ## 版本
 
-当前 **v9.12.0（认知分级与自动执行）**：认知调度改为 **T0–T3 分级**，等级由**用户原始
+当前 **v9.13.1（认知策略作用域分离）**：命令级 `--cognition` 只影响当次调用，任务级策略
+只能经 `start` / `cognition-policy` 持久化，单次 `off` 不再静默后续 C/E 窗口。
+
+上一版 **v9.13.0（自主执行闭环与生命周期可靠性）**：用户回合成为可跟踪事实——Stop 与
+UserPromptSubmit 把原文写入任务目录 `.user-inputs.jsonl`（`U<n>`，只记录不推断授权），
+`input --consume <U> --block-id <B>` 把真实授权落成 decision 并解除**对应**阻塞，
+`--dismiss` 记录不构成任务事实的原因；`unblock --from-input` 直接以该事件原文作为授权引用；
+`start` 对同 `task_id` 拒绝建立重复任务。`drive` 在存在可处置输入时返回续跑码 10，Stop 守卫
+优先要求处置输入（`[COPILOT 用户输入待处置]`）而不是直接续跑。工作项领取按**父会话归属**
+（`effective_owner`，子代理会话不参与绑定）统一，避免会话错位导致同一工作项被隐藏或重复
+派发；`drive` 把下一步写入 `state.next_step`（`copilot-next-step/v1`），跨回合与 xmc=3 上限后
+可由状态恢复，而不是依赖对话上下文。认知义务补齐终态审计：`finished_at`、`responsible`、
+`resolution_condition`、`disposition_basis` 与 `not-executed → missed` 事实，新增只读
+`cognition-audit` 与 `cognition-skip`（用户放弃／外部阻塞／被新计划取代），`_policy_suffix`
+不再把 `off` 渲染成“允许自动执行”；`drive` 收口路径补传认知策略。G1–G3、认知 advisory、
+G4 退役与授权边界不变。
+
+v9.12.0（认知分级与自动执行）：认知调度改为 **T0–T3 分级**，等级由**用户原始
 意图**、目标、合同文字与状态事实确定性判定，文件类型、工作项数量与默认 `risk=medium`
 不能单独把任务降为 T0；`docs`/`mechanical` 若内容涉及治理/架构/协作规则仍升级。窗口固定为
 T0 无、T1 `A`、T2/T3 `A/B/E`，C 仍由事件触发。`start --intent` / `intent --text|--file`
@@ -865,7 +940,8 @@ v9.9.0（Astra 默认引擎：模型身份入账）与 v9.8.0（多模态设计�
 有图/无图两种咨询模式）的细节见 `references/history.md`；命令级口径见
 `references/workflow.md`。
 
-**近期版本**：v9.12.0（认知分级与自动执行）、v9.11.0（认知自动调度与调用率优化）、
+**近期版本**：v9.13.1（认知策略作用域分离）、v9.13.0（自主执行闭环与生命周期可靠性）、v9.12.0（认知分级与自动执行）、
+v9.11.0（认知自动调度与调用率优化）、
 v9.10.0（认知命名收敛与 SOL 退役）、
 v9.9.0（Astra 默认认知引擎）、v9.7.1（认知记录与义务处置的终态闭环）、v9.7.0（认知主动调度与可选议程）、
 v9.6.2（统计口径修正与认知锁等待有界）、v9.6.1（最终验证完成才执行收口 CONSULT）、

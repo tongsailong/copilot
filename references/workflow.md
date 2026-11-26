@@ -62,16 +62,20 @@ python3 -B scripts/copilot_dispatch.py <子命令> --state <state.json> [参数]
 | `report` | 登记执行报告，或接入 verify 结构化质量报告 | `--summary`（可与下一项同用）、`--verify-report <报告文件>`、`--blocked`、`--reason`；PWW 自动登记用户接受条件 |
 | `accept` | 登记用户对 PWW 的明确接受 | `--report <report_id>`（仅一份可省）、`--accept W1,R1`、`--by user`（必填）、`--quote "<用户原话>"`（必填）、`--note`；部分接受保持 pending |
 | `quality` | 查看质量结论与接受状态 | `--json` |
-| `decide` | 记录用户/任务决策 | `--text`、`--source`；**不能替代 PWW 接受** |
-| `block` / `unblock` | 记录/解除真实阻塞 | `block --reason ... --needs ... (--work-item A2 [--work-item A3] [--criterion C2] | --scope task [--force])`；`unblock --reason ... [--block-id B...] [--by user --quote "<原话>"]`（多条未解除时必须指定）；解除后被冻结工作项自动恢复 `pending`。仍有可执行项时任务级 `--scope task` 被拒绝，必须显式 `--force`，状态记录 `ready_at_creation`/`forced_scope`；`--by user` 必须带原话，记录 `resolved_by` 与 `authorization_source=caller-declared` |
+| `decide` | 记录用户/任务决策 | `--text`、`--source`；BLOCKED 下也允许登记（只记录事实，**不自动解除任何阻塞**，解除仍走 `unblock`）；**不能替代 PWW 接受** |
+| `input` | 用户回合输入的落地入口：查看/处置 `.user-inputs.jsonl` 中的 `U<n>` 事件（钩子写入，只记录、不推断授权）。`--consume` 把真实授权写成 decision 并解除指定阻塞，`--dismiss` 记录不构成任务事实的原因；未给 `--block-id` 时只列候选阻塞与建议命令（退出码 2） | `--show U1`；`--consume U1 --block-id B1 [--block-id B2] --reason "为何满足 needs"`；`--dismiss U1 --reason "..."`；`--by user\|zcode\|agent`、`--quote`（缺省取事件原文）、`--json`；处置后打印续跑判定 |
+| `block` / `unblock` | 记录/解除真实阻塞 | `block --reason ... --needs ... (--work-item A2 [--work-item A3] [--criterion C2] | --scope task [--force])`；`unblock --reason ... [--block-id B...] [--by user --quote "<原话>"] [--from-input U1]`（多条未解除时必须指定）；`--from-input` 直接取该输入事件原文作为授权引用并同时登记 decision、消费输入；解除后被冻结工作项自动恢复 `pending`。仍有可执行项时任务级 `--scope task` 被拒绝，必须显式 `--force`，状态记录 `ready_at_creation`/`forced_scope`；`--by user` 必须带原话，记录 `resolved_by` 与 `authorization_source=caller-declared` |
 | `closure-check` | 只读检查 G1–G3 | `--json` |
 | `review-admission` | 认知生命周期建议的单一确定性入口（只读、不写状态、不是门禁）：先算原始意图、任务类型、T0–T3 等级、窗口与已有认知覆盖，再给出 `advice.action`（`none`/`reuse`/`consult`/`plan`/`review`）、建议模式、阶段与命令 | `--trigger security`（可重复）、`--reason`、`--user-request`、`--review-request`、`--json`；返回 `decision`、`advice`、`task_kind`、`complexity`（含 `tier`/`tier_reason`/`windows`/`intent`）、`recommended_action`/`recommended_mode`/`recommended_stage`、`cognition_calls_total` |
 | `cognition-consult` | 认知判断入口：材料 + 问题 → 一次请求 → 目标理解/问题本质/路线与取舍/风险/调查方向/再咨询条件；建议写入统一 `cognition_calls`（`mode=CONSULT`），不入门禁；失败只登记并降级 | `--materials <file>`（调度执行时可省略）、`--question`（必填，`--obligation` 时回落到义务问题）、`--stage <understanding\|planning\|development\|stage\|closure>`、`--obligation SO<n>`（按调度义务执行，材料由状态确定性生成）、`--lock-timeout <秒>`、`--knowledge-file`、`--dry-run`、`--list`、`--json`、`--timeout`、`--max-output-tokens`、`--audit-log`（默认 `cognition-audit.jsonl`）、`--output-dir`、`--ignore-backoff`（默认在上游退避窗口内不发请求；仅在上游已确认恢复时显式使用，仍然只发一次、不重试）；模型固定 `gpt-6.2-astra`，没有 `--model` 开关；再次调用：`--force --trigger <user-request\|scope-changed\|new-risk\|materials-omitted\|strategy-failed\|major-uncertainty\|stage-result> --reason` |
 | `cognition-plan` | 认知调查后规划判断：方案比较、取舍、优先级、阶段目标与验收关注点；记录写入统一 `cognition_calls`（`mode=PLAN`） | 参数同 `cognition-consult`；省略 `--stage` 时默认 `planning` |
 | ~~`sol-consult`~~ | v9.10.0 已移除（不保留跳转表，解析阶段即拒绝）；改用 `cognition-consult`，`--sol` 也改用 `--cognition` | — |
 | `cognition-accept` | 回填主代理对认知建议的采纳结论（事实记录，不改变阶段、G1–G3 或授权）。v2 记录含实际决策、理由、modified 差异、证据引用与 `advice_ref`；缺项只给非阻断提示。`--historical` 只用于**已收口**任务的历史复核：`--status pending` 必须配 `--reason`（可加 `--reason-code`），重复执行幂等、不覆盖既有已决结论、不把已决结论降级为 `pending`；不因代码已改、测试通过或任务 PASS 推断采纳 | `--call-id SC...`、`--status accepted\|modified\|rejected\|pending`、`--decision`、`--rationale`（省略回落 `--reason`）、`--delta`、`--evidence-ref E1,E3`（可重复/逗号分隔，指向本任务已登记证据）、`--source-ref`（报告章节/文件路径，只定位不核验）、`--evidence-note`、`--note`、`--reason`、`--reason-code`、`--historical`、`--decided-by`（默认 `zcode`）、`--json` |
+| `cognition-policy` | **任务级**认知策略的唯一持久化入口：`--policy off\|advise\|auto` 必须配 `--reason`，记录操作者/时间/原值/原因并写历史；省略 `--policy` 为只读查看（不迁移历史任务）。命令行 `--cognition` 只影响当次命令 | `--state`、`--policy`、`--reason`、`--by`、`--json` |
 | `cognition-schedule` | 认知生命周期调度视图（只读）：义务清单、漏调、终态处置与所属周期、下一条可执行项与可直接粘贴的命令；`--execute` 时有界执行 1 条 `recommended` 义务（1 次请求，失败只记录）；同时显示当前上游退避窗口（窗口内不发起新请求） | `--state`、`--execute`、`--json`、`--cognition auto\|advise\|off`；不带 `--execute` 不写状态 |
 | `cognition-stats` | 认知调度观测（显式分母）：`expected`/`triggered`/`invoked`/`succeeded`/`failed`/`reused`/`deferred`/`skipped`/`missed` 分开统计并区分 auto/manual，成功率/漏调率用显式分母（`success_rate`、`missed_rate`，分母 0 记 null），含 T0–T3 等级、A/B/C/E 窗口（`by_window`）与 CONSULT/PLAN/REVIEW 模式（`by_mode`）分布、任务类型覆盖（`totals.task_kind_tasks`）、事件分布、采纳分布、义务终态处置与周期分布、tokens（输入/输出/reasoning/总）与延迟、`by_model`（请求数/完成/失败/Token/p50/p95/重复调用）与 `reuse`（命中数、按模型）；`invoked` 只认带 `call_id` 的真实请求 | `--state` 或 `--workspace <根>`（聚合 `.copilot-tasks/*/state.json`）、`--json` |
+| `cognition-audit` | 只读义务审计：逐条输出 `obligation_id`/`family`/`event`/`stage`/`cycle`/`status`/`window`/`opened_at`/`opened_by`/`closed_at`/`closed_reason`/`finished_at`/`disposition`/`disposition_reason`/`disposition_basis`/`policy_at_open`/`responsible`/`resolution_condition`/`missed`/`call_id`/`failure`/`skip_by`/`skip_reason`，并汇总 `total`/`open`/`unexecuted`/`dangling`/`missed`/`missing_audit`；不改状态、不是门禁 | `--state`、`--obligation-id SO1`（可重复）、`--json` |
+| `cognition-skip` | 登记义务的合法终态处置（不伪造 `satisfied`）：`waiver`＝用户明确放弃（必须 `--by user --quote`，记 `authorization_*`）；`external`＝真实外部阻塞；`replaced`＝被新计划/新合同取代。写入 `status=skipped`、`skip_by`、`terminal`、`resolution_condition` 与原因 | `--obligation-id SO<n>`、`--kind waiver\|external\|replaced`、`--reason`、`--by user\|zcode`、`--quote`、`--json` |
 | `agent-policy` | Agent 调度建议：主代理默认，Explore/general-purpose 按需（只读、不派发）。判定顺序：子代理不可用 → 主代理；写入冲突 → 主代理；`--research-only` → Explore（绝不交给全工具代理）；独立交付物需并发且有收益才建议 general-purpose；其余 → 主代理 | `--needs-independent-context`、`--parallel`、`--independent-deliverable`、`--write-conflict`、`--saves-time`、`--research-only`、`--subagent-unavailable`、`--json` |
 | `finding` | 查看 / 更新 Finding 台账（不触发复核） | `--list`；`--id F1 --status open\|fixed\|verified\|closed\|regressed\|dropped --evidence E1[,E2] --note`；`fixed`/`verified` 必须有证据，多个证据可用逗号分隔；回填成功后按续跑判定返回 10 |
 | `review-metrics` | 统计统一认知调用流（`cognition.consult_total` / `cognition.plan_total` / `cognition.failed` / `cognition.modes`）、准入门槛、停止标记与 Finding 计数 | `--state`；历史 G4 数据标记 `g4.retired` |
@@ -265,6 +269,40 @@ python3 -B scripts/copilot_auto.py drive --state T/state.json    # PASS → 0
 
 PARTIAL 时不需要额外命令：直接再次 `drive`，由本地派生工作项。
 
+### 用户回合（批准 / 授权 / 解除阻塞）
+
+Stop 与 UserPromptSubmit 钩子把用户原文写入 `<state 目录>/.user-inputs.jsonl`
+（`copilot-user-input/v1`，`U1`、`U2`…，300 秒内相同文本去重；只记录，不解释、不推断授权）。
+主代理按事件处置，而不是按对话记忆：
+
+```bash
+# 查看待处置输入与候选阻塞
+python3 -B scripts/copilot_dispatch.py input --state T/state.json
+
+# 把授权落到原任务：写 decision + 解除对应阻塞 + 消费该输入
+python3 -B scripts/copilot_dispatch.py input --state T/state.json \
+  --consume U1 --block-id B1 --reason "用户原话满足 needs：批准方案 A" \
+  --quote "同意方案 A，按这个继续"
+
+# 或从输入直接解除（同一语义，授权引用取自事件）
+python3 -B scripts/copilot_dispatch.py unblock --state T/state.json \
+  --from-input U1 --block-id B1 --reason "用户批准"
+
+# 确认不是任务事实时显式丢弃
+python3 -B scripts/copilot_dispatch.py input --state T/state.json \
+  --dismiss U2 --reason "只是询问进度，不构成决策或授权"
+```
+
+- 一条输入只解除它真正覆盖的阻塞；其余阻塞、工作项、合同范围不变。未给 `--block-id`
+  时命令只列候选与建议，退出码 2，不猜授权。
+- 处置后立即 `drive`；`continuation.required=true` 时返回 10。Stop 在存在可处置输入时
+  以 exit 2 要求先处置（`[COPILOT 用户输入待处置]`），处置完成后恢复常规续跑提示。
+- `drive` 在 BLOCKED 且存在可处置输入时也返回 10 并打印处置命令，不再静默等待（11）。
+- 输入事件是**授权引用来源**，不是授权本身：`--by user` 仍是调用方声明，
+  `authorization_source=user-input-event` 只表示引用取自该事件原文。
+- `start` 对同一 `task_id` 拒绝建立重复任务，并指向已有 `state.json`；不要在用户回合
+  重新 `start` 一条“同类任务”。
+
 收口顺序是**最终工程验证 → 收口 CONSULT（如建议）→ G1–G3 收口**：`drive` 在 PASS 但验证
 有缺口（例如合同 `test_policy.required=true` 却没有 `--capture-cmd` 证据）时打印缺口并
 返回 10，不执行认知、不收口；补齐测试与证据后再 `drive`（或 `closure --close`）即自动执行
@@ -339,7 +377,8 @@ python3 -B scripts/copilot_dispatch.py formal-review --state T/state.json \
   原始记录、授权快照和 verdict 不被覆盖；`review-metrics` 分开统计 amendment 与
   superseded。
 - BLOCKED 下允许登记已授权的正式 REVIEW 及其 amendment；不会解除阻塞，也不能替代
-  `unblock` 或收口。`plan`、`decide`、`evidence --drop` 在 BLOCKED 下仍被拒绝。
+  `unblock` 或收口。`plan`、`evidence --drop` 在 BLOCKED 下仍被拒绝；`decide` 与
+  `input --consume` 允许登记用户决议，但只记录事实、不自动解除阻塞。
 - G4 已退役：`risk=high` 不再需要原生复核信封，也不要求 `--backend native`；收口只检查
   G1–G3。历史 G4 记录只读保留（见 `review.md` 第 3 节）。
 

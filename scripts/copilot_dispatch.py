@@ -52,7 +52,7 @@ import review_policy as RP  # noqa: E402
 import cognition_call as CC  # noqa: E402
 import cognition_schedule as SCH  # noqa: E402
 
-__version__ = "9.12.0"
+__version__ = "9.13.1"
 
 
 class CLIError(Exception):
@@ -205,7 +205,7 @@ EXIT_CONTINUE = 10
 READ_ONLY_COMMANDS = frozenset({
     "closure-check", "review-metrics", "review-admission", "agent-policy",
     "handoff", "legacy-status", "next", "status", "quality",
-    "cognition-stats",
+    "cognition-stats", "cognition-audit",
 })
 
 
@@ -225,6 +225,9 @@ def _is_read_only(args) -> bool:
     if command == "cognition-schedule":
         # 只读查看调度；--execute 会发起一次真实调用，属于写动作。
         return not getattr(args, "execute", False)
+    if command == "cognition-policy":
+        # 只查看任务级策略是纯读取；`--policy` 才是持久化写入。
+        return not str(getattr(args, "policy", "") or "").strip()
     return False
 
 
@@ -235,20 +238,15 @@ def _is_read_only(args) -> bool:
 #   1. 每条命令最多执行 1 个义务、最多 1 次请求（有界）；
 #   2. 只自动执行 recommended 级；optional 级只提示；
 #   3. 读命令永不执行；认知失败只记录，不改变命令退出码。
-POLICIES = ("off", "advise", "auto")
-# 三种模式的明确语义（模型无关，`--cognition` 与历史 `--cognition` 等价）：
-#   auto   自动：recommended 义务直接执行（会真实计费）
-#   advise 建议：只给可直接粘贴的命令，不发起调用
-#   off    禁用：只记录义务，不打印、不执行
-POLICY_ALIASES = {
-    "auto": "auto", "on": "auto", "enable": "auto", "enabled": "auto",
-    "advise": "advise", "advisory": "advise", "suggest": "advise",
-    "off": "off", "disable": "off", "disabled": "off", "none": "off",
-}
-DEFAULT_POLICY = "auto"
+# 三种模式的明确语义（模型无关）：
+# 认知策略的常量定义在 `cognition_schedule`（调度层是唯一权威），这里只做别名，
+# 避免“命令层一套、调度层一套”导致作用域语义漂移。
+POLICIES = SCH.POLICIES
+POLICY_ALIASES = SCH.POLICY_ALIASES
+DEFAULT_POLICY = SCH.DEFAULT_POLICY
 # 纯登记/报告/查询命令的默认：只物化义务并给建议，绝不隐式发起付费调用。
 # 生命周期命令（start / drive / plan / closure / cognition-schedule --execute）仍默认 auto。
-REGISTRATION_POLICY = "advise"
+REGISTRATION_POLICY = SCH.REGISTRATION_POLICY
 # 可以在本命令内真正消费一条义务的命令：它们都改变任务的生命周期事实（计划登记、
 # 工作项回填、条件核销、重试、解除阻塞、重开、收口、驱动）。纯记录命令
 # （judgment / evidence / report / accept / decide / finding / contract 等）不属于
@@ -257,47 +255,78 @@ DISPATCH_COMMANDS = frozenset({
     "start", "plan", "record", "rerun", "criterion", "unblock", "reopen",
     "closure", "cognition-schedule", "drive",
 })
+# 只有这两个命令可以持久化任务级策略：一个是任务创建（`start`），一个是显式的
+# 任务策略设置入口（`cognition-policy`）。
+TASK_POLICY_COMMANDS = frozenset({"start", "cognition-policy"})
+
+# 策略来源：显式命令参数 / 环境变量 / 任务级策略 / 命令默认。
+POLICY_SCOPE_COMMAND = "command"
+POLICY_SCOPE_ENV = "environment"
+POLICY_SCOPE_TASK = "task"
+POLICY_SCOPE_DEFAULT = "default"
 
 
 def _task_policy(state: dict | None) -> str:
-    """任务**最近一次记录的**调度策略；没有记录时返回空串。
+    """任务级调度策略；没有记录时返回空串（由命令自身默认值决定）。
 
-    这是“认知策略随任务生效”的唯一读取口径：`start` 时记录的策略（默认 auto）
-    对同一任务的后续命令持续有效，因此不需要在每条命令上重复 `--cognition
-    auto`，显式 `off` 也能对整条任务生效。当前周期还没有快照时回退到更早周期
-    （重开后第一条命令不应把上一周期声明的策略丢掉）；更早周期同样没有记录时
-    返回空串，由命令自身的默认值决定，不推断历史。
+    读取顺序由调度层统一维护（`state.cognition_policy` → 周期快照兼容 →
+    空串）：命令级 `--cognition` 覆盖**永远不**参与这里，因此一次 `criterion
+    --cognition off` 不会改变整条任务的后续窗口。
     """
-    if not isinstance(state, dict):
-        return ""
-    schedule = SCH.schedule_view(state)
-    if not isinstance(schedule, dict):
-        return ""
-    for cycle in range(SCH.current_cycle(state), 0, -1):
-        snapshot = SCH.policy_snapshot(schedule, cycle)
-        value = str(snapshot.get("value") or "").strip().lower()
-        if value in POLICIES:
-            return value
-    return ""
+    return SCH.task_policy_value(state)
+
+
+def _policy_resolution(args, state: dict | None = None) -> dict:
+    """解析本次命令的有效策略及其作用域（唯一求值入口）。
+
+    - `value`：本次命令实际使用的策略（决定是否执行义务）；
+    - `scope`：`command`（`--cognition` 显式）/ `environment`
+      （`COPILOT_COGNITION`）/ `task`（任务级策略）/ `default`（命令默认）；
+    - `task_value`：任务级策略（写快照与义务 `policy_at_open` 的口径）；
+    - `override`：本次是否有“非任务级”的覆盖（用于审计环，不写任务级）。
+
+    这样“单次覆盖”与“任务策略”是两个独立事实：前者只决定本次调用行为，后者
+    决定后续生命周期默认行为。
+    """
+    raw = str(getattr(args, "cognition", "") or "")
+    default = str(getattr(args, "cognition_default", "") or DEFAULT_POLICY)
+    task_value = _task_policy(state)
+    if raw.strip():
+        value, scope = SCH.normalize_policy(raw), POLICY_SCOPE_COMMAND
+        source_text = raw
+    else:
+        env = str(os.environ.get("COPILOT_COGNITION") or "")
+        if env.strip():
+            value, scope = SCH.normalize_policy(env), POLICY_SCOPE_ENV
+            source_text = env
+        elif task_value:
+            value, scope = task_value, POLICY_SCOPE_TASK
+            source_text = task_value
+        else:
+            value, scope = SCH.normalize_policy(default), POLICY_SCOPE_DEFAULT
+            source_text = default
+    if value not in POLICIES:
+        print(f"提示：未知认知调用策略 {source_text!r}；按 "
+              f"{default} 处理。", file=sys.stderr)
+        value = SCH.normalize_policy(default) or DEFAULT_POLICY
+        scope = POLICY_SCOPE_DEFAULT
+    return {
+        "value": value,
+        "scope": scope,
+        "task_value": task_value,
+        "override": value if scope in (POLICY_SCOPE_COMMAND, POLICY_SCOPE_ENV)
+        and value != task_value else "",
+        "source": scope,
+    }
 
 
 def _cognition_policy(args, state: dict | None = None) -> str:
-    raw = str(getattr(args, "cognition", "") or "")
-    if not raw.strip():
-        env = str(os.environ.get("COPILOT_COGNITION") or "")
-        default = str(getattr(args, "cognition_default", "") or DEFAULT_POLICY)
-        # 任务策略随任务生效：显式参数 > 环境变量 > 任务策略 > 命令默认。这样
-        # “自动调度”在 `start` 时决定一次即可，不需要在每条回填命令上重复人工
-        # 开关；显式 off/advise 仍然对整条任务有效。
-        raw = env or _task_policy(state) or default
-    value = raw.strip().lower()
-    normalized = POLICY_ALIASES.get(value, "")
-    if normalized not in POLICIES:
-        print(f"提示：未知认知调用策略 {raw!r}；按 "
-              f"{getattr(args, 'cognition_default', '') or DEFAULT_POLICY} 处理。",
-              file=sys.stderr)
-        return getattr(args, "cognition_default", "") or DEFAULT_POLICY
-    return normalized
+    """本次命令的有效策略（命令级覆盖 > 环境变量 > 任务策略 > 命令默认）。
+
+    只返回**本次调用**应使用的值：它不会被写回任务级策略，也不会影响后续命令。
+    需要任务级策略时用 `_task_policy(state)` / `SCH.task_policy_value(state)`。
+    """
+    return str(_policy_resolution(args, state)["value"])
 
 
 def _auto_dispatch(args) -> bool:
@@ -472,7 +501,8 @@ def _cognition_schedule_step(path: str, args, *, gates_passed: bool = False,
     的未执行窗口挤掉；更早的窗口仍按窗口事实记为漏调。
     """
     state = G.load_state(path)
-    policy = _cognition_policy(args, state)
+    resolution = _policy_resolution(args, state)
+    policy = str(resolution["value"])
     if execute is None:
         execute = _auto_dispatch(args)
     origin = origin or str(getattr(args, "command", "") or "")
@@ -482,9 +512,14 @@ def _cognition_schedule_step(path: str, args, *, gates_passed: bool = False,
         else G.closure_readiness(state, cache=cache)
     advice = G.cognition_advice_summary(state, gates_passed=gates_passed,
                                   closure_ready=readiness, cache=cache)
-    synced = G.sync_cognition_schedule(state, advice=advice, policy=policy,
-                                auto_execution=_auto_execution_allowed(),
-                                origin=origin)
+    # 只有任务级策略写快照与义务 `policy_at_open`；本次命令的覆盖只进审计环。
+    # 否则一条 `evidence --cognition off` 会把整条任务的后续 A/B/C/E 静默掉。
+    synced = G.sync_cognition_schedule(
+        state, advice=advice, policy=str(resolution["task_value"]),
+        auto_execution=_auto_execution_allowed(), origin=origin,
+        task_policy=str(resolution["task_value"]),
+        command_policy=str(resolution["override"]),
+        command_source=str(resolution["source"]))
     if synced["changes"]:
         G.save_state(path, state)
     due = SCH.due_obligations(state)
@@ -557,8 +592,17 @@ def _print_continuation(path: str, args=None) -> int:
         step = _cognition_schedule_step(path, args, cache=cache)
     state = step.get("state") if isinstance(step, dict) and \
         isinstance(step.get("state"), dict) else G.load_state(path)
-    ev = G.evaluate(state, cache=cache)
+    owner = G.effective_owner(path)
+    ev = G.evaluate(state, cache=cache, owner=owner)
     cont = ev.get("continuation") or {}
+    pending = _inbox_pending(path)
+    G.persist_next_step(path, cont, phase=str(ev.get("phase") or ""),
+                        pending_inputs=[str(row.get("input_id") or "")
+                                        for row in pending])
+    if pending:
+        print("未处置用户输入："
+              + "、".join(str(row.get("input_id") or "") for row in pending)
+              + "（先 input --consume/--dismiss 处置，再判断续跑）")
     if cont.get("required"):
         print(f"续跑：必须继续（{cont.get('action')}）—— {cont.get('reason')}")
         if cont.get("executable"):
@@ -586,6 +630,128 @@ def _under_tasks_dir(path: str) -> bool:
     return ".copilot-tasks" in parts
 
 
+def _inbox_module():
+    import copilot_inbox  # 同目录模块；不含网络依赖
+    return copilot_inbox
+
+
+def _inbox_pending(path: str) -> list[dict]:
+    try:
+        return _inbox_module().pending(path)
+    except Exception:  # noqa: BLE001 - 收件箱缺失不阻断既有命令
+        return []
+
+
+def cmd_input(args) -> int:
+    """用户输入收件箱：查看 / 处置本回合的用户原话。
+
+    这是“用户批准 → 解除对应阻塞 → 恢复工作项 → 继续执行”的唯一落地入口。
+    只处理显式指定的输入与 block_id；不按模糊语义自动解除授权（授权不能由
+    模型推断），但会把候选阻塞与原话一起展示，避免主代理漏掉。
+    """
+    path = _state_path(args)
+    INBOX = _inbox_module()
+    state = G.load_state(path)
+    show = str(getattr(args, "show", "") or "").strip()
+    consume = str(getattr(args, "consume", "") or "").strip()
+    dismiss = str(getattr(args, "dismiss", "") or "").strip()
+    if consume and dismiss:
+        raise CLIError("--consume 与 --dismiss 只能选一个。")
+    if consume:
+        event, done = INBOX.get(path, consume)
+        if not event:
+            raise CLIError(f"输入事件不存在：{consume}")
+        if done:
+            raise CLIError(f"输入 {consume} 已处置（{done.get('op')}），不能重复处置。")
+        block_ids = [str(item) for item in getattr(args, "block_id", None) or []
+                     if str(item or "").strip()]
+        if not block_ids and getattr(args, "auto", False):
+            matches = INBOX.candidates(state, str(event.get("text") or ""))
+            unique = [row for row in matches if row.get("score", 0) > 0]
+            block_ids = [row["block_id"] for row in unique]
+        if not block_ids:
+            matches = INBOX.candidates(state, str(event.get("text") or ""))
+            print(f"输入 {consume} 尚未处置。原话：{INBOX.quote(event.get('text', ''))}")
+            if not matches:
+                print("当前没有未解除阻塞；若这条输入只是补充信息/与任务无关：")
+                print(f"  python3 -B {__file__} input --state {path} --dismiss "
+                      f"{consume} --reason \"<原因>\"")
+                return 2
+            print("候选阻塞（按条件词命中排序；选择真正被这条输入满足的那一条）：")
+            for row in matches:
+                print(f"- {row['block_id']}（{'、'.join(row['work_items']) or row['scope'] or '任务级'}）"
+                      f" 需要：{row['needs'] or '未写明'}"
+                      f"；命中：{'、'.join(row['matched']) or '无'}")
+            for command in INBOX.suggested_commands(path, state, event, matches):
+                print("  " + command)
+            return 2
+        reason = str(getattr(args, "reason", "") or "").strip()
+        if not reason:
+            raise CLIError("--consume 必须说明依据（--reason：用户原话满足了哪条 needs）。")
+        quote = str(getattr(args, "quote", "") or "").strip() \
+            or str(event.get("text") or "")
+        by = str(getattr(args, "by", "") or "user").strip().lower()
+        resolved_ids: list[str] = []
+        resumed: list[str] = []
+        for block_id in block_ids:
+            result = G.resolve_block(path, reason, block_id=block_id, by=by,
+                                     quote=quote, input_id=consume)
+            resolved_ids.extend(result.get("block_ids") or [])
+            resumed.extend(result.get("resumed") or [])
+        decision = G.add_decision(path, str(event.get("text") or ""),
+                                  source="user", allow_blocked=True,
+                                  input_id=consume, block_ids=resolved_ids,
+                                  quote=quote)
+        INBOX.consume(path, consume, block_ids=resolved_ids, reason=reason,
+                      by=by, decision_id=decision.get("decision_id") or "",
+                      authorization_source="user-input-event")
+        print(f"已处置输入 {consume}：解除 {len(resolved_ids)} 条阻塞"
+              + (f"（{'、'.join(resolved_ids)}）" if resolved_ids else ""))
+        print(f"决策已关联：{decision.get('decision_id')} · 授权原话已写入阻塞记录"
+              "（authorization_source=user-input-event）")
+        if resumed:
+            print("已恢复工作项：" + "、".join(resumed) + "（重新进入可执行）")
+        return _print_continuation(path, args)
+    if dismiss:
+        event, done = INBOX.get(path, dismiss)
+        if not event:
+            raise CLIError(f"输入事件不存在：{dismiss}")
+        if done:
+            print(f"输入 {dismiss} 已处置（{done.get('op')}）：{done.get('reason') or ''}")
+            return 0
+        reason = str(getattr(args, "reason", "") or "").strip()
+        if not reason:
+            raise CLIError("--dismiss 必须说明原因（--reason）。")
+        INBOX.dismiss(path, dismiss, reason=reason,
+                      by=str(getattr(args, "by", "") or "zcode"))
+        print(f"输入 {dismiss} 已标记为不处置：{reason}")
+        return 0
+    pending = INBOX.pending(path)
+    if not pending:
+        print("没有未处置的用户输入。")
+        return 0
+    for row in pending:
+        flag = "需处置" if row.get("actionable") else "仅记录"
+        print(f"- {row.get('input_id')}（{flag}，{row.get('at')}，会话 "
+              f"{row.get('session') or '-'}）：{INBOX.quote(row.get('text', ''))}")
+        matches = INBOX.candidates(state, str(row.get("text") or ""))
+        scored = [item for item in matches if item.get("score", 0) > 0]
+        if scored:
+            print("  候选阻塞：" + "、".join(
+                f"{item['block_id']}（命中 {'、'.join(item['matched'])}）"
+                for item in scored[:3]))
+        for command in INBOX.suggested_commands(path, state, row, matches)[-1:]:
+            print("  无关时：" + command)
+    if show:
+        event, done = INBOX.get(path, show)
+        if not event:
+            raise CLIError(f"输入事件不存在：{show}")
+        print(f"\n{show} 原文（{event.get('chars')} 字）：\n{event.get('text')}")
+        if done:
+            print(f"处置：{done.get('op')} by {done.get('by')} · {done.get('reason')}")
+    return 0
+
+
 def cmd_start(args) -> int:
     contract = _read_text(args.contract_file) if args.contract_file else ""
     criteria = _load_criteria(args.criteria_file) if args.criteria_file else None
@@ -594,6 +760,16 @@ def cmd_start(args) -> int:
     state_path = _state_path(args)
     workspace = args.workspace or G._git_workspace(
         os.path.dirname(os.path.abspath(state_path)))
+    # 同一 task_id 只允许一个任务状态。用户批准/授权必须落到原任务；新建一个
+    # 同名任务会让授权写进新状态，而原任务仍停在 BLOCKED（v9.13 之前的真实故障）。
+    explicit_task_id = str(args.task_id or "").strip()
+    if explicit_task_id:
+        existing = G.find_task_state(workspace, explicit_task_id)
+        if existing and os.path.abspath(existing) != os.path.abspath(state_path):
+            raise CLIError(
+                f"task_id={explicit_task_id} 已存在：{existing}\n"
+                "用户批准/继续请直接驱动原任务（`drive --state <该文件>`），"
+                "不要新建重复任务；确需新任务请换一个 task_id。")
     state = G.start_state(
         state_path, args.goal, contract=contract, criteria=criteria,
         risk=args.risk, execution_backend=args.backend,
@@ -603,7 +779,10 @@ def cmd_start(args) -> int:
         test_policy=_load_test_policy(args),
         task_kind=args.task_kind or "",
         triggers=args.trigger or [],
-        intent=intent)
+        intent=intent,
+        # 任务级认知策略：`start --cognition` 是唯一创建入口（省略落默认 auto）。
+        # 这是持久化动作，与后续命令的 `--cognition` 单次覆盖语义不同。
+        cognition_policy=str(args.cognition or ""))
     print(f"任务已创建：{state['task_id']}")
     print(f"状态文件：{os.path.abspath(state_path)}")
     if not _under_tasks_dir(state_path):
@@ -696,16 +875,49 @@ def _context_hint(state_path: str, state: dict) -> str:
 
 
 def cmd_next(args) -> int:
-    state = G.load_state(_state_path(args))
+    path = _state_path(args)
+    state = G.load_state(path)
     cache: dict = {}
-    ev = G.evaluate(state, cache=cache)
+    owner = G.effective_owner(path)
+    ev = G.evaluate(state, cache=cache, owner=owner)
+    pending = _inbox_pending(path)
+    actionable = [row for row in pending if row.get("actionable")]
+    obligations = {}
+    try:
+        obligations = SCH.summary(state)
+    except Exception:  # noqa: BLE001 - 只读视图不因调度模块异常整体失败
+        obligations = {}
     if args.json:
-        _print({"task_id": state.get("task_id"), **ev})
-    else:
-        print(G.render_status(state, ev, cache=cache))
-        hint = _context_hint(_state_path(args), state)
-        if hint:
-            print(hint)
+        env = {"task_id": state.get("task_id"), **ev,
+               "pending_inputs": [
+                   {"input_id": row.get("input_id"), "at": row.get("at"),
+                    "quote": str(row.get("text") or "")[:200],
+                    "actionable": bool(row.get("actionable"))}
+                   for row in pending],
+               "cognition_obligations": {
+                   "pending": obligations.get("pending", 0),
+                   "missed": obligations.get("missed", 0),
+                   "pending_obligations": obligations.get("pending_obligations") or [],
+               }}
+        _print(env)
+        return 0
+    print(G.render_status(state, ev, cache=cache))
+    if actionable:
+        print("未处置用户输入（先 input --consume / --dismiss，再 drive）：")
+        for row in actionable:
+            text = str(row.get("text") or "").replace("\n", " ")
+            print(f"- {row.get('input_id')}：{text[:200]}"
+                  + ("…" if len(text) > 200 else ""))
+    elif pending:
+        print("另有仅记录的用户输入（不构成授权）："
+              + "、".join(str(row.get("input_id") or "") for row in pending))
+    if obligations.get("pending"):
+        print(f"认知义务未终结：{obligations.get('pending')} 条"
+              f"（漏调 {obligations.get('missed', 0)}）；只读审计："
+              f"cognition-audit --state {path}")
+    hint = _context_hint(path, state)
+    if hint:
+        print(hint)
     return 0
 
 
@@ -874,11 +1086,19 @@ def cmd_quality(args) -> int:
 
 
 def cmd_decide(args) -> int:
-    entry = G.add_decision(_state_path(args), args.text, source=args.source)
+    path = _state_path(args)
+    # 用户可以在一项任务已阻塞时给出决策/授权（例如批准方案 A、同意 push）。
+    # 决策必须能写进原 task_id，否则授权只存在于对话里，恢复后无从核对。
+    # 但决策记录不自动解除阻塞：解除必须显式走 `input --consume` / `unblock`，
+    # 授权不能被“记录决策”这个动作推断出来。
+    entry = G.add_decision(path, args.text, source=args.source,
+                           allow_blocked=True)
     print(f"决策已记录（{entry['source']}）：{entry['text'][:120]}")
+    print("提示：决策本身不解除阻塞；若它同时满足了某条阻塞的解除条件，"
+          "用 `input --consume <U> --block-id <B>`（或 `unblock --block-id`）显式解除。")
     # 用户决策是 decision-point 的可归因事实：这里同步一次调度窗口。
-    _cognition_schedule_step(_state_path(args), args)
-    return 0
+    _cognition_schedule_step(path, args)
+    return _print_continuation(path, args)
 
 
 def cmd_block(args) -> int:
@@ -934,10 +1154,22 @@ def cmd_block(args) -> int:
 
 
 def cmd_unblock(args) -> int:
-    result = G.resolve_block(_state_path(args), args.reason,
+    path = _state_path(args)
+    input_id = str(getattr(args, "from_input", "") or "").strip()
+    quote = str(args.quote or "").strip()
+    if input_id:
+        INBOX = _inbox_module()
+        event, done = INBOX.get(path, input_id)
+        if not event:
+            raise CLIError(f"输入事件不存在：{input_id}")
+        if done:
+            raise CLIError(f"输入 {input_id} 已处置（{done.get('op')}），不能重复解除。")
+        quote = quote or str(event.get("text") or "")
+    result = G.resolve_block(path, args.reason,
                              block_id=args.block_id or "",
                              by=args.by or "zcode",
-                             quote=args.quote or "")
+                             quote=quote,
+                             input_id=input_id)
     print(f"已解除 {result['resolved']} 条阻塞：{result['reason']}")
     print(f"解除方：{result.get('resolved_by') or 'zcode'}"
           + ("（调用方声明；原话已记录）" if result.get("resolved_by") == "user"
@@ -946,7 +1178,18 @@ def cmd_unblock(args) -> int:
         print("block_id：" + ", ".join(result["block_ids"]))
     if result.get("resumed"):
         print("已恢复工作项：" + ", ".join(result["resumed"]) + "（重新进入可执行）")
-    return _print_continuation(_state_path(args), args)
+    if input_id:
+        decision = G.add_decision(path, quote or args.reason, source="user",
+                                  allow_blocked=True, input_id=input_id,
+                                  block_ids=list(result.get("block_ids") or []),
+                                  quote=quote)
+        _inbox_module().consume(path, input_id,
+                                block_ids=list(result.get("block_ids") or []),
+                                reason=args.reason, by=args.by or "zcode",
+                                decision_id=decision.get("decision_id") or "",
+                                authorization_source="user-input-event")
+        print(f"输入 {input_id} 已处置，决策 {decision.get('decision_id')} 已关联原任务。")
+    return _print_continuation(path, args)
 
 
 def cmd_evidence(args) -> int:
@@ -1035,8 +1278,17 @@ def cmd_closure_check(args) -> int:
     # 门禁结果必须体现在退出码上：FAIL 仍返回 0 会让调用方（和管道后的 shell）
     # 把“检查过”误当“通过了”。PASS=0，FAIL=1。
     exit_code = 0 if check.get("passed") else 1
+    try:
+        obligations = SCH.summary(state)
+    except Exception:  # noqa: BLE001 - 认知摘要不改变 G1–G3 结论
+        obligations = {}
     if args.json:
-        _print({"task_id": state.get("task_id"), **check})
+        _print({"task_id": state.get("task_id"), **check,
+                "cognition_obligations": {
+                    "pending": obligations.get("pending", 0),
+                    "missed": obligations.get("missed", 0),
+                    "dispositions": obligations.get("dispositions") or {},
+                }})
         return exit_code
     print(f"任务 {state.get('task_id')} 三道门检查："
           f"{'PASS' if check['passed'] else 'FAIL'}")
@@ -1052,6 +1304,11 @@ def cmd_closure_check(args) -> int:
               f"已接受 {'、'.join(quality.get('accepted_ids') or []) or '无'}）")
     for warning in check.get("warnings") or []:
         print(f"- 提醒（不阻断）：{warning}")
+    if obligations.get("pending"):
+        print(f"- 提醒（不阻断）：认知义务仍未终结 {obligations.get('pending')} 条；"
+              f"收口会按窗口事实记为未执行/漏调（审计：cognition-audit --state {path}）")
+    if obligations.get("missed"):
+        print(f"- 已记漏调：{obligations.get('missed')} 条（只读口径，不影响 G1–G3）")
     if exit_code:
         print("门禁未通过：这不是任务终点；按 drive 的下一步继续处理缺口，"
               "不要以本次检查结果收束回合。")
@@ -1941,13 +2198,60 @@ def _cognition_schedule_view(state: dict, path: str) -> dict:
             "backoff": G.cognition_backoff_status(state, model=CC.model_key())}
 
 
+def cmd_cognition_policy(args) -> int:
+    """查看或设置**任务级**认知调度策略（唯一持久化入口）。
+
+    与其它命令上的 `--cognition` 语义不同：这里的结果会写进任务状态，决定该任务
+    后续所有生命周期命令的默认行为；因此必须给出 `--reason`，并记录操作者、
+    时间、原策略与新策略。命令级覆盖只影响一次调用，不写任务级策略。
+    """
+    path = _state_path(args)
+    if args.policy:
+        state = G.set_cognition_policy(
+            path, policy=args.policy, reason=args.reason,
+            by=str(args.by or "zcode"))
+        print(f"任务级认知策略已更新：{args.policy} → "
+              f"{SCH.task_policy_value(state)}")
+        # 策略变更后同步一次快照（只记录事实，不发起调用）：下一次生命周期命令
+        # （drive / record / criterion 等）才按新策略真正消费待执行窗口。
+        synced = G.sync_cognition_schedule(
+            state, policy=str(SCH.task_policy_value(state) or ""),
+            auto_execution=_auto_execution_allowed(), origin="cognition-policy")
+        if synced.get("changes"):
+            G.save_state(path, state)
+    else:
+        # 纯查看必须严格只读：历史任务不能因为“看一眼”被补字段或补义务。
+        state = G.load_state(path)
+    view = G.cognition_policy_view(state)
+    if args.json:
+        _print({"schema": "copilot-cognition-policy/v1",
+                "cognition_policy": view,
+                "summary": SCH.summary(state)})
+        return 0
+    value = view.get("value") or "（未设置：按命令默认决定）"
+    print(f"任务级认知策略：{value}"
+          f"（来源：{view.get('origin')} / {view.get('source')}）")
+    if view.get("set_at"):
+        print(f"设置时间：{view['set_at']} · 操作者：{view.get('set_by') or '-'}")
+    if view.get("previous"):
+        print(f"原策略：{view['previous']}")
+    if view.get("reason"):
+        print(f"原因：{view['reason']}")
+    summary = SCH.summary(state)
+    print(f"调度义务：{summary['total']} 个（未闭合 {summary['pending']}，"
+          f"漏调 {summary['missed']}）；命令级覆盖记录 "
+          f"{summary.get('command_overrides', 0)} 条")
+    print("说明：命令行的 --cognition 只影响当次命令；要改变整条任务的策略请用本命令。")
+    return 0
+
+
 def cmd_cognition_schedule(args) -> int:
     """认知生命周期调度：显示（或执行）当前应做的认知窗口。"""
     path = _state_path(args)
     state = G.load_state(path)
     advice = G.cognition_advice_summary(state)
     synced = G.sync_cognition_schedule(state, advice=advice,
-                                 policy=_cognition_policy(args, state),
+                                 policy=str(_policy_resolution(args, state)["task_value"]),
                                  auto_execution=_auto_execution_allowed(),
                                  origin="cognition-schedule")
     if args.execute:
@@ -2031,6 +2335,81 @@ def cmd_cognition_stats(args) -> int:
     return 0
 
 
+def cmd_cognition_audit(args) -> int:
+    """只读审计认知义务：状态、终态处置、责任方、解除条件、漏调口径。"""
+    path = _state_path(args)
+    state = G.load_state(path)
+    audit = SCH.audit_summary(state)
+    if args.json:
+        _print({"task_id": state.get("task_id"), **audit})
+        return 0
+    print(f"任务 {state.get('task_id')} 认知义务审计：共 {audit['total']} 条"
+          f"（未终结 {audit['open']}、未执行 {audit['unexecuted']}、"
+          f"漏调 {audit['missed']}、无终态 {audit['dangling']}、"
+          f"缺审计字段 {audit['missing_audit']}）")
+    for row in audit["rows"]:
+        label = row["disposition"] or ("未终结" if row["window"] == "open"
+                                       else "无终态")
+        line = (f"- {row['obligation_id']} {row['family']}/{row['event']}"
+                f"（周期 {row['cycle']}）{row['status']}/{row['window']} → {label}")
+        if row["missed"]:
+            line += " · 计入漏调"
+        print(line)
+        if row["disposition_reason"]:
+            print(f"    处置依据：{row['disposition_reason']}")
+        if row["disposition"] in ("not-executed", "failed", "skipped"):
+            print(f"    责任方：{row['responsible'] or '未记录'}；"
+                  f"解除条件：{row['resolution_condition'] or '未记录'}")
+        if row["window"] == "open":
+            print("    未终结：先 cognition-schedule --execute 或按策略处置，"
+                  "收口前必须有终态依据")
+    if audit["dangling"]:
+        print("警告：存在已关闭窗口但没有终态处置的义务；这是审计缺口，不能当作已解决。")
+    return 0
+
+
+def cmd_cognition_skip(args) -> int:
+    """显式终止一条认知义务：用户批准放弃 / 真实外部阻塞 / 被新计划取代。
+
+    这是 4.5 要求的合法终态入口：不能只把义务留在“非门禁、未执行”里，也不能
+    靠改 status 假装完成。必须写清来源、依据与解除条件。
+    """
+    path = _state_path(args)
+    kind = str(args.kind or "waiver")
+    mapping = {
+        "waiver": ("user-waived", "用户批准放弃"),
+        "external": ("external-block", "真实外部阻塞"),
+        "replaced": ("superseded-by-newer", "被新计划取代"),
+    }
+    source, label = mapping.get(kind, ("user-waived", "用户批准放弃"))
+    by = str(getattr(args, "by", "") or "").strip().lower()
+    if source == "user-waived":
+        if by != "user":
+            raise CLIError("用户批准放弃必须显式 --by user，并给出 --quote 用户原话。")
+        if not str(getattr(args, "quote", "") or "").strip():
+            raise CLIError("--by user 必须给出 --quote 用户授权放弃的原话。")
+    reason = str(args.reason or "").strip()
+    if not reason:
+        raise CLIError("必须说明依据（--reason）。")
+    state = G.load_state(path)
+    record = G.resolve_cognition_obligation(
+        state, args.obligation_id, status="skipped",
+        source=source, reason=f"{label}：{reason}")
+    if record is None:
+        raise CLIError(f"当前任务不存在该义务：{args.obligation_id}")
+    if source == "user-waived":
+        record["authorization_quote"] = str(args.quote or "")[:1000]
+        record["authorization_by"] = "user"
+    record["terminal"] = "skipped"
+    record["resolution_condition"] = reason[:500]
+    G.save_state(path, state)
+    disposition = SCH.obligation_disposition(record, SCH.schedule_view(state))
+    print(f"{args.obligation_id} → skipped（{source}）：{reason}")
+    print(f"处置：{disposition.get('kind')} · {disposition.get('reason')}")
+    print("说明：这是认知义务的终态记录，不是工程完成证据，也不改变 G1–G3。")
+    return 0
+
+
 def cmd_agent_policy(args) -> int:
     """只读调度建议：主代理默认执行，Explore/general-purpose 按需。
 
@@ -2107,7 +2486,9 @@ def cmd_closure(args) -> int:
             print("不登记采纳不影响收口：G1–G3 只由工程事实判定。")
     closure = G.close_task(path, by=args.by, cache=cache,
                            cognition_entry="closure-command",
-                           cognition_policy=_cognition_policy(args, state),
+                           # 任务级策略（不是本次命令的覆盖）：收口快照要解释
+                           # “为什么这个窗口没被自动执行”，不能把单次 off 写进去。
+                           cognition_policy=_task_policy(state),
                            cognition_auto=_auto_execution_allowed())
     quality = closure.get("quality") or {}
     print(f"任务已收口：verdict={closure['verdict']} "
@@ -2649,8 +3030,24 @@ def build_parser() -> argparse.ArgumentParser:
                    help="解除方；只有用户授权解除时用 user，并须给出 --quote")
     p.add_argument("--quote", default="",
                    help="用户授权解除的原话（--by user 时必填）")
+    p.add_argument("--from-input", default="",
+                   help="用收件箱里的用户输入（U<n>）作为授权原话并标记已处置")
     p.set_defaults(func=cmd_unblock)
     _add_cognition_policy(p, default=REGISTRATION_POLICY)
+
+    p = sub.add_parser("input", help="查看/处置用户回合输入（授权承接的唯一落地入口）")
+    p.add_argument("--state", required=True)
+    p.add_argument("--show", default="", help="显示某条输入的完整原文与处置记录")
+    p.add_argument("--consume", default="", help="处置某条输入（需配 --block-id 或 --auto）")
+    p.add_argument("--dismiss", default="", help="标记输入与任务无关/不构成授权")
+    p.add_argument("--block-id", action="append", default=[],
+                   help="这条输入满足的阻塞（可重复）；只解除显式指定的阻塞")
+    p.add_argument("--auto", action="store_true",
+                   help="仅当输入与唯一/多个未解除阻塞的条件词命中时自动选 block")
+    p.add_argument("--reason", default="", help="依据：用户原话满足了哪条 needs")
+    p.add_argument("--quote", default="", help="授权原话（默认为输入原文）")
+    p.add_argument("--by", default="user", choices=["user", "zcode", "agent"])
+    p.set_defaults(func=cmd_input)
 
     p = sub.add_parser("closure-check", help="检查 G1–G3")
     p.add_argument("--state", required=True)
@@ -2874,6 +3271,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_cognition_schedule)
     _add_cognition_policy(p)
 
+    p = sub.add_parser("cognition-policy",
+                       help="查看或设置任务级认知调度策略（持久化；单次 --cognition 只影响当次命令）")
+    p.add_argument("--state", required=True)
+    p.add_argument("--policy", default="",
+                   help=f"任务级策略：{' / '.join(SCH.POLICIES)}；省略时只查看")
+    p.add_argument("--reason", default="",
+                   help="变更原因（--policy 必填）：写入任务状态的审计记录")
+    p.add_argument("--by", default="zcode", help="操作者标记（默认 zcode）")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_cognition_policy)
+
     p = sub.add_parser("cognition-stats",
                        help="认知调度覆盖率：应调用/执行/复用/跳过/失败/漏调（显式分母）")
     p.add_argument("--state", default="", help="单个任务状态文件")
@@ -2881,6 +3289,23 @@ def build_parser() -> argparse.ArgumentParser:
                    help="工作区根目录：聚合 .copilot-tasks/*/state.json")
     p.add_argument("--json", action="store_true", help="输出 JSON（默认即为 JSON）")
     p.set_defaults(func=cmd_cognition_stats)
+
+    p = sub.add_parser("cognition-audit",
+                       help="只读审计每条认知义务的状态/终态/责任方/解除条件/漏调")
+    p.add_argument("--state", required=True)
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_cognition_audit)
+
+    p = sub.add_parser("cognition-skip",
+                       help="显式终止一条认知义务（用户放弃/外部阻塞/被新计划取代）")
+    p.add_argument("--state", required=True)
+    p.add_argument("--obligation-id", required=True)
+    p.add_argument("--kind", choices=["waiver", "external", "replaced"],
+                   default="waiver")
+    p.add_argument("--reason", required=True)
+    p.add_argument("--by", default="")
+    p.add_argument("--quote", default="")
+    p.set_defaults(func=cmd_cognition_skip)
 
     p = sub.add_parser("handoff", help="只读列出生效交付清单与未提交/未跟踪文件")
     p.add_argument("--state", default="", help="任务状态文件（可选）")
