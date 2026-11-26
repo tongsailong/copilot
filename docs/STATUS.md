@@ -6,8 +6,8 @@
 > 旧名只作事实与审计记录，不代表当前角色、模型、命令或默认配置。
 
 更新：2026-11-26 CST。本文件只记录现场可核实的事实；规划与未完成事项单独标注。
-当前版本：v9.12.0（认知分级与自动执行，工作区改动未提交）；v9.11.0（认知自动调度与调用率
-优化，已交付 `main`）；v9.10.0（认知命名收敛与
+当前版本：v9.12.0（认知分级与自动执行，已交付 `main` `109119f`）；v9.11.0（认知自动调度与
+调用率优化，已交付 `main`）；v9.10.0（认知命名收敛与
 SOL 退役，已交付 `main`）；v9.9.0（Astra 默认认知引擎迁移与调用效率优化，已交付 `main`）；
 v9.8.0 多模态设计认知、v9.7.1 及更早的治理记录见下。基线以本次交付的最终提交与运行时核验为准。
 任务 `sol-cognition-governance-p1p3-2026-11-23` 经用户授权一次性 `reopen` 后，已于
@@ -18,11 +18,18 @@ v9.8.0 多模态设计认知、v9.7.1 及更早的治理记录见下。基线以
 main 三方（本地 / `origin/main` / `ls-remote`）同为 `b83cf33`（0/0），工作区干净；
 运行时 `--check` 缺失 0 / 不同 0，27 个受管理文件源码与运行时 SHA-256 全部一致。
 
-## 认知分级与自动执行（2026-11-26，v9.12.0，工作区改动未提交）
+## 认知分级与自动执行（2026-11-26，v9.12.0，已交付 `main`）
 
 依据：用户《v9.12.0 认知调度分级与自动执行专项》。用户要求把 GPT 从“配置好的默认模型”
 变成重要工程任务在正确生命周期阶段**可靠且可证明**参与的默认协作方；不允许只增加关键词或
 调用数，不允许把 GPT 变成工程审批门禁。
+
+**正式交付（2026-11-26）**：提交 `513c091`（17 文件，+1548/−176，含新增
+`tests/test_cognition_tiers.py`）经 PR #20 squash 合并为 **`109119f`**；PR CI 的 Python 3.10 /
+3.12 各 **1100 项 OK**（36.3 s / 48.1 s）；`--verify-baseline` 通过；main 三方（本地 /
+`origin/main` / GitHub `commits/main`）同为 `109119f`（0/0），工作区干净、临时分支已删；
+运行时 `--apply` 0 写入（此前已同步）、`--check` 缺失 0 / 不同 0，27 个受管理文件源码与运行时
+SHA-256 全部一致，版本 `9.12.0`，未受管理的 `hm.txt` 保留。未建 Tag / Release。
 
 **本轮实现（源码 + 测试，运行时已同步）**：
 
@@ -95,13 +102,39 @@ invoked 1 / succeeded 1 / failed 0 / missed 0，`success_rate=1.0`、`missed_rat
 （`/tmp/copilot-v912-real-0ZdHJf`，3 次自动调用，digest `a4b081ac671ce542`），其结论只作
 过程事实保留；本表是补齐 dispatch 语义后的最终代码证据。
 
+**真实 ZCode GUI 集成验收（2026-11-26，运行时 v9.12.0，未手动调用认知）**：在真实 ZCode
+Desktop GUI 会话（工作区 `/media/vdb/projects/pedometer`，业务仓库全程只读、`git status`
+空）里跑两个任务。加载证据：会话注入的 Skill 描述为 v9.12.0，而当时 `HEAD:SKILL.md` 仍是
+v9.11.0，运行时 `SKILL.md` 的 SHA-256（`190c8384…`）与 v9.12.0 源码一致，mtime 早于首条命令。
+
+| 场景 | 任务 | 等级 | 义务 / 调用 | 结果 |
+|---|---|---|---|---|
+| A 规则一致性审计 | `rules-consistency-audit-2026-11-26`（`governance`，`risk=medium`，原始意图 169 字符 `explicit`） | T3 | SO1(A)/SO2(B)/SO3(E) 全 `auto-obligation` | CLOSED/pass，digest `c9eb4d2fd917c09d` |
+| B 行数统计 | `visual-identity-lines-2026-11-26`（`mechanical`） | T0 | 0 义务 / 0 调用 | CLOSED/pass，digest `99789d68b993c641` |
+
+- T3 三次自动请求（`gpt-6.2-astra` / provider `codex` / `high` / 零工具 / `attempts=1`）：
+  `SC317906da530fb002a6f54f29` A `start` 39,809 ms / 4,452 tok；
+  `SCa42aafc0ac9b86aadf7528a3` B `plan` 45,972 ms / 5,953 tok；
+  `SCa8c61f9bb5c4b016e10e6a3f` E `criterion`（最终验证就绪后）30,245 ms / 6,328 tok。
+  三者 `dispatch=auto-obligation`、`tier=T3`、`cognition_family` A/B/E，`opened_by` 分别为
+  `start` / `evidence`（`plan` 消费）/ `criterion`。`cognition-stats`：expected/triggered/
+  invoked/succeeded = 3/3/3/3，failed/reused/deferred/skipped/missed 全 0，`auto_invoked=3`、
+  `manual_invoked=0`；`by_mode` CONSULT 2（10,780 tok）/ PLAN 1（5,953 tok）/ REVIEW 0；
+  coverage 启动/规划/收口 各 1/1，事件分母 0。
+- T0 全流程（`start` → `plan` → `record` → `criterion` → `closure`）义务与调用恒 0，
+  `success_rate`/`missed_rate` 为 `null`（分母 0）；任务策略仍为 `auto`，即没有靠关闭认知
+  策略制造零调用。
+- 自动调度没有被手动命令冒充：纯记录 `evidence` 只物化 SO2 不付费，A/B/E 分别由 `start`、
+  `plan`、最后一条 `criterion` 消费；三次 GPT 输出都进入主代理现场上下文并改变了后续工作
+  （B 的三个追问改写了对 F2 的处置，E 的提醒把调度证据与审计结论分开表述）。
+
 **未验证 / 已知限制**：
 
-- 未在真实 GUI 会话跑完整 `drive` 端到端；自动执行、失败、退避、复用、锁与 E 时序由
-  `tests/test_cognition_tiers.py` 的夹具覆盖。
-- 本轮未 commit / push / 建 PR / Tag / Release（用户明确禁止），`main` 仍为 `a7d67e3`；
-  工作区 16 个修改文件 + 1 个未跟踪测试文件。T3 的 3 次调用发生在补齐统计维度之前，
-  请求路径其后未改；T1 的 1 次调用在最终树上完成，作为最终代码的真实请求证据。
+- `copilot_auto.py drive` 在真实 GUI 会话里仍未做端到端复跑；自动执行、失败、退避、复用、
+  锁与 E 时序由 `tests/test_cognition_tiers.py` 的夹具覆盖。
+- T3 的 3 次 `/tmp` 最终树调用发生在补齐统计维度之前，请求路径其后未改；T1 的 1 次调用在
+  最终树上完成，作为最终代码的真实请求证据；GUI 验收的 3 次调用在 v9.12.0 运行时上完成。
+- legacy 853 项只核了数量（`99F+47E+32S`），未再逐条 diff 集合；该套件不覆盖本次改动路径。
 - 认知仍是 advisory：T0–T3、覆盖率与采纳都不改变阶段、G1–G3、技术方案或授权。
 
 ## 认知自动调度与调用率优化（2026-11-25/26，v9.11.0，已交付 `main`）
