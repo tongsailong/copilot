@@ -12,12 +12,19 @@ Copilot 是运行于 ZCode 内的**轻量协作治理 Skill**：负责任务承�
 提供整体判断，用户明确要求时执行一次独立复核（REVIEW），均由 `gpt-6.2-astra` 零工具单轮调用
 完成。只有这一个认知模型：没有第二模型、没有 `--model` 切换、没有失败回退。
 
-当前基线 **v9.12.0**（认知分级与自动执行：T0–T3 按用户原始意图判定、A/B/E 窗口自动发出
-真实请求、材料按阶段组织、`cognition-stats` 重建）。与版本号无关、长期有效的关键约束：
+当前基线 **v9.13.1**（认知策略作用域分离：命令级 `--cognition` 只影响当次调用，任务级策略
+只能由 `start --cognition` / `cognition-policy` 持久化；v9.13.0 的自主执行闭环不变）。与
+版本号无关、长期有效的关键约束：
 
 - **执行与续跑**：任务必须经 `start` / `drive` 进入状态机；PARTIAL 不是终点，
   `continuation.required=true` 时必须继续派生/执行；阻塞按工作项成立，单项缺授权不冻结
   其余工作；`drive` 用 `claims`（短租约）避免并发重复，回填/阻塞自动释放。
+- **用户回合必须落地**：用户批准/授权/解除阻塞先由钩子写入任务目录 `.user-inputs.jsonl`
+  （`U<n>`，只记录不推断授权），再由 `input --consume U --block-id B --reason`（或
+  `unblock --from-input U`）写成 decision 并只解除对应阻塞；`--dismiss` 记录不构成任务
+  事实的原因。一条输入只解除它覆盖的阻塞，不猜授权、不改合同范围；`start` 对同 `task_id`
+  拒绝重复建任务。Stop 在存在可处置输入时优先 exit 2 要求处置，`drive` 在 BLOCKED 且可
+  处置时退出 10——控制流必须真的接通，不能只改提示词。
 - **认知是认知引擎，不是门禁**：生命周期为 A 启动 CONSULT → B 调查后 PLAN → C 升级型事件
   CONSULT → E 最终验证完成后的收口 CONSULT（D 普通里程碑复盘已退役，不得恢复）。等级为
   **T0–T3**，第一依据是**用户原始意图**（`start --intent` / `intent --text|--file`，默认不可
@@ -25,8 +32,12 @@ Copilot 是运行于 ZCode 内的**轻量协作治理 Skill**：负责任务承�
   判成 T0，`docs`/`mechanical` 涉及治理/规则/架构/协作时仍升级。窗口固定：T0 无、T1 仅 A、
   T2/T3 为 A/B/E；意图缺失或无法分类时至少 T1。`cognition_schedule.py` 把窗口物化为义务，
   每条命令最多 1 个义务 / 1 次请求（`--cognition auto|advise|off`，无其他别名）。
-  策略**随任务生效**：命令行显式 > 环境变量 `COPILOT_COGNITION` > 任务策略快照 > 命令默认；
-  `start` 记录的默认 `auto` 对整条任务有效。**调度点**为生命周期命令（`start`/`plan`/`record`/
+  **策略有两个作用域，不能互相写回**：命令行 `--cognition` 或环境变量 `COPILOT_COGNITION`
+  只决定**本次调用**的有效策略（覆盖只记入 `policy_overrides` 审计环），**绝不**写任务级
+  策略、快照或后续 A/B/C/E 调度；任务级策略只由 `start --cognition` 与
+  `cognition-policy --policy … --reason …`（持久化：操作者/时间/原值/原因，写
+  `state["cognition_policy"]` 与历史）写入。求值优先级：命令行显式 > 环境变量 > 任务级策略
+  > （历史任务）周期快照 > 命令默认。**调度点**为生命周期命令（`start`/`plan`/`record`/
   `rerun`/`criterion`/`unblock`/`reopen`/`closure`/`drive`）：省略 `--cognition` 时按任务策略
   **自动发出真实请求**；纯记录命令（`judgment`/`evidence`/`report`/`accept`/`decide`/`block`/
   `finding`/`contract`）只物化窗口并打印命令，不隐式付费，显式 `--cognition auto` 才执行。
@@ -39,7 +50,11 @@ Copilot 是运行于 ZCode 内的**轻量协作治理 Skill**：负责任务承�
   延迟口径。
   义务窗口关闭时写 `disposition`：`not-executed` 用**窗口打开时**的策略
   （`policy_at_open`；历史义务按周期策略快照的变更历史回推，无可证明快照记 `unknown`），
-  不用当前配置倒推；`cycle` = 1 + 重开次数，窗口比较不跨周期追溯。`cognition-accept` 只记录采纳
+  不用当前配置倒推；`cycle` = 1 + 重开次数，窗口比较不跨周期追溯。义务终态须可审计：
+  关闭仍 due 记 `not-executed` + `missed` + `finished_at` + `responsible` +
+  `resolution_condition`，`cognition-audit` 只读列出、`cognition-skip` 只登记
+  waiver/external/replaced 处置；PASS、G1–G3 与 `cognition-accept` 都不改写义务终态。
+  `cognition-accept` 只记录采纳
   事实，**不因代码已改、测试通过或任务 PASS 推断采纳**。CONSULT / PLAN 失败只登记并降级
   （退出码 0）；REVIEW 只在用户明确要求时执行。认知不进入 Finding 台账，不影响阶段与 G1–G3。
 - **收口顺序**：最终工程验证（`closure_readiness` 是 E 窗口与收口的唯一准入）→ 收口 CONSULT
@@ -48,7 +63,8 @@ Copilot 是运行于 ZCode 内的**轻量协作治理 Skill**：负责任务承�
   `native_review_retired`。
 - **上下文与恢复**：只读 Context Engine（`resolve`/`recall`/`pack`/`capture`）衔接原生
   Memory、Vault 与工程现场，零模型调用、不写知识库；SessionStart 只读快照与 UserPromptSubmit
-  只读提醒都不写任务状态，异常一律 exit 0。
+  只读提醒都不改写 `state.json`（用户输入只追加到 `.user-inputs.jsonl`），异常一律 exit 0；
+  `state.next_step` 是跨回合与 xmc=3 之后的唯一下一步事实来源。
 - **唯一源码**：本仓库是唯一源码。`~/.zcode/skills/copilot` 是构建产物，只能由
   `scripts-sync/sync_runtime.py` 单向下发，不得直接编辑。旧 Reviewer 全局 Profile 已退役；
   工作区 `.zcode/agents/independent-readonly.md` 是通用只读能力载体（只声明宿主权限，不定义

@@ -123,8 +123,10 @@
 
 1. 读取状态 → `evaluate`；
 2. CLOSED → 打印状态，退出 0；
-3. BLOCKED → 打印原因与 `needs`；若 `continuation.required` 为真（口径不一致）抛出内部
-   错误，否则退出 11；
+3. BLOCKED → 打印原因与 `needs`；若存在**可处置的用户输入**（`copilot_inbox.actionable`），
+   逐条打印 `U<n>`、关联阻塞与 `input --consume|--dismiss` 命令，写入 `next_step`，退出 10
+   （把“用户已批准但状态没落地”变成必须处理的下一步）；否则若 `continuation.required`
+   为真（口径不一致）抛出内部错误，否则退出 11；
 4. PASS → 先查最终验证准入（`closure_readiness`）：有缺口就打印缺口并退出 10，既不执行
    E 也不收口；准入通过才按 §5 消费 family E 的收口认知窗口（`--cognition auto` 时真的执行一次
    CONSULT），再 `close_task`，退出 0；
@@ -147,12 +149,16 @@
 要求换路线而不是重复执行。
 
 **调度领取（`state.claims`）**：`drive` 在 RUNNING 阶段把本次交办写入短租约，记录
-`work_item_id`、`owner`（会话标识；无会话时为 `local`）、`claim_id`、`acquired`、
+`work_item_id`、`owner`（**父会话标识**；无会话时为 `local`）、`claim_id`、`acquired`、
 `expires_at`、`handoff_count`。默认 TTL 1800s，可用 `COPILOT_CLAIM_TTL` 调整（0 表示立即
 过期，便于测试与快速回收）。语义：
 
 - **不是执行证明**：领取只表示“已交给某个会话”；工作项终态仍由 `status`/`result`/证据决定。
-- **不重复交办**：其它会话的有效租约不会被抢占，`ready_actions` 对非领取方隐藏该项；
+- **归属统一到父会话**：`effective_owner` 只在状态目录没有父会话绑定时回落 `local`，
+  `sess_subagent_*` 等子代理会话不写绑定、不参与领取判定（`touch_session` 忽略子代理）。
+  这样主代理在 `drive` 中领取的工作项不会因为子代理会话或新会话的环境标识而对外隐藏
+  1800s；`claim_owner(state_path)` 供 CLI 与守卫共用同一口径。
+- **不重复交办**：其它父会话的有效租约不会被抢占，`ready_actions` 对非领取方隐藏该项；
   重试/再次 `drive` 可由同一领取方续租（`handoff_count` 递增）。
 - **不会永久锁死**：租约到期自动失效；`record` / `rerun` / 条件 `met` / `block` 会删除
   对应领取，进程崩溃最多等到 TTL 结束即可重新领取。
@@ -178,6 +184,31 @@ SessionStart（`startup|resume|compact`）对绑定当前会话且 `continuation
 （`python3 -B <runtime>/scripts/copilot_auto.py drive --state <绝对路径>`）、一次拦截只做
 一个最小可验证工作单元、结束前必须落盘（进展/证据/未完成项/原因）、不得把 PARTIAL 改写成
 BLOCKED/PASS 规避上限、以及新回合先 `status --json` 核实再继续。守卫不持久化计数器。
+
+**用户输入落地（`.user-inputs.jsonl`，v9.13.0）**：用户回合的原文由钩子确定性记录，
+再从状态侧处置——不依赖模型“记得”用户在上一条消息里批准了什么。
+
+- **写入**：Stop（`stop`）与 UserPromptSubmit（`user-prompt`）对**绑定当前会话**的任务追加
+  一条 `copilot-user-input/v1` 事件：`input_id`（`U1`…）、`at`、`session`、`source`
+  （`stop` / `user-prompt`）、`text`（≤4000 字符）、`task_id`、`actionable`、`disposition`
+  （未处置为 `pending`）。300 秒内相同文本去重；文件超过 512KB 或 `pending` 过多时压缩为
+  摘要并保留最近 40 条已处置记录。钩子只做记录，**不推断授权、不改状态、不解除阻塞**。
+- **处置**：`copilot_dispatch.py input --consume U1 --block-id B1 --reason ...` 写 decision
+  （`source=user`、`input_id`、`block_ids`、`authorization_quote`）并解除指定阻塞，同时把
+  事件标为 `consumed`；`--dismiss` 记录 `reason` 与 `dismissed_by`。`unblock --from-input`
+  是同一语义的捷径。
+- **强制**：Stop 在绑定任务存在可处置输入时先以 exit 2 输出 `[COPILOT 用户输入待处置]`
+  （U 编号、原文摘要、关联阻塞、consume/dismiss 命令），处置完成后才回到常规续跑判定；
+  `drive` 在 BLOCKED 且存在可处置输入时退出 10。`status`/`next`/`closure-check` 都列出
+  待处置输入与计数（非阻断）。
+- **不可处置即不打扰**：低信号文本（“继续看看”“嗯”）、已处置事件、CLOSED 任务不进入提醒；
+  判定由 `copilot_inbox.actionable` 统一给出，避免钩子与 CLI 口径分叉。
+
+**下一步持久化（`state.next_step`，v9.13.0）**：任何输出续跑判定的命令（`drive`、回填类、
+`input`、`unblock`）都把下一步写入状态（`copilot-next-step/v1`：`phase`/`action`/`required`/
+`reason`/`next_command`/`executable`/`derivable`/`pending_inputs`/`owner`/`session`/`at`）。
+只有内容变化才落盘，CLOSED 任务不写。跨回合、用满 xmc=3、进程重启或新会话恢复时，
+`SessionStart` 与 `status` 都读同一事实，而不是重新推断对话上下文。
 
 **单回合上限（`xmc=3`）**：ZCode 每回合最多接受 3 次 Stop 自动续跑（发行版硬编码，无配置项，
 钩子拿不到已用/剩余次数）；第 4 次及以后的退出码 2 被宿主忽略，`stop_hook_active` 只能说明
@@ -302,9 +333,9 @@ instance、`contract_sha256`、`level`、`status`、`window`。`status` 取值 `
   `not-executed`（关闭时仍未执行）、`unsettled`（`in_flight`：请求已发出但未落盘）。
   附 `disposition_reason` 与 `disposition_at`；已有处置不覆盖（只增不改），也不改变
   `status`、`window` 与 `missed` 口径。
-- **`due` 不等于强制调用**：`schedule.policy_snapshots[<cycle>]` 记录本周期实际生效的
-  `off` / `advise` / `auto` 与是否允许自动执行（由生命周期命令的 `--cognition` /
-  `COPILOT_COGNITION_AUTO` 写入）。`not-executed` 的理由引用这份快照；**没有快照的历史义务一律
+- **`due` 不等于强制调用**：`schedule.policy_snapshots[<cycle>]` 记录本周期**任务级**策略
+  （`off` / `advise` / `auto`）与是否允许自动执行（`COPILOT_COGNITION_AUTO`）。命令级
+  `--cognition` 只进 `policy_overrides`，不改变这里的事实。`not-executed` 的理由引用这份快照；**没有快照的历史义务一律
   记 `unknown`**，不拿当前配置倒推“当时为什么没调用”。
 - **未能调度要留痕**：条件成立但本次没能执行（认知锁被占用等）只累加 `deferrals` 与
   `last_deferral_reason`，义务仍保持 `due`；窗口关闭时这条事实现身在 `not-executed` 的
@@ -329,10 +360,18 @@ instance、`contract_sha256`、`level`、`status`、`window`。`status` 取值 `
 - **纯记录命令不隐式付费**：`judgment` / `evidence` / `report` / `accept` / `decide` /
   `block` / `finding` / `contract` 仍会物化窗口并打印可执行命令，但只有命令行显式
   `--cognition auto` 才真的调用模型；环境变量或任务策略的 `auto` 不使这些命令付费。
-- **策略随任务生效（v9.11.0）**：优先级为命令行显式 `--cognition` > 环境变量
-  `COPILOT_COGNITION` > 任务策略快照（`start` 写入，默认 `auto`，按周期回退读取）>
-  命令默认（生命周期命令 `auto`，其余 `advise`）。因此 `start` 记录后无需逐条命令重复
-  `--cognition auto`；`start --cognition off` 对整条任务（含 `drive`）持续生效。
+- **策略的两个作用域（v9.13.1）**：任务级策略活在 `state["cognition_policy"]`
+  （`{value, source, set_by, set_at, reason, previous}`），**只能**由 `start --cognition`
+  与 `cognition-policy --policy … --reason …` 写入；命令级策略来自 `--cognition` 或
+  `COPILOT_COGNITION`，只决定**当次调用**，不一致时追加一条 `policy_overrides`
+  （`value`/`task_policy`/`command`/`source`/`at`，环 20 条）。`sync()` 只把
+  **任务级**策略写周期快照与义务 `policy_at_open`；命令级覆盖永远不写快照。
+  求值顺序：命令行显式 > 环境变量 > 任务级策略 > 历史周期快照 > 命令默认（生命周期命令
+  `auto`，其余 `advise`）。v9.13.0 的缺陷正是一次 `evidence --cognition off` 把 `off` 写进
+  快照，从而静默整条任务的后续 A/B/C/E。
+- **任务级开关要走受控入口**：`cognition-policy`（`--policy` 省略时严格只读、不迁移历史
+  任务）要求 `--reason`，写入 `previous` 与历史事件 `cognition_policy_set`；收口后拒绝。
+  任务级 `off` 使窗口按策略关闭（`not-executed` + `missed=false`），命令级 `off` 不豁免漏调。
 - **上限 1 个义务 / 1 次请求 per 命令**：不存在每任务固定次数上限，也不自动重试；剩余
   窗口留给下一条命令（`continuation` 仍要求继续，因此驱动链会自然走到）。
 - `--cognition auto|advise|off`：`auto` 直接经既有认知通道执行到期义务；`advise` 只打印
@@ -422,6 +461,35 @@ triggered（条件成立）/ invoked（真正发起请求，只认带 `call_id` 
 不参与覆盖率分母，也不是门禁。义务同时记录 `opened_by`
 （`start` / `plan` / `record` / `drive` / `closure` …），便于定位是哪条生命周期命令
 开了窗口却没有走到执行。
+
+**义务终态与审计（v9.13.0）**：收口、漏调与“未解决”是三种不同事实，必须能分开查。
+
+- **字段**：每条义务记录 `obligation_id` / `family` / `event` / `stage` / `cycle` /
+  `status` / `window` / `opened_at` / `opened_by` / `closed_at` / `closed_reason` /
+  `finished_at` / `disposition` / `disposition_reason` / `disposition_basis` /
+  `policy_at_open` / `responsible` / `resolution_condition` / `skip_by` / `skip_reason` /
+  `call_id` / `failure` / `missed`。`finished_at` 在窗口关闭（`_mark_terminal`）或显式处置
+  （`resolve_cognition_obligation`）时写入，之前为空。
+- **关闭即终态**：窗口关闭时仍 `due`/`claimed` 的义务写
+  `disposition=not-executed` + `disposition_basis`（`window-closed`），
+  并补 `responsible`（默认 `zcode`）与 `resolution_condition`；这是**可审计的未执行**，
+  不是“已解决”，也不阻断收口或 G1–G3。
+- **漏调口径只看窗口打开时的策略**：`missed=true` 只在“窗口打开时策略允许自动执行
+  （`auto`）”时写入。窗口打开时策略已是 `off`（显式关闭自动认知，例如整条任务都用
+  `--cognition off`）时仍如实关闭窗口、写 `not-executed` 与 `disposition_basis`
+  （含“策略为 off，义务未被要求执行，不计漏调”），但 `missed=false`：调用方主动关闭
+  认知不是 agent 漏做，记漏调会污染 `missed_rate` 与收口报告。这些窗口仍会出现在收口
+  提醒（`cognition_schedule_warnings`）与 `cognition-audit` 里，不会从报告里消失。
+- **合法终态**：`completed` / `covered`（完成或复用）、`skipped/user-waived`（用户明确
+  放弃，`cognition-skip --kind waiver --by user --quote`）、`skipped/external-block`
+  （真实外部阻塞）、`skipped/superseded-by-newer` 或 `contract-amended`（被新计划/新合同
+  取代）、`failed`（失败已记录，仍可被后续有界调度重试，同一认知对象不重复付费）。
+- **不自动消解**：`PASS`、G1–G3 通过、工作项关闭、`cognition-accept` 都不改写义务终态；
+  `cognition-skip` 只登记处置事实，不写 `satisfied`。
+- **审计**：`cognition-audit --state S [--obligation-id O…] [--json]` 只读列字段并汇总
+  `total`/`open`/`unexecuted`/`dangling`/`missed`/`missing_audit`；`closure-check` 打印
+  未执行/漏调摘要（非阻断）。历史义务缺字段时按周期快照回推，回推不出记 `unknown`，
+  不伪造当时的策略。
 
 ## 6. 收口与重开
 

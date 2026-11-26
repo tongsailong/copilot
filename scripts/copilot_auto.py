@@ -63,6 +63,15 @@ def _state_path(args) -> str:
     return value
 
 
+def _pending_inputs(path: str) -> list[dict]:
+    """任务目录里未处置的用户输入（只读）；模块缺失时不阻断驱动。"""
+    try:
+        import copilot_inbox as INBOX
+        return INBOX.pending(path)
+    except Exception:  # noqa: BLE001 - 收件箱是增强能力，不是 drive 的前置
+        return []
+
+
 # ── 工作单 ─────────────────────────────────────────────────────────────────
 def work_order(state: dict, action: dict, state_path: str,
                next_eid: str = "E1") -> str:
@@ -125,6 +134,9 @@ def work_order(state: dict, action: dict, state_path: str,
     ]
     if field:
         lines.extend(["## 任务现场", *field, ""])
+    origin = str(action.get("origin") or "").strip()
+    if origin:
+        lines.extend(["## 交接来源", f"- 来源：{origin}（由运行时派生，不是用户新指令）", ""])
     lines.extend([
         "## 期望证据",
         str(action.get("expected_evidence") or "").strip(),
@@ -138,7 +150,14 @@ def work_order(state: dict, action: dict, state_path: str,
         f"--id {criterion_hint} --status met --evidence {next_eid}`"
         + (f"（本工作项还对应 {'、'.join(criterion_extra)}，分别执行同一命令）"
            if criterion_extra else ""),
-        "4. 继续推进：`copilot_auto.py drive --state ...`",
+        "4. 继续推进：`copilot_auto.py drive --state ...`（回填会返回续跑码 10；"
+        "必须再次 drive，不以工作单/报告为终点）",
+        "",
+        "## 交接约束",
+        "- 本工作项已写入调度领取（短租约）：不要重复派发同一项，也不要新建同义工作项。",
+        "- 失败或受阻时：`record --status failed` 让运行时派生替换路线，或 `block "
+        "--work-item ... --reason ... --needs ...` 只冻结本项；不要静默跳过。",
+        "- 完成后立即 `record` + `drive`；不得只输出“下一步计划”就结束回合。",
         "",
         "## 授权提醒",
         "工作单不是授权：不得越过用户原始授权；commit / push / 发布 / 部署 / 付费 / "
@@ -230,6 +249,10 @@ def _drive_cognition_step(path: str, args, *, gates_passed: bool = False,
 
 def drive(args) -> int:
     path = _state_path(args)
+    # 领取方必须是任务归属会话（子代理回落到父会话）：否则子代理领取的工作项
+    # 会以另一个身份隐藏 1800s，父会话的 Stop 守卫看到 wait/required=False，
+    # 回合就此结束——这正是“打印了 NEXT 却没人执行”的根因之一。
+    owner = G.effective_owner(path)
     # 单次驱动内工作区不会被本进程改写：代码快照与证据摘要只算一次，
     # 后续求值/派生/收口复用同一份，避免同一命令里重复扫描 git 工作区。
     cache: dict = {}
@@ -241,7 +264,7 @@ def drive(args) -> int:
     progress_start = G.progress_digest(G.load_state(path))
     for step in range(MAX_DRIVE_STEPS):
         state = G.load_state(path)
-        evaluation = G.evaluate(state, cache=cache)
+        evaluation = G.evaluate(state, cache=cache, owner=owner)
         phase = evaluation.get("phase")
         print(f"[{step}] {state.get('task_id')} → {phase}：{evaluation.get('reason')}")
         cognition_advice = evaluation.get("cognition") or {}
@@ -259,6 +282,29 @@ def drive(args) -> int:
             return EXIT_DONE
         if phase == "BLOCKED":
             print(G.render_status(state, evaluation, cache=cache))
+            # 用户可能刚好在这一回合补齐了授权：先把未处置的用户输入指出来，
+            # 让主代理用原话解除对应阻塞，而不是在“等用户”里结束回合。
+            pending_inputs = _pending_inputs(path)
+            actionable = [row for row in pending_inputs if row.get("actionable")]
+            for row in pending_inputs:
+                quote_text = str(row.get("text") or "").replace("\n", " ")
+                quote_text = quote_text[:200] + ("…" if len(quote_text) > 200 else "")
+                print(f"未处置用户输入 {row.get('input_id')}：{quote_text}")
+                print("  → copilot_dispatch.py input --state "
+                      f"{path} --consume {row.get('input_id')} "
+                      "--block-id <B...> --reason \"<依据>\"")
+                print("  → 与任务无关时：copilot_dispatch.py input --state "
+                      f"{path} --dismiss {row.get('input_id')} "
+                      "--reason \"<原因>\"")
+            G.persist_next_step(path, evaluation.get("continuation") or {},
+                                phase=phase,
+                                pending_inputs=[str(row.get("input_id") or "")
+                                                for row in pending_inputs])
+            if actionable:
+                # 用户刚给出可处置的输入：不能以“等用户”结束，必须先落地授权。
+                print("本回合有未处置的用户输入：先用原话解除对应阻塞（或 dismiss），"
+                      "再 drive；不要直接结束回合。")
+                return EXIT_EXECUTE
             # continuation() 对 BLOCKED 恒给出 required=False；若这里仍要求继续，
             # 说明求值口径不一致（例如阻塞范围标记错误），报错而不是空转到上限。
             if (evaluation.get("continuation") or {}).get("required"):
@@ -280,6 +326,9 @@ def drive(args) -> int:
                     print(f"- {blocker}")
                 print("先补齐上述验证缺口（必要测试的执行证据、条件核销、证据登记"
                       "或质量报告的用户接受），再重新 drive。")
+                G.persist_next_step(path,
+                                    evaluation.get("continuation") or {},
+                                    phase=phase)
                 return EXIT_EXECUTE
             # 这里必须消费调度，否则收口 CONSULT 在 drive 路径上永远不可达。
             step = _drive_cognition_step(path, args, gates_passed=True,
@@ -301,7 +350,18 @@ def drive(args) -> int:
                       f"--call-id {pending_acceptance['call_id']} "
                       "--status accepted|modified|rejected --rationale <依据>")
                 print("不登记采纳不影响收口：G1–G3 只由工程事实判定。")
-            closure = G.close_task(path, cache=cache, cognition_entry="drive")
+            # 收口快照要记录真实生效的**任务级**调度策略与自动执行事实，否则
+            # drive 路径收口的任务在审计里只能看到 unknown/默认值。命令级
+            # `--cognition off` 只是本次覆盖，不能写进任务级快照。
+            try:
+                D = _dispatch_module()
+                policy = D._task_policy(fresh)
+                auto_exec = D._auto_execution_allowed()
+            except Exception:  # noqa: BLE001 - 策略记录失败不阻断收口
+                policy, auto_exec = "", None
+            closure = G.close_task(path, cache=cache, cognition_entry="drive",
+                                   cognition_policy=policy,
+                                   cognition_auto=auto_exec)
             print(f"G1–G3 通过，任务已收口：verdict={closure.get('verdict')} "
                   f"iteration={closure['iteration_id']} by={closure['closed_by']}")
             quality = closure.get("quality") or {}
@@ -323,7 +383,7 @@ def drive(args) -> int:
                 if G.load_state(path).get("save_seq") != before_seq:
                     # 调度步可能已写入调用记录：重新读取，避免领取被 CAS 拒绝。
                     state = G.load_state(path)
-            ready = G.ready_actions(state)
+            ready = G.ready_actions(state, owner=owner)
             if not ready:
                 print("阶段为 RUNNING 但没有可领取工作项；重新求值。")
                 continue
@@ -349,7 +409,8 @@ def drive(args) -> int:
             # 调度领取落盘：同一工作项不会同时交给两个会话；租约到期自动失效，
             # 崩溃不会永久锁死工作。领取只是交办事实，不是执行完成。
             try:
-                claimed = G.claim_actions(state, [a["id"] for a in chosen])
+                claimed = G.claim_actions(state, [a["id"] for a in chosen],
+                                          owner=owner)
                 if claimed["claimed"]:
                     G.save_state(path, state)
             except G.GovernanceError as exc:
@@ -365,6 +426,9 @@ def drive(args) -> int:
             if claimed["busy"]:
                 print("未领取（其它会话持有有效租约）：" + "、".join(claimed["busy"]))
             _print_work_orders(state, chosen, path, dispatch_path)
+            G.persist_next_step(path, cont, phase=phase,
+                                pending_inputs=[str(row.get("input_id") or "")
+                                                for row in _pending_inputs(path)])
             return EXIT_EXECUTE
         # PARTIAL：本地派生下一步，不等待任何外部判断。
         cont = evaluation.get("continuation") or {}
@@ -372,6 +436,7 @@ def drive(args) -> int:
             # 唯一可能：工作项已被其它会话领取且没有其它可派生缺口。等待对方的
             # 回填或租约到期即可，这不是整体 BLOCKED，也不需要用户授权。
             print(f"等待其它会话回填：{cont.get('reason')}")
+            G.persist_next_step(path, cont, phase=phase)
             return EXIT_WAIT
         before = G.progress_digest(state)
         created = G.derive_work(state, cache=cache)
@@ -387,6 +452,9 @@ def drive(args) -> int:
                                        for a in created):
             print("警告：本次派生没有改变进展摘要；下一轮若重复，将记录替代方案要求。")
     state = G.load_state(path)
+    final_eval = G.evaluate(state, cache=cache, owner=owner)
+    G.persist_next_step(path, final_eval.get("continuation") or {},
+                        phase=str(final_eval.get("phase") or ""))
     if G.progress_digest(state) != progress_start:
         # 本次驱动确实推进了进展（派生/回填/条件核销），只是单进程步数用完：
         # 这是“继续”而不是错误，下一轮 drive 从新状态接着走。

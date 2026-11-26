@@ -1252,6 +1252,36 @@
     - **未验证**：GUI 新会话的真实 Astra 调用与 Provider 级退避隔离未在本轮重测（未改通道）；
       真实宿主 Stop 续跑未重跑（钩子未改）。
 
+### 认知策略作用域分离（v9.13.1，2026-11-26）
+
+- **决定**：认知策略分两个作用域，且不能互相写回。**任务级**策略活在
+  `state["cognition_policy"]`，只能由 `start --cognition` 与 `cognition-policy` 写入；
+  **命令级**策略来自 `--cognition` / `COPILOT_COGNITION`，只决定当次调用，差异只进
+  `policy_overrides` 审计环。求值顺序：命令行显式 > 环境变量 > 任务级策略 > 历史周期快照 >
+  命令默认。
+- **依据（缺陷）**：v9.13.0 里 `note_policy()` 把任意命令的有效策略写进
+  `policy_snapshots[<cycle>]`，`_task_policy()` 又从那里回读——一次
+  `evidence --cognition off` 会静默整条任务后续的 A/B/C/E。受控复现：`/tmp` 工作区下一条
+  命令直接继承 `off`；真实样本 `copilot-v9.13-autonomy-2026-11-26` 的 E 窗口因此记
+  `not-executed`。
+- **理由**：命令级开关是“这一次别花钱”的操作意图，不是政策变更；让一次随手覆盖改变整条
+  任务策略，等于让最便宜的入口拥有最贵的权力，且事后无法从记录里分辨“用户关掉了任务认知”
+  与“某条命令当时不想付钱”。分离后快照与 `policy_at_open` 只表达政策事实，漏调口径也
+  因此诚实：任务级 `off` 不误报漏调，任务级 `auto` 的一次性 `off` 也不豁免漏调。
+- **任务级入口**：`cognition-policy --policy <off|advise|auto> --reason <原因>` 必填原因，
+  写 `previous`、操作者、时间与历史事件 `cognition_policy_set`，收口后拒绝；省略 `--policy`
+  严格只读（不迁移历史任务、不补义务、不改 `state.json`）。
+- **兼容**：不追溯改写旧快照、旧调用记录与旧 `not-executed`；无 `cognition_policy` 的历史
+  任务只读回退到周期快照（`origin=legacy-snapshot`）；`sol_*` 状态键仍只读兼容。
+- **验证**：`tests/test_v913_policy_scope.py` 19 项 + 14 个受影响套件 445 项全绿；真实宿主
+  两次任务（`e2e-v913-ce` 4 次真实 Astra 调用含 C 与 E、`e2e-v913-off` 0 次调用）均
+  CLOSED/PASS；三份历史任务 `state.json` 只读前后哈希不变。详见 `docs/STATUS.md`。
+- **交付前补测（2026-11-26）**：全量活动测试 `tests/` 1 134 项全绿（102.7 s）；v9.13.1 运行时
+  下发后已由真实新会话完成加载与策略恢复验收（宿主实际注入上下文即 v9.13.1，详见
+  `docs/STATUS.md`「新会话加载与策略恢复验收」）。
+- **未验证**：`legacy/tests` 历史回归未跑（只验证 v5 历史契约）；业务项目侧未参与（本版本只改
+  Copilot 自身）。
+
 ## 建议（未采纳）
 
 > 以下为 v5 时期记录，保留原文；其中涉及 `call_gpt.py`、SOL 预算或远程 REVIEW 的建议
@@ -2377,3 +2407,49 @@
       squash 合并 `109119f`；CI Python 3.10 / 3.12 各 1100 项 OK；运行时 27 个受管理文件
       SHA-256 一致（`--check` 0/0，`--verify-baseline` 通过）；真实 ZCode GUI 验收 PASS
       （T3 任务 A/B/E 三次 `auto-obligation`，T0 任务 0 义务 0 调用）。未建 Tag / Release。
+
+86. **自主执行闭环与生命周期可靠性（2026-11-26，v9.13.0 工作区，用户任务）。**
+    - **用户回合必须成为状态事实（已确认）**：新增 `copilot_inbox.py` 与任务目录
+      `.user-inputs.jsonl`（`copilot-user-input/v1`，`U<n>`、300s 去重、512KB/40 条压缩），
+      Stop 与 UserPromptSubmit 只记录绑定会话的用户原文，**不解释、不推断授权**。处置入口
+      是 `copilot_dispatch.py input`：`--consume U --block-id B --reason` 写 decision
+      （`input_id` / `block_ids` / `authorization_quote`）并只解除指定阻塞，`--dismiss`
+      记录不构成任务事实的原因；`unblock --from-input` 是同一语义的捷径。一条输入只解除
+      它真正覆盖的阻塞，不改变合同范围；无法判断时不猜授权，只列候选并退出 2。
+    - **不重复建任务（已确认）**：`start` 在 `<workspace>/.copilot-tasks/*/state.json` 中
+      查到同 `task_id` 时拒绝创建并指向已有状态（`find_task_state`），避免用户回合被当作
+      新任务重开。
+    - **BLOCKED 下的决议登记（已确认）**：`decide` 与 `input --consume` 允许在 BLOCKED 下
+      写入（`add_decision(allow_blocked=True)`），但只记录事实，不自动解除任何阻塞；解除
+      仍须 `unblock`。这修掉了“用户已批准但没有合法落点”的死锁，同时保持最小授权边界。
+    - **控制流必须真的接通（已确认）**：`drive` 在 BLOCKED 且存在可处置输入时返回
+      `EXIT_CONTINUE=10` 并打印处置命令；Stop 在绑定任务存在可处置输入时以 exit 2 输出
+      `[COPILOT 用户输入待处置]`，处置完成后才恢复常规续跑。实现落在钩子与 CLI 控制流上，
+      不是提示词约定。
+    - **领取归属统一（已确认）**：`effective_owner` / `claim_owner` 统一以父会话为 owner，
+      `touch_session` 忽略 `sess_subagent_*`；`drive`、`next`、`unblock`、`input` 共用同一
+      owner，修掉“同一工作项对本会话隐藏 1800s”的假停顿。子代理仍可执行任务，但不改写
+      任务归属。
+    - **下一步持久化（已确认）**：`persist_next_step` 把续跑判定写入 `state.next_step`
+      （`copilot-next-step/v1`：phase/action/required/reason/next_command/executable/
+      derivable/pending_inputs/owner/session/at），只在实际变化时落盘，CLOSED 不写；跨回合、
+      xmc=3、进程重启与新会话都由同一事实恢复，不重新猜测对话上下文。
+    - **义务终态可审计（已确认）**：窗口关闭时仍 due 的义务写 `disposition=not-executed` +
+      `missed=true` + `disposition_basis=window-closed` + `finished_at`，并补
+      `responsible`（默认 `zcode`）与 `resolution_condition`；合法终态为 completed / covered
+      / user-waived / external-block / superseded-by-newer / contract-amended / failed。
+      新增只读 `cognition-audit`（字段 + `dangling`/`missed`/`missing_audit` 汇总）与
+      `cognition-skip`（waiver 必须 `--by user --quote`）；`PASS`、G1–G3、
+      `cognition-accept` 都不改写义务终态。`_policy_suffix` 不再把 `off` 渲染成
+      “允许自动执行”。
+    - **漏调口径只看窗口打开时的策略（已确认，真实宿主 E2E 暴露）**：`missed=true` 只在
+      窗口打开时策略允许自动执行（`auto`）时写入。全程 `--cognition off` 的任务里，窗口
+      关闭仍如实落 `not-executed` + `finished_at` + `disposition_basis`（写明“策略为 off，
+      义务未被要求执行，不计漏调”），但 `missed=false`：调用方主动关闭认知不是 agent 漏做，
+      计入 `missed_rate` 与收口报告会变成错误指控。这些窗口仍出现在收口提醒
+      （`cognition_schedule_warnings`）与 `cognition-audit` 里，不会被静默遗忘——
+      “是否执行”与“是否漏调”是两个事实。
+    - **不变量（已确认）**：ZCode 主代理仍是唯一工程执行与技术决策主体；认知仍为 advisory，
+      A/B/C/E 保留、D 退役；G1–G3 与 `closure_readiness` fail-closed；G4 永久退役；不新增
+      Reviewer、审批链、Provider、模型或常驻服务；失败不冻结工程；未新增人工轮次/Token 上限。
+      交付（提交/PR/发布）仍须用户单独授权。

@@ -490,6 +490,10 @@ def touch_session(state_path: str, *, session: str = "") -> str:
     sid = str(session or "").strip() or current_session_id()
     if not sid or not state_path:
         return ""
+    # 子代理会话不写任务归属：它完成任务后上下文即销毁，绑定只会让父会话的
+    # Stop 守卫失去对任务的强制续跑能力（v9.13 前的真实故障）。
+    if is_subagent_session(sid):
+        return ""
     target = os.path.abspath(state_path)
     directory = os.path.dirname(target)
     if not os.path.isdir(directory):
@@ -531,6 +535,40 @@ def touch_session(state_path: str, *, session: str = "") -> str:
     except OSError:
         return ""
     return path
+
+
+def persist_next_step(path: str, cont: dict, *, phase: str = "",
+                      pending_inputs: list[str] | None = None) -> dict:
+    """把“下一步是什么”写进 state，跨会话/宿主续跑上限后仍可恢复。
+
+    只记录事实（阶段、动作、原因、命令、可执行/可派生项、领取方），不是完成
+    证明；内容未变化时不写盘，避免每条命令都增加 save_seq。
+    """
+    state = load_state(path)
+    if bool((state.get("closure") or {}).get("closed")):
+        return {}
+    payload = {
+        "schema": "copilot-next-step/v1",
+        "phase": str(phase or cont.get("phase") or ""),
+        "action": str(cont.get("action") or ""),
+        "required": bool(cont.get("required")),
+        "reason": str(cont.get("reason") or "")[:500],
+        "next_command": str(cont.get("next_command") or ""),
+        "executable": [str(item) for item in cont.get("executable") or []],
+        "derivable": [str(item) for item in cont.get("derivable") or []],
+        "pending_inputs": [str(item) for item in (pending_inputs or [])],
+        "owner": effective_owner(path),
+        "session": current_session_id(),
+        "at": now_iso(),
+    }
+    old = state.get("next_step") if isinstance(state.get("next_step"), dict) else {}
+    keys = ("phase", "action", "required", "reason", "next_command",
+            "executable", "derivable", "pending_inputs")
+    if all(old.get(key) == payload.get(key) for key in keys):
+        return old
+    state["next_step"] = payload
+    save_state(path, state)
+    return payload
 
 
 def log_attempt(state_path: str, kind: str, code: str, message: str,
@@ -818,7 +856,7 @@ def start_state(path: str, goal: str, *, contract: str = "", criteria: object = 
                 contract_source: str = "", workspace: str = "",
                 test_policy: dict | None = None,
                 task_kind: str = "", triggers: object = None,
-                intent: str = "") -> dict:
+                intent: str = "", cognition_policy: str = "") -> dict:
     if os.path.exists(path):
         raise GovernanceError(f"任务状态已存在：{path}；续跑请直接使用，勿重建。")
     goal = (goal or "").strip()
@@ -858,6 +896,14 @@ def start_state(path: str, goal: str, *, contract: str = "", criteria: object = 
     if str(workspace or "").strip() and not os.path.isdir(workspace_value):
         raise GovernanceError(f"任务工作区不存在：{workspace_value}")
     intent_text = (intent or "").strip()
+    # 任务级认知策略：`start --cognition` 是任务策略的唯一创建入口（后续变更走
+    # `cognition-policy`）。省略时落默认 auto；非法值直接拒绝，不静默改写。
+    policy_value = SCH.normalize_policy(cognition_policy) or ""
+    if str(cognition_policy or "").strip() and not policy_value:
+        raise GovernanceError(
+            f"认知策略 {cognition_policy!r} 非法；只能是 "
+            f"{' / '.join(SCH.POLICIES)}。")
+    policy_value = policy_value or SCH.DEFAULT_POLICY
     state = _default_state()
     state.update({
         "task_id": task_id,
@@ -876,6 +922,14 @@ def start_state(path: str, goal: str, *, contract: str = "", criteria: object = 
         "workspace": workspace_value,
         "workspace_source": "start" if workspace_value else "",
         "contract_sha256": _contract_fingerprint(goal, contract, items, policy),
+        "cognition_policy": {
+            "value": policy_value,
+            "source": "start",
+            "set_by": "zcode",
+            "set_at": now_iso(),
+            "reason": "任务创建时声明的任务级认知调度策略（--cognition；省略为 auto）",
+            "previous": "",
+        },
     })
     state["contract"].update({
         "done_criteria_text": (contract or "").strip(),
@@ -927,6 +981,58 @@ def record_intent(path: str, intent: str, *, replace: bool = False) -> dict:
     })
     save_state(path, state)
     return state
+
+
+def set_cognition_policy(path: str, *, policy: str, reason: str = "",
+                         by: str = "zcode") -> dict:
+    """设置**任务级**认知调度策略（唯一受控入口，`cognition-policy` 命令使用）。
+
+    与命令级 `--cognition` 覆盖的区别：这里的结果会持久化，决定该任务后续所有
+    生命周期命令（A/B/C/E 窗口、drive、收口）的默认行为。因此每次变更都必须
+    说明原因，并记录操作者、时间、原策略与新策略；只读命令与普通回填命令都
+    不能改它。已收口任务拒绝设置（后续不再有生命周期窗口）。
+    """
+    value = SCH.normalize_policy(policy)
+    if not value:
+        raise GovernanceError(
+            f"认知策略 {policy!r} 非法；只能是 {' / '.join(SCH.POLICIES)}。")
+    reason_text = (reason or "").strip()
+    if not reason_text:
+        raise GovernanceError("设置任务级认知策略必须给出原因（--reason）。")
+    state = load_state(path)
+    _assert_open(state, "设置任务级认知策略")
+    record = SCH.task_policy_record(state)
+    previous = str(record.get("value") or "")
+    effective = {
+        "value": value,
+        "source": "cognition-policy",
+        "set_by": (by or "zcode").strip() or "zcode",
+        "set_at": now_iso(),
+        "reason": reason_text[:500],
+        "previous": previous,
+    }
+    state["cognition_policy"] = effective
+    _history(state, "cognition_policy_set", {
+        "task_id": state.get("task_id"),
+        "previous": previous,
+        "value": value,
+        "set_by": effective["set_by"],
+        "reason": effective["reason"],
+        "contract_sha256": state.get("contract_sha256"),
+    })
+    save_state(path, state)
+    return state
+
+
+def cognition_policy_view(state: dict) -> dict:
+    """任务级认知策略的只读视图（含来源；历史任务回退标记）。"""
+    record = SCH.task_policy_record(state)
+    if record.get("value"):
+        return {**record, "origin": "cognition_policy"}
+    fallback = SCH.task_policy_value(state)
+    return {"value": fallback, "source": "policy-snapshot" if fallback else "default",
+            "set_by": "", "set_at": "", "reason": "", "previous": "",
+            "origin": "legacy-snapshot" if fallback else "unset"}
 
 
 def _history(state: dict, event: str, detail: dict | None = None) -> None:
@@ -1501,9 +1607,96 @@ DEFAULT_CLAIM_TTL = 1800
 LOCAL_CLAIM_OWNER = "local"
 
 
-def claim_owner() -> str:
-    """当前领取方：会话标识；无会话标识（手工/测试）时用 local。"""
-    return current_session_id() or LOCAL_CLAIM_OWNER
+SUBAGENT_SESSION_PREFIXES = ("sess_subagent_", "sess_subagent-")
+
+
+def is_subagent_session(session: str = "") -> bool:
+    """宿主给子代理分配的临时会话标识（`sess_subagent_*`）。
+
+    子代理上下文是临时的：它可以用自己身份执行，但不能成为任务的长期归属方，
+    否则 Stop 守卫（按父会话判定）永远看不到子代理领取的工作项。
+    """
+    value = str(session or "").strip() or current_session_id()
+    return bool(value) and value.startswith(SUBAGENT_SESSION_PREFIXES)
+
+
+def bound_sessions(state_path: str = "") -> list[str]:
+    """任务目录 `session.json` 里记录的会话（最近的在最后）。只读。"""
+    if not state_path:
+        return []
+    path = os.path.join(os.path.dirname(os.path.abspath(state_path)),
+                        SESSION_BINDING_FILE)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            payload = json.load(fh)
+    except (OSError, ValueError):
+        return []
+    rows: list[str] = []
+    if isinstance(payload, dict):
+        for row in payload.get("sessions") or []:
+            if isinstance(row, dict) and str(row.get("session_id") or ""):
+                rows.append(str(row["session_id"]))
+        if not rows and str(payload.get("session") or ""):
+            rows.append(str(payload["session"]))
+    return rows
+
+
+def effective_owner(state_path: str = "") -> str:
+    """领取/续跑判定使用的归属方：优先父会话，绝不把临时子代理当成任务归属。
+
+    - 主会话：就是当前会话标识；
+    - 子代理：回落到任务已绑定的最近一个非子代理会话（父会话）；
+    - 都没有：保持原子代理标识或 local，至少不凭空冒充别的会话。
+    """
+    sid = current_session_id()
+    if sid and not is_subagent_session(sid):
+        return sid
+    for candidate in reversed(bound_sessions(state_path)):
+        if not is_subagent_session(candidate):
+            return candidate
+    return sid or LOCAL_CLAIM_OWNER
+
+
+def find_task_state(workspace: str, task_id: str) -> str:
+    """在 `<workspace>/.copilot-tasks/*/state.json` 中查找同 task_id 的任务。
+
+    返回已存在的状态文件路径（优先未收口的任务），不存在返回空串。
+    用于阻止“用户批准后新建一个同名任务，授权写进新状态而原任务仍 BLOCKED”。
+    """
+    target = str(task_id or "").strip()
+    if not target or not workspace:
+        return ""
+    root = os.path.join(os.path.abspath(workspace), ".copilot-tasks")
+    try:
+        names = sorted(os.listdir(root))
+    except OSError:
+        return ""
+    matches: list[tuple[bool, str]] = []
+    for name in names:
+        path = os.path.join(root, name, "state.json")
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, encoding="utf-8") as fh:
+                payload = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        if str(payload.get("task_id") or "") != target:
+            continue
+        closed = bool((payload.get("closure") or {}).get("closed"))
+        matches.append((closed, path))
+    if not matches:
+        return ""
+    matches.sort(key=lambda row: (row[0], row[1]))
+    return matches[0][1]
+
+
+def claim_owner(state_path: str = "") -> str:
+    """当前领取方：任务归属会话；无会话标识（手工/测试）时用 local。"""
+    return effective_owner(state_path) if state_path else (
+        current_session_id() or LOCAL_CLAIM_OWNER)
 
 
 def _claim_ttl() -> int:
@@ -1975,6 +2168,22 @@ def add_block(path: str, reason: str, needs: str,
         "resolved_by": None,
         "resolution": "",
     }
+    for existing in state.get("blocks") or []:
+        if existing.get("resolved_at"):
+            continue
+        if (str(existing.get("scope") or "") == block["scope"]
+                and sorted(str(x) for x in existing.get("work_items") or [])
+                == sorted(items)
+                and sorted(str(x) for x in existing.get("criteria") or [])
+                == sorted(criterion_ids)
+                and str(existing.get("reason") or "").strip() == reason
+                and str(existing.get("needs") or "").strip() == needs):
+            # 同一作用域、同一原因与同一所需条件的阻塞重复登记：返回已有记录，
+            # 不追加第二条（避免同一工作项出现“两条一样的阻塞”、解除时漏一条），
+            # 也不重写工作项状态。重复次数只作审计计数。
+            existing["duplicate_hits"] = int(existing.get("duplicate_hits") or 0) + 1
+            save_state(path, state)
+            return existing
     state.setdefault("blocks", []).append(block)
     now = now_iso()
     for aid in items:
@@ -1997,7 +2206,8 @@ def add_block(path: str, reason: str, needs: str,
 
 
 def resolve_block(path: str, reason: str, block_id: str = "", *,
-                  by: str = "zcode", quote: str = "") -> dict:
+                  by: str = "zcode", quote: str = "",
+                  input_id: str = "") -> dict:
     state = load_state(path)
     if bool((state.get("closure") or {}).get("closed")):
         raise GovernanceError("任务已收口（CLOSED），不能解除阻塞；请先 reopen。")
@@ -2039,6 +2249,9 @@ def resolve_block(path: str, reason: str, block_id: str = "", *,
             "caller-declared" if resolved_by == "user" else "")
         block["authorization_quote"] = quote[:MAX_REPORT_CHARS]
         block["resolution"] = reason[:MAX_REPORT_CHARS]
+        if input_id:
+            # 授权来源可回溯到收件箱里的原始用户输入（含时间/会话/原话摘要）。
+            block["authorization_input_id"] = str(input_id)
     ids = [str(b.get("block_id") or "") for b in target]
     # 项级阻塞解除后，被它冻结的工作项恢复可执行；这是「用户授权更新后对应
     # 工作项恢复」的唯一入口，不需要重新建工作项。
@@ -2050,7 +2263,11 @@ def resolve_block(path: str, reason: str, block_id: str = "", *,
                 action = _by_id(state, aid)
             except GovernanceError:
                 continue
-            if str(action.get("status") or "") != "blocked":
+            # 阻塞成员以 `blocks[].work_items` 为准，而不是工作项当前状态：
+            # `record` 允许在阻塞期间把状态改成 running/failed（审计需要），
+            # 若只恢复 status=="blocked" 的项，解除阻塞后它会永远不可执行。
+            status = str(action.get("status") or "")
+            if status in TERMINAL:
                 continue
             # 同一工作项可能叠加多条真实阻塞：只有全部解除才恢复可执行。
             # 只按 blocked_by 单值判定会在解除第一条时把它错误放行。
@@ -2061,6 +2278,14 @@ def resolve_block(path: str, reason: str, block_id: str = "", *,
                 action["blocked_by"] = remaining[0].get("block_id")
                 action["blocked_reason"] = remaining[0].get("reason") or ""
                 action["blocked_needs"] = remaining[0].get("needs") or ""
+                action["updated"] = now
+                continue
+            if status == "running" and active_claims(state).get(aid):
+                # 另一会话正在执行：不要把它重新排队造成重复执行；只清阻塞标记，
+                # 等执行方 record 后再由 continuation 判定。
+                action["blocked_by"] = None
+                action["blocked_reason"] = ""
+                action["blocked_needs"] = ""
                 action["updated"] = now
                 continue
             action["status"] = "pending"
@@ -2079,17 +2304,34 @@ def resolve_block(path: str, reason: str, block_id: str = "", *,
             "resolved_by": resolved_by, "reason": reason}
 
 
-def add_decision(path: str, text: str, *, source: str = "user") -> dict:
+def add_decision(path: str, text: str, *, source: str = "user",
+                 allow_blocked: bool = False, input_id: str = "",
+                 block_ids: list[str] | None = None,
+                 quote: str = "") -> dict:
+    """记录决策/授权事实；可选绑定一条用户输入与被解除的阻塞。
+
+    `allow_blocked=True` 用于“任务已阻塞、但用户正是在给出授权/决策”的场景：
+    决策记录本身不解除阻塞（解除必须显式走 `input --consume` / `unblock`），
+    但必须能写进原 task_id，否则用户批准只存在于对话里，恢复后无从核对。
+    """
     state = load_state(path)
-    _assert_open(state, "记录决策")
+    _assert_open(state, "记录决策", allow_blocked=allow_blocked)
     text = (text or "").strip()
     if not text:
         raise GovernanceError("决策文本不能为空。")
     entry = {"decision_id": f"D{len(state.get('decisions') or []) + 1}",
              "text": text[:MAX_REPORT_CHARS], "source": source,
              "at": now_iso()}
+    if input_id:
+        entry["input_id"] = str(input_id)
+    if block_ids:
+        entry["block_ids"] = [str(item) for item in block_ids if str(item or "")]
+    if quote:
+        entry["authorization_quote"] = quote[:MAX_REPORT_CHARS]
     state.setdefault("decisions", []).append(entry)
-    _history(state, "decision_recorded", {"source": source, "text": text[:200]})
+    _history(state, "decision_recorded", {"source": source, "text": text[:200],
+                                          "input_id": str(input_id or ""),
+                                          "block_ids": list(block_ids or [])})
     save_state(path, state)
     return entry
 
@@ -4781,6 +5023,17 @@ def record_cognition_call(path: str, call: dict, *, mode: str = "",
     # 已经付费得到的记录（台账事实优先于调度簿记）。
     if obligation_id:
         record["obligation_id"] = str(obligation_id)
+        # 调用与调度窗口的归属直接刻在调用记录上：义务在后续周期里可能被取代或
+        # 关闭，但“这次请求是为哪个任务、哪条窗口发的”必须能从调用记录本身读到
+        # （task_id / family / event / cycle），而不是事后遍历义务去猜。
+        window_row = SCH.find_obligation(state, obligation_id=str(obligation_id))
+        if isinstance(window_row, dict):
+            record["task_id"] = str(window_row.get("task_id")
+                                    or state.get("task_id") or "")
+            record["family"] = str(window_row.get("family") or "")
+            record["event"] = str(window_row.get("event") or "")
+            record["cycle"] = SCH.obligation_cycle(window_row)
+            record["window_opened_at"] = str(window_row.get("opened_at") or "")
         try:
             resolve_cognition_obligation(state, obligation_id, status="satisfied",
                                    source="executed", call_id=record["call_id"])
@@ -4789,7 +5042,11 @@ def record_cognition_call(path: str, call: dict, *, mode: str = "",
             record["obligation_link"] = "unresolved"
             record["obligation_link_note"] = str(exc)[:300]
         detail["obligation"] = {"id": str(obligation_id),
-                                "link": record["obligation_link"]}
+                                "link": record["obligation_link"],
+                                "task_id": record.get("task_id") or "",
+                                "family": record.get("family") or "",
+                                "event": record.get("event") or "",
+                                "cycle": record.get("cycle")}
     state.setdefault(COGNITION_CALLS_KEY, []).append(record)
     _history(state, "cognition_call_completed", detail)
     # 成功调用只证明**该模型**可用：只清除这个模型的退避窗口（错误分类各自
@@ -5953,6 +6210,12 @@ def cognition_schedule_warnings(state: dict) -> list[str]:
                if isinstance(item, dict) and item.get("window") == "open"
                and str(item.get("status") or "") in ("due", "claimed", "in_flight")]
     missed = [item for item in rows if isinstance(item, dict) and SCH.is_missed(item)]
+    # 策略关闭（off）下关闭的窗口不是漏调，但仍然要提醒：否则“认知没跑”这件事
+    # 会从收口报告里彻底消失（C6 要求未完成义务都留下可审计痕迹）。
+    policy_off = [item for item in rows
+                  if isinstance(item, dict) and item.get("window") == "closed"
+                  and str(item.get("disposition") or "") == "not-executed"
+                  and item.get("missed") is False]
     warnings: list[str] = []
     if pending:
         ids = ", ".join(str(item.get("obligation_id")) for item in pending[:6])
@@ -5963,6 +6226,11 @@ def cognition_schedule_warnings(state: dict) -> list[str]:
         ids = ", ".join(str(item.get("obligation_id")) for item in missed[:6])
         warnings.append(
             f"认知调度：已关闭但未执行的窗口 {len(missed)} 个（{ids}），计为漏调。")
+    if policy_off:
+        ids = ", ".join(str(item.get("obligation_id")) for item in policy_off[:6])
+        warnings.append(
+            f"认知调度：已关闭但未执行的窗口 {len(policy_off)} 个（{ids}）；"
+            "窗口打开时策略为 off（调度关闭），不计漏调，补做需重新开启策略。")
     return warnings
 
 
@@ -6067,6 +6335,9 @@ def close_task(path: str, *, by: str = "zcode-native", cognition_entry: str = ""
         if isinstance(iteration, dict) and not iteration.get("ended"):
             iteration["ended"] = state["closure"]["closed_at"]
             iteration["phase"] = "CLOSED"
+    # 收口后不应留下“下一步 required=true”的旧快照：它会与 CLOSED 自相矛盾，
+    # 也让恢复逻辑误以为还有工作。关闭事实本身由 closure 与 history 记录。
+    state.pop("next_step", None)
     save_state(path, state)
     return state["closure"]
 
@@ -6538,7 +6809,8 @@ def _reopened_without_progress(state: dict) -> bool:
     return True
 
 
-def _evaluate_core(state: dict, *, cache: dict | None = None) -> dict:
+def _evaluate_core(state: dict, *, cache: dict | None = None,
+                   owner: str = "") -> dict:
     """本地阶段求值；返回 phase、work、gate、next_commands 与说明。"""
     if (state.get("closure") or {}).get("closed") is True:
         return {
@@ -6566,7 +6838,7 @@ def _evaluate_core(state: dict, *, cache: dict | None = None) -> dict:
             ],
         }
 
-    ready = ready_actions(state)
+    ready = ready_actions(state, owner=owner or None)
     stalled = stalled_actions(state)
     criteria = _criteria_summary(state)
     contract = state.get("contract") or {}
@@ -6695,7 +6967,7 @@ def _dry_derive_ids(state: dict, *, cache: dict | None = None) -> list[str]:
 
 
 def continuation(state: dict, *, cache: dict | None = None,
-                 evaluation: dict | None = None) -> dict:
+                 evaluation: dict | None = None, owner: str = "") -> dict:
     """续跑判定（只读）：任务是否还有必须继续执行的下一步。
 
     `required=True` 表示本次回填/报告之后还有可执行动作（执行工作项、派生下一步
@@ -6704,7 +6976,8 @@ def continuation(state: dict, *, cache: dict | None = None,
 
     判定只使用本地状态，不调用任何模型。
     """
-    ev = evaluation if evaluation is not None else evaluate(state, cache=cache)
+    ev = evaluation if evaluation is not None else evaluate(state, cache=cache,
+                                                            owner=owner)
     phase = str(ev.get("phase") or "")
     base = {
         "phase": phase,
@@ -6758,7 +7031,7 @@ def continuation(state: dict, *, cache: dict | None = None,
         # 认知采纳不是收口前置：未登记 `cognition-accept` 也照常收口。需要登记时
         # 主代理可在收口前调用 cognition-accept（accepted/modified/rejected）。
         return base
-    ready = [str(a.get("id") or "") for a in ready_actions(state)]
+    ready = [str(a.get("id") or "") for a in ready_actions(state, owner=owner or None)]
     if ready:
         base.update({
             "required": True,
@@ -6769,7 +7042,7 @@ def continuation(state: dict, *, cache: dict | None = None,
         })
         return base
     # 其它会话的有效领取：先算出来，避免把“对方正在做”误判成本会话可派生。
-    mine = claim_owner()
+    mine = str(owner or "").strip() or claim_owner()
     actions = {str(a.get("id") or ""): a for a in _tracked_actions(state)}
     others = []
     for aid, claim in active_claims(state).items():
@@ -6856,21 +7129,28 @@ def sync_cognition_schedule(state: dict, *, closed: bool = False,
                       advice: dict | None = None,
                       now: str | None = None, policy: str = "",
                       auto_execution: bool | None = None,
-                      origin: str = "") -> dict:
+                      origin: str = "", task_policy: str = "",
+                      command_policy: str = "",
+                      command_source: str = "") -> dict:
     """把当前生命周期建议物化为调度义务（只改内存状态，调用方负责保存）。
 
     这是调度层的唯一写入口：义务的创建、刷新、复用满足、窗口关闭都在这里发生，
     其它命令通过它读取「当前应当执行哪一次调用」。函数不调用模型、不读写其它
-    文件，也不改变阶段与 G1–G3。`policy` / `auto_execution` 只记录当时的策略
-    事实（事后解释“为什么没有调用”），不推断历史、不影响任何状态。
+    文件，也不改变阶段与 G1–G3。
+
+    策略参数分两个作用域（v9.13.1）：`policy` / `task_policy` 是任务级策略，只有
+    它会写周期快照与义务 `policy_at_open`；`command_policy` 是本次命令的有效策略
+    （`--cognition` 或环境变量），只进 `policy_overrides` 审计环，绝不写回任务级。
     """
     moment = now or now_iso()
     advice = advice if isinstance(advice, dict) else cognition_advice_summary(state)
     schedule = SCH.ensure_schedule(state)
     is_closed = closed or bool((state.get("closure") or {}).get("closed"))
     changes = SCH.sync(schedule, state, advice, now=moment, closed=is_closed,
-                      policy=policy, auto_execution=auto_execution,
-                      origin=origin)
+                       policy=policy, auto_execution=auto_execution,
+                       origin=origin, task_policy=task_policy,
+                       command_policy=command_policy,
+                       command_source=command_source)
     if changes:
         _history(state, "cognition_schedule_sync", {
             "changes": changes,
@@ -6908,6 +7188,15 @@ def resolve_cognition_obligation(state: dict, obligation_id: str, *, status: str
             item["call_id"] = call_id
         if reason:
             item["failure" if status == "failed" else "result_note"] = reason[:1000]
+        if status == "skipped":
+            # 跳过必须有可归因来源：被新计划取代、用户批准放弃、真实外部阻塞。
+            # 只写 status=skipped 而不写 skip_by，事后无法区分“技术跳过”和
+            # “用户放弃”，等于把义务静默遗忘。
+            item["skip_by"] = source or "explicit"
+            item["skip_reason"] = reason[:1000] or "显式跳过"
+            item.setdefault("responsible", "zcode")
+            if reason:
+                item.setdefault("resolution_condition", reason[:500])
         if status == "failed":
             item["attempts"] = int(item.get("attempts") or 0) + 1
         # 结算即关闭窗口：已执行的义务不应在收口时被算成“仍未执行”。
@@ -6945,9 +7234,15 @@ def record_cognition_obligation_error(state: dict, obligation_id: str, reason: s
     raise GovernanceError(f"当前任务的调度义务中不存在：{target}")
 
 
-def evaluate(state: dict, *, cache: dict | None = None) -> dict:
-    """本地阶段求值；附带非阻断提醒（不影响 phase 与 G1–G3）。"""
-    result = _evaluate_core(state, cache=cache)
+def evaluate(state: dict, *, cache: dict | None = None,
+             owner: str = "") -> dict:
+    """本地阶段求值；附带非阻断提醒（不影响 phase 与 G1–G3）。
+
+    `owner` 是领取/续跑判定使用的归属方：Stop 守卫传入宿主 payload 的会话标识，
+    `drive` 传入任务归属会话（子代理回落到父会话），避免“领取方”与“判定方”
+    使用两个不同身份，把仍在执行的工作误判成别人的租约。
+    """
+    result = _evaluate_core(state, cache=cache, owner=owner)
     warnings = contract_source_warnings(state)
     if warnings:
         result["warnings"] = warnings
@@ -6991,7 +7286,8 @@ def evaluate(state: dict, *, cache: dict | None = None) -> dict:
                 "--status accepted|modified|rejected --note <实际做法与差异>"
                 f"（{len(pending_accepts)} 次已完成认知调用未回填，advisory 不阻断）")
     # 续跑判定：忽略它不会改变状态，但阶段报告与工作项回填必须据此继续。
-    result["continuation"] = continuation(state, cache=cache, evaluation=result)
+    result["continuation"] = continuation(state, cache=cache, evaluation=result,
+                                          owner=owner)
     return result
 
 

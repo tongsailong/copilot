@@ -58,6 +58,29 @@ POLICY_HISTORY_LIMIT = 50
 # 1 次请求，以及这条锁等待上限（不是请求本身的时长上限）。
 AUTO_LOCK_WAIT_S = 120.0
 
+# ── 认知调度策略：两个作用域，不能互相写回（v9.13.1） ────────────────────────
+# `auto`   自动：recommended 义务直接执行（会真实计费）
+# `advise` 建议：只给可直接粘贴的命令，不发起调用
+# `off`    禁用：只记录义务，不打印、不执行
+# 作用域规则（用户明确要求）：
+#   1. 命令行 `--cognition` / 环境变量 `COPILOT_COGNITION` 只决定**本次调用**的
+#      有效策略，绝不写任务级策略，也不影响后续 A/B/C/E 调度；
+#   2. 任务级策略只由显式入口（`start --cognition`、`cognition-policy`）持久化，
+#      存在 `state["cognition_policy"]`，记录操作者/时间/原值/原因；
+#   3. 未显式指定时继承任务级策略；任务级也没有记录（历史任务）才回退到周期快照，
+#      最后才用命令默认。
+POLICIES = ("off", "advise", "auto")
+POLICY_ALIASES = {
+    "auto": "auto", "on": "auto", "enable": "auto", "enabled": "auto",
+    "advise": "advise", "advisory": "advise", "suggest": "advise",
+    "off": "off", "disable": "off", "disabled": "off", "none": "off",
+}
+DEFAULT_POLICY = "auto"
+# 纯登记/报告/查询命令的默认：只物化义务并给建议，绝不隐式发起付费调用。
+REGISTRATION_POLICY = "advise"
+# 命令级覆盖审计环长度：只用于解释“某条命令为什么没有调用”，不是策略来源。
+POLICY_OVERRIDE_LIMIT = 20
+
 
 def _text(value: object) -> str:
     return str(value or "").strip()
@@ -248,8 +271,20 @@ def due_obligations(state: dict, *, recommended_only: bool = True) -> list[dict]
 
 
 def is_missed(obligation: dict) -> bool:
-    return (obligation.get("window") == "closed"
-            and _text(obligation.get("status")) in MISSED_STATUSES)
+    """窗口关闭且从未执行 = 漏调。
+
+    但“从未被要求执行”的窗口关闭不算漏调：任务级策略为 `off` 时义务仍会被物化
+    （用于审计窗口边界），关闭时按已持久化的 `missed=False` + `disposition=
+    not-executed` 记录，漏调率与收口报告不会把“按策略关闭”误报成 agent 漏做。
+    注意口径是**任务级**策略：单次命令的 `--cognition off` 覆盖不影响该判定。
+    """
+    if obligation.get("window") != "closed":
+        return False
+    if _text(obligation.get("status")) not in MISSED_STATUSES:
+        return False
+    if obligation.get("missed") is False:
+        return False
+    return _text(obligation.get("disposition")) not in ("skipped", "covered")
 
 
 def is_unresolved_in_flight(obligation: dict) -> bool:
@@ -292,11 +327,66 @@ def policy_snapshot(schedule: dict | None, cycle: int) -> dict:
     return dict(entry) if isinstance(entry, dict) else {}
 
 
+def normalize_policy(value: object) -> str:
+    """把用户输入归一为 `off` / `advise` / `auto`；未知值返回空串（不猜）。"""
+    return POLICY_ALIASES.get(_text(value).strip().lower(), "")
+
+
+def task_policy_record(state: dict | None) -> dict:
+    """任务级认知策略记录（`state["cognition_policy"]`）；没有时返回空 dict。
+
+    这是任务级策略的**唯一**权威来源：只有 `start --cognition` 与
+    `cognition-policy` 会写它，任何命令级 `--cognition` 覆盖都不写。历史任务没有
+    该字段时返回空 dict，由 `task_policy_value` 按周期快照回退（不迁移、不改写）。
+    """
+    if not isinstance(state, dict):
+        return {}
+    raw = state.get("cognition_policy")
+    if not isinstance(raw, dict):
+        return {}
+    value = normalize_policy(raw.get("value"))
+    if not value:
+        return {}
+    return {
+        "value": value,
+        "source": _text(raw.get("source")) or "unknown",
+        "set_by": _text(raw.get("set_by")) or "unknown",
+        "set_at": _text(raw.get("set_at")),
+        "reason": _text(raw.get("reason")),
+        "previous": normalize_policy(raw.get("previous")),
+    }
+
+
+def task_policy_value(state: dict | None) -> str:
+    """当前任务的有效任务级策略；都没有记录时返回空串（由命令默认决定）。
+
+    读取顺序：`state["cognition_policy"]` → 周期策略快照（历史任务兼容，取最近
+    一个周期里有值的快照）→ 空串。快照回退只服务于升级前创建的任务：升级后快照
+    只记录任务级策略，不再被单次命令覆盖污染，所以回退不会把单次 `off` 当成任务
+    级策略。
+    """
+    record = task_policy_record(state)
+    if record.get("value"):
+        return str(record["value"])
+    if not isinstance(state, dict):
+        return ""
+    schedule = schedule_view(state)
+    if not isinstance(schedule, dict):
+        return ""
+    for cycle in range(current_cycle(state), 0, -1):
+        value = normalize_policy(policy_snapshot(schedule, cycle).get("value"))
+        if value:
+            return value
+    return ""
+
+
 def note_policy(schedule: dict, *, policy: str, auto_execution: bool | None,
                 now: str, cycle: int) -> bool:
-    """记录本周期的实际调度策略，供事后解释“为什么没有调用”。
+    """记录本周期的**任务级**调度策略，供事后解释“为什么没有调用”。
 
     只记录事实（策略、自动执行是否允许），不据此推断历史，也不改变任何义务状态。
+    这里的 `policy` 必须是任务级策略：命令级 `--cognition` 覆盖不能被写进来，
+    否则一次 `cognition off` 的证据登记就会把整条任务的后续窗口全部关掉。
     """
     value = _text(policy).lower()
     if not value:
@@ -322,6 +412,31 @@ def note_policy(schedule: dict, *, policy: str, auto_execution: bool | None,
     history.append({"value": value, "auto_execution": auto, "at": now})
     entry["history"] = history[-POLICY_HISTORY_LIMIT:]
     store[key] = entry
+    return True
+
+
+def note_policy_override(schedule: dict, *, value: str, task_policy: str,
+                         command: str, source: str, now: str) -> bool:
+    """记录一次**命令级**策略覆盖（只读审计事实，不改变任何策略来源）。
+
+    单次 `--cognition off` 必须能在事后被解释清楚（哪条命令、什么值、当时任务级
+    策略是什么），但它不是任务级策略的一部分：这里只追加到独立的
+    `policy_overrides` 环，绝不写入 `policy_snapshots`，也不参与 `_task_policy`
+    的读取顺序。
+    """
+    normalized = normalize_policy(value)
+    if not normalized:
+        return False
+    store = schedule.get("policy_overrides")
+    rows = list(store) if isinstance(store, list) else []
+    rows.append({
+        "value": normalized,
+        "task_policy": normalize_policy(task_policy) or "unknown",
+        "command": _text(command),
+        "source": _text(source) or "command",
+        "at": now,
+    })
+    schedule["policy_overrides"] = rows[-POLICY_OVERRIDE_LIMIT:]
     return True
 
 
@@ -376,10 +491,23 @@ def _policy_at_open(obligation: dict, schedule: dict | None) -> dict:
 
 
 def _policy_suffix(policy: dict) -> str:
-    """策略值的可读后缀：明确写“允许/不自动执行”，避免只凭 auto 猜测。"""
-    if policy.get("auto_execution") is True:
+    """策略值的可读后缀：按策略值本身说明是否会自动执行。
+
+    早期实现只看 `auto_execution`，于是 `off` 也会渲染成“（允许自动执行）”，
+    与本意相反。这里以 value 为准，auto_execution 只用于区分 auto 是否被临时禁用。
+    """
+    value = _text(policy.get("value"))
+    auto = policy.get("auto_execution")
+    if value == "off":
+        return "（调度关闭，不会自动执行）"
+    if value == "advise":
+        return "（仅建议，不自动执行）"
+    if value == "auto":
+        return "（允许自动执行）" if auto is not False \
+            else "（auto，但本次自动执行被禁用）"
+    if auto is True:
         return "（允许自动执行）"
-    if policy.get("auto_execution") is False:
+    if auto is False:
         return "（不自动执行）"
     return ""
 
@@ -407,9 +535,9 @@ def _disposition_facts(obligation: dict, schedule: dict | None) -> tuple[str, st
             return "covered", reason or "收口综合判断已覆盖该窗口的认知对象"
         return "skipped", reason or f"显式跳过（{closed_reason}）"
     if status in MISSED_STATUSES:
-        parts = [f"窗口关闭（{closed_reason}）时仍未执行"]
         opened = _policy_at_open(obligation, schedule)
         opened_value = _text(opened.get("value"))
+        parts = [f"窗口关闭（{closed_reason}）时仍未执行"]
         if opened_value:
             parts.append(f"当时调度策略={opened_value}" + _policy_suffix(opened))
         else:
@@ -459,7 +587,12 @@ def obligation_disposition(obligation: dict, schedule: dict | None = None) -> di
 
 def _stamp_disposition(obligation: dict, *, now: str,
                        schedule: dict | None = None) -> bool:
-    """窗口关闭时落一次终态处置；已写过的不覆盖（只增不改）。"""
+    """窗口关闭时落一次终态处置；已写过的不覆盖（只增不改）。
+
+    `not-executed` 也需要可审计的终态事实：责任方、解除条件、处置依据与
+    是否计入漏调。此前只写 kind/reason，收口报告无法回答“为什么没做、谁该做、
+    什么条件下才算解决”，于是未执行义务看起来像被静默遗忘。
+    """
     if _text(obligation.get("disposition")) in DISPOSITION_KINDS:
         return False
     if obligation.get("window") != "closed":
@@ -470,7 +603,36 @@ def _stamp_disposition(obligation: dict, *, now: str,
     obligation["disposition"] = kind
     obligation["disposition_reason"] = reason[:500]
     obligation["disposition_at"] = now
+    if kind == "not-executed":
+        obligation["terminal"] = "window-closed"
+        # 漏调口径：只有“本应自动执行”的窗口关闭才算漏调。窗口打开时策略已是 off
+        # （显式关闭自动认知）时义务从未被要求执行，计入 missed 会把策略选择误报成
+        # agent 漏做，并污染 missed_rate 与收口报告。
+        opened_value = _text(_policy_at_open(obligation, schedule).get("value"))
+        obligation["missed"] = opened_value != "off"
+        obligation.setdefault("responsible", "zcode")
+        obligation.setdefault(
+            "resolution_condition",
+            "补做该窗口对应的认知判断，或在用户明确批准后放弃；"
+            "补做/放弃都要写成新的认知事实，不能只改状态")
+        obligation["disposition_basis"] = (
+            f"窗口关闭（{_text(obligation.get('closed_reason')) or 'closed'}）时"
+            f"仍未执行；策略={opened_value or 'unknown'}"
+            + ("；策略为 off，义务未被要求执行，不计漏调" if opened_value == "off" else ""))
+    elif kind == "skipped":
+        obligation["missed"] = False
+        obligation["terminal"] = "window-closed"
+        obligation["disposition_basis"] = (
+            f"窗口关闭（{_text(obligation.get('closed_reason')) or 'closed'}）时"
+            f"策略={_text(_policy_at_open(obligation, schedule).get('value')) or 'unknown'}；"
+            "按策略未要求执行")
     return True
+
+
+def _mark_terminal(obligation: dict, *, now: str) -> None:
+    """所有关闭路径都补齐 `finished_at`，避免只有部分 skip 路径有结束时间。"""
+    if not _text(obligation.get("finished_at")):
+        obligation["finished_at"] = now
 
 
 def settle(obligation: dict, *, status: str, now: str, reason: str = "",
@@ -482,6 +644,7 @@ def settle(obligation: dict, *, status: str, now: str, reason: str = "",
     结算同时写一次终态处置（`schedule` 只用于读取当时策略快照）。
     """
     obligation["status"] = status
+    _mark_terminal(obligation, now=now)
     if obligation.get("window") == "closed":
         _stamp_disposition(obligation, now=now, schedule=schedule)
         return
@@ -498,6 +661,7 @@ def _close(schedule: dict, obligation: dict, *, now: str, reason: str) -> None:
     obligation["window"] = "closed"
     obligation["closed_at"] = now
     obligation["closed_reason"] = reason
+    _mark_terminal(obligation, now=now)
     _stamp_disposition(obligation, now=now, schedule=schedule)
 
 
@@ -648,24 +812,45 @@ def _collapse_duplicate_windows(schedule: dict, *, now: str) -> list[str]:
 
 def sync(schedule: dict, state: dict, advice: dict, *, now: str,
          closed: bool = False, policy: str = "",
-         auto_execution: bool | None = None, origin: str = "") -> list[str]:
+         auto_execution: bool | None = None, origin: str = "",
+         task_policy: str = "", command_policy: str = "",
+         command_source: str = "") -> list[str]:
     """把当前建议物化为调度义务，并按已发生的事实关闭窗口。
 
     返回人类可读的变更说明（供状态历史/输出使用）。函数只改动传入的 schedule。
-    `policy` / `auto_execution` 只用于记录**当时的**调度策略事实：有了它，事后
-    才能区分“策略关闭所以没调用”与“应当调用但漏了”；没有它就记 unknown，绝不
-    用当前配置倒推。
+
+    策略分两个作用域，写入口不同：
+
+    - `policy` / `task_policy`：**任务级**策略（`task_policy` 优先，缺省回退到
+      `policy` 以兼容旧调用方）。只有它会写周期快照与义务的 `policy_at_open`；
+    - `command_policy` / `command_source`：**本次命令**的有效策略（可能来自
+      `--cognition` 或环境变量）。它只追加到 `policy_overrides` 审计环，绝不
+      写快照、绝不成为后续命令的默认。
+
+    单次 `cognition off` 只应影响本次命令是否执行义务，因此把覆盖写进任务级
+    快照会让整条任务后续的 A/B/C/E 全部静默（v9.13.0 的真实缺陷）。
+    `auto_execution` 记录“这次进程是否允许自动执行”，是某一时刻的观察事实。
     """
     changes: list[str] = []
     if not isinstance(schedule.get("obligations"), list):
         schedule["obligations"] = []
     cycle = current_cycle(state)
-    if note_policy(schedule, policy=policy, auto_execution=auto_execution,
+    task_value = _text(task_policy) or _text(policy)
+    if note_policy(schedule, policy=task_value, auto_execution=auto_execution,
                    now=now, cycle=cycle):
-        changes.append(f"认知调度策略（周期 {cycle}）："
-                       f"{_text(policy).lower()}"
+        changes.append(f"认知调度策略（周期 {cycle}，任务级）："
+                       f"{_text(task_value).lower()}"
                        + ("，允许自动执行" if auto_execution else
                           "，不自动执行" if auto_execution is False else ""))
+    override = normalize_policy(command_policy)
+    if override and override != normalize_policy(task_value):
+        if note_policy_override(schedule, value=override,
+                                task_policy=task_value,
+                                command=origin or _text(origin),
+                                source=command_source, now=now):
+            changes.append(
+                f"本次命令策略覆盖：{override}（只影响本次命令；任务级策略仍为 "
+                f"{normalize_policy(task_value) or 'unknown'}）")
     changes.extend(_expire_superseded(schedule, state, now=now))
     changes.extend(_collapse_duplicate_windows(schedule, now=now))
     action = _text(advice.get("action"))
@@ -772,12 +957,19 @@ def summary(state: dict) -> dict:
             dispositions[disposition["kind"]] += 1
             row["dispositions"][disposition["kind"]] += 1
     current = current_cycle(state)
+    record = task_policy_record(state)
     return {
         "schema": SCHEDULE_SCHEMA,
         "total": len(rows),
         "pending": len(pending),
         "missed": len(missed),
         "cycle": current,
+        # `task_policy` 是任务级策略的唯一权威口径；`policy` 是本周期的策略快照
+        # （历史任务只读兼容）。`command_overrides` 只统计命令级覆盖次数。
+        "task_policy": record.get("value") or "",
+        "task_policy_record": record,
+        "command_overrides": len(raw.get("policy_overrides") or [])
+        if isinstance(raw, dict) else 0,
         "policy": policy_snapshot(raw, current),
         "dispositions": dispositions,
         "by_cycle": [by_cycle[key] for key in sorted(by_cycle)],
@@ -800,6 +992,81 @@ def summary(state: dict) -> dict:
 
 
 # ── 可直接执行的命令 ──────────────────────────────────────────────────────
+def audit_rows(state: dict) -> list[dict]:
+    """逐条义务的只读审计视图：状态、终态处置、责任方、解除条件、漏调口径。
+
+    用于回答“这条未执行义务为什么没做、谁该做、什么条件下才算解决”。
+    只读：不补写任何历史行；缺失的终态事实按窗口事实现算。
+    """
+    raw = schedule_raw(state)
+    rows: list[dict] = []
+    for item in obligations(state):
+        if not isinstance(item, dict):
+            continue
+        disposition = obligation_disposition(item, raw)
+        opened = _policy_at_open(item, raw)
+        # 历史行没有持久化责任方/解除条件时按窗口事实现算（只读），保证 SO6 这类
+        # 旧义务也能回答“为什么没做、谁该做、什么条件下才算解决”。
+        responsible = _text(item.get("responsible"))
+        resolution = _text(item.get("resolution_condition"))
+        if disposition.get("kind") == "not-executed":
+            responsible = responsible or "zcode"
+            resolution = resolution or (
+                "补做该窗口对应的认知判断，或在用户明确批准后放弃；"
+                "补做/放弃都要写成新的认知事实，不能只改状态")
+        rows.append({
+            "obligation_id": _text(item.get("obligation_id")),
+            "family": _text(item.get("family")),
+            "event": _text(item.get("event")),
+            "stage": _text(item.get("stage")),
+            "cycle": obligation_cycle(item),
+            "mode": _text(item.get("mode")),
+            "level": _text(item.get("level")),
+            "status": _text(item.get("status")),
+            "window": _text(item.get("window")),
+            "opened_at": _text(item.get("opened_at")),
+            "opened_by": _text(item.get("opened_by")),
+            "closed_at": _text(item.get("closed_at")),
+            "closed_reason": _text(item.get("closed_reason")),
+            "finished_at": _text(item.get("finished_at")),
+            "disposition": disposition.get("kind") or "",
+            "disposition_reason": disposition.get("reason") or "",
+            "disposition_basis": _text(item.get("disposition_basis")),
+            "policy_at_open": _text(opened.get("value")) or "unknown",
+            "policy_auto_execution": opened.get("auto_execution"),
+            "responsible": responsible,
+            "resolution_condition": resolution,
+            "missed": is_missed(item),
+            "call_id": _text(item.get("call_id")),
+            "failure": _text(item.get("failure")),
+            "skip_by": _text(item.get("skip_by")),
+            "skip_reason": _text(item.get("skip_reason")),
+        })
+    return rows
+
+
+def audit_summary(state: dict) -> dict:
+    """审计汇总：未执行/未终结/漏调各多少，并给出责任与解除条件覆盖缺口。"""
+    rows = audit_rows(state)
+    unexecuted = [row for row in rows if row["disposition"] == "not-executed"]
+    open_rows = [row for row in rows if row["window"] == "open"]
+    dangling = [row for row in rows
+                if row["window"] == "closed" and not row["disposition"]]
+    missing_audit = [row for row in rows
+                     if row["disposition"] == "not-executed"
+                     and not (row["responsible"] and row["resolution_condition"])]
+    return {
+        "schema": "copilot-cognition-audit/v1",
+        "total": len(rows),
+        "open": len(open_rows),
+        "unexecuted": len(unexecuted),
+        "dangling": len(dangling),
+        "missing_audit": len(missing_audit),
+        "missed": len([row for row in rows if row["missed"]]),
+        "rows": rows,
+    }
+
+
 def dispatch_path() -> str:
     return os.path.join(os.path.dirname(os.path.abspath(__file__)),
                         "copilot_dispatch.py")

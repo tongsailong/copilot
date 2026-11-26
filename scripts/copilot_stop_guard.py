@@ -447,8 +447,38 @@ def _open_blocks(state: dict) -> list[dict]:
     return out
 
 
+def _inbox():
+    try:
+        import copilot_inbox  # 同目录模块；无网络依赖
+        return copilot_inbox
+    except Exception:  # noqa: BLE001 - 收件箱可选，缺失不阻断钩子
+        return None
+
+
+def _pending_inputs(task_dir: str, state: dict) -> list[dict]:
+    """未处置的用户输入（只读投影）；模块缺失或解析失败返回空列表。"""
+    path = os.path.join(task_dir, "state.json")
+    module = _inbox()
+    if module is None:
+        return []
+    try:
+        if not os.path.isfile(module.inbox_path(path)):
+            return []
+        rows = module.pending(path)
+    except Exception:  # noqa: BLE001 - 钩子高频路径不得因收件箱异常 fail-closed
+        return []
+    return [{
+        "input_id": str(row.get("input_id") or ""),
+        "at": str(row.get("at") or ""),
+        "quote": module.quote(str(row.get("text") or ""), 200),
+        "actionable": bool(row.get("actionable")),
+        "session": str(row.get("session") or ""),
+    } for row in rows if str(row.get("input_id") or "")]
+
+
 def collect(root: str, *, session: str = "",
-            include_open: bool = False) -> tuple[list[dict], list[dict]]:
+            include_open: bool = False, include_pending: bool = False,
+            ) -> tuple[list[dict], list[dict]]:
     """返回 (要求续跑的任务, 异常)。
 
     任务是否“要求续跑”只由 Copilot 的本地判定决定；这里的会话绑定只决定
@@ -456,6 +486,10 @@ def collect(root: str, *, session: str = "",
 
     `include_open=True` 额外纳入“没有续跑动作但仍有未解除阻塞”的任务（BLOCKED），
     用于恢复提示与用户回合提示；不改变 Stop 的拦截口径。
+
+    `include_pending=True` 额外纳入“没有续跑动作但有未处置且可处置的用户输入”的
+    任务：Stop 必须先把用户刚给出的授权/决策落地（`input --consume/--dismiss`），
+    否则“用户说继续”会在回合结束时被静默丢弃。
     """
     rows: list[dict] = []
     anomalies: list[dict] = []
@@ -518,15 +552,24 @@ def collect(root: str, *, session: str = "",
             continue
         if not cont.get("required"):
             # BLOCKED 只在显式要求提示时纳入：Stop 不能因“等用户授权”反复续跑。
+            # 但如果本任务有未处置的用户输入（用户刚给出批准/条件），必须纳入：
+            # 这正是“用户说继续，回合却直接结束”的断点。
             blocks = _open_blocks(state)
-            if not include_open or not blocks:
+            pending_inputs = _pending_inputs(task_dir, state)
+            actionable_inputs = [row for row in pending_inputs if row.get("actionable")]
+            if not ((include_open and blocks)
+                    or (include_pending and actionable_inputs)):
                 continue
+        else:
+            pending_inputs = _pending_inputs(task_dir, state)
+            actionable_inputs = [row for row in pending_inputs if row.get("actionable")]
         rows.append({
             "task_id": str(state.get("task_id") or name),
             "task_dir": task_dir,
             "state_path": path,
             "phase": cont.get("phase"),
             "action": cont.get("action"),
+            "required": bool(cont.get("required")),
             "reason": cont.get("reason") or "",
             "executable": list(cont.get("executable") or []),
             "derivable": list(cont.get("derivable") or []),
@@ -534,6 +577,8 @@ def collect(root: str, *, session: str = "",
             "unattributed_criteria": list(cont.get("unattributed_criteria") or []),
             "unmet_criteria": _unmet_criteria(state),
             "blocks": _open_blocks(state),
+            "pending_inputs": pending_inputs,
+            "actionable_inputs": actionable_inputs,
             "next_command": cont.get("next_command") or "",
             "updated": str(state.get("updated") or ""),
             "binding": binding,
@@ -558,6 +603,47 @@ def _resume_command(row: dict) -> str:
     script = os.path.join(HERE, "copilot_auto.py")
     return (f"python3 -B {shlex.quote(script)} drive --state "
             f"{shlex.quote(row['state_path'])}")
+
+
+def _input_commands(row: dict) -> list[str]:
+    """处置未决用户输入的可执行命令（consume / dismiss）。"""
+    dispatch = os.path.join(HERE, "copilot_dispatch.py")
+    base = f"python3 -B {shlex.quote(dispatch)} input --state {shlex.quote(row['state_path'])}"
+    lines: list[str] = []
+    for item in row.get("actionable_inputs") or []:
+        iid = item.get("input_id") or "U?"
+        lines.append(f"{base} --consume {iid} --block-id <B...> --reason \"<用户原话满足了哪条 needs>\"")
+        lines.append(f"{base} --dismiss {iid} --reason \"<与任务无关/不构成授权>\"")
+    return lines
+
+
+def _input_block_text(row: dict) -> str:
+    """Stop 拦截文本：用户输入尚未落地，先处置再续跑。
+
+    这是 v9.13 的核心修复。此前 BLOCKED 任务的 `continuation.required=False`，
+    用户批准后模型可以直接结束回合，授权随上下文一起丢失。现在把“未处置的用户
+    输入”本身作为拦截条件：要么用原话解除对应阻塞，要么显式标记与任务无关。
+    """
+    lines = [
+        f"[COPILOT 用户输入待处置] 任务 {row['task_id']} 有未处置的用户输入：",
+    ]
+    ids = []
+    for item in (row.get("actionable_inputs") or [])[:3]:
+        ids.append(item.get("input_id") or "")
+        lines.append(f"- {item.get('input_id') or 'U?'}（{item.get('at') or '-'}）："
+                     f"{item.get('quote') or ''}")
+    for block in (row.get("blocks") or [])[:3]:
+        scope = "、".join(block.get("work_items") or block.get("criteria") or []) or "任务级"
+        lines.append(f"- 待解除阻塞 {block.get('id') or '（未编号）'}（{scope}）："
+                     f"需要 {block.get('needs') or '未写明'}")
+    lines.append("- 必须用真实用户原话处置，不得推断授权：")
+    for command in _input_commands(row)[:4]:
+        lines.append("  " + command)
+    lines.append("- 处置完（阻塞解除、工作项恢复可执行）再跑 drive 继续；"
+                 "不要直接结束回合，也不要把“已理解”当成已执行。")
+    if row.get("blocked_items"):
+        lines.append("- 只解除被这条输入真正满足的阻塞；其它阻塞与工作项保持原状。")
+    return _fit_lines(lines, REASON_LIMIT, "- 处置后用 drive 继续。")
 
 
 def render(row: dict, *, total: int = 1, anomalies: list[dict] | None = None,
@@ -585,6 +671,11 @@ def render(row: dict, *, total: int = 1, anomalies: list[dict] | None = None,
         lines.append(f"- 阻塞 {block['id'] or '（未编号）'}（{scope}）："
                      f"{block['reason'] or '原因未记录'}；需要："
                      f"{block['needs'] or '未写明'}")
+    if row.get("actionable_inputs"):
+        lines.append("- 另有未处置的用户输入："
+                     + "、".join(str(item.get("input_id") or "")
+                                for item in row["actionable_inputs"])
+                     + "；若它满足某条阻塞的解除条件，先用 `input --consume` 落地再继续。")
     if row["next_command"]:
         lines.append("- 下一步命令：" + row["next_command"].replace(
             "<state>", row["state_path"]))
@@ -706,11 +797,19 @@ def _check() -> int:
     if os.path.exists(os.path.join(base, OFF_MARKER)):
         _log(0, root, note="marker-off", session=session)
         return 0
-    rows, anomalies = collect(root, session=session)
+    rows, anomalies = collect(root, session=session, include_pending=True)
 
     if session:
         enforced = [row for row in rows if row["binding"] in ("bound", "corrupt")]
-        if not enforced:
+        input_rows = [row for row in enforced if row.get("actionable_inputs")]
+        cont_rows = [row for row in enforced if row.get("required")]
+        if input_rows:
+            # 用户刚给出批准/授权/条件：先把原话落地，再判断是否续跑。这是把
+            # “用户说继续 → 回合结束 → 授权丢失”接通的机械环节。
+            _log(2, root, task_id=input_rows[0]["task_id"], session=session,
+                 note=f"input-pending:{len(input_rows)}")
+            return _block(_input_block_text(input_rows[0]))
+        if not cont_rows:
             # 没有本会话负责的续跑任务：不拦截。其它会话/旧任务的责任不转嫁给
             # 当前会话，否则旧任务会永久堵住工作区。
             if anomalies:
@@ -724,16 +823,22 @@ def _check() -> int:
                                             total=len(targets)))
             _log(0, root, note=f"out-of-scope:{len(rows)}", session=session)
             return 0
+        enforced = cont_rows
     else:
         # 手工调用或宿主未提供会话标识：无法判定归属。只有“恰好一个候选任务”时才
         # 安全回退；多个任务时不替任一会话选人——按“最近更新”选等于替别人的任务
         # 强制续跑，也不把别人的状态异常当成本会话的责任。
+        input_rows = [row for row in rows if row.get("actionable_inputs")]
         if len(rows) > 1:
             note = f"ambiguous-no-session:{len(rows)}:anomalies={len(anomalies)}"
             if anomalies:
                 # 不选任务，但状态异常本身无法归给某个会话，仍 fail-closed。
                 _log(2, root, note=note, session="")
                 return _block(_anomaly_reason(anomalies))
+            if len(input_rows) == 1:
+                _log(2, root, task_id=input_rows[0]["task_id"], session="",
+                     note="input-pending")
+                return _block(_input_block_text(input_rows[0]))
             _log(0, root, note=note, session="")
             return 0
         enforced = rows[:1]
@@ -743,6 +848,10 @@ def _check() -> int:
                 return _block(_anomaly_reason(anomalies))
             _log(0, root, note="no-continuation", session="")
             return 0
+        if enforced[0].get("actionable_inputs") and not enforced[0].get("required"):
+            _log(2, root, task_id=enforced[0]["task_id"], session="",
+                 note="input-pending")
+            return _block(_input_block_text(enforced[0]))
         _log(2, root, task_id=enforced[0]["task_id"], session="",
              note=f"{enforced[0]['phase']}/{enforced[0]['action']}"
                   f"/{enforced[0]['binding']}")
@@ -830,8 +939,12 @@ def _row_open_line(row: dict) -> str:
         parts.append("可执行 " + "、".join(row["executable"]))
     elif row["derivable"]:
         parts.append("可派生 " + "、".join(row["derivable"]))
-    elif not row["blocks"]:
+    elif not row["blocks"] and not row.get("actionable_inputs"):
         parts.append(row["reason"] or "仍有未完成工作")
+    if row.get("actionable_inputs"):
+        parts.append("待处置用户输入 "
+                     + "、".join(str(item.get("input_id") or "")
+                                for item in row["actionable_inputs"]))
     if row["blocks"]:
         parts.append("；".join(_block_line(block) for block in row["blocks"]))
     return f"- 任务 {row['task_id']} · 阶段 {row['phase']} · " + "｜".join(parts)
@@ -923,8 +1036,9 @@ def _user_prompt_text(rows: list[dict], anomalies: list[dict] | None = None,
         lines.append(f"- 另有 {len(anomalies)} 处任务状态读取异常；先按 status 的 fix 提示"
                      "处理，不得忽略，也不得伪造 PASS。")
     lines.append("本回合判断：用户这条消息补齐了某个阻塞的授权/决策/条件，或明确要求继续"
-                 " → 先用其原话登记解除（unblock --by user --quote \"<用户原话>\"，"
-                 "或补齐对应条件）再 drive 执行到下一个真实终点；否则不要恢复执行"
+                 " → 先用其原话登记解除（`input --consume <U> --block-id <B>`，"
+                 "或 `unblock --by user --quote \"<用户原话>\"`，或补齐对应条件）"
+                 "再 drive 执行到下一个真实终点；否则不要恢复执行"
                  "（本提示不是授权，也不要把“已理解”当成已执行）。")
     lines.append("继续前先 status --json 核对阶段、工作项与证据，不重复已完成工作。")
     lines.append(POINTER_CLOSE)
@@ -945,6 +1059,9 @@ def _session_start_text(rows: list[dict], anomalies: list[dict] | None = None,
             lines.append("  未闭合条件：" + "、".join(row["unmet_criteria"]))
         for block in row.get("blocks") or []:
             lines.append("  " + _block_line(block))
+        for item in row.get("actionable_inputs") or []:
+            lines.append(f"  待处置用户输入 {item.get('input_id') or 'U?'}："
+                         f"{item.get('quote') or ''}（先 input --consume/--dismiss）")
         if row["next_command"]:
             lines.append("  下一步命令：" + row["next_command"].replace(
                 "<state>", row["state_path"]))
@@ -1026,7 +1143,7 @@ def cmd_session_start() -> int:
         if os.path.exists(os.path.join(root, TASKS_DIR, OFF_MARKER)):
             _log(0, root, note="session-start-marker-off", session=session)
             return 0
-        rows, anomalies = collect(root, session=session)
+        rows, anomalies = collect(root, session=session, include_pending=True)
         bound = [row for row in rows if row["binding"] == "bound"]
         # 只披露本会话任务目录的异常：其它任务的异常不属于本会话，不应诱导它越界处理。
         # 本会话任务自己的状态/绑定损坏时仍要提示修复——静默跳过会让会话以为没有
@@ -1054,7 +1171,8 @@ def cmd_session_start() -> int:
         # 没有本会话任务：给只读指针（含 BLOCKED 的原因/需要），不自动绑定。
         # 归属其它会话的任务也列出并标注，否则重启换了会话标识就再也发现不了现场；
         # 是否接管由用户/主代理判断，Stop 仍只强制绑定本会话的任务。
-        all_rows, all_anomalies = collect(root, session="", include_open=True)
+        all_rows, all_anomalies = collect(root, session="", include_open=True,
+                                          include_pending=True)
         if not all_rows:
             _log(0, root, note="session-start-no-open-task", session=session)
             return 0
@@ -1088,6 +1206,75 @@ def _recall_block(payload: dict) -> tuple[str, str]:
     return str(outcome.get("text") or ""), str(outcome.get("reason") or "")
 
 
+def _record_prompt(root: str, session: str, payload: dict,
+                   rows: list[dict]) -> str:
+    """把本回合用户原话落到候选任务的收件箱（只记录，不推断授权）。
+
+    - 本会话负责的任务：记录；
+    - 没有绑定任务、且工作区唯一的未闭合任务没有绑定其它会话：记录（跨会话恢复时
+      用户可能直接在旧任务上回话）；
+    - 多个候选、或唯一候选属于其它会话：不记录，避免把授权写到错的 task_id。
+
+    记录是“用户说了什么”的审计事实；是否解除阻塞仍由主代理用 `input --consume`
+    显式决定，钩子不解除任何阻塞。
+    """
+    text = str(payload.get("prompt") or "").strip()
+    if not text:
+        return "no-prompt"
+    module = _inbox()
+    if module is None:
+        return "no-inbox"
+    bound = [row for row in rows
+             if session and session in (row.get("sessions") or [])]
+    if bound:
+        targets = bound
+    elif len(rows) == 1:
+        # 唯一候选若已属于别的会话，本会话的这句话不是它的输入：
+        # 记录会污染别的 task_id 的待处置队列并误导 Stop 拦截。
+        foreign = [item for item in (rows[0].get("sessions") or [])
+                   if item and item != session]
+        if foreign:
+            return f"foreign-session:{rows[0].get('task_id') or ''}"
+        targets = rows[:1]
+    else:
+        return f"ambiguous:{len(rows)}"
+    G = _governance()
+    recorded: list[str] = []
+    for row in targets:
+        try:
+            state = G.load_state(row["state_path"])
+        except Exception:  # noqa: BLE001 - 记录失败不阻断用户回合
+            continue
+        try:
+            # 只记录可处置的输入：寒暄/无关内容不进入待处置队列，避免 Stop 反复拦截。
+            if not module.actionable(text, state):
+                continue
+            event = module.record(row["state_path"], text, session=session,
+                                  task_id=row["task_id"], state=state)
+        except Exception:  # noqa: BLE001 - 收件箱不是钩子的必需依赖
+            continue
+        iid = str((event or {}).get("input_id") or "")
+        if not iid:
+            continue
+        existing = {item.get("input_id")
+                    for item in row.get("pending_inputs") or []}
+        if iid in existing:
+            recorded.append(iid)
+            continue
+        projected = {
+            "input_id": iid,
+            "at": str(event.get("at") or ""),
+            "quote": module.quote(text, 200),
+            "actionable": bool(event.get("actionable")),
+            "session": session,
+        }
+        row.setdefault("pending_inputs", []).append(projected)
+        if projected["actionable"]:
+            row.setdefault("actionable_inputs", []).append(projected)
+        recorded.append(iid)
+    return ",".join(recorded) if recorded else "not-actionable"
+
+
 def cmd_user_prompt() -> int:
     """UserPromptSubmit 钩子模式：逐回合提示未闭合任务 + 工程任务首轮召回。
 
@@ -1110,8 +1297,13 @@ def cmd_user_prompt() -> int:
         recall_text, recall_note = _recall_block(payload)
         task_text = ""
         tasks_n = 0
+        input_note = "none"
         if root:
-            rows, anomalies = collect(root, session="", include_open=True)
+            rows, anomalies = collect(root, session="", include_open=True,
+                                      include_pending=True)
+            # 先把本回合用户原话落到候选任务（只记录，不解除阻塞）：用户批准/授权
+            # 必须成为可审计的任务事实，否则模型漏跑一次 unblock 就会随上下文丢失。
+            input_note = _record_prompt(root, session, payload, rows)
             # 逐回合只提示本会话负责的任务，以及归属无法确认（Stop 会 fail-closed 拦截）
             # 的任务：其它会话的旧任务由 SessionStart 指针披露一次即可，不必每轮重复，
             # 否则一条无关的“你好”也会带上别处旧任务的完整阻塞原因。
@@ -1132,11 +1324,11 @@ def cmd_user_prompt() -> int:
                 tasks_n = len(mine)
         if not task_text and not recall_text:
             _log(0, root or start, session=session,
-                 note=f"user-prompt-skip:tasks={tasks_n}:recall={recall_note}")
+                 note=f"user-prompt-skip:tasks={tasks_n}:recall={recall_note}:input={input_note}")
             return 0
         text = "\n".join(part for part in (task_text, recall_text) if part)
         _log(0, root or start, task_id="", session=session,
-             note=f"user-prompt-inject:tasks={tasks_n}:recall={recall_note}")
+             note=f"user-prompt-inject:tasks={tasks_n}:recall={recall_note}:input={input_note}")
         print(json.dumps({"hookSpecificOutput": {
             "hookEventName": USER_PROMPT_EVENT,
             "additionalContext": text,
@@ -1154,13 +1346,16 @@ def cmd_status(args) -> int:
         print(f"未找到 {TASKS_DIR}：{start}")
         return 0
     session = str(getattr(args, "session", "") or "") or _session_from({})
-    rows, anomalies = collect(root, session=session)
+    rows, anomalies = collect(root, session=session, include_pending=True)
     print(f"工作区：{root}")
     print(f"会话：{session or '（不可用；仅唯一候选任务时判定归属，多个任务不选）'}")
     if not rows:
         print("没有要求续跑的任务。")
     for row in rows:
-        print(render(row, total=len(rows)))
+        if row.get("actionable_inputs") and not row.get("required"):
+            print(_input_block_text(row))
+        else:
+            print(render(row, total=len(rows)))
         print(f"- 阶段：{row['phase']} · 绑定：{row['binding']} · 更新：{row['updated']}\n")
     if anomalies:
         print(_anomaly_reason(anomalies))
