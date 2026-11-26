@@ -5,8 +5,9 @@
 > `gpt-6.2-sol` 与 `--model` 已移除，认知只剩 `gpt-6.2-astra` 单一模型。历史段落里的
 > 旧名只作事实与审计记录，不代表当前角色、模型、命令或默认配置。
 
-更新：2026-11-25 CST。本文件只记录现场可核实的事实；规划与未完成事项单独标注。
-当前版本：v9.11.0（认知自动调度与调用率优化，已交付 `main` 并同步运行时）；v9.10.0（认知命名收敛与
+更新：2026-11-26 CST。本文件只记录现场可核实的事实；规划与未完成事项单独标注。
+当前版本：v9.12.0（认知分级与自动执行，工作区改动未提交）；v9.11.0（认知自动调度与调用率
+优化，已交付 `main`）；v9.10.0（认知命名收敛与
 SOL 退役，已交付 `main`）；v9.9.0（Astra 默认认知引擎迁移与调用效率优化，已交付 `main`）；
 v9.8.0 多模态设计认知、v9.7.1 及更早的治理记录见下。基线以本次交付的最终提交与运行时核验为准。
 任务 `sol-cognition-governance-p1p3-2026-11-23` 经用户授权一次性 `reopen` 后，已于
@@ -16,6 +17,92 @@ v9.8.0 多模态设计认知、v9.7.1 及更早的治理记录见下。基线以
 经 PR #9 合并为 `b83cf33`；CI Python 3.10 / 3.12 各 956 项 OK、`--verify-baseline` 通过；
 main 三方（本地 / `origin/main` / `ls-remote`）同为 `b83cf33`（0/0），工作区干净；
 运行时 `--check` 缺失 0 / 不同 0，27 个受管理文件源码与运行时 SHA-256 全部一致。
+
+## 认知分级与自动执行（2026-11-26，v9.12.0，工作区改动未提交）
+
+依据：用户《v9.12.0 认知调度分级与自动执行专项》。用户要求把 GPT 从“配置好的默认模型”
+变成重要工程任务在正确生命周期阶段**可靠且可证明**参与的默认协作方；不允许只增加关键词或
+调用数，不允许把 GPT 变成工程审批门禁。
+
+**本轮实现（源码 + 测试，运行时已同步）**：
+
+- **T0–T3 分级**：`review_policy.task_complexity` 输出 `tier` / `tier_reason` / `windows`，
+  第一依据是 `state.intent`（用户原始意图），随后是目标、合同/完成条件与边界；文件类型、
+  工作项数量与默认 `risk=medium` 不能单独判成 T0。T0 为显式简单类型 ＋ 无信号 ＋ 无高影响
+  范围；T1 为其余无信号任务（含意图缺失的默认落点，仅 A）；T2 为有信号普通任务（A/B/E）；
+  T3 由 `high-impact-scope`、高影响任务类型或高影响触发因素决定（A/B/E）。
+- **原始意图登记**：`start --intent|--intent-file` 与 `intent --text|--file`，状态保存
+  `intent` / `intent_sha256` / `intent_source`，默认拒绝覆盖（`--replace` 留 history）。
+  `review-admission` / `status` / `start` 输出等级、窗口与意图是否已登记。
+- **自动真实执行**：`auto` 策略下生命周期命令消费至多 1 条到期义务并发出真实请求；
+  调用记录新增 `tier` / `dispatch=auto-obligation|manual-obligation|manual` /
+  `cognition_family`，义务新增
+  `tier` 与 `opened_by`，`invoked` 只认带 `call_id` 的义务。
+- **材料 v4**：`build_materials` 按阶段组织——所有阶段含原始意图与授权边界；B 追加调查事实
+  与候选方案；C 追加新增事实与决策问题；E 追加最终成果、完成情况、验证证据与未解决问题。
+- **统计重建**：`cognition-stats` 输出 `expected`/`triggered`/`invoked`/`succeeded`/
+  `failed`/`reused`/`deferred`/`skipped`/`missed` 与 `auto_invoked`/`manual_invoked`，
+  成功率/漏调率用显式分母（`success_rate` = succeeded/invoked、`missed_rate` =
+  missed/expected，分母 0 记 null），加 T0–T3、A/B/C/E（`by_window`）、
+  CONSULT/PLAN/REVIEW（`by_mode`）、任务类型覆盖（`totals.task_kind_tasks`）、
+  采纳与 tokens/延迟。覆盖率仍是观测，不进入 G1–G3。
+
+**验证（2026-11-26）**：
+
+- 活动测试 `1100 OK`（新增 `tests/test_cognition_tiers.py` 28 项：分级、意图、自动执行、
+  收口窗口、材料、统计/CLI；更新 `test_lightweight_architecture.py`、
+  `test_cognition_lifecycle.py`、`test_cognition_trigger.py` 的旧零调用断言）。
+- legacy `853` 项：`99 failures + 47 errors + 32 skipped`，失败/错误集合与 HEAD `a7d67e3`
+  的独立 worktree 运行**逐条相同**（`diff` 为空），无新增回归；统计维度新增后重跑，
+  计数仍为 `99F+47E+32S`（本次只核数量，未再逐条 diff 集合）。
+- 运行时已同步（`--apply`；`--check` 缺失 0 / 不同 0，27 个受管理文件，未受管理的
+  `hm.txt` 保留）；`--baseline` 重建 27 项，`--verify-baseline` 通过。版本号 `9.12.0`。
+
+**真实 Astra 调用（3 次，全部由调度窗口自动发起，最终代码）**：临时 git 工作区
+`/tmp/copilot-v912-final-xrHUhu`，任务 `task-fb6c91764a772468`（`feature` / `risk=medium`，
+原始意图涉及治理、架构与协作规则 → T3）。三次请求均为 `gpt-6.2-astra` / provider `codex` /
+`reasoning.effort=high` / `mode=standard` / 零工具 / 单轮，`request_attempted=true`、
+`send_observed=response_received`、无重试：
+
+| 窗口 | call_id | 义务 | 触发命令 | latency | tokens |
+|---|---|---|---|---|---|
+| A understanding | `SC9994d9a0d4e0cfb1f07c1a17` | `SO1` | `start` | 43,228 ms | 3,403 |
+| B planning | `SCa7b8fdd468b557dc95743529` | `SO2` | `plan` | 39,590 ms | 3,547 |
+| E closure | `SC0033645b077ced62766e2702` | `SO3` | `criterion`（最终验证就绪后） | 27,961 ms | 3,850 |
+
+三条记录的 `dispatch` 均为 `auto-obligation`、`tier=T3`、`cognition_family` 分别为 A/B/E。
+`cognition-stats`：expected 3 / triggered 3 / invoked 3 / succeeded 3 / failed 0 / reused 0 /
+deferred 0 / skipped 0 / missed 0（`success_rate=1.0`、`missed_rate=0.0`）；
+`auto_invoked=3`、`manual_invoked=0`；处置 completed=3；
+`totals.tier_tasks.T3=1`、`intent_registered_tasks=1`；新增维度
+`by_mode` = CONSULT 2 / PLAN 1 / REVIEW 0（tokens 7,253 / 3,547 / 0），
+`totals.task_kind_tasks.feature=1`，与上表逐条一致。`closure --close` 得 `verdict=pass`、
+CLOSED（I0），`final_verification_digest=f8ba09dc9ccf163f`。
+
+**最终代码再验证（T1，1 次真实调用）**：在补齐统计维度后的最终源码上新建临时工作区
+`/tmp/copilot-v912-final2-5t1d74au`，任务 `task-c88cc2b53ae874f7`（`standard` / `risk=medium`
+/ 已登记原始意图，无高影响信号 → **T1**，窗口仅 A）。`start` 自动执行 `SO1`：
+`call_id=SCaa95e2ed0c9cd0d8785c01f7`，CONSULT stage=understanding，`gpt-6.2-astra` /
+provider `codex` / `reasoning_effort=high` / `reasoning_mode=standard` / `zero_tool=true` /
+`attempts=1` / `request_attempted=true` / `send_observed=response_received` /
+`dispatch=auto-obligation` / `tier=T1` / `cognition_family=A`，latency 32,770 ms，
+2,923 tokens（输入 1,848 / 输出 1,075）。`cognition-stats`：expected 1 / triggered 1 /
+invoked 1 / succeeded 1 / failed 0 / missed 0，`success_rate=1.0`、`missed_rate=0.0`；
+`by_mode` CONSULT 1 / PLAN 0 / REVIEW 0。该运行确认最终树（含 `by_mode`、
+`task_kind_tasks` 与两个派生率）仍会发出真实请求，且统计与调用记录逐项对得上。
+
+此前还有一次预验证运行
+（`/tmp/copilot-v912-real-0ZdHJf`，3 次自动调用，digest `a4b081ac671ce542`），其结论只作
+过程事实保留；本表是补齐 dispatch 语义后的最终代码证据。
+
+**未验证 / 已知限制**：
+
+- 未在真实 GUI 会话跑完整 `drive` 端到端；自动执行、失败、退避、复用、锁与 E 时序由
+  `tests/test_cognition_tiers.py` 的夹具覆盖。
+- 本轮未 commit / push / 建 PR / Tag / Release（用户明确禁止），`main` 仍为 `a7d67e3`；
+  工作区 16 个修改文件 + 1 个未跟踪测试文件。T3 的 3 次调用发生在补齐统计维度之前，
+  请求路径其后未改；T1 的 1 次调用在最终树上完成，作为最终代码的真实请求证据。
+- 认知仍是 advisory：T0–T3、覆盖率与采纳都不改变阶段、G1–G3、技术方案或授权。
 
 ## 认知自动调度与调用率优化（2026-11-25/26，v9.11.0，已交付 `main`）
 

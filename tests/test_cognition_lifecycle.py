@@ -28,6 +28,7 @@ import v6_support as F
 G = F.G
 import review_policy as RP  # noqa: E402  v6_support 已把 scripts/ 加入 sys.path
 import cognition_call as CC  # noqa: E402
+import cognition_schedule as SCH  # noqa: E402
 import copilot_dispatch as CD  # noqa: E402
 
 CONTRACT = """## 完成条件
@@ -173,20 +174,23 @@ class RoutingTests(CognitionLifecycleBase):
                           G.evaluate(G.load_state(self.state_path)).get(
                               "next_commands") or [] if "sol-" in cmd])
 
-    def test_undeclared_standard_task_gets_zero_calls(self):
-        # 未声明 task_kind（standard）＋默认 risk=medium 不构成任何认知价值信号：
-        # 普通任务按 0 调用推进，不因“没写类型”或“默认风险等级”被抬进认知流程。
+    def test_undeclared_standard_task_is_t1_startup_consult(self):
+        # 未声明 task_kind（standard）＋默认 risk=medium 不构成中/高价值信号，
+        # 因此不升级 T2/T3；但也不是显式机械类型，性质无法可靠分类时按 T1
+        # 给一次启动判断，而不是直接 0 调用。
         self.start()
         state = G.load_state(self.state_path)
         advice = self.advice()
         self.assertEqual(advice["task_kind"], "standard")
-        self.assertEqual(advice["action"], "none")
-        self.assertEqual(advice["recommended_action"], "not_needed")
-        self.assertEqual(advice["command"], "")
+        self.assertEqual(advice["tier"], "T1")
+        self.assertEqual(advice["action"], "consult")
+        self.assertEqual(advice["family"], "A")
+        self.assertEqual(advice["mode"], "CONSULT")
+        self.assertIn("cognition-consult", advice["command"])
         synced = G.sync_cognition_schedule(state, advice=advice)
-        self.assertEqual(synced["changes"], [])
-        self.assertEqual(state.get("cognition_schedule", {}).get(
-            "obligations") or [], [])
+        self.assertTrue(synced["changes"])
+        families = [row["family"] for row in SCH.obligations(state)]
+        self.assertEqual(families, ["A"])
 
     def test_plan_is_suggested_after_investigation(self):
         # 方案价值的来源是真实信号（这里声明核心逻辑触发），不是工作项数量。
@@ -204,9 +208,10 @@ class RoutingTests(CognitionLifecycleBase):
     def test_product_design_gets_default_consult(self):
         self.start(kind="product-design")
         advice = self.advice()
+        self.assertEqual(advice["tier"], "T3")
         self.assertEqual(advice["action"], "consult")
         self.assertEqual(advice["stage"], "understanding")
-        self.assertIn("中/高认知价值信号", advice["reason"])
+        self.assertIn("认知等级 T3", advice["reason"])
 
     def test_architecture_task_gets_consult_then_plan(self):
         self.start(kind="architecture")

@@ -34,7 +34,7 @@ STATS_SCHEMA = "copilot-cognition-stats/v2"
 # 材料口径版本。v2：合同正文改读 `contract["done_criteria_text"]`（`body` 兼容回退），
 # 正文缺失时显式标注“（未登记）”。该版本参与 `closure_verification_digest`，所以
 # 材料内容变化会让旧收口判断停止覆盖新结果，而不是靠“代码改过了”想当然。
-MATERIALS_SCHEMA = "copilot-cognition-schedule-materials/v3"
+MATERIALS_SCHEMA = "copilot-cognition-schedule-materials/v4"
 
 # 义务状态：due 未执行 / claimed 已被本进程领取 / in_flight 已发出请求未落盘 /
 # satisfied 已满足（含复用）/ failed 真实失败 / skipped 显式跳过（须有理由）。
@@ -172,6 +172,9 @@ def _new_obligation(state: dict, advice: dict, *, now: str,
         "event": event,
         "instance": instance,
         "level": _text(advice.get("level")) or "recommended",
+        # 认知等级（T0–T3）：义务打开时的分级快照，只用于归因与统计；
+        # 等级变化不重写旧义务（审计保留当时的判断依据）。
+        "tier": _text(advice.get("tier")),
         "question": _text(advice.get("question")),
         "reason": _text(advice.get("reason")),
         # 收口周期：重开后新建的义务属于新周期，旧义务保持原周期与原始事实。
@@ -909,6 +912,50 @@ def _delta_rows(state: dict, obligation: dict) -> list[str]:
     return rows
 
 
+def _intent_lines(state: dict) -> list[str]:
+    """原始意图区块：只陈述是否登记，不把目标摘要伪装成原始意图。"""
+    intent = _text(state.get("intent"))
+    if not intent:
+        return ["- 原始意图：未登记（按目标、合同与声明触发分类；不得据此假定"
+                "用户只要求了合同摘要所述的范围）。"]
+    return [
+        f"- 原始意图（{_text(state.get('intent_source')) or 'explicit'}，"
+        f"{len(intent)} 字符，sha={_text(state.get('intent_sha256'))[:16]}…）：",
+        "",
+        *["  " + line for line in intent.splitlines()[:40]],
+    ]
+
+
+def _outcome_rows(state: dict) -> list[str]:
+    """E 阶段的成果事实：条件、工作项、证据与未闭合问题的可复核计数。"""
+    criteria = [item for item in (state.get("contract") or {}).get("criteria") or []
+                if isinstance(item, dict)]
+    met = [item for item in criteria
+           if _text(item.get("status")) == "met"]
+    actions = [item for item in state.get("actions") or []
+               if isinstance(item, dict)]
+    done = [item for item in actions
+            if _text(item.get("status")) in RP.TERMINAL_STATUSES]
+    evidence = [item for item in state.get("evidence") or []
+                if isinstance(item, dict) and not item.get("dropped")]
+    ledger = state.get("finding_ledger") or {}
+    open_findings = [item for item in ledger.get("items") or []
+                     if isinstance(item, dict)
+                     and _text(item.get("status")) in ("open", "regressed")]
+    rows = [
+        f"- 完成条件：{len(met)}/{len(criteria)} 已核销",
+        f"- 工作项：{len(done)}/{len(actions)} 终态",
+        f"- 已登记证据：{len(evidence)} 条",
+        f"- 未闭合 finding：{len(open_findings)} 条",
+        f"- 收口状态：{'已收口' if (state.get('closure') or {}).get('closed') else '未收口'}",
+    ]
+    if open_findings:
+        rows.append("- 未闭合问题：" + "、".join(
+            f"{item.get('finding_id')}({item.get('severity')})"
+            for item in open_findings[:10]))
+    return rows
+
+
 def build_materials(state: dict, obligation: dict, *,
                     max_chars: int = DEFAULT_MATERIALS_CHARS,
                     readiness: dict | None = None) -> str:
@@ -958,6 +1005,10 @@ def build_materials(state: dict, obligation: dict, *,
         *prior_lines,
         *agenda_lines,
         "",
+        "## 用户原始任务意图",
+        "",
+        *_intent_lines(state),
+        "",
         "## 任务目标与合同约束",
         "",
         f"- 目标：{_text(state.get('goal'))}",
@@ -970,7 +1021,43 @@ def build_materials(state: dict, obligation: dict, *,
             _text(item.get("name"))
             for item in state.get("admission_triggers") or []
             if isinstance(item, dict) and item.get("name")) or "无"),
+        "- 授权边界与已知约束："
+        + (_text((state.get("contract") or {}).get("boundaries"))[:600]
+           or "合同未单独声明边界；按任务目标与既有授权范围执行"),
         "",
+    ]
+    if family == "B":
+        # B 的材料必须能支撑“比较方案”：已有 A 结论（见上）+ 调查事实。
+        # 候选方案只来自状态里已登记的事实，不由 Copilot 生成新方案。
+        lines += [
+            "## 调查事实与候选方案",
+            "",
+            "### 已登记的现场事实",
+            "",
+            *(_evidence_rows(state, limit=20) or ["- 尚未登记证据"]),
+            "",
+            "### 候选方案来源",
+            "",
+            "- 候选方案必须来自用户意图、合同约束与上述现场事实；材料未列出的",
+            "  方案视为未调查，不得用泛化最佳实践代替真实取舍。",
+            "",
+        ]
+    if family == "C":
+        lines += [
+            "## 本次决策问题与新增事实",
+            "",
+            "- 本次只判断与上次结论不同的部分：既有结论仍然成立的部分不需要重复",
+            "  论证；如认为旧结论已失效，请指出证据与影响范围。",
+            "",
+        ]
+    if family == "E" or _text(obligation.get("stage")) == "closure":
+        lines += [
+            "## 最终成果与完成情况",
+            "",
+            *_outcome_rows(state),
+            "",
+        ]
+    lines += [
         "## 完成条件",
         "",
         *(_criteria_rows(state) or ["- 无"]),
@@ -1122,14 +1209,16 @@ def task_stats(state: dict) -> dict:
                          for t in state.get("admission_triggers") or []
                          if isinstance(t, dict) and t.get("name")],
         workspace=_text(state.get("workspace")))
-    cognition_applicable = admission["level"] in ("medium", "high")
+    tier = admission.get("tier") or "T1"
+    # 启动窗口对 T1/T2/T3 适用（A 是默认认知协作者的入口）；只有 T0 是 0 调用。
+    cognition_applicable = tier != "T0"
     progressed = RP.has_substantive_progress(state)
     # 收口窗口的适用条件必须与建议口径逐字一致（`cognition_advice` 的 E：复杂度
     # 中/高 + 有实质进展）。不沿用任务类别（`non_simple`）：真实信号决定复杂度，
     # 简单类别 + 高风险的真实任务同样会创建 E 义务。两处口径不一致会产生双向
     # 失真——分母要求却永远创建不出义务（假漏调），或义务已满足却不进分母，
     # 让多任务聚合覆盖率超过 100% 或掩盖其它任务的漏调。
-    closure_eligible = bool(cognition_applicable and progressed)
+    closure_eligible = bool(tier in ("T2", "T3") and progressed)
 
     by_family: dict[str, dict] = {}
     for family in RP.COGNITION_FAMILIES:
@@ -1179,6 +1268,9 @@ def task_stats(state: dict) -> dict:
                         if _text(item.get("status")) == "skipped"]),
         "missed": len([item for item in rows if is_missed(item)]),
         "deferred": len([item for item in rows if item.get("deferrals")]),
+        # 复用是“没有重复付费”的事实，不是调用成功；与 succeeded 分开计数。
+        "reused": len([item for item in rows
+                       if _text(item.get("source")) == "reuse"]),
         "skip_reasons": {},
         "missed_by_origin": {},
     }
@@ -1213,13 +1305,12 @@ def task_stats(state: dict) -> dict:
     # 原始义务计数，避免通过缩小分母制造覆盖率。
     coverage = {
         "startup": {
-            # 与建议口径一致：启动窗口只对“存在中/高认知价值信号”的任务适用。
-            # 用任务类别（非简单）当分母会制造假漏调——普通 standard 任务按设计
-            # 不做启动 CONSULT，不能事后算成“应调未执行”。
+            # 与建议口径一致：启动窗口对 T1/T2/T3 适用（A 是默认认知入口）。
+            # 只有 T0（显式机械、无信号、无高影响范围）按设计 0 调用。
             "denominator": 1 if cognition_applicable else 0,
-            "reason": (f"启动 CONSULT 适用：复杂度 {admission['level']}"
+            "reason": (f"启动 CONSULT 适用：认知等级 {tier}"
                        "（按任务计 1 次）" if cognition_applicable else
-                       f"启动 CONSULT 不适用：复杂度 {admission['level']}"),
+                       f"启动 CONSULT 不适用：认知等级 {tier}（T0 保持 0 调用）"),
             "numerator": _window_covered(by_family["A"]),
             "skipped": by_family["A"]["skipped"],
             "missed": by_family["A"]["missed"],
@@ -1235,9 +1326,9 @@ def task_stats(state: dict) -> dict:
         },
         "closure": {
             "denominator": 1 if closure_eligible else 0,
-            "reason": ("有实质进展且中/高认知价值任务（收口 CONSULT 适用；"
+            "reason": ("有实质进展的 T2/T3 任务（收口 CONSULT 适用；"
                        "按任务计 1 次）" if closure_eligible else
-                       "收口 CONSULT 不适用：无实质进展或复杂度不足"),
+                       f"收口 CONSULT 不适用：认知等级 {tier} 或无实质进展"),
             "numerator": _window_covered(by_family["E"]),
             "skipped": by_family["E"]["skipped"],
             "missed": by_family["E"]["missed"],
@@ -1365,6 +1456,88 @@ def task_stats(state: dict) -> dict:
         "by_model": [{"model_key": key, "hits": reuse_by_model[key]}
                      for key in sorted(reuse_by_model)],
     }
+    # ── 期望窗口与实际调用（v9.12 统一口径）────────────────────────────
+    # expected 是“按等级应该发生的窗口数”，由等级窗口决定；triggered 是实际
+    # 物化的义务；invoked 只认真实调用记录（有 call_id 的义务）。三者不能互相
+    # 冒充：建议次数、义务条数与真实请求数是三种不同的事实。
+    expected = sum(int(row["denominator"] or 0)
+                   for row in coverage.values())
+    by_window = {family: dict(by_family[family])
+                 for family in RP.COGNITION_FAMILIES}
+    # 自动 vs 手动：新记录以 dispatch 为准（手动 `--obligation` 是
+    # manual-obligation）；历史记录没有 dispatch 时回退到 obligation_id 归属。
+    def _auto_call(item: dict) -> bool:
+        dispatch = _text(item.get("dispatch"))
+        if dispatch:
+            return dispatch == "auto-obligation"
+        return bool(_text(item.get("obligation_id")))
+
+    auto_calls = [item for item in calls if _auto_call(item)]
+    auto_ids = {id(item) for item in auto_calls}
+    manual_calls = [item for item in calls if id(item) not in auto_ids]
+    # 模式分布：CONSULT / PLAN / REVIEW 各自真实请求数、成功/失败与用量。
+    # THINK 是 CONSULT 的历史别名，只读归并；这是调用维度，不是窗口维度。
+    by_mode: dict[str, dict] = {}
+    for mode in ("CONSULT", "PLAN", "REVIEW"):
+        mode_calls = [
+            item for item in calls
+            if ("CONSULT" if _text(item.get("mode")).upper() == "THINK"
+                else _text(item.get("mode")).upper()) == mode]
+        usage = [_usage(item) for item in mode_calls
+                 if item.get("status") == "completed"]
+        by_mode[mode] = {
+            "calls": len(mode_calls),
+            "succeeded": len([item for item in mode_calls
+                              if item.get("status") == "completed"]),
+            "failed": len([item for item in mode_calls
+                           if item.get("status") == "failed"]),
+            "tokens": sum(row["tokens"] for row in usage),
+            "latency_ms_total": sum(
+                int(float(item["latency_ms"])) for item in mode_calls
+                if item.get("latency_ms")),
+        }
+    risks_total = sum(len(item.get("risks") or []) for item in completed
+                      if isinstance(item.get("risks"), list))
+    findings_total = sum(int((item.get("findings_count") or {}).get(key) or 0)
+                         for item in completed
+                         if isinstance(item.get("findings_count"), dict)
+                         for key in ("blocking", "major", "minor", "info"))
+    effect = {
+        "accepted": acceptance["accepted"],
+        "modified": acceptance["modified"],
+        "rejected": acceptance["rejected"],
+        "unrecorded": acceptance["unrecorded"],
+        "risks_total": risks_total,
+        "findings_total": findings_total,
+        # 采纳时登记的实际差异条数：只统计 ZCode 明确写下的影响，不根据
+        # 代码改动或测试通过推断“建议产生了效果”。
+        "material_delta": sum(
+            1 for item in completed
+            if isinstance(item.get("acceptance"), dict)
+            and _text(item["acceptance"].get("delta"))),
+    }
+    # 派生率只由已计入的分母算出，分母为 0 时记 null（不是 0%）：成功率的分母
+    # 是“真实发起的请求”，漏调率的分母是“应按等级发生的窗口”，两者不可互换。
+    metrics = {
+        "expected": expected,
+        "triggered": len(rows),
+        "invoked": lifecycle["invoked"],
+        "succeeded": lifecycle["succeeded"],
+        "failed": lifecycle["failed"],
+        "reused": lifecycle["reused"],
+        "deferred": lifecycle["deferred"],
+        "skipped": lifecycle["skipped"],
+        "missed": lifecycle["missed"],
+        "auto_invoked": len([item for item in auto_calls
+                             if item.get("status") == "completed"]),
+        "manual_invoked": len([item for item in manual_calls
+                               if item.get("status") == "completed"]),
+    }
+    metrics["success_rate"] = round(
+        metrics["succeeded"] / metrics["invoked"], 4) \
+        if metrics["invoked"] else None
+    metrics["missed_rate"] = round(metrics["missed"] / metrics["expected"], 4) \
+        if metrics["expected"] else None
     return {
         "task_id": _text(state.get("task_id")),
         # 认知适用＝存在真实的认知价值信号（中/高复杂度），不是“任务类别非
@@ -1375,8 +1548,17 @@ def task_stats(state: dict) -> dict:
         "progressed": bool(progressed),
         "closure_eligible": closure_eligible,
         "level": admission["level"],
+        "tier": tier,
+        "tier_reason": _text(admission.get("tier_reason")),
+        "windows": list(admission.get("windows") or ()),
+        "intent": RP.intent_routing(state),
         "task_kind": admission["task_kind"],
         "obligations": len(rows),
+        # 统一口径：期望窗口 / 实际物化义务 / 真实请求 / 复用 / 失败 / 跳过 / 漏调。
+        "metrics": metrics,
+        "by_window": by_window,
+        "by_mode": by_mode,
+        "effect": effect,
         # “应登记而未登记”只适用于本应拥有启动窗口的任务：低认知价值任务
         # （0 信号）按设计要求不产生任何义务，不能算作登记缺口。
         "not_registered": bool(cognition_applicable
@@ -1439,6 +1621,19 @@ def stats(states: list[dict], *, scope: str = "") -> dict:
             for kind in DISPOSITION_KINDS
         },
         "reopened_tasks": sum(1 for d in details if d["cycle"] > 1),
+        # 等级分布：统计口径的维度之一，不参与评分也不构成门禁。
+        "tier_tasks": {
+            tier: sum(1 for d in details if d.get("tier") == tier)
+            for tier in RP.TIERS
+        },
+        "intent_registered_tasks": sum(
+            1 for d in details if (d.get("intent") or {}).get("available")),
+        # 任务类型覆盖：按声明类型统计任务数（含未产生认知调用者），用于看
+        # 等级与调用是否只落在少数类别上；这是覆盖面观察值，不评分也不构成门禁。
+        "task_kind_tasks": {
+            kind: sum(1 for d in details if d.get("task_kind") == kind)
+            for kind in RP.TASK_KINDS
+        },
     }
     coverage = {}
     for key in ("startup", "plan", "closure", "events"):
@@ -1475,6 +1670,59 @@ def stats(states: list[dict], *, scope: str = "") -> dict:
             missed_by_origin[key] = missed_by_origin.get(key, 0) + count
     lifecycle["skip_reasons"] = dict(sorted(skip_reasons.items()))
     lifecycle["missed_by_origin"] = dict(sorted(missed_by_origin.items()))
+    metric_keys = ("expected", "triggered", "invoked", "succeeded", "failed",
+                   "reused", "deferred", "skipped", "missed",
+                   "auto_invoked", "manual_invoked")
+    metrics = {key: sum(int(d["metrics"][key]) for d in details)
+               for key in metric_keys}
+    # 聚合率必须用聚合后的分子分母重算，不能把任务级比率求平均。
+    metrics["success_rate"] = round(
+        metrics["succeeded"] / metrics["invoked"], 4) \
+        if metrics["invoked"] else None
+    metrics["missed_rate"] = round(
+        metrics["missed"] / metrics["expected"], 4) \
+        if metrics["expected"] else None
+    by_window = {
+        family: {
+            key: sum(int(d["by_window"][family][key]) for d in details)
+            for key in ("obligations", "due", "satisfied", "failed", "skipped",
+                        "missed", "in_flight", "reused", "executed")
+        }
+        for family in RP.COGNITION_FAMILIES
+    }
+    # 模式分布跨任务合并：CONSULT / PLAN / REVIEW 的请求数、成功/失败与用量。
+    # 延迟用全量调用样本重算分位（与 by_model 同口径），不用“均值之和”。
+    mode_calls: dict[str, list[dict]] = {}
+    for state in states:
+        for item in state.get("cognition_calls") or []:
+            if not isinstance(item, dict):
+                continue
+            mode = _text(item.get("mode")).upper()
+            mode = "CONSULT" if mode == "THINK" else mode
+            if mode not in ("CONSULT", "PLAN", "REVIEW"):
+                continue
+            mode_calls.setdefault(mode, []).append(item)
+    by_mode = {}
+    for mode in ("CONSULT", "PLAN", "REVIEW"):
+        items = mode_calls.get(mode, [])
+        done = [item for item in items if item.get("status") == "completed"]
+        latencies = sorted(int(float(item["latency_ms"]))
+                           for item in done if item.get("latency_ms"))
+        by_mode[mode] = {
+            "calls": len(items),
+            "succeeded": len(done),
+            "failed": len([item for item in items
+                           if item.get("status") == "failed"]),
+            "tokens": sum(_usage(item)["tokens"] for item in done),
+            "latency_ms_recorded": len(latencies),
+            "latency_ms_p50": _percentile(latencies, 0.50),
+            "latency_ms_p95": _percentile(latencies, 0.95),
+        }
+    effect = {
+        key: sum(int(d["effect"][key]) for d in details)
+        for key in ("accepted", "modified", "rejected", "unrecorded",
+                    "risks_total", "findings_total", "material_delta")
+    }
     # 模型级聚合：跨任务按 model_key 合并，耗时用全量样本重算分位，避免“平均值
     # 的平均”掩盖长尾；复用命中同样按模型合并，历史无 model 的记录归 "-"。
     model_rows: dict[str, dict] = {}
@@ -1528,6 +1776,12 @@ def stats(states: list[dict], *, scope: str = "") -> dict:
         "coverage": coverage,
         "by_event": dict(sorted(by_event.items())),
         "lifecycle": lifecycle,
+        # v9.12 统一口径：expected / triggered / invoked / … 与 by_window / effect
+        # 是 Prometheus 式可核对集合，不是一个包办一切的“成功率”。
+        "metrics": metrics,
+        "by_window": by_window,
+        "by_mode": by_mode,
+        "effect": effect,
         "calls": {
             key: sum(d["calls"][key] for d in details) for key in call_keys
         },
@@ -1571,6 +1825,19 @@ def stats(states: list[dict], *, scope: str = "") -> dict:
                   "by_model": [{"model_key": key, "hits": reuse_by_model[key]}
                                for key in sorted(reuse_by_model)]},
         "notes": [
+            "metrics 是任务级统一口径：expected（按 T0–T3 应发生的窗口数）/ "
+            "triggered（实际物化义务）/ invoked（有真实 call_id 的义务）/ "
+            "succeeded / failed / reused / deferred / skipped / missed，"
+            "另分 auto_invoked（调度义务自动执行）与 manual_invoked（主代理手动）。"
+            "success_rate = succeeded/invoked、missed_rate = missed/expected，"
+            "分母为 0 时记 null（不是 0%）。"
+            "建议或命令文本不算 invoked，也不计入 succeeded。",
+            "by_window 按 A/B/C/E 给出义务条数与状态；effect 只汇总 ZCode 显式登记的"
+            "采纳结果与差异，不根据代码改动或测试通过推断采纳。",
+            "by_mode 按 CONSULT / PLAN / REVIEW 给出真实请求数、成功/失败、tokens 与"
+            "延迟分位（THINK 历史别名归入 CONSULT）；模式分布与窗口分布是两个维度，"
+            "A 窗口的咨询仍记 CONSULT。totals.task_kind_tasks 是任务类型覆盖面，"
+            "两类都是观察值，不评分、不构成门禁。",
             "覆盖率分母只含适用任务/窗口：简单任务、无实质方案决策的 PLAN、"
             "未发生的事件、无合格里程碑、尚无实质进展的收口都不进入分母。",
             "跳过（skipped）需有可审计理由并单列：任务级窗口（A/B/E）的跳过不进入"

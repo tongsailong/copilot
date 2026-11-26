@@ -209,6 +209,11 @@ def _default_state() -> dict:
         "contract_sha256": "",
         "goal": "",
         "goal_sha256": "",
+        # 用户原始任务意图：认知分级的第一输入。`goal` 可能已被整理成目标摘要，
+        # 不能替代原始意图；只有显式登记时 `intent_source="explicit"`。
+        "intent": "",
+        "intent_sha256": "",
+        "intent_source": "",
         "mode": "",
         "note": "",
         "risk": "medium",
@@ -812,7 +817,8 @@ def start_state(path: str, goal: str, *, contract: str = "", criteria: object = 
                 task_id: str = "", mode: str = "", note: str = "",
                 contract_source: str = "", workspace: str = "",
                 test_policy: dict | None = None,
-                task_kind: str = "", triggers: object = None) -> dict:
+                task_kind: str = "", triggers: object = None,
+                intent: str = "") -> dict:
     if os.path.exists(path):
         raise GovernanceError(f"任务状态已存在：{path}；续跑请直接使用，勿重建。")
     goal = (goal or "").strip()
@@ -851,11 +857,15 @@ def start_state(path: str, goal: str, *, contract: str = "", criteria: object = 
     workspace_value = _canonical_workspace(workspace)
     if str(workspace or "").strip() and not os.path.isdir(workspace_value):
         raise GovernanceError(f"任务工作区不存在：{workspace_value}")
+    intent_text = (intent or "").strip()
     state = _default_state()
     state.update({
         "task_id": task_id,
         "goal": goal,
         "goal_sha256": _sha256_text(goal),
+        "intent": intent_text,
+        "intent_sha256": _sha256_text(intent_text) if intent_text else "",
+        "intent_source": "explicit" if intent_text else "",
         "mode": (mode or "").strip().upper(),
         "note": (note or "").strip(),
         "risk": risk,
@@ -887,6 +897,35 @@ def start_state(path: str, goal: str, *, contract: str = "", criteria: object = 
                                      "task_kind": kind,
                                      "triggers": [t["name"] for t in admission_triggers]})
     save_state(path, state, expect={"absent": True})
+    return state
+
+
+def record_intent(path: str, intent: str, *, replace: bool = False) -> dict:
+    """登记用户原始任务意图（认知分级的第一输入）。
+
+    默认只允许登记一次：原始意图是历史事实，后续合同修订不能悄悄改写它。
+    确需更正时必须显式 `replace=True`，并在历史里留下旧值指纹，避免“用新
+    目标覆盖旧意图”让认知分级失去可追溯性。
+    """
+    text = (intent or "").strip()
+    if not text:
+        raise GovernanceError("原始意图为空：请给出用户实际要求的原文或等价摘要。")
+    state = load_state(path)
+    previous = str(state.get("intent") or "")
+    if previous and not replace:
+        raise GovernanceError(
+            "任务的原始意图已登记且不允许覆盖；确需更正请显式 replace=True"
+            "（CLI：--replace），旧值指纹会写入历史。")
+    state["intent"] = text
+    state["intent_sha256"] = _sha256_text(text)
+    state["intent_source"] = "explicit"
+    _history(state, "task_intent_recorded", {
+        "intent_sha256": state["intent_sha256"],
+        "previous_sha256": _sha256_text(previous) if previous else "",
+        "chars": len(text),
+        "replaced": bool(previous),
+    })
+    save_state(path, state)
     return state
 
 
@@ -5270,6 +5309,7 @@ def record_cognition_call_failure(path: str, *, mode: str = "CONSULT",
                             materials_sha256: str = "",
                             model: str = "", provider: str = "",
                             obligation_id: str = "",
+                            dispatch: str = "",
                             stage: str = "", request_attempted: bool = True,
                             send_observed: str = "unknown",
                             http_status: int | None = None,
@@ -5296,6 +5336,11 @@ def record_cognition_call_failure(path: str, *, mode: str = "CONSULT",
         "call_id": "SC" + secrets.token_hex(12),
         "task_id": str(state.get("task_id") or ""),
         "mode": resolved,
+        # 调用来源（auto-obligation / manual-obligation / manual）：失败记录也
+        # 保留同一口径，避免统计只能从 obligation_id 猜测是否自动执行。
+        "dispatch": (str(dispatch)
+                     if dispatch in ("auto-obligation", "manual-obligation",
+                                     "manual") else ""),
         # 阶段只用于审计定位（例如收口窗口失败）：失败记录不构成任何结论。
         "stage": str(stage or "")[:40],
         "status": "failed",

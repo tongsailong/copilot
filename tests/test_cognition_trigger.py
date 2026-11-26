@@ -206,9 +206,10 @@ class SimpleTaskZeroCallTests(TriggerBase):
         给一次理解性 CONSULT。"""
         self.start(risk="high")
         advice = self.advice()
+        self.assertEqual(advice["tier"], "T2")
         self.assertEqual(advice["action"], "consult")
         self.assertEqual(advice["stage"], "understanding")
-        self.assertIn("中/高认知价值信号", advice["reason"])
+        self.assertIn("认知等级 T2", advice["reason"])
 
 
 class ProactiveTriggerTests(TriggerBase):

@@ -2339,3 +2339,38 @@
       D 阶段、G4、强制 Reviewer 不恢复；Provider/凭据/CPA 与全局 `AGENTS.md` 未改动。交付
       （2026-11-26，用户明确授权）：`bb18416` + 测试稳定性修复 `8cc9d16` → PR #18 → squash
       `01b1b9c`；CI 3.10/3.12 通过；运行时 27 个受管理文件 SHA-256 一致；未建 Tag / Release。
+
+85. **认知分级与自动执行（2026-11-26，v9.12.0 工作区，用户任务）。**
+    - **判定依据改为原始意图优先（已确认）**：新增 `start --intent` / `--intent-file` 与
+      `intent --text|--file`，把用户原始需求（`intent_text` + `intent_sha256` +
+      `intent_source=explicit`）持久化到任务状态，默认拒绝覆盖（`--replace` 才重写并留
+      history）。`task_complexity` 的信号文本顺序为 **原始意图 → 目标 → 合同/完成条件 →
+      边界**，文件类型、工作项数量与默认 `risk=medium` 都不能单独把任务判成 T0。
+    - **T0–T3 等级（已确认）**：T0＝显式简单类型 ＋ 无信号 ＋ 无高影响范围（0 调用）；
+      T1＝其余无信号任务，含意图缺失或性质无法可靠分类的默认落点（仅 A）；T2＝存在信号
+      的普通任务（A/B/E）；T3＝高影响范围（`high-impact-scope`）、高影响任务类型（治理/
+      架构/数据基础设施/产品设计/发布）或高影响触发因素（安全/权限/数据完整性/生产等）
+      （A/B/E）。等级只用于决定窗口与归因，不是风险等级、不是门禁；C 仍由可归因事件
+      触发，D 保持退役。
+    - **窗口与自动执行（已确认）**：`TIER_WINDOWS` 固定 T0 无 / T1 `A` / T2/T3 `A,B,E`；
+      E 仍要求 `closure_readiness` 就绪且任务有实质进展。生命周期命令在有效策略为 `auto`
+      时自动消费至多 1 条到期义务并发出真实请求（`dispatch=auto-obligation`），不再只打印
+      命令；纯登记命令仍不隐式付费。调用记录新增 `tier` / `dispatch` /
+      `cognition_family`，义务新增 `tier`，使“建议了但没调用”与“自动执行了”可区分。
+    - **材料按阶段组织（已确认）**：`build_materials` 升级为 materials v4：所有阶段含
+      `## 用户原始任务意图`、目标与授权边界；B 追加调查事实与候选方案；C 追加新增事实与
+      决策问题；E 追加最终成果、完成情况、验证证据与未解决问题。材料由 ZCode 的现场事实
+      构成，不把仓库文件或日志整段倾倒给模型。
+    - **统计口径重建（已确认）**：`cognition-stats` 输出 `expected` / `triggered` /
+      `invoked` / `succeeded` / `failed` / `reused` / `deferred` / `skipped` / `missed`，
+      并区分 `auto_invoked` / `manual_invoked`，成功率与漏调率用显式分母
+      （`success_rate`/`missed_rate`，分母 0 记 null）；另给等级（T0–T3）、窗口（A/B/C/E，
+      `by_window`）、模式（CONSULT/PLAN/REVIEW，`by_mode`，含请求/成功/失败/tokens/延迟
+      分位，THINK 归并 CONSULT）与任务类型覆盖（`totals.task_kind_tasks`）分布、
+      采纳（accepted/modified/rejected/unrecorded）与 tokens/延迟。`invoked`
+      只认带 `call_id` 的真实请求；覆盖率是质量观测，不进入 G1–G3，也不构成收口门禁。
+    - **兼容与不变量**：旧任务的 `sol_*` 字段与历史义务只读兼容；策略优先级（命令行显式 >
+      `COPILOT_COGNITION` > 任务快照 > 命令默认）、复用键、失败降级、退避窗口、G1–G3、
+      `closure_readiness`、PARTIAL 续跑、REVIEW 仅用户明确要求、G4 退役均不变。未新增
+      Provider、模型、Agent 或 Reviewer 体系，未改 CPA/凭据/模型路由与全局 `AGENTS.md`；
+      本轮只做源码、测试、文档与运行时同步，未 commit / push / Tag / Release。

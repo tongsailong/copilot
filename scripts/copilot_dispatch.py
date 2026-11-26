@@ -52,7 +52,7 @@ import review_policy as RP  # noqa: E402
 import cognition_call as CC  # noqa: E402
 import cognition_schedule as SCH  # noqa: E402
 
-__version__ = "9.11.0"
+__version__ = "9.12.0"
 
 
 class CLIError(Exception):
@@ -313,6 +313,19 @@ def _auto_dispatch(args) -> bool:
     return str(getattr(args, "command", "") or "") in DISPATCH_COMMANDS
 
 
+def _dispatch_label(args) -> str:
+    """调用来源标记：调度自动执行 / 手动指定义务 / 手动咨询。
+
+    “有 obligation_id”不等于“自动执行”：主代理也可以手动执行某条义务。
+    统计要区分两者，否则 `manual_invoked` 会被系统性低估。
+    """
+    if bool(getattr(args, "auto_scheduled", False)):
+        return "auto-obligation"
+    if str(getattr(args, "obligation_id", "") or "").strip():
+        return "manual-obligation"
+    return "manual"
+
+
 def _auto_execution_allowed() -> bool:
     """是否允许自动执行（会真实计费）。
 
@@ -407,6 +420,8 @@ def _execute_obligation(path: str, obligation: dict) -> int:
                             round_two=_obligation_round_two(state, obligation))
     try:
         ns = build_parser().parse_args(argv)
+        # 只有这条路径是调度自动执行；手动 `--obligation` 仍记为 manual-obligation。
+        ns.auto_scheduled = True
     except SystemExit:
         print(f"认知调度：义务 {obligation_id} 的参数不合法；保持待执行。",
               file=sys.stderr)
@@ -574,6 +589,8 @@ def _under_tasks_dir(path: str) -> bool:
 def cmd_start(args) -> int:
     contract = _read_text(args.contract_file) if args.contract_file else ""
     criteria = _load_criteria(args.criteria_file) if args.criteria_file else None
+    intent = (_read_text(args.intent_file).strip() if args.intent_file else "") \
+        or str(getattr(args, "intent", "") or "").strip()
     state_path = _state_path(args)
     workspace = args.workspace or G._git_workspace(
         os.path.dirname(os.path.abspath(state_path)))
@@ -585,7 +602,8 @@ def cmd_start(args) -> int:
         workspace=workspace,
         test_policy=_load_test_policy(args),
         task_kind=args.task_kind or "",
-        triggers=args.trigger or [])
+        triggers=args.trigger or [],
+        intent=intent)
     print(f"任务已创建：{state['task_id']}")
     print(f"状态文件：{os.path.abspath(state_path)}")
     if not _under_tasks_dir(state_path):
@@ -598,6 +616,12 @@ def cmd_start(args) -> int:
           f"（{', '.join(c['criterion_id'] for c in state['contract']['criteria'])}）")
     print(f"风险：{state['risk']} · 类型：{state['task_kind']} "
           f"· 执行后端：{state['execution_backend']}")
+    profile = RP.task_complexity(
+        state, triggers=[t.get("name") for t in state.get("admission_triggers") or []],
+        workspace=str(state.get("workspace") or ""))
+    print(f"认知等级：{profile['tier']}（{profile['tier_reason']}）；"
+          f"窗口：{'、'.join(profile['windows']) or '无'}；"
+          f"原始意图：{'已登记' if profile['intent']['available'] else '未登记（按目标与合同分类）'}")
     # 生命周期调度（v9.6）：启动认知窗口在 start 自身事务内兑现——`--cognition auto` 时真的
     # 执行一次 CONSULT，而不是只打印命令等主代理记得跑；`advise` 给无占位符的可执行
     # 命令；`off` 明确静默。
@@ -617,6 +641,23 @@ def cmd_start(args) -> int:
             print(f"下一步：{advice['command']}")
     else:
         print(f"认知默认流程：跳过（{advice.get('reason')}）")
+    return 0
+
+
+def cmd_intent(args) -> int:
+    """登记用户原始任务意图（已有任务补录；默认不可覆盖）。"""
+    path = _state_path(args)
+    text = _read_text(args.file).strip() if args.file else \
+        str(getattr(args, "text", "") or "").strip()
+    if not text:
+        raise CLIError("需要 --text 或 --file 提供用户原始意图。")
+    state = G.record_intent(path, text, replace=bool(args.replace))
+    profile = RP.task_complexity(
+        state, triggers=[t.get("name") for t in state.get("admission_triggers") or []],
+        workspace=str(state.get("workspace") or ""))
+    print(f"原始意图已登记：{state['intent_sha256'][:16]}…（{len(text)} 字符）")
+    print(f"认知等级：{profile['tier']}（{profile['tier_reason']}）；"
+          f"窗口：{'、'.join(profile['windows']) or '无'}")
     return 0
 
 
@@ -1077,6 +1118,20 @@ def cmd_review_admission(args) -> int:
         print(f"任务类型：{advice.get('task_kind') or decision.get('task_kind') or '-'}")
         print(f"任务复杂度：{complexity.get('level') or '-'}"
               f"（信号：{', '.join(signals) if signals else '无'}）")
+        windows = list(advice.get("windows") or [])
+        print(f"认知等级：{advice.get('tier') or complexity.get('tier') or '-'}"
+              f"（窗口：{'/'.join(windows) if windows else '无'}）")
+        intent = advice.get("intent") or {}
+        if intent.get("available"):
+            print(f"原始意图：已登记（{intent.get('chars')} 字符，"
+                  f"来源 {intent.get('source') or '-'}）")
+        elif intent.get("goal_fallback"):
+            print("原始意图：未登记（按目标推断；用 `intent --text` 补录）")
+        else:
+            print("原始意图：未登记")
+        if advice.get("tier_reason") or complexity.get("tier_reason"):
+            print("等级依据：" + (advice.get("tier_reason")
+                                 or complexity.get("tier_reason") or ""))
         print(f"认知建议：{advice.get('action') or '-'}"
               f"（mode={advice.get('mode') or '-'}，"
               f"stage={advice.get('stage') or advice.get('phase') or '-'}）")
@@ -1205,6 +1260,7 @@ def _invoke_cognition_once(*, state_path: str, task_dir: str, prompt: str,
                 materials_sha256=digest, model=resolved_model,
                 provider=CC.PROVIDER,
                 obligation_id=str(getattr(args, "obligation_id", "") or ""),
+                dispatch=_dispatch_label(args),
                 stage=stage,
                 request_attempted=bool(getattr(exc, "request_attempted", True)),
                 send_observed=str(getattr(exc, "send_observed", "unknown")),
@@ -1617,6 +1673,13 @@ def _run_cognition_channel(args, mode: str) -> int:
             "task_kind": str(state.get("task_kind") or RP.DEFAULT_TASK_KIND),
             "complexity": complexity["level"],
             "complexity_signals": complexity["signal_codes"],
+            "tier": complexity.get("tier") or "",
+            # 调用来源：调度义务自动执行 / 手动指定义务 / 手动咨询。统计口径要能
+            # 区分三者，不能把“生成过命令/建议”当成真实调用。
+            "dispatch": _dispatch_label(args),
+            "obligation_id": obligation_id,
+            # A/B/C/E 生命周期归因：手动调用可能没有义务（未知时留空）。
+            "cognition_family": str((obligation or {}).get("family") or ""),
             "status": "completed",
             "mode": mode,
             "stage": stage if mode in ("CONSULT", "PLAN") else "",
@@ -1846,6 +1909,8 @@ def _cognition_schedule_view(state: dict, path: str) -> dict:
             "mode": item.get("mode"),
             "stage": item.get("stage"),
             "level": item.get("level"),
+            "tier": item.get("tier"),
+            "opened_by": item.get("opened_by"),
             "status": item.get("status"),
             "window": item.get("window"),
             "cycle": SCH.obligation_cycle(item),
@@ -1917,7 +1982,8 @@ def cmd_cognition_schedule(args) -> int:
         if row.get("deferrals"):
             extra += f" 未调度 {row['deferrals']} 次"
         print(f"- {row['obligation_id']} [{mark}] {row['family']}/{row['event']} "
-              f"{row['mode']} {row['level']} stage={row['stage'] or '-'}"
+              f"{row['mode']} {row['level']} tier={row['tier'] or '-'}"
+              f" stage={row['stage'] or '-'}"
               f" cycle={row['cycle']}{extra}")
     if view["command"]:
         print("下一条可执行：" + str(view["next"]))
@@ -2421,6 +2487,10 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("start", help="创建任务合同与状态")
     p.add_argument("--state", required=True)
     p.add_argument("--goal", required=True)
+    p.add_argument("--intent", default="",
+                   help="用户原始任务意图（原文或等价摘要）：认知分级的第一输入；"
+                        "省略时按目标与合同分类，无法可靠分类时至少 T1")
+    p.add_argument("--intent-file", default="", help="用户原始意图文本文件")
     p.add_argument("--contract-file", default="", help="合同 Markdown；`## 完成条件` 列表")
     p.add_argument("--criteria-file", default="", help="条件 JSON 数组或逐行文本")
     p.add_argument("--test-policy", default="",
@@ -2444,6 +2514,14 @@ def build_parser() -> argparse.ArgumentParser:
                    help="任务实际 git 工作区；省略时取状态文件所在目录的 git 根")
     p.set_defaults(func=cmd_start)
     _add_cognition_policy(p)
+
+    p = sub.add_parser("intent", help="登记用户原始任务意图（缺口补录，默认不可覆盖）")
+    p.add_argument("--state", required=True)
+    p.add_argument("--text", default="", help="用户原始要求的原文或等价摘要")
+    p.add_argument("--file", default="", help="原始意图文本文件")
+    p.add_argument("--replace", action="store_true",
+                   help="显式更正已登记的意图（旧值指纹写入历史）")
+    p.set_defaults(func=cmd_intent)
 
     p = sub.add_parser("plan", help="登记 ZCode 本地计划（JSON）")
     p.add_argument("--state", required=True)

@@ -35,11 +35,12 @@ Reviewer 与 G4 只读复核均已退役；独立审查由认知单轮复核承�
 `model: inherit` 跟随主代理。执行信封绑定见 `references/agent-bridge.md`；复核细则与历史
 G4 记录见 `references/review.md`。
 
-**协作闭环**：ChatGPT 定义目标 → ZCode 原生 Agent 承接 → Copilot 生命周期给出认知建议 →
-起点 CONSULT（有中/高认知价值信号时）→ 调查 → PLAN（需要多步/多方案时）→ 实施与验证（新证据触发
-动态 CONSULT）→ 收口判断（如建议）→ ZCode 自主采纳/调整/否决并完成验证 → Copilot 做
-轻量治理与证据桥接（必要时）→ 结果回传 → 验收。简单任务不强制经过 Copilot、认知或正式
-REVIEW；正式 REVIEW 只在用户明确要求时进行，且授权在同一任务合同内持续有效。
+**协作闭环**：ChatGPT 定义目标 → ZCode 原生 Agent 承接 → Copilot 按用户原始意图与合同判定
+T0–T3 认知等级 → 起点 CONSULT（T1–T3）→ 调查 → PLAN（T2/T3）→ 实施与验证（重大新证据触发
+动态 CONSULT）→ 最终工程验证 → 收口判断（T2/T3，如建议）→ ZCode 自主采纳/调整/否决并完成
+验证 → Copilot 做轻量治理与证据桥接（必要时）→ 结果回传 → 验收。简单任务不强制经过 Copilot、
+认知或正式 REVIEW；T0 不产生认知调用；正式 REVIEW 只在用户明确要求时进行，且授权在同一任务
+合同内持续有效。
 
 ## 固定原则
 

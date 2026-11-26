@@ -41,6 +41,30 @@ COMPLEXITY_SIGNALS = {
     "user-request": "用户明确要求认知判断或独立复核",
     "high-impact-scope": "目标或合同涉及治理/架构/协作规则等高影响范围（与任务类型无关）",
 }
+# ── 任务认知分级（v9.12）──────────────────────────────────────────────
+# T0–T3 是“认知价值等级”，不是工程风险等级，也不是门禁：
+#   T0 单步、明确、机械、低影响且没有实质方案取舍 → 0 次调用
+#   T1 存在实质问题分析、多步骤判断或一定决策不确定性 → A（启动 CONSULT）
+#   T2 多方案取舍、跨模块、重要功能设计或重要技术决策 → A + B + E
+#   T3 产品方向、项目规则、治理体系、系统架构、安全、数据完整性等重大影响
+#      → A + B + E（与 T2 同一窗口集合，等级用于归因与统计）
+# 等级只由可复核的状态事实计算；文件类型、工作项数量与默认 risk=medium
+# 都不能单独把任务降为 T0。
+TIERS = ("T0", "T1", "T2", "T3")
+TIER_WINDOWS = {
+    "T0": (),
+    "T1": ("A",),
+    "T2": ("A", "B", "E"),
+    "T3": ("A", "B", "E"),
+}
+# 任务类型本身表示高影响范围（治理/架构/数据/产品方向/发布）。
+HIGH_STAKES_TASK_KINDS = ("governance", "architecture", "data-infra",
+                          "product-design", "release")
+# 声明的触发因素属于高影响类别时，判定为 T3（安全/权限/数据完整性/生产等）。
+HIGH_STAKES_TRIGGERS = ("security", "permissions", "data-integrity",
+                        "production", "release", "global-execution",
+                        "architecture")
+
 # 任务类型不是“复杂度信号”，而是默认路由前提：非简单类型始终进入认知
 # 流程（至少一次 CONSULT），简单类型只有出现真实升级信号才进入。这样默认
 # standard 任务不会仅凭类型被抬到 high，也不会默认跳过复杂任务。
@@ -800,9 +824,15 @@ def _module_dirs(state: dict, workspace: str = "") -> list[str]:
 
 
 def _scope_texts(state: dict) -> list[str]:
-    """高影响范围识别的输入文本：目标、合同正文、边界与完成条件描述。"""
+    """高影响范围识别的输入文本：用户原始意图、目标、合同正文、边界与条件。
+
+    原始意图是第一输入：合同摘要可能被整理得比用户真实要求更“温和”，只看
+    合同会把规则/架构类任务误判为普通文档修改。`intent` 缺失时退回目标，但
+    不把目标伪装成“已登记的原始意图”（见 `intent_routing`）。
+    """
     contract = state.get("contract") or {}
-    parts = [_text(state.get("goal")),
+    parts = [_text(state.get("intent")),
+             _text(state.get("goal")),
              _text(contract.get("done_criteria_text")),
              _text(contract.get("boundaries"))]
     for item in contract.get("criteria") or []:
@@ -842,6 +872,28 @@ def high_impact_scope(state: dict) -> dict:
     return {"hit": hit, "groups": groups, "phrases": phrases, "detail": detail}
 
 
+def intent_routing(state: dict) -> dict:
+    """用户原始任务意图的路由事实：是否登记、来源、长度与指纹。
+
+    只有 `start --intent`（或显式写入 `state.intent`）才算“已登记的原始
+    意图”。`goal` 通常已经被整理成目标摘要，只能作为分类的补充文本，不能
+    当成原始意图的替代证明；两者都不存在时，等级判定按无法可靠分类处理。
+    """
+    intent = _text(state.get("intent"))
+    source = _text(state.get("intent_source"))
+    if intent:
+        source = source or "explicit"
+    else:
+        source = "missing"
+    return {
+        "available": bool(intent),
+        "source": source,
+        "chars": len(intent),
+        "sha256": sha256_text(intent) if intent else "",
+        "goal_fallback": bool(not intent and _text(state.get("goal"))),
+    }
+
+
 def task_complexity(state: dict, *, triggers: list[str] | None = None,
                     workspace: str = "") -> dict:
     """确定性的任务认知复杂度：只用状态事实，不调用任何模型。
@@ -855,6 +907,10 @@ def task_complexity(state: dict, *, triggers: list[str] | None = None,
     """
     codes: list[str] = []
     details: dict[str, str] = {}
+    if triggers is None:
+        # 调用方未显式传入时读取任务自己声明的触发因素：等级与信号不能因为
+        # 某个调用点忘了传参而与建议层得出不同结论。
+        triggers = declared_triggers(state)
 
     def add(code: str, detail: str) -> None:
         if code not in codes:
@@ -881,10 +937,10 @@ def task_complexity(state: dict, *, triggers: list[str] | None = None,
 
     # 高影响范围与任务类型解耦：方案类任务已由 plan-kind 覆盖，其余类型（含
     # docs/mechanical）在合同文字表明规则/架构/协作影响时仍然进入中等复杂度。
-    if kind not in PLAN_KINDS:
-        scope = high_impact_scope(state)
-        if scope["hit"]:
-            add("high-impact-scope", scope["detail"])
+    # 这里始终计算一次：它同时决定等级（T3）与信号，避免两处口径漂移。
+    scope = high_impact_scope(state)
+    if kind not in PLAN_KINDS and scope["hit"]:
+        add("high-impact-scope", scope["detail"])
 
     actions = _action_list(state, plan_only=True)
     edges = _dependency_edges(actions)
@@ -904,12 +960,46 @@ def task_complexity(state: dict, *, triggers: list[str] | None = None,
 
     count = len(codes)
     level = "low" if count == 0 else ("medium" if count == 1 else "high")
+    # ── T0–T3：认知价值等级（v9.12）───────────────────────────────────
+    # 判定顺序固定，先排除真正机械的任务，再按影响面升级：
+    #   T0 只有“显式简单类型 + 无任何信号 + 无高影响范围”才成立；
+    #   T1 是其余无信号任务（含原始意图缺失、无法可靠分类的默认落点）；
+    #   T3 由高影响范围、任务类型或声明触发因素决定；
+    #   T2 是其余有信号任务（多方案/复杂/重要技术决策）。
+    # `user-request` 不改变风险等级；它只保证用户要求的那次窗口不被过滤。
+    stakes_triggers = [name for name in requested
+                       if name in HIGH_STAKES_TRIGGERS]
+    if kind in SIMPLE_TASK_KINDS and level == "low" and not scope["hit"]:
+        tier = "T0"
+        tier_reason = (f"显式简单类型 {kind} 且没有认知价值信号"
+                       "（单步、机械、无实质方案取舍）")
+    elif level == "low":
+        tier = "T1"
+        tier_reason = ("任务不是显式机械类型且没有中/高价值信号：按一次启动"
+                       "判断处理（原始意图缺失或性质无法可靠分类时默认进入 T1）")
+    elif scope["hit"]:
+        tier = "T3"
+        tier_reason = "高影响范围：" + (scope.get("detail") or "规则/架构/协作")
+    elif kind in HIGH_STAKES_TASK_KINDS:
+        tier = "T3"
+        tier_reason = f"任务类型 {kind} 属于治理/架构/数据/产品方向等高影响范围"
+    elif stakes_triggers:
+        tier = "T3"
+        tier_reason = "声明的触发因素属于高影响类别：" + "、".join(stakes_triggers)
+    else:
+        tier = "T2"
+        tier_reason = ("存在多方案/复杂度/重要技术决策信号："
+                       + "、".join(codes))
     understood = bool(actions) or bool(state.get("plans")) or \
         bool([item for item in state.get("evidence") or []
               if isinstance(item, dict) and not item.get("dropped")])
     return {
         "schema": COMPLEXITY_SCHEMA,
         "level": level,
+        "tier": tier,
+        "tier_reason": tier_reason,
+        "windows": list(TIER_WINDOWS[tier]),
+        "intent": intent_routing(state),
         "signals": [{"code": code, "detail": details[code]} for code in codes],
         "signal_codes": codes,
         "task_kind": kind,
@@ -1028,17 +1118,21 @@ def plan_admission(state: dict, *, triggers: list[str] | None = None,
                 if _text(item.get("status")) in TERMINAL_STATUSES])
     understood = bool(profile["readiness"]["understood"])
     kind = profile["task_kind"]
-    required = (profile["level"] in ("medium", "high") or kind in PLAN_KINDS)
+    tier = profile.get("tier") or "T1"
+    required = tier in ("T2", "T3")
     return {
         "required": bool(required and understood),
         "understood": understood,
+        "tier": tier,
+        "tier_reason": profile.get("tier_reason") or "",
+        "windows": list(profile.get("windows") or TIER_WINDOWS[tier]),
         "level": profile["level"],
         "task_kind": kind,
         "planned": planned,
         "done": done,
         "non_simple": bool(profile.get("non_simple")),
-        "reason": ("方案类任务或中/高认知复杂度" if required
-                   else "既无方案类信号也没有中/高认知复杂度"),
+        "reason": (f"认知等级 {tier}：需要调查后的方案规划" if required
+                   else f"认知等级 {tier}：不需要自动规划窗口"),
     }
 
 
@@ -1288,17 +1382,17 @@ def cognition_advice(state: dict, *, calls: list[dict] | None = None,
 
     生命周期与调用策略（事件驱动，认知按价值触发）：
 
-    1. 简单/机械任务（无中/高复杂信号）→ 0 调用；默认 task_kind 不再自动等于
-       “需要认知”，是否有价值只看真实信号（影响面、真实产物、自评不确定性）。
-    2. A 启动：**存在中/高认知价值信号**的非简单任务 → 一次 CONSULT；普通局部
-       修复不因任务未声明类型就自动调用。
-    3. B 规划：已形成现场事实且存在实质方案决策 → 一次 PLAN；准入由复杂度信号
-       或方案类任务类型决定，不由工作项数量单独决定。
+    1. T0（显式机械类型、无信号、无高影响范围）→ 0 调用；文件类型本身不能
+       把规则/架构类任务压成 T0（高影响范围优先判定）。
+    2. A 启动：T1/T2/T3 的非简单任务 → 一次 CONSULT；普通局部修复不因任务
+       未声明类型就自动调用，但“无法可靠分类”时默认落在 T1 而不是静默跳过。
+    3. B 规划：T2/T3 任务已形成现场事实且存在实质方案决策 → 一次 PLAN；
+       准入由等级决定，不由工作项数量单独决定。
     4. C 执行期：出现可归因的新事件（实质证据变化、决策点、风险上升、重规划、
        合同修订、重开）→ 追加 CONSULT；普通证据追加与常规进展不触发。
     5. D 里程碑：**不再自动生成**。需要阶段复盘时由 ZCode 自行判断并手动发起
        `cognition-consult --stage stage`；没有自动义务、也不进入覆盖率分母。
-    6. E 收口：有实质进展且中/高认知价值任务在最终验证后 → 收口综合判断（按收口
+    6. E 收口：T2/T3 且已有实质进展的任务在最终验证后 → 收口综合判断（按收口
        周期去重）；认知不拥有 PASS 批准权，也不是门禁。
     7. REVIEW 只由用户明确要求，不由阶段或风险自动派生。
 
@@ -1369,6 +1463,8 @@ def cognition_advice(state: dict, *, calls: list[dict] | None = None,
         events = _signals_to_events(new_codes)
     new_events = [str(item.get("code") or "") for item in events]
     level = profile["level"]
+    tier = profile.get("tier") or "T1"
+    tier_windows = list(profile.get("windows") or TIER_WINDOWS[tier])
     kind = profile["task_kind"]
     actions = _action_list(state, plan_only=True)
     planned = len(actions)
@@ -1408,6 +1504,9 @@ def cognition_advice(state: dict, *, calls: list[dict] | None = None,
     base = {
         "schema": COGNITION_ADVICE_SCHEMA,
         "task_kind": kind,
+        "tier": tier,
+        "windows": tier_windows,
+        "intent": intent_routing(state),
         "complexity": profile,
         "covered": covered,
         "new_signals": new_codes,
@@ -1439,13 +1538,14 @@ def cognition_advice(state: dict, *, calls: list[dict] | None = None,
         base["reason"] = ("任务处于 BLOCKED：先解除授权/决策/资源缺口；认知不提供本地事实，"
                           "也不能替代用户决定。")
         return base
-    if level == "low" and not events and not user_request and not review_requested:
-        # 没有中/高认知价值信号：普通局部修复与机械任务保持 0 调用。风险等级
-        # 默认 medium 不构成信号，也不单独触发任何阶段（见 task_complexity）。
+    if tier == "T0" and not events and not user_request and not review_requested:
+        # T0：显式机械类型、无信号、无高影响范围，保持 0 调用。风险等级默认
+        # medium 不构成信号，也不单独触发任何阶段（见 task_complexity）。
         # 升级型事件（重大失败、方案被推翻、风险或范围变化）仍然放行：它们本身
         # 就是“值得再判断一次”的可归因事实。
-        base["reason"] = ("简单/局部任务（无中/高认知价值信号）：主代理自检、diff 与"
-                          "必要测试闭环，认知保持 0 调用；需要时可手动发起咨询。")
+        base["reason"] = (f"认知等级 {tier}（{profile.get('tier_reason') or '简单/机械任务'}）："
+                          "主代理自检、diff 与必要测试闭环，认知保持 0 调用；"
+                          "需要时可手动发起咨询。")
         return base
 
     def command_for(mode: str, stage: str, trigger: str) -> str:
@@ -1480,9 +1580,9 @@ def cognition_advice(state: dict, *, calls: list[dict] | None = None,
     # 终态、条件尚未核销或必要测试没有验证痕迹时，E 保持待执行而不是拿不完整的
     # 材料去问收口问题。仍未处理的动态事件优先于收口判断。
     if final_verified:
-        if not closure_consulted and progressed and level in ("high", "medium"):
-            # 收口综合判断只对“有认知价值且确有进展”的任务成立。复杂度来自真实
-            # 信号（高风险是其中一个信号），不由 risk 标签单独决定。
+        if not closure_consulted and progressed and tier in ("T2", "T3"):
+            # 收口综合判断只对“T2/T3 且确有进展”的任务成立。等级来自真实信号
+            # （高风险是其中一个信号），不由 risk 标签单独决定。
             recommended = "recommended"
             event = "closure"
             trigger = _retry_trigger(new_codes) if new_codes else "stage-result"
@@ -1518,7 +1618,7 @@ def cognition_advice(state: dict, *, calls: list[dict] | None = None,
     # 启动变成范围变化，问题也应问“哪些旧结论仍成立”而不是“重新理解任务”）。
     # 没有中/高价值信号（level=low）时不会走到这里：普通局部修复不因“任务未声明
     # 为简单类型”就自动产生启动义务。
-    if not covered["CONSULT"] and not events and level in ("medium", "high"):
+    if not covered["CONSULT"] and not events and tier != "T0":
         stage = "understanding" if not understood else "development"
         if attempted["CONSULT"]:
             trigger = "user-request" if user_request else "scope-changed"
@@ -1533,7 +1633,7 @@ def cognition_advice(state: dict, *, calls: list[dict] | None = None,
             "instance": sha256_text(canonical_json(
                 [snapshot["contract_sha256"], "startup"]))[:16],
             "question": question_for("startup", base),
-            "reason": ("任务存在中/高认知价值信号（影响面、真实产物或自评不确定性）："
+            "reason": (f"认知等级 {tier}（{profile.get('tier_reason') or '存在实质认知价值'}）："
                        "建议在启动阶段做一次 CONSULT，确认目标理解、关键矛盾、"
                        "初步策略与主要风险；随后由 ZCode 自主调查并核实。"),
             "command": command_for("CONSULT", stage, trigger),
