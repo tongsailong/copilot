@@ -2372,5 +2372,8 @@
     - **兼容与不变量**：旧任务的 `sol_*` 字段与历史义务只读兼容；策略优先级（命令行显式 >
       `COPILOT_COGNITION` > 任务快照 > 命令默认）、复用键、失败降级、退避窗口、G1–G3、
       `closure_readiness`、PARTIAL 续跑、REVIEW 仅用户明确要求、G4 退役均不变。未新增
-      Provider、模型、Agent 或 Reviewer 体系，未改 CPA/凭据/模型路由与全局 `AGENTS.md`；
-      本轮只做源码、测试、文档与运行时同步，未 commit / push / Tag / Release。
+      Provider、模型、Agent 或 Reviewer 体系，未改 CPA/凭据/模型路由与全局 `AGENTS.md`。
+    - **交付（2026-11-26，用户明确授权）**：提交 `513c091`（17 文件，+1548/−176）→ PR #20 →
+      squash 合并 `109119f`；CI Python 3.10 / 3.12 各 1100 项 OK；运行时 27 个受管理文件
+      SHA-256 一致（`--check` 0/0，`--verify-baseline` 通过）；真实 ZCode GUI 验收 PASS
+      （T3 任务 A/B/E 三次 `auto-obligation`，T0 任务 0 义务 0 调用）。未建 Tag / Release。
