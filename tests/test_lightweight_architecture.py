@@ -126,20 +126,31 @@ class CognitionValueTests(Base):
                 self.sync()
                 self.assertEqual(SCH.obligations(self.state()), [])
 
-    def test_default_medium_standard_task_gets_no_obligation(self):
-        """默认 `risk=medium` + 未声明任务类型不构成任何认知价值信号。"""
+    def test_default_standard_task_is_t1_with_startup_consult(self):
+        """未声明类型且没有中/高价值信号：按 T1 给一次启动 CONSULT。
+
+        默认 `risk=medium` 本身不构成认知价值信号，因此任务不会升级到 T2/T3；
+        但它也不是显式机械类型，原始意图缺失时不能按 T0 处理——一次启动判断
+        正是“任务性质无法可靠分类”时的保守落点。
+        """
         self.start()
         self.plan(2)
         self.evidence()
+        complexity = RP.task_complexity(self.state())
+        self.assertEqual(complexity["level"], "low", complexity)
+        self.assertEqual(complexity["tier"], "T1", complexity)
+        self.assertEqual(complexity["windows"], ["A"])
         advice = self.advice()
-        self.assertEqual(advice["action"], "none")
-        self.assertEqual(advice.get("family") or "", "")
+        self.assertEqual(advice["action"], "consult")
+        self.assertEqual(advice.get("family"), "A")
         self.sync()
-        self.assertEqual(SCH.obligations(self.state()), [])
+        families = [row["family"] for row in SCH.obligations(self.state())]
+        self.assertEqual(families, ["A"])
         stats = SCH.task_stats(self.state())
-        # 低认知价值任务不是“漏登记”：它按设计就没有启动窗口。
         self.assertFalse(stats["not_registered"])
-        self.assertEqual(stats["coverage"]["startup"]["denominator"], 0)
+        self.assertEqual(stats["coverage"]["startup"]["denominator"], 1)
+        self.assertEqual(stats["coverage"]["plan"]["denominator"], 0)
+        self.assertEqual(stats["coverage"]["closure"]["denominator"], 0)
 
     def test_multiple_work_items_do_not_raise_risk(self):
         """工作项数量只影响“多动作”信号，绝不改写 risk 或制造高风险门禁。"""

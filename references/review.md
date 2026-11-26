@@ -6,11 +6,11 @@
 **一句话区分：**
 
 - **普通自检**：ZCode 自己做，不登记为复核，不构成任何门禁依据。
-- **认知 CONSULT（默认认知入口）**：存在中/高认知价值信号（影响面、真实产物、自评不确定
-  性）的任务在启动、升级型事件与收口前一次性调用 `gpt-6.2-astra`（零工具、单轮、high），输出目标理解、问题本质、路线与取舍、
-  风险、调查方向与再咨询条件；结论是认知输入，不是门禁。
-- **认知 PLAN（调查后的规划判断）**：多步骤 / 多方案 / 重要决策任务在形成现场事实后调用，
-  输出方案比较、优先级、阶段目标与验收关注点；最终技术方案仍由 ZCode 决定。
+- **认知 CONSULT（默认认知入口）**：按 T1–T3 认知等级在启动、升级型事件与收口前一次性调用
+  `gpt-6.2-astra`（零工具、单轮、high），输出目标理解、问题本质、路线与取舍、风险、调查方向
+  与再咨询条件；结论是认知输入，不是门禁。T0 不产生调用。
+- **认知 PLAN（调查后的规划判断）**：T2/T3 任务在形成现场事实后调用，输出方案比较、优先级、
+  阶段目标与验收关注点；最终技术方案仍由 ZCode 决定。
 - **认知 REVIEW（用户要求）**：用户明确要求时一次性独立复核，输出结构化 findings；结论是
   建议，不是门禁。
 - **正式 REVIEW**：用户明确授权时才做，是一个治理记录，**不是普通开发的强制前置门**。
@@ -29,28 +29,32 @@
 - `review-admission` / `evaluate` / `drive` / `status` 是“要不要调用认知”的确定性入口：
   先算任务类型与本地复杂度（只用状态事实），再结合已有覆盖给出建议；不写状态、不派生
   工作项、不改变阶段。
-- 复杂度的唯一口径是**真实认知价值信号**（见 `runtime.md` 信号表）：简单/机械类型与默认
-  `risk=medium` 的 standard 任务都是 0 信号 → 0 调用；没有硬性次数或 Token 上限。
+- 复杂度的唯一口径是**认知等级 T0–T3**（见 `runtime.md` §5）：第一依据是用户原始意图
+  （`start --intent` / `intent --text|--file`），再结合目标、合同文字与状态事实；文件类型、
+  工作项数量与默认 `risk=medium` 不能单独判成 T0。没有硬性次数或 Token 上限。
 
 ### 任务类型与生命周期
 
-`start --task-kind <kind>` 声明 16 类任务；未声明按 `standard` 处理：
+`start --task-kind <kind>` 声明 16 类任务；未声明按 `standard` 处理。等级按合同内容与原始
+意图判定，不只看类型：
 
-- 简单/机械类型：`trivial` / `mechanical` / `docs` / `format` —— 默认 0 调用，除非出现
-  `risk-high` / `replan-history` / `reopened` 或用户明确要求；
-- 方案类类型（`architecture` / `multi-option` / `governance` / `refactor` / `research` 等
-  `PLAN_KINDS`）本身构成 `plan-kind` 信号；
-- 其余类型（`standard` / `feature` / `bugfix`）**不因类型进入生命周期**，只在出现真实信号
-  （`risk-high` / 声明触发 / 多模块 / 多动作 / 重规划 / 重开）时才建议调用；
-- 任务类型不是调用开关，工作项数量本身也不是高风险的证据。
+- 显式简单类型（`trivial` / `mechanical` / `docs` / `format`）且无信号、无高影响范围 → T0；
+  一旦合同或意图涉及治理/规则/架构/协作，或出现 `risk-high` / `replan-history` / `reopened`，
+  仍会升级；
+- 高影响任务类型（`governance` / `architecture` / `data-infra` / `product-design` /
+  `release`）与高影响触发因素（安全/权限/数据完整性/生产等）→ T3；
+- 方案类类型（`PLAN_KINDS`）本身构成 `plan-kind` 信号，进入 T2 或以上；
+- 未声明类型的 `standard` / `feature` / `bugfix` 默认 T1（一次启动 CONSULT），不因“没写
+  类型”或“默认风险值”被压成 T0；
+- 任务类型不是调用开关，工作项数量本身也不是高风险或高认知价值的证据。
 
 | 阶段 | 建议 | 入口 |
 |---|---|---|
-| A 启动 | 存在中/高认知价值信号时建议一次 CONSULT：目标与隐含需求、问题本质、关键矛盾、初步策略、风险、调查方向 | `cognition-consult --stage understanding` |
-| B 调查后 | 多步骤 / 多方案 / 重要决策建议一次 PLAN：方案比较、取舍、优先级、阶段目标 | `cognition-plan --stage planning` |
+| A 启动 | T1/T2/T3 在启动时执行一次 CONSULT：目标与隐含需求、问题本质、关键矛盾、初步策略、风险、调查方向 | `cognition-consult --stage understanding` |
+| B 调查后 | T2/T3 在形成现场事实后执行一次 PLAN：方案比较、取舍、优先级、阶段目标 | `cognition-plan --stage planning` |
 | C 执行期 | 升级型新信号（风险升级/方案失败重规划/任务重开）或合同实质修订时追加 CONSULT | `cognition-consult --stage development --force --trigger ...` |
 | ~~D 阶段复盘~~ | **已退役**：普通里程碑不再自动派生义务；需要阶段性判断时由主代理按价值手动发起 | `cognition-consult --stage stage` |
-| E 收口前 | 最终工程验证完成后（工作项终态、条件核销、证据与必要测试齐备）一次综合判断：目标达成、遗漏与剩余风险 | `cognition-consult --stage closure` |
+| E 收口前 | T2/T3 且最终工程验证完成后（工作项终态、条件核销、证据与必要测试齐备）一次综合判断：目标达成、遗漏与剩余风险 | `cognition-consult --stage closure` |
 
 - **E 的时机不是“最后一项关闭”**：收口 CONSULT 以 `closure_readiness` 为唯一准入——工作项
   终态、条件核销、证据登记、合同必要测试的执行痕迹全部满足后才执行；G1–G3 通过本身不等于
@@ -281,12 +285,13 @@ v8 起原生 Reviewer 已退役，正式 REVIEW 的独立意见只能来自 SOL 
 
 | 场景 | 建议 |
 |---|---|
-| 简单文案、小 Bug、简单 UI（简单类型且 0 复杂度信号） | 0 调用；主代理自检闭环 |
-| 存在中/高认知价值信号（中/高复杂度）的任务启动 | 建议一次 CONSULT（understanding） |
-| 调查后多步骤 / 多方案 / 重要决策 | 建议一次 PLAN（planning） |
-| 出现升级型新信号（风险升级/重规划/重开）或合同修订 | 允许追加一次 CONSULT |
-| ~~中高复杂任务重要阶段完成~~ | 里程碑复盘已退役；需要阶段判断时按价值手动发起 |
-| 收口前（最终工程验证已完成，中/高复杂） | 一次收口 CONSULT（closure）；验证缺口未补齐时不执行；采纳与否都不阻止收口 |
+| T0：显式简单类型、无信号、无高影响范围 | 0 调用；主代理自检闭环 |
+| T1：启动 | 启动 CONSULT（understanding） |
+| T2/T3：启动 | 启动 CONSULT（understanding） |
+| T2/T3：调查后形成现场事实 | PLAN（planning） |
+| 出现升级型新信号（风险升级/重规划/重开）或合同修订 | 追加一次 CONSULT（C） |
+| ~~T2/T3 重要阶段完成~~ | 里程碑复盘已退役；需要阶段判断时按价值手动发起 |
+| T2/T3：最终工程验证已完成 | 收口 CONSULT（closure）；验证缺口未补齐时不执行；采纳与否都不阻止收口 |
 | 用户明确要求独立复核（`--review-request`） | 一次 REVIEW |
 | 用户明确要求认知判断（`--user-request`） | 直接一次 CONSULT |
 

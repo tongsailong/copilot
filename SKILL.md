@@ -1,6 +1,6 @@
 ---
 name: copilot
-description: "Copilot v9.11.0 轻量协作治理：任务承接、合同与完成条件、状态与证据登记、PARTIAL 强制续跑与调度领取、认知咨询（默认 gpt-6.2-astra，high，零工具单轮）。Copilot 只做治理，不实施工程、不替代技术决策；ZCode 原生 Agent 是唯一执行与技术决策主体，子代理按需。PARTIAL 是连续执行状态而不是终点：只要仍有原始授权内的可执行工作，就必须派生、领取并继续；阻塞按工作项成立，单项缺授权不冻结整个任务。drive 把工作项领取落盘（短租约）避免并发重复，回填/阻塞自动释放；SessionStart 与 UserPromptSubmit 只读提示未闭合任务。认知仅 advisory：复杂度按合同内容与真实信号判定（治理/架构/协作类文字不会被文件类型跳过），简单/机械任务与默认 risk=medium 不产生任何调用；只有中/高认知价值时才建议启动 CONSULT、调查后 PLAN、重大事件追加与收口前综合判断（D 阶段里程碑复盘已退役）；策略随任务生效（start 记录、默认 auto，任务级 off 对整条任务有效），每条命令最多执行 1 条义务（--cognition auto|advise|off），纯记录命令不隐式付费；认知采纳只是可选审计记录、不阻止收口；REVIEW 仅在用户明确要求时执行。G4 原生只读复核已退役，历史台账只读保留。"
+description: "Copilot v9.12.0 轻量协作治理：任务承接、合同与完成条件、状态与证据登记、PARTIAL 强制续跑与调度领取、认知咨询（默认 gpt-6.2-astra，high，零工具单轮）。Copilot 只做治理，不实施工程、不替代技术决策；ZCode 原生 Agent 是唯一执行与技术决策主体，子代理按需。PARTIAL 是连续执行状态而不是终点：只要仍有原始授权内的可执行工作，就必须派生、领取并继续；阻塞按工作项成立，单项缺授权不冻结整个任务。drive 把工作项领取落盘（短租约）避免并发重复，回填/阻塞自动释放；SessionStart 与 UserPromptSubmit 只读提示未闭合任务。认知仅 advisory：按 T0–T3 认知等级与用户原始意图决定窗口——T0（显式简单类型且无信号/无高影响范围）0 调用；T1 只在启动 CONSULT；T2/T3 在启动 A、调查后 B、收口前 E 自动真实执行，重大事件追加 C；默认 risk=medium 不构成信号，docs/mechanical 不掩盖真实治理意图，意图缺失或无法分类时至少 T1；策略随任务生效（start 记录、默认 auto，任务级 off 对整条任务有效），每条命令最多执行 1 条义务（--cognition auto|advise|off），纯记录命令不隐式付费；认知采纳只是可选审计记录、不阻止收口；REVIEW 仅在用户明确要求时执行。G4 原生只读复核已退役，历史台账只读保留。"
 when_to_use: >
   需要把多步骤工程任务纳入可追踪治理时：合同/完成条件需要固定、证据与审计需要绑定、
   长任务需要 PARTIAL 持续推进与上下文恢复、存在真实认知价值信号（架构取舍、多方案
@@ -8,7 +8,7 @@ when_to_use: >
   或只读查看历史调用与台账。简单、单步、低风险任务直接由 ZCode 原生完成，不进入本 Skill。
 ---
 
-# copilot：轻量协作治理（v9.11.0）
+# copilot：轻量协作治理（v9.12.0）
 
 Copilot 是运行在 ZCode 内的**协作治理层**，不是决策模型，也不是执行体。它负责把任务变成可
 追踪的合同、状态、证据与收口条件，并在任务没有真正完成时继续推进。
@@ -54,29 +54,31 @@ Copilot 是运行在 ZCode 内的**协作治理层**，不是决策模型，也�
 1. 任务需要固定合同与完成条件，并在多轮之间保持状态（长任务、跨会话续跑）。
 2. 需要证据登记、SHA-256 完整性、审计留痕与可追溯收口。
 3. 任务处于 PARTIAL（还有工作要做），需要本地派生下一步而不是等待外部判断。
-4. 存在真实认知价值信号（影响面、真实产物、自评不确定性：架构/方案取舍、多模块、
-   重大风险、重规划史）时按需做一次启动 CONSULT，调查后按需 PLAN；简单/机械任务与
-   默认 `risk=medium` 不做任何认知调用（`review-admission` 给出复杂度与建议）。
+4. 任务有实质认知价值（架构/方案取舍、多模块、重大风险、重规划史，或原始意图本身
+   涉及治理/规则/协作）时按 T1–T3 在启动、调查后与收口前自动执行认知窗口；只有
+   显式简单类型且无信号、无高影响范围的 T0 保持 0 调用（`review-admission` 给出
+   等级、窗口与依据）。
 5. 复杂问题存在多条技术路线、跨模块调用链或疑难故障，需要一次独立认知视角。
 6. 重大新证据（原方案失败、风险升级、任务重开）出现，需要一次定向再咨询。
 7. 用户明确要求认知判断，或明确要求正式独立复核（REVIEW）。
 8. 用户要求只读查看历史 SOL 调用、REVIEW 台账或旧任务状态。
 
-不适用：单步查询、单文件小改、纯问答、简单命令确认——直接由 ZCode 完成，不建立任务状态。
+不适用：单步查询、单文件小改、纯问答、简单命令确认——直接由 ZCode 完成，不建立任务状态；
+若任务已进入状态机，这类工作对应 T0（不调用认知）。
 
 ## 核心循环
 
 ```
-start（合同 + 完成条件 + 风险 + 任务类型 + 后端）
-  → [有中/高认知价值信号时，启动] cognition-consult（understanding：目标理解/问题/风险/调查方向）
+start（合同 + 完成条件 + 风险 + 任务类型 + 后端 + 原始意图）
+  → 分级 T0–T3（用户原始意图是第一输入；文件类型/默认风险值不能单独决定不调用）
+  → [T1/T2/T3，启动] cognition-consult A（understanding：目标理解/问题/风险/调查方向；自动执行）
   → plan（ZCode 本地计划）或 PARTIAL 自动派生工作项
-  → [调查后，按需] cognition-plan（方案比较/优先级/阶段目标）
+  → [T2/T3，调查后] cognition-plan B（方案比较/优先级/阶段目标；自动执行）
   → drive（本地求值：PASS 收口 / BLOCKED 停下 / 打印工作单）
   → ZCode 执行（主代理或原生子代理）
   → ingest / record / criterion / evidence（回填真实结果与原始证据）
-  → [新证据/新风险/方案失败] cognition-consult 动态追加；主代理自主采纳/调整/否决
-  → [中高复杂，阶段边界] cognition-consult --stage stage（成果复盘，recommended 自动执行）
-  → [最终工程验证完成后、收口前] cognition-consult --stage closure（综合判断）→ ZCode 最终验收 → 收口
+  → [重大事件] cognition-consult C 动态追加；主代理自主采纳/调整/否决
+  → [T2/T3，最终工程验证完成后、收口前] cognition-consult E（综合判断）→ ZCode 最终验收 → 收口
   → [仅用户明确要求] cognition-review 一次（REVIEW 独立复核）
 ```
 
@@ -449,35 +451,60 @@ verify 的结构化质量报告（`copilot-verify-result/v1`）走报告接入�
   `bind-execution` 都会拒绝没有 captured 策略的高风险任务；合同策略进入合同指纹，
   `required=false` 才允许测试层 N/A，调用方只能加严，不能删除或放宽合同要求。
 
-## 认知策略（v9.0）
+## 认知策略（v9.12：T0–T3 分级）
 
 **认知是默认认知引擎，但不是按阶段机械运行的流程。** ZCode 主代理是唯一工程执行与技术决策
 主体：认知给出目标理解、问题判断、路线比较、取舍、风险与优先级，主代理自主采纳、调整或
 否决，并按现场事实实施与验证。认知不调查、不读仓库、不跑测试、不写代码、不维护台账。
 
-### 任务类型与路由
+### 认知等级 T0–T3 与原始意图
+
+`start --intent`（或 `--intent-file`）登记**用户原始任务意图**；它是分级的**第一输入**，
+合同摘要与目标只作补充。已有任务可用 `intent --text/--file` 补录，默认不可覆盖，确需
+更正必须显式 `--replace`（旧值指纹进历史）。意图缺失、合同无法可靠分类时**至少 T1**，
+不能因为“没写类型”或“默认 `risk=medium`”直接归入 T0。
+
+| 等级 | 判定（确定性） | 窗口 |
+|---|---|---|
+| T0 | 显式简单类型（trivial/mechanical/docs/format）＋ 无认知价值信号 ＋ 无高影响范围 | 无（0 调用） |
+| T1 | 非显式机械任务，且没有中/高价值信号；含原始意图缺失、性质无法可靠分类 | A |
+| T2 | 有多方案/复杂度/重要技术决策信号（含 `risk=high`、声明触发、多模块、依赖、重规划、重开） | A、B、E |
+| T3 | 高影响范围（用户原始意图/目标/合同命中治理/规则/架构/协作/门禁类文字）、治理/架构/数据/产品方向任务类型，或声明的触发因素属于高影响类别 | A、B、E |
+
+- 类型、文件后缀、工作项数量、默认风险值与单个关键词都**不能单独决定不调用**；
+  `docs` / `mechanical` 任务只要用户原始意图或合同涉及规则/架构/协作，就按 T3 处理。
+- 等级不是门禁：用户明确要求 CONSULT/PLAN/REVIEW 时按用户要求执行；等级只决定默认
+  生命周期窗口，避免“全部任务都升级成 T2/T3”的另一种噪声。
+- 等级与依据通过 `start`、`review-admission`、`cognition-schedule`、`cognition-stats`
+  输出；义务保存打开时的等级快照，后续等级变化不回写旧义务。
+
+### 任务类型（不是调用开关）
 
 `start --task-kind <kind>` 声明任务性质；未声明时按 `standard` 处理。**类型不是调用开关**，
 只是“自评不确定性”的一个输入，也不是工作量估算或门禁：
 
-- 简单/机械类型（`trivial` / `mechanical` / `docs` / `format`）：不产生任何调用，除非出现
-  `risk-high`、`replan-history`、`reopened` 等升级型信号或用户明确要求；
+- 简单/机械类型（`trivial` / `mechanical` / `docs` / `format`）：只有同时没有信号、没有
+  高影响范围才是 T0；否则按真实信号进入 T1–T3；
 - 方案类类型（`architecture` / `refactor` / `research` / `multi-option` / `release` /
   `performance` / `product-design` / `data-infra` / `governance`）：显式声明本身构成
-  `plan-kind` 信号（存在多方案取舍），按中复杂度给出建议；
-- 其余类型（`standard` / `feature` / `bugfix`）：默认不产生信号；是否需要认知由下面的
-  真实信号决定。
+  `plan-kind` 信号（存在多方案取舍），按 T2/T3 处理；
+- 其余类型（`standard` / `feature` / `bugfix`）：默认没有中/高信号时按 T1 给一次启动
+  判断；是否升级到 T2/T3 由下面的真实信号与高影响范围决定。
 
 ### 生命周期（默认调用，不是门禁）
 
 | 阶段 | 默认行为 | 入口 |
 |---|---|---|
-| A 任务启动 | 存在中/高认知价值信号时建议一次 CONSULT：目标与隐含需求、问题本质、关键矛盾、初步策略、主要风险、调查方向 | `cognition-consult --stage understanding` |
-| B 调查之后 | 已形成现场事实且 `plan_admission.required`（中/高复杂或方案类任务）时建议一次 PLAN：方案比较、取舍、优先级、阶段目标。工作项数量本身不是理由 | `cognition-plan --stage planning` |
+| A 任务启动 | T1/T2/T3 在启动时执行一次 CONSULT：目标与隐含需求、问题本质、关键矛盾、初步策略、主要风险、调查方向 | `cognition-consult --stage understanding` |
+| B 调查之后 | T2/T3 在形成现场事实且 `plan_admission.required` 时执行一次 PLAN：方案比较、取舍、优先级、阶段目标。工作项数量本身不是理由 | `cognition-plan --stage planning` |
 | C 执行期动态 | 出现六类可归因事件之一时追加 CONSULT：实质证据变化（finding 复现、条件回退）、决策点（新登记决策）、风险升级、重规划、合同实质修订（scope-changed）、任务重开；普通证据追加、备注变化、常规步骤推进不触发 | `cognition-consult --stage development --force --trigger ...` |
 | D 阶段复盘 | **已退役**：普通里程碑不再自动派生义务；需要阶段性判断时由主代理按价值手动发起 | — |
-| E 收口判断 | 有实质进展且中/高复杂的任务在最终工程验证完成后（工作项终态、条件核销、证据与合同必要测试齐备）、G1–G3 收口之前做一次综合判断：目标达成、重要遗漏与剩余风险；工程验收仍由 ZCode 完成 | `cognition-consult --stage closure` |
+| E 收口判断 | T2/T3 且有实质进展的任务在最终工程验证完成后（工作项终态、条件核销、证据与合同必要测试齐备）、G1–G3 收口之前执行一次综合判断：目标达成、重要遗漏与剩余风险；工程验收仍由 ZCode 完成 | `cognition-consult --stage closure` |
 
+- **自动执行是真实请求**：生命周期命令（`start`/`plan`/`record`/`rerun`/`criterion`/
+  `unblock`/`reopen`/`closure`/`drive`）在有效策略为 `auto` 时消费至多 1 条义务并发出
+  真实请求；只打印命令/建议不算调用，`cognition-stats` 的 `invoked` 只认带 `call_id`
+  的义务。
 - **没有硬性调用次数或 Token 上限**：重大新证据、实质策略变化、方案失败、新风险都可以
   追加；但每次必须有明确问题与预期决策价值（`--force --trigger --reason` 是决策价值声明，
   不是次数配额）。同一材料/同一合同没有新信息时复用已有结论，不重复付费。
@@ -486,14 +513,16 @@ verify 的结构化质量报告（`copilot-verify-result/v1`）走报告接入�
 - **REVIEW 只在用户明确要求时执行**：不由阶段、风险或调用次数自动派生；用户明确要求后，
   授权在同一任务合同内持续有效，范围或风险实质变化时重新确认。
 - 任务处于任务级 BLOCKED 或已收口（CLOSED）时不建议新的认知调用；项级阻塞只冻结对应
-  工作项，其余工作与认知照常推进。
+  工作项，其余工作与认知照常推进；认知失败只记录，不冻结工程。
 
 ### 复杂度与建议（确定性，只读）
 
-`review-admission` / `evaluate` / `drive` / `status` 输出三个层次，全部只读、不写状态、
+`review-admission` / `evaluate` / `drive` / `status` 输出四个层次，全部只读、不写状态、
 不是门禁：
 
-- `complexity`：`low` / `medium` / `high` ＋ 命中的信号（见下表）与 `non_simple`；
+- `intent`：原始意图是否已登记（`available` / `goal_fallback` / `chars` / `sha256`）；
+- `complexity`：`tier`（T0–T3）＋ `tier_reason` ＋ `windows` ＋ 命中的 `signals` 与
+  `level`（`low` / `medium` / `high`，仅作信号计数的兼容视图）；
 - `advice.action`：`none` / `reuse` / `consult` / `plan` / `review`，附建议模式、阶段与命令；
 - `recommended_action`：`not_needed` / `optional` / `recommended` 兼容视图。
 
@@ -502,6 +531,7 @@ verify 的结构化质量报告（`copilot-verify-result/v1`）走报告接入�
 | `risk-high` | 任务风险为 high（不可逆/生产/安全影响） |
 | `plan-kind` | 显式声明为方案类任务类型（架构/重构/研究/多方案/发布/性能/产品设计/数据基础设施/治理） |
 | `declared-trigger` | 准入时声明了 security / permissions / core-logic / data-integrity / architecture / global-execution / production / release |
+| `high-impact-scope` | 目标/意图/合同文字涉及治理、架构、协作规则等高影响范围（与文件类型无关，`docs` 也适用） |
 | `multi-module` | 已登记证据跨越 ≥2 个模块目录 |
 | `multi-action` | 计划内工作项 ≥4 |
 | `interdependent` | 计划内工作项依赖边 ≥2 |
@@ -509,8 +539,15 @@ verify 的结构化质量报告（`copilot-verify-result/v1`）走报告接入�
 | `reopened` | 任务曾重开 |
 | `user-request` | 用户明确要求认知判断或独立复核（`--user-request`） |
 
-- 0 个信号 → `none`：0 调用，任何任务类型都一样（默认 `risk=medium` 不是信号）；
-- 1 个 → `medium`，≥2 个 → `high`：按生命周期建议 CONSULT / PLAN；
+等级按固定顺序判定（细节见 `references/runtime.md` §5）：
+
+- 简单类型 ＋ `low` ＋ 无高影响范围 → **T0**（0 调用）；
+- `low` 但非简单类型，或其他未触发升级的任务 → **T1**（A）；
+- 高影响范围、高影响任务类型（治理/架构/数据基础设施/产品设计/发布）、高影响触发因素
+  → **T3**（A/B/E）；
+- 其余 → **T2**（A/B/E）。信号取 `intent` → 目标 → 合同/边界/条件，文件类型、工作项
+  数量与默认 `risk=medium` 都不能单独把任务判为 T0。
+
 - 已覆盖且没有升级型新信号 → `reuse`：直接复用已有认知结论；
 - 只有升级型信号（`risk-high` / `replan-history` / `reopened`）新出现，或合同被修订
   （合同指纹变化＝新范围），才允许追加；证据目录增加、工作项增减等结构变化不算新的认知对象。
@@ -518,6 +555,8 @@ verify 的结构化质量报告（`copilot-verify-result/v1`）走报告接入�
   固定顺序推进：最终验证 → 收口 CONSULT（如建议）→ G1–G3 收口。`cognition-accept` 只是
   可选的采纳审计记录，**不登记采纳不影响收口**。验证有缺口时 `drive` 直接返回
   `EXIT_EXECUTE`，不执行认知、不收口。
+- T2/T3 的 A/B/E 窗口在有效策略为 `auto` 时由生命周期命令自动执行真实请求；`advise`
+  只打印建议，`off` 完全静默。等级与窗口都不是门禁，不影响阶段、G1–G3 或工程决策。
 
 ### 生命周期主动调度（义务化，不是门禁）
 
@@ -541,12 +580,17 @@ verify 的结构化质量报告（`copilot-verify-result/v1`）走报告接入�
   终态处置写 `disposition` 与**打开窗口时**的策略快照
   （`policy_at_open`，历史按周期快照回推，不可证明记 `unknown`），条件成立但未调度只累加
   `deferrals` 并保持 `due`。`cycle` = 1 + 重开次数，窗口比较不跨周期。
-- **观测**：`cognition-stats` 输出显式分母（启动＝有中/高认知价值信号、PLAN＝
-  `plan_admission` 适用、收口＝有实质进展且中/高复杂或高风险、事件＝每次事件一个窗口），
-  区分建议/执行/复用/跳过/失败/漏调/未登记，并给采纳与 tokens/延迟。`lifecycle` 把义务
-  翻译成 `triggered / invoked / succeeded / failed / skipped / missed / deferred`，跳过按
-  `skip_by`、漏调按**打开窗口的命令**（`opened_by`，如 `start` / `record` / `drive`）归因；
-  覆盖率**不改变阶段、G1–G3 或收口结论**。
+- **观测**：`cognition-stats` 输出显式分母（按等级窗口：T0 无、T1 仅启动、T2/T3 启动/
+  PLAN/收口，收口还要求有实质进展；事件每次一个窗口），指标为 `expected` / `triggered` /
+  `invoked` / `succeeded` / `failed` / `reused` / `deferred` / `skipped` / `missed` 并区分
+  `auto_invoked` / `manual_invoked`，并给显式分母的成功率（`success_rate` =
+  succeeded/invoked）与漏调率（`missed_rate` = missed/expected，分母 0 记 null）；
+  另给等级/窗口分布（`by_window`）、模式分布
+  （`by_mode`：CONSULT/PLAN/REVIEW 的请求、成功/失败、tokens 与延迟分位）、任务类型覆盖
+  （`totals.task_kind_tasks`）、采纳与 tokens/延迟。
+  `lifecycle` 把义务翻译成 `triggered / invoked / succeeded / failed / skipped / missed /
+  deferred`，跳过按 `skip_by`、漏调按**打开窗口的命令**（`opened_by`，如 `start` /
+  `record` / `drive`）归因；采纳与覆盖率**不改变阶段、G1–G3 或收口结论**。
 - **采纳记录**：`cognition-accept --status accepted|modified|rejected` 是可选的审计事实，
   不是收口门禁；不因代码已改、测试通过或任务 PASS 推断采纳。
 
@@ -789,7 +833,18 @@ python3 -B scripts/efficiency_report.py --workspace <ws> [--workspace <ws2>] \
 
 ## 版本
 
-当前 **v9.11.0（认知自动调度与调用率优化）**：复杂度按**合同内容**判定——新增
+当前 **v9.12.0（认知分级与自动执行）**：认知调度改为 **T0–T3 分级**，等级由**用户原始
+意图**、目标、合同文字与状态事实确定性判定，文件类型、工作项数量与默认 `risk=medium`
+不能单独把任务降为 T0；`docs`/`mechanical` 若内容涉及治理/架构/协作规则仍升级。窗口固定为
+T0 无、T1 `A`、T2/T3 `A/B/E`，C 仍由事件触发。`start --intent` / `intent --text|--file`
+登记原始意图（`intent_sha256`，默认不可覆盖），材料按阶段组织（A 原始意图与边界、B 调查
+事实与候选方案、C 新增事实与决策问题、E 最终结果与剩余风险）。`auto` 策略下生命周期命令
+**自动发出真实请求**，每条命令至多 1 条义务，调用记录带 `tier` / `dispatch` /
+`cognition_family`，`cognition-stats` 重建为 expected / triggered / invoked / succeeded /
+failed / reused / deferred / skipped / missed ＋ auto/manual ＋ 等级/窗口/覆盖/采纳维度。
+义务、复用、失败、退避与门禁语义不变。
+
+v9.11.0（认知自动调度与调用率优化）：复杂度按**合同内容**判定——新增
 `high-impact-scope` 信号（治理/规则/架构/协作/门禁类文字），与任务类型解耦，`docs` /
 `mechanical` 任务不会因为文件类型被静默跳过；策略**随任务生效**（命令行显式 > 环境变量 >
 任务策略 > 命令默认，`start` 记录的默认 `auto` 对后续命令持续有效，任务级 `off` 对 `drive`
@@ -810,7 +865,8 @@ v9.9.0（Astra 默认引擎：模型身份入账）与 v9.8.0（多模态设计�
 有图/无图两种咨询模式）的细节见 `references/history.md`；命令级口径见
 `references/workflow.md`。
 
-**近期版本**：v9.11.0（认知自动调度与调用率优化）、v9.10.0（认知命名收敛与 SOL 退役）、
+**近期版本**：v9.12.0（认知分级与自动执行）、v9.11.0（认知自动调度与调用率优化）、
+v9.10.0（认知命名收敛与 SOL 退役）、
 v9.9.0（Astra 默认认知引擎）、v9.7.1（认知记录与义务处置的终态闭环）、v9.7.0（认知主动调度与可选议程）、
 v9.6.2（统计口径修正与认知锁等待有界）、v9.6.1（最终验证完成才执行收口 CONSULT）、
 v9.5.0（调度领取与阻塞边界）等条目的完整变更记录已迁入 `references/history.md`；

@@ -229,10 +229,30 @@ BLOCKED/PASS 规避上限、以及新回合先 `status --json` 核实再继续�
 `closure-check` 的退出码与结论一致：PASS=0、FAIL=1（`--json` 同样），避免“检查过”被误当
 “通过”。
 
-## 5. 认知生命周期调度（v9.6）认知仍是 advisory：调度只决定**什么时候该有一次认知判断**，不决定阶段、门禁或技术方案。
+## 5. 认知生命周期调度（v9.12：T0–T3 分级）认知仍是 advisory：调度只决定**什么时候该有一次认知判断**，不决定阶段、门禁或技术方案。
 实现分两层——`scripts/cognition_schedule.py` 是纯策略/投影层（无网络、无文件 I/O、无门禁），
 `governance.py` 把义务落盘到 `state.cognition_schedule`，`copilot_dispatch.py` 在生命周期命令内
 有界执行。
+
+**认知等级（`review_policy.task_complexity`，确定性）**
+
+等级只看状态里可复核的事实，顺序固定：
+
+| 等级 | 判定 | 窗口 |
+|---|---|---|
+| T0 | 显式简单类型（trivial/mechanical/docs/format）＋ 无信号 ＋ 无高影响范围 | 无（0 调用） |
+| T1 | 其余无信号任务；原始意图缺失或性质无法可靠分类的默认落点 | A |
+| T2 | 存在复杂度/方案类/多模块等信号，但不属于高影响类别 | A/B/E |
+| T3 | `high-impact-scope` 命中（治理/规则/架构/协作/门禁类文字），或高影响任务类型（治理/架构/数据基础设施/产品设计/发布），或高影响触发因素（安全/权限/数据完整性/生产/发布/全局执行/架构） | A/B/E |
+
+- 信号文本按 **原始意图（`state.intent`）→ 目标 → 合同/完成条件 → 边界** 读取；
+  `intent` 只认 `start --intent` / `--intent-file` 或 `intent --text|--file` 显式登记的文本，
+  目标推断不算已登记意图（`goal_fallback`）。
+- 文件类型、工作项数量、默认 `risk=medium` 都不能单独把任务判成 T0；`docs` / `mechanical`
+  若合同或意图涉及治理/规则/架构/协作，同样升级。等级不是风险等级，也不是门禁：
+  它只决定自动窗口与统计归因；C 仍由事件触发，D 保持退役。
+- 义务与建议都带 `tier` / `tier_reason` / `windows`，调用记录带 `tier` / `dispatch` /
+  `cognition_family`，因此“建议但未执行”与“自动执行”可区分。
 
 **历史调度只读兼容（v9.10）**：v9.10.0 之前的任务只有 `state.sol_schedule`。读取路径
 （`obligations` / `schedule_view` / `summary` / `task_stats`）在两键并存时以
@@ -244,11 +264,11 @@ schema 按普通字段读取。写入路径只创建/更新 `cognition_schedule`
 
 | 窗口 | 时机 | 模式 |
 |---|---|---|
-| A | 启动 / 未覆盖当前合同的 CONSULT | CONSULT（understanding） |
-| B | 调查后方案取舍（方案类任务、声明触发或中高复杂；工作项数量本身不是理由） | PLAN（planning） |
+| A | 启动 / 未覆盖当前合同的 CONSULT（T1/T2/T3） | CONSULT（understanding） |
+| B | 调查后方案取舍（T2/T3 且已形成现场事实；工作项数量本身不是理由） | PLAN（planning） |
 | C | 重大新证据（六类事件：`material-evidence-change` / `decision-point` / `risk-escalation` / `replan-history` / `scope-changed` / `reopened`） | CONSULT（development） |
 | ~~D~~ | **已退役**：里程碑复盘不再自动派生义务；历史状态的 D 义务只读结算 | — |
-| E | 收口综合判断（最终工程验证完成后、G1–G3 收口之前，中/高认知价值且有实质进展的任务） | CONSULT（closure） |
+| E | 收口综合判断（最终工程验证完成后、G1–G3 收口之前，T2/T3 且有实质进展的任务） | CONSULT（closure） |
 
 **义务与窗口**：每条义务记录 `obligation_id`（`SO<n>`）、family / mode / stage / event /
 instance、`contract_sha256`、`level`、`status`、`window`。`status` 取值 `due` / `claimed` /
@@ -264,7 +284,7 @@ instance、`contract_sha256`、`level`、`status`、`window`。`status` 取值 `
   新建时即记 `skipped` + `skip_by=superseded-by-newer` 并关闭（历史状态里已堆积的多条
   打开窗口在下一次同步时同样收敛成一条）；`in_flight` 不被取代，避免把一条认知对象
   堆成多条漏调。
-- **E 是 recommended（含 medium）**：收口综合判断对中高复杂有进展任务是必需窗口；
+- **E 是 T2/T3 的 recommended**：收口综合判断对 T2/T3 且有进展的任务是必需窗口；
   `due_obligations()` 只取 recommended，标成 optional 会让它结构性无法自动执行
   （`drive` / `closure` 永远取不到）。历史 `optional` 义务在收口时按 `skipped` +
   `skip_by=not-required` 结算为合理跳过，`missed` 只统计确实应执行而未执行的窗口。
@@ -302,9 +322,10 @@ instance、`contract_sha256`、`level`、`status`、`window`。`status` 取值 `
 
 **有界执行**
 
-- **调度点（v9.11.0）**：`start` / `plan` / `record` / `rerun` / `criterion` / `unblock` /
+- **调度点（v9.11/v9.12）**：`start` / `plan` / `record` / `rerun` / `criterion` / `unblock` /
   `reopen` / `closure` 与 `drive` 的调度步（`_cognition_schedule_step`）属于生命周期命令，
-  省略 `--cognition` 时按任务策略判定并执行到期义务（最多 1 条）。
+  省略 `--cognition` 时按任务策略判定并**自动发出真实请求**（至多 1 条到期义务）；只打印
+  命令或生成建议不算调用。
 - **纯记录命令不隐式付费**：`judgment` / `evidence` / `report` / `accept` / `decide` /
   `block` / `finding` / `contract` 仍会物化窗口并打印可执行命令，但只有命令行显式
   `--cognition auto` 才真的调用模型；环境变量或任务策略的 `auto` 不使这些命令付费。
@@ -380,23 +401,25 @@ instance、`contract_sha256`、`level`、`status`、`window`。`status` 取值 `
   `--lock-timeout <秒>`。
 
 **覆盖率统计（观测，不是门禁）**：`cognition-stats --state <path>` 或 `--workspace <dir>` 按
-合同口径输出应调/实际执行/失败/复用/合理跳过/应调未执行与原因、CONSULT 与 PLAN 的阶段
-分布、六类事件分布、采纳（accepted/modified/rejected）、tokens 与延迟。分母只统计当前
-合同下的适用窗口：启动＝复杂度 medium/high（存在真实认知价值信号；`risk=medium` 默认值不是信号）、
-规划＝`plan_admission().required`、收口＝有实质进展且复杂度 medium/high
-（`closure_eligible_tasks` 在 totals 中单列）、事件＝已识别事件数减去合理跳过数。任务级窗口（A 启动 / B 规划 / E 收口）的分母是“本任务是否适用”（0/1），
-所以分子也按任务计 1 次：满足＝**真实执行或复用**（`by_family` 仍分别保留执行/复用/
-跳过/漏调的条数，用于解释“覆盖了几次”）。事件窗口按“每出现一次事件 → 一个适用窗口”
-计数，执行/复用计入分子，合理跳过不进入分母，漏调单列。打印命令、预检通过与模拟响应
-都不算执行。分母为 0 时 `rate` 输出 `null`（不是 100%），任务级 `not_registered`
+合同口径输出 `expected` / `triggered` / `invoked` / `succeeded` / `failed` / `reused` /
+`deferred` / `skipped` / `missed`，并区分 `auto_invoked` / `manual_invoked`；另给等级
+（T0–T3）与窗口（A/B/C/E）分布、事件分布、采纳（accepted/modified/rejected/unrecorded）、
+tokens 与延迟。分母只统计当前合同下的**等级窗口**：T0 无；T1 仅启动；T2/T3 启动/规划/收口，
+收口还要求 `has_substantive_progress`（`closure_eligible_tasks` 在 totals 中单列）；
+事件＝已识别事件数减去合理跳过数。任务级窗口（A 启动 / B 规划 / E 收口）的分母是“本任务
+是否适用”（0/1），所以分子也按任务计 1 次：满足＝**真实执行或复用**（`by_family` 仍分别
+保留执行/复用/跳过/漏调的条数，用于解释“覆盖了几次”）。事件窗口按“每出现一次事件 → 一个
+适用窗口”计数，执行/复用计入分子，合理跳过不进入分母，漏调单列。打印命令、预检通过与模拟
+响应都不算执行。分母为 0 时 `rate` 输出 `null`（不是 100%），任务级 `not_registered`
 表示“应当登记却没有义务记录”。
 
-**生命周期观测（v9.11.0）**：`task_stats()` / `stats()` 额外输出 `lifecycle`，按
-triggered（条件成立）/ invoked（真正发起请求）/ succeeded / failed（含
-failed_before_request）/ skipped / missed / deferred 归类同一批义务，并给出
+**生命周期观测（v9.11/v9.12）**：`task_stats()` / `stats()` 额外输出 `lifecycle`，按
+triggered（条件成立）/ invoked（真正发起请求，只认带 `call_id` 的义务）/ succeeded / failed
+（含 failed_before_request）/ skipped / missed / deferred 归类同一批义务，并给出
 `skip_reasons`（按 `skip_by` 或 `skip_reason`）与 `missed_by_origin`（按义务
-`opened_by` 记录的调度点归因）。`--workspace` 汇总时这些计数跨任务相加、原因字典合并
-排序。它解释“为什么没有调用”，不参与覆盖率分母，也不是门禁。义务同时记录 `opened_by`
+`opened_by` 记录的调度点归因）。义务同时记录 `tier`，统计按 T0–T3 与 A/B/C/E 分组；
+`--workspace` 汇总时这些计数跨任务相加、原因字典合并排序。它解释“为什么没有调用”，
+不参与覆盖率分母，也不是门禁。义务同时记录 `opened_by`
 （`start` / `plan` / `record` / `drive` / `closure` …），便于定位是哪条生命周期命令
 开了窗口却没有走到执行。
 

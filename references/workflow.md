@@ -39,18 +39,19 @@ python3 -B scripts/copilot_dispatch.py <子命令> --state <state.json> [参数]
 
 生命周期命令（`start` / `plan` / `record` / `rerun` / `criterion` / `unblock` / `reopen` /
 `closure`）与 `copilot_auto.py drive` 接受 `--cognition auto|advise|off`：做一次有界调度步，
-最多执行 1 条义务、1 次请求；`optional` 级只提示；读命令永不执行。**省略 `--cognition` 时
-策略随任务生效**：命令行显式 > `COPILOT_COGNITION` > 任务快照（`start` 写入，默认 `auto`）>
-命令默认，因此 `start` 之后无需逐条重复 `--cognition auto`，`start --cognition off`
-会让整条任务（含 `drive`）保持离线。纯记录/报告/合同命令（`judgment` / `evidence` /
-`report` / `accept` / `decide` / `block` / `finding` / `contract`）默认 `advise`：回填后
-只物化义务、给出可粘贴命令，不隐式调用模型；确需顺带执行时必须在该条命令上显式写
+`auto` 下**自动发出真实请求**，最多执行 1 条义务、1 次请求；`optional` 级只提示；读命令永不
+执行。**省略 `--cognition` 时策略随任务生效**：命令行显式 > `COPILOT_COGNITION` > 任务快照
+（`start` 写入，默认 `auto`）> 命令默认，因此 `start` 之后无需逐条重复 `--cognition auto`，
+`start --cognition off` 会让整条任务（含 `drive`）保持离线。纯记录/报告/合同命令（`judgment` /
+`evidence` / `report` / `accept` / `decide` / `block` / `finding` / `contract`）默认 `advise`：
+回填后只物化义务、给出可粘贴命令，不隐式调用模型；确需顺带执行时必须在该条命令上显式写
 `--cognition auto`。`COPILOT_COGNITION_AUTO=off` 可整体关闭自动执行，`on` 只放开测试进程的
 执行闸门，不改变策略级别。
 
 | 子命令 | 用途 | 关键参数 |
 |---|---|---|
-| `start` | 创建任务合同 | `--goal`、`--contract-file`、`--criteria-file`、`--task-kind <kind>`（默认 `standard`，简单类型见 `trivial`/`mechanical`/`docs`/`format`）、`--trigger <name>`（可重复，声明 security/permissions/core-logic/...）、`--test-policy`/`--test-policy-file`（JSON：`required`/`commands`/`report`/`artifacts`/`require_*`）、`--risk low\|medium\|high`（历史 `normal` 等价 `medium`）、`--backend legacy\|native`、`--task-id`、`--mode`、`--note`、`--workspace`（省略取状态文件所在目录的 git 根）；`risk=high` 不再强制 native |
+| `start` | 创建任务合同 | `--goal`、`--intent` / `--intent-file`（用户原始任务意图，认知分级的第一输入；省略时按目标与合同分类，无法可靠分类至少 T1）、`--contract-file`、`--criteria-file`、`--task-kind <kind>`（默认 `standard`，简单类型见 `trivial`/`mechanical`/`docs`/`format`）、`--trigger <name>`（可重复，声明 security/permissions/core-logic/...）、`--test-policy`/`--test-policy-file`（JSON：`required`/`commands`/`report`/`artifacts`/`require_*`）、`--risk low\|medium\|high`（历史 `normal` 等价 `medium`）、`--backend legacy\|native`、`--task-id`、`--mode`、`--note`、`--workspace`（省略取状态文件所在目录的 git 根）；输出认知等级 T0–T3 与窗口；`risk=high` 不再强制 native |
+| `intent` | 补录/更正用户原始任务意图（默认拒绝覆盖，`--replace` 才重写并留 history）；输出按新意图计算的等级与窗口 | `--text` 或 `--file`、`--replace` |
 | `plan` | 登记 ZCode 本地计划 | `--plan <plan.json>`（或 stdin）、`--source` |
 | `status` / `next` | 查看阶段、工作项、门禁、下一步与认知建议 | `--json` |
 | `record` | 回填工作项结果 | `--id`、`--status`、`--result`、`--evidence E1`（可重复） |
@@ -64,13 +65,13 @@ python3 -B scripts/copilot_dispatch.py <子命令> --state <state.json> [参数]
 | `decide` | 记录用户/任务决策 | `--text`、`--source`；**不能替代 PWW 接受** |
 | `block` / `unblock` | 记录/解除真实阻塞 | `block --reason ... --needs ... (--work-item A2 [--work-item A3] [--criterion C2] | --scope task [--force])`；`unblock --reason ... [--block-id B...] [--by user --quote "<原话>"]`（多条未解除时必须指定）；解除后被冻结工作项自动恢复 `pending`。仍有可执行项时任务级 `--scope task` 被拒绝，必须显式 `--force`，状态记录 `ready_at_creation`/`forced_scope`；`--by user` 必须带原话，记录 `resolved_by` 与 `authorization_source=caller-declared` |
 | `closure-check` | 只读检查 G1–G3 | `--json` |
-| `review-admission` | 认知生命周期建议的单一确定性入口（只读、不写状态、不是门禁）：先算任务类型、复杂度与已有认知覆盖，再给出 `advice.action`（`none`/`reuse`/`consult`/`plan`/`review`）、建议模式、阶段与命令 | `--trigger security`（可重复）、`--reason`、`--user-request`、`--review-request`、`--json`；返回 `decision`、`advice`、`task_kind`、`complexity`、`recommended_action`/`recommended_mode`/`recommended_stage`、`cognition_calls_total` |
+| `review-admission` | 认知生命周期建议的单一确定性入口（只读、不写状态、不是门禁）：先算原始意图、任务类型、T0–T3 等级、窗口与已有认知覆盖，再给出 `advice.action`（`none`/`reuse`/`consult`/`plan`/`review`）、建议模式、阶段与命令 | `--trigger security`（可重复）、`--reason`、`--user-request`、`--review-request`、`--json`；返回 `decision`、`advice`、`task_kind`、`complexity`（含 `tier`/`tier_reason`/`windows`/`intent`）、`recommended_action`/`recommended_mode`/`recommended_stage`、`cognition_calls_total` |
 | `cognition-consult` | 认知判断入口：材料 + 问题 → 一次请求 → 目标理解/问题本质/路线与取舍/风险/调查方向/再咨询条件；建议写入统一 `cognition_calls`（`mode=CONSULT`），不入门禁；失败只登记并降级 | `--materials <file>`（调度执行时可省略）、`--question`（必填，`--obligation` 时回落到义务问题）、`--stage <understanding\|planning\|development\|stage\|closure>`、`--obligation SO<n>`（按调度义务执行，材料由状态确定性生成）、`--lock-timeout <秒>`、`--knowledge-file`、`--dry-run`、`--list`、`--json`、`--timeout`、`--max-output-tokens`、`--audit-log`（默认 `cognition-audit.jsonl`）、`--output-dir`、`--ignore-backoff`（默认在上游退避窗口内不发请求；仅在上游已确认恢复时显式使用，仍然只发一次、不重试）；模型固定 `gpt-6.2-astra`，没有 `--model` 开关；再次调用：`--force --trigger <user-request\|scope-changed\|new-risk\|materials-omitted\|strategy-failed\|major-uncertainty\|stage-result> --reason` |
 | `cognition-plan` | 认知调查后规划判断：方案比较、取舍、优先级、阶段目标与验收关注点；记录写入统一 `cognition_calls`（`mode=PLAN`） | 参数同 `cognition-consult`；省略 `--stage` 时默认 `planning` |
 | ~~`sol-consult`~~ | v9.10.0 已移除（不保留跳转表，解析阶段即拒绝）；改用 `cognition-consult`，`--sol` 也改用 `--cognition` | — |
 | `cognition-accept` | 回填主代理对认知建议的采纳结论（事实记录，不改变阶段、G1–G3 或授权）。v2 记录含实际决策、理由、modified 差异、证据引用与 `advice_ref`；缺项只给非阻断提示。`--historical` 只用于**已收口**任务的历史复核：`--status pending` 必须配 `--reason`（可加 `--reason-code`），重复执行幂等、不覆盖既有已决结论、不把已决结论降级为 `pending`；不因代码已改、测试通过或任务 PASS 推断采纳 | `--call-id SC...`、`--status accepted\|modified\|rejected\|pending`、`--decision`、`--rationale`（省略回落 `--reason`）、`--delta`、`--evidence-ref E1,E3`（可重复/逗号分隔，指向本任务已登记证据）、`--source-ref`（报告章节/文件路径，只定位不核验）、`--evidence-note`、`--note`、`--reason`、`--reason-code`、`--historical`、`--decided-by`（默认 `zcode`）、`--json` |
 | `cognition-schedule` | 认知生命周期调度视图（只读）：义务清单、漏调、终态处置与所属周期、下一条可执行项与可直接粘贴的命令；`--execute` 时有界执行 1 条 `recommended` 义务（1 次请求，失败只记录）；同时显示当前上游退避窗口（窗口内不发起新请求） | `--state`、`--execute`、`--json`、`--cognition auto\|advise\|off`；不带 `--execute` 不写状态 |
-| `cognition-stats` | 认知调度覆盖率（显式分母）：建议/执行/复用/跳过/失败/漏调/未登记分开统计，含事件分布、采纳分布、义务终态处置与周期分布、tokens（输入/输出/reasoning/总）与延迟、`by_model`（请求数/完成/失败/Token/p50/p95/重复调用）与 `reuse`（命中数、按模型） | `--state` 或 `--workspace <根>`（聚合 `.copilot-tasks/*/state.json`）、`--json` |
+| `cognition-stats` | 认知调度观测（显式分母）：`expected`/`triggered`/`invoked`/`succeeded`/`failed`/`reused`/`deferred`/`skipped`/`missed` 分开统计并区分 auto/manual，成功率/漏调率用显式分母（`success_rate`、`missed_rate`，分母 0 记 null），含 T0–T3 等级、A/B/C/E 窗口（`by_window`）与 CONSULT/PLAN/REVIEW 模式（`by_mode`）分布、任务类型覆盖（`totals.task_kind_tasks`）、事件分布、采纳分布、义务终态处置与周期分布、tokens（输入/输出/reasoning/总）与延迟、`by_model`（请求数/完成/失败/Token/p50/p95/重复调用）与 `reuse`（命中数、按模型）；`invoked` 只认带 `call_id` 的真实请求 | `--state` 或 `--workspace <根>`（聚合 `.copilot-tasks/*/state.json`）、`--json` |
 | `agent-policy` | Agent 调度建议：主代理默认，Explore/general-purpose 按需（只读、不派发）。判定顺序：子代理不可用 → 主代理；写入冲突 → 主代理；`--research-only` → Explore（绝不交给全工具代理）；独立交付物需并发且有收益才建议 general-purpose；其余 → 主代理 | `--needs-independent-context`、`--parallel`、`--independent-deliverable`、`--write-conflict`、`--saves-time`、`--research-only`、`--subagent-unavailable`、`--json` |
 | `finding` | 查看 / 更新 Finding 台账（不触发复核） | `--list`；`--id F1 --status open\|fixed\|verified\|closed\|regressed\|dropped --evidence E1[,E2] --note`；`fixed`/`verified` 必须有证据，多个证据可用逗号分隔；回填成功后按续跑判定返回 10 |
 | `review-metrics` | 统计统一认知调用流（`cognition.consult_total` / `cognition.plan_total` / `cognition.failed` / `cognition.modes`）、准入门槛、停止标记与 Finding 计数 | `--state`；历史 G4 数据标记 `g4.retired` |
@@ -236,9 +237,10 @@ python3 -B scripts/copilot_auto.py ingest --state <state.json> [--result-file f]
 ## 4. 标准回合
 
 ```bash
-# 1. 建立合同
+# 1. 建立合同（--intent 记录用户原始要求，是认知分级的第一输入）
 python3 -B scripts/copilot_dispatch.py start --state T/state.json \
-  --goal "目标" --contract-file contract.md --risk medium \
+  --goal "目标" --intent "用户原始要求的原文或等价摘要" \
+  --contract-file contract.md --risk medium \
   --workspace /path/to/task-repo
 
 # 2. 登记 ZCode 计划
@@ -266,7 +268,7 @@ PARTIAL 时不需要额外命令：直接再次 `drive`，由本地派生工作�
 收口顺序是**最终工程验证 → 收口 CONSULT（如建议）→ G1–G3 收口**：`drive` 在 PASS 但验证
 有缺口（例如合同 `test_policy.required=true` 却没有 `--capture-cmd` 证据）时打印缺口并
 返回 10，不执行认知、不收口；补齐测试与证据后再 `drive`（或 `closure --close`）即自动执行
-一次收口 CONSULT（任务有中/高认知价值时），随后直接收口。`cognition-accept` 只是可选的
+一次收口 CONSULT（任务为 T2/T3 且有实质进展时），随后直接收口。`cognition-accept` 只是可选的
 采纳审计记录：不登记、甚至明确 rejected，都不阻止收口。手动
 `cognition-consult --stage closure` 同样被缺口与“摘要不符”拒绝。
 
