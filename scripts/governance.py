@@ -32,6 +32,7 @@ from datetime import datetime, timedelta, timezone
 import code_scope as CS
 import review_policy as RP
 import cognition_schedule as SCH
+from lib_common import canonical_json
 
 SCHEMA = "copilot-governance/v1"
 VERSION = 1
@@ -102,10 +103,6 @@ def _sha256_file(path: str) -> str:
         for chunk in iter(lambda: fh.read(1 << 20), b""):
             digest.update(chunk)
     return digest.hexdigest()
-
-
-def canonical_json(value: object) -> str:
-    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
 def _text(value: object, name: str, *, allow_empty: bool = False,

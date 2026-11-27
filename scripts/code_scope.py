@@ -7,12 +7,11 @@
 from __future__ import annotations
 
 import copy
-import json
 import os
 import re
 import subprocess
 
-from lib_common import sha256_file, sha256_text
+from lib_common import canonical_json, sha256_file, sha256_text
 
 _EXCLUDE_PREFIXES = (".git/", ".copilot-tasks/", ".audit/")
 _EXCLUDE_PARTS = {
@@ -49,12 +48,6 @@ def snapshot_digest(snapshot: dict) -> str:
         "submodule_worktrees": snapshot.get("submodule_worktrees") or [],
         "nested_repos": snapshot.get("nested_repos") or [],
     }))
-
-
-def canonical_json(value: object) -> str:
-    """确定性 JSON：代码快照与绑定 id 的唯一序列化口径。"""
-    return json.dumps(value, ensure_ascii=False, sort_keys=True,
-                      separators=(",", ":"))
 
 
 _canonical_json = canonical_json

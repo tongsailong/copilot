@@ -20,9 +20,10 @@ from __future__ import annotations
 
 import difflib
 import hashlib
-import json
 import os
 import re
+
+from lib_common import canonical_json
 
 LEDGER_SCHEMA = "copilot-finding-ledger/v1"
 COMPLEXITY_SCHEMA = "copilot-task-complexity/v2"
@@ -185,11 +186,6 @@ PLAN_KINDS = ("architecture", "data-infra", "governance", "product-design",
 
 class ReviewPolicyError(ValueError):
     """策略输入不合法；调用方必须显式报告，不得静默降级。"""
-
-
-def canonical_json(value: object) -> str:
-    return json.dumps(value, ensure_ascii=False, sort_keys=True,
-                      separators=(",", ":"))
 
 
 def sha256_text(text: str) -> str:
