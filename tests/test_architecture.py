@@ -143,6 +143,56 @@ class RemoteReviewBoundaryTests(unittest.TestCase):
         self.assertEqual(proc.stdout.strip(), "[]")
 
 
+class CanonicalJsonSingleSourceTests(unittest.TestCase):
+    """确定性 JSON 序列化只有一个实现：四处副本曾在未来只改一处时改变摘要输入。"""
+
+    MODULES = ("lib_common", "governance", "review_policy", "native_bridge",
+               "code_scope")
+
+    def test_all_modules_share_one_implementation(self):
+        import importlib
+        impls = {}
+        for name in self.MODULES:
+            module = importlib.import_module(name)
+            self.assertTrue(hasattr(module, "canonical_json"), name)
+            impls[name] = module.canonical_json
+        unique = {id(func) for func in impls.values()}
+        self.assertEqual(len(unique), 1, f"canonical_json 出现多份实现：{impls}")
+        import lib_common
+        self.assertIs(impls["lib_common"], lib_common.canonical_json)
+        import code_scope
+        self.assertIs(code_scope._canonical_json, lib_common.canonical_json)
+
+    def test_no_module_redeclares_canonical_json(self):
+        tree = ast.parse(source("lib_common.py"), filename="lib_common.py")
+        self.assertIn("canonical_json",
+                      {node.name for node in ast.walk(tree)
+                       if isinstance(node, ast.FunctionDef)})
+        for name in self.MODULES:
+            if name == "lib_common":
+                continue
+            tree = ast.parse(source(name + ".py"), filename=name)
+            defs = {node.name for node in ast.walk(tree)
+                    if isinstance(node, ast.FunctionDef)}
+            self.assertNotIn("canonical_json", defs,
+                             f"{name}.py 不应再定义 canonical_json 副本")
+
+    def test_bytes_match_reference_serialization(self):
+        import lib_common
+        samples = [
+            {"b": 1, "a": 2},
+            {"嵌套": {"列表": [1, None, True]}, "ascii": "x\ny"},
+            ["é", "中", {"z": 0}],
+            {},
+            [],
+        ]
+        for value in samples:
+            expected = json.dumps(value, ensure_ascii=False, sort_keys=True,
+                                  separators=(",", ":")).encode("utf-8")
+            self.assertEqual(lib_common.canonical_json(value).encode("utf-8"),
+                             expected)
+
+
 class StateMachineTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

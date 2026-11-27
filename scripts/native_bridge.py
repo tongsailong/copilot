@@ -22,11 +22,11 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import os
 import re
-import shlex
 from datetime import datetime
+
+from lib_common import canonical_json
 
 DISPATCH_SCHEMA = "copilot-native-dispatch/v2"
 RESULT_SCHEMA = "copilot-native-result/v2"
@@ -120,10 +120,6 @@ def _sha(value: object, name: str) -> str:
 
 def _now() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
-
-
-def canonical_json(value: object) -> str:
-    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
 def sha256_text(text: str) -> str:

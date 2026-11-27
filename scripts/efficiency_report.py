@@ -29,7 +29,6 @@ import argparse
 import glob
 import json
 import os
-import statistics
 import sys
 from datetime import datetime, timedelta, timezone
 
