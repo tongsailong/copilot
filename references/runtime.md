@@ -423,7 +423,7 @@ instance、`contract_sha256`、`level`、`status`、`window`。`status` 取值 `
   并把原始 `http_status`、`upstream_code`、`retry_after`（秒数）与 `retry_after_raw`
   （原始文本，可能是 HTTP-date）、`request_id`、`trace_id` 原样写入 `cognition-audit.jsonl` 与
   `cognition_calls` 失败记录；上游过载与本地凭据冷却期 503 都**不**记作认证失败。重试语义不变：
-  一次调用只发一次请求，不自动重试、不换 Provider。
+  一次调用最多两次请求（默认模型一次 + 可归因故障时 Astra 接管一次），不自动重试、不换 Provider。
   `state["model_backoff"]`（`copilot-model-backoff/v2`，键 `codex:<model>`）按
   `provider + model + error_class` 记录到期时间：**服务端 Retry-After 是
   最短等待时间**（秒、毫秒、HTTP-date 均支持，HTTP-date 按 UTC 换算，过期或不可解析则不用），

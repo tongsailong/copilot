@@ -3,7 +3,8 @@
 
 覆盖四组要求：
 - A 迁移：默认入口是 `gpt-6.2-sol` + high + standard + 零工具（v9.14.0 回切）；
-  `gpt-6.2-astra` 只作为显式可选模型，不做自动回退，历史结论不被当成新模型的响应。
+  `gpt-6.2-astra` 只作为注册表内的单次兜底目标与显式可选模型（v9.15.0），
+  历史模型名永不参与回退，历史结论不被当成新模型的响应。
 - B 效率：纯登记/报告命令不隐式付费调用；复用命中可观测；复用键含 task_id。
 - C 隔离：退避窗口按 provider+model+error_class 隔离，互不冻结。
 - D 完整性：incomplete / max_output_tokens 不算成功，24000 预算不下调。
@@ -87,7 +88,8 @@ class DefaultModelMigrationTests(unittest.TestCase):
             self.assertEqual(CC.resolve_model(""), CC.DEFAULT_MODEL)
             self.assertEqual(CC.model_key(), "codex:gpt-6.2-sol")
         self.assertEqual(CC.resolve_model(CC.DEFAULT_MODEL), CC.DEFAULT_MODEL)
-        # Astra 只作为显式选择存在，不是默认值，也不是回退目标。
+        # Astra 是注册表内的显式可选模型，也是唯一允许的单次兜底目标；
+        # 只有默认模型请求失败且故障可归因时才由它接管。
         self.assertEqual(CC.resolve_model("gpt-6.2-astra"), "gpt-6.2-astra")
         for rejected in (HISTORICAL_MODEL, "gpt-6.2-sol-x", "gpt-6.0-fake"):
             with self.subTest(model=rejected):
@@ -147,7 +149,7 @@ class DispatchMigrationTests(unittest.TestCase):
         self.assertEqual(record["model_key"], CC.model_key())
         self.assertEqual(record["provider"], CC.PROVIDER)
 
-    def test_astra_failure_never_falls_back_to_legacy_model(self):
+    def test_sol_failure_falls_back_once_to_registered_astra_only(self):
         error = CC.CognitionOverloadedError(
             "cognition_upstream_overloaded", "上游瞬时容量不足",
             http_status=502, retry_after=300,
@@ -155,14 +157,27 @@ class DispatchMigrationTests(unittest.TestCase):
             error_class=CC.UPSTREAM_OVERLOADED, response_received=True)
         error.request_attempted = True
         error.send_observed = "response_received"
-        with mock.patch.object(CC, "run_consult", side_effect=error) as run:
+        seen: list[str] = []
+
+        def boom(*_args, **kwargs):
+            seen.append(str(kwargs.get("model") or ""))
+            raise error
+
+        with mock.patch.object(CC, "run_consult", side_effect=boom):
             self.assertEqual(self._consult(), 0)
-        self.assertEqual(run.call_count, 1)
-        self.assertEqual(run.call_args.kwargs.get("model"),
-                         CC.DEFAULT_MODEL)
+        # 只有两次尝试：默认 SOL → 注册表内的 Astra；历史模型永不参与。
+        self.assertEqual(seen, [CC.DEFAULT_MODEL, CC.FALLBACK_MODEL])
         records = self.state()["cognition_calls"]
-        self.assertEqual([item.get("model") for item in records],
-                         [CC.DEFAULT_MODEL])
+        self.assertEqual(len(records), 1)
+        record = records[-1]
+        self.assertEqual(record["status"], "failed")
+        self.assertEqual(record["requested_model"], CC.DEFAULT_MODEL)
+        self.assertEqual(record["actual_model"], CC.FALLBACK_MODEL)
+        self.assertTrue(record["fallback_used"])
+        self.assertTrue(record["fallback_exhausted"])
+        self.assertEqual(record["attempt_count"], 2)
+        self.assertEqual([item.get("model") for item in record["attempt_trail"]],
+                         [CC.DEFAULT_MODEL, CC.FALLBACK_MODEL])
         self.assertNotIn(HISTORICAL_MODEL,
                          [item.get("model") for item in records])
 

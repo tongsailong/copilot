@@ -1804,6 +1804,36 @@ def task_stats(state: dict) -> dict:
         if metrics["invoked"] else None
     metrics["missed_rate"] = round(metrics["missed"] / metrics["expected"], 4) \
         if metrics["expected"] else None
+    # 单次兜底口径：主模型失败后是否真的由备用模型接管，以及四种真实结局
+    # （接管成功 / 双模型均失败 / 因禁止条件未兜底 / 因退避窗口跳过）。
+    # 兜底成功只说明“这一次拿到了可用回复”，不证明结论正确，也不影响门禁。
+    fallback = {
+        "used": 0,
+        "succeeded": 0,
+        "failed": 0,
+        "exhausted": 0,
+        "denied": 0,
+        "skipped": 0,
+        "attempts": 0,
+        "by_route": {},
+    }
+    for item in calls:
+        if item.get("fallback_used"):
+            fallback["used"] += 1
+            if item.get("status") == "completed":
+                fallback["succeeded"] += 1
+            else:
+                fallback["failed"] += 1
+            route = (f"{_text(item.get('requested_model')) or _text(item.get('model'))}"
+                     f"->{_text(item.get('actual_model')) or _text(item.get('model'))}")
+            fallback["by_route"][route] = fallback["by_route"].get(route, 0) + 1
+        if item.get("fallback_exhausted"):
+            fallback["exhausted"] += 1
+        if _text(item.get("fallback_denied")):
+            fallback["denied"] += 1
+        if _text(item.get("fallback_skipped")):
+            fallback["skipped"] += 1
+        fallback["attempts"] += int(item.get("attempt_count") or 1)
     return {
         "task_id": _text(state.get("task_id")),
         # 认知适用＝存在真实的认知价值信号（中/高复杂度），不是“任务类别非
@@ -1866,6 +1896,7 @@ def task_stats(state: dict) -> dict:
                       [int(value) for value in ordered_latency], 0.95)},
         "by_model": [by_model[key] for key in sorted(by_model)],
         "reuse": reuse,
+        "fallback": fallback,
     }
 
 
@@ -2035,6 +2066,17 @@ def stats(states: list[dict], *, scope: str = "") -> dict:
     call_keys = ("completed", "failed", "total", "request_attempted",
                  "response_received", "send_unknown", "not_attempted",
                  "transport_observation_missing")
+    # 兜底跨任务聚合：按任务明细求和，路由键保留“请求模型->实际模型”。
+    fallback_totals = {
+        key: sum(int(d["fallback"][key]) for d in details)
+        for key in ("used", "succeeded", "failed", "exhausted", "denied",
+                    "skipped", "attempts")
+    }
+    fallback_routes: dict[str, int] = {}
+    for detail in details:
+        for route, count in detail["fallback"]["by_route"].items():
+            fallback_routes[route] = fallback_routes.get(route, 0) + count
+    fallback_totals["by_route"] = dict(sorted(fallback_routes.items()))
     return {
         "schema": STATS_SCHEMA,
         "scope": scope,
@@ -2090,6 +2132,7 @@ def stats(states: list[dict], *, scope: str = "") -> dict:
         "reuse": {"hits": sum(d["reuse"]["hits"] for d in details),
                   "by_model": [{"model_key": key, "hits": reuse_by_model[key]}
                                for key in sorted(reuse_by_model)]},
+        "fallback": fallback_totals,
         "notes": [
             "metrics 是任务级统一口径：expected（按 T0–T3 应发生的窗口数）/ "
             "triggered（实际物化义务）/ invoked（有真实 call_id 的义务）/ "
@@ -2125,5 +2168,9 @@ def stats(states: list[dict], *, scope: str = "") -> dict:
             "failed/not-executed/unsettled 只描述窗口关闭时的实际结果，不改 coverage "
             "分子分母、不改 missed、不阻止收口；not-executed 的理由里若没有当时的"
             "策略快照，一律记 unknown，不用当前配置倒推。",
+            "fallback 是单次兜底的观测口径：used/succeeded 是备用模型真实接管，"
+            "exhausted 是两次尝试都失败，denied 是按错误分类禁止回退（认证/额度/"
+            "4xx/质量问题），skipped 是备用模型处于自己的退避窗口；attempts 是全部"
+            "尝试数。兜底成功不证明结论正确，也不是门禁。",
         ],
     }

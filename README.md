@@ -139,14 +139,22 @@ python3 .../copilot_dispatch.py closure --state ... --close
   Copilot 命令本身不构成授权。
 - **fail-closed**：证据缺失、绑定不符、门禁未过时一律失败关闭，不用“看起来合理”替代验证；认知结论也不等于证据或授权。
 - **不存凭据**：仓库与分发物中不含 API Key、凭据、真实审计日志或任务状态。认知只从本机既有配置
-  读取凭据，只允许本机回环出口，失败不重试、不换 Provider、不自动降级模型。
+  读取凭据，只允许本机回环出口，失败不自动重试、不换 Provider；只有可明确归因的模型级/传输级
+  故障才由 Astra 接管一次，其余故障如实降级。
 - **不删除历史**：历史审计、证据与只读台账保留，不因退役而改写。
 
 ## 已知限制
 
-- **认知模型**默认 `gpt-6.2-sol`（`reasoning.effort=high`、零工具、单轮）；`gpt-6.2-astra`
-  只作显式可选（`COPILOT_COGNITION_MODEL=gpt-6.2-astra`），没有 `--model` 开关、没有失败
-  回退或自动切换；上游回显不一致即拒绝消费。
+- **认知模型**默认 `gpt-6.2-sol`（`reasoning.effort=high`、`mode=standard`、零工具、单轮）；
+  `gpt-6.2-astra` 既可显式选择（`COPILOT_COGNITION_MODEL=gpt-6.2-astra`），也是默认模型发生
+  可明确归因的模型级/传输级故障（连接失败、超时/重置、408、500/502/503/504、模型级 429、
+  上游过载、响应截断、协议损坏、模型身份不符）时**唯一**允许的单次兜底目标：一次调用最多两次
+  请求，同一认知对象、同一 Provider，不写默认模型、不产生第三次尝试。没有 `--model` 开关；
+  认证/凭据冷却/账户额度/请求构造 4xx/回答质量不回退，显式 Astra 不反向回退
+  （`COPILOT_COGNITION_FALLBACK=off` 可整体关闭）；上游回显不一致即拒绝消费。兜底结论保留
+  审计、追踪、采纳与统计信息，但**不进入可复用缓存**：下次同模型请求仍先尝试该模型；
+  复用要求 `requested_model` 与 `actual_model` 一致且非兜底产物，缺 `actual_model` 的旧记录
+  按未命中处理。
   公共环境没有该模型时应显式 `--cognition off`。
 - **知识库路径是作者本机默认值**：`context_engine.py` 可用 `--vault-root` 改；
   `knowledge_handoff.py` 的白名单根目录（`ALLOWED_ROOTS`）写死在源码中，换目录需自行调整该常量
@@ -198,6 +206,7 @@ python3 -B scripts-sync/sync_runtime.py --baseline --verify-baseline
 
 | 版本 | 要点 |
 |---|---|
+| **v9.15.0** | SOL 主导认知 + Astra 单次兜底：默认模型发生**可明确归因**的模型级/传输级故障时，同一认知对象由 `gpt-6.2-astra` 接管**一次**（最多两次请求、同 Provider、零工具、`effort=high`），如实记录 `requested_model` / `actual_model` / `fallback_used` / `primary_error` / `attempt_count` 与两条 trace；认证/凭据冷却/账户额度/请求构造 4xx/回答质量**不**回退，显式 Astra 不反向回退，`COPILOT_COGNITION_FALLBACK=off` 可关闭；退避与复用按模型隔离（兜底结论不复用，缺 `actual_model` 的旧记录按未命中），失败尝试同样计入各自模型的退避窗口 |
 | **v9.14.0** | 默认认知模型回切 SOL：一次真实 `gpt-6.2-sol` 诊断调用（HTTP 200、模型回显一致、`effort=high`、零工具、`SOL_CALL_OK`）验证可用后，默认模型由 `gpt-6.2-astra` 改为 `gpt-6.2-sol`；Astra 保留为显式可选（`COPILOT_COGNITION_MODEL`），认知窗口/调度/零工具单轮不变 |
 | **v9.11.0** | 认知自动调度与调用率优化：复杂度按**合同内容**判定，新增 `high-impact-scope` 信号（治理/规则/架构/协作/门禁类文字），`docs`/`mechanical` 任务不因文件类型被跳过；策略**随任务生效**（命令行显式 > `COPILOT_COGNITION` > 任务快照 > 命令默认，`start` 记录的 `auto` 对整条任务有效，任务级 `off` 对 `drive` 也生效）；调度点收敛为生命周期命令，纯记录命令不隐式付费；义务记录 `opened_by`，`cognition-stats` 输出 `lifecycle`（触发/调用/成功/失败/跳过/漏调/延后 + 跳过原因 + 漏调归因）；窗口关闭动作计入 `changes` 并落盘 |
 | **v9.10.0** | 认知命名收敛与 SOL 退役：`sol_review.py`/`sol_schedule.py` → `cognition_call.py`/`cognition_schedule.py`，`sol-*` 命令 → `cognition-*`（旧命令名与 `--sol` 别名**一并移除**，不保留跳转表）；状态键统一为 `cognition_calls`/`cognition_reuses`/`cognition_schedule`，`sol_calls`/`sol_reviews`/`sol_advisories`/`sol_reuses`/`sol_backoff`/`sol_schedule` 只读兼容（不迁移、不回写、不再写旧退避单例）；`gpt-6.2-sol` 与 `--model` 彻底移除，只剩 `gpt-6.2-astra`；`knowledge_handoff`/`context_engine` 的 `sol` 目标名改 `cognition`（别名兼容） |

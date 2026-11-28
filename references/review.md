@@ -73,10 +73,18 @@
 ### 模型与推理强度
 
 - 默认 `gpt-6.2-sol`（Responses API `/v1/responses`，既有本机 CPA `127` 出口）；
-  `gpt-6.2-astra` 只作为显式可选（`COPILOT_COGNITION_MODEL` 或显式参数），没有 `--model`
-  开关、没有别名，也没有失败回退或自动切换：SOL 不可用不会改选 Astra。
+  `gpt-6.2-astra` 可显式选择（`COPILOT_COGNITION_MODEL` 或显式参数），也是默认模型发生
+  可明确归因的模型级/传输级故障时唯一的单次兜底目标（同一材料/问题/推理等级/零工具，
+  最多两次尝试）。认证 401/403、凭据冷却、账户额度、请求构造 4xx、安全终止/用户取消、
+  回答质量问题不回退（账户/认证/终止类结构化错误码即使被包进 5xx 外壳也按禁止类归类）；
+  不重试主模型、不找第三个模型、不切 Provider、不写默认模型；显式 Astra 不反向回退，
+  `COPILOT_COGNITION_FALLBACK=off` 可关闭。没有 `--model` 开关、没有别名。
+  兜底结果同时记录 `requested_model` / `actual_model` / `fallback_used` / `fallback_reason` /
+  `primary_error` / `fallback_error` / `attempt_count` 与两次 trace；兜底结论**不进入**
+  可复用缓存（保留审计/追踪/采纳/统计价值），下一次同模型请求仍先尝试该模型。
 - 请求、回显校验、审计与 `cognition_calls` 记录都带 `provider` 与 `model_key`（`codex:<model>`）；
-  复用只命中同模型记录，缺模型归属的历史记录不被当成新模型响应。
+  复用要求 `requested_model` 与 `actual_model` 都等于本次请求模型、且记录不是兜底产物；
+  缺少 `actual_model` 的历史记录（v9.14 及更早）按**未命中**处理，不猜测来源。
 - 所有模式统一 `reasoning.effort="high"`、`reasoning.mode="standard"`：不按角色降级，
   不接受 `low`/`medium`/`xhigh`/`max`，也不允许配置缺失时静默回退。
 - 不发送 GPT-6.2 推理模型不支持的采样参数（`temperature`/`top_p`/`top_logprobs`/
@@ -183,8 +191,10 @@ python3 -B scripts/copilot_dispatch.py cognition-review --state <state.json> \
 
 ### 单轮与失败
 
-- 一次调用只发一次请求。相同认知对象（合同 + 材料 + 问题 + 阶段 + 提示词版本）再次调用
-  直接复用已有结论，不重复付费。CONSULT / PLAN / REVIEW 各自独立判定，不互相复用。
+- 一次调用最多两次请求：默认模型一次，发生可明确归因的模型级/传输级故障时由 Astra
+  接管一次（同一材料/问题/推理等级/零工具）。相同认知对象（合同 + 材料 + 问题 + 阶段 +
+  提示词版本）再次调用直接复用已有结论，不重复付费。CONSULT / PLAN / REVIEW 各自独立判定，
+  不互相复用。
 - **复用键**（`review_subject_sha256`）：提示词版本 `PROMPT_VERSION`、**提示词模板摘要**
   （`MODE_INSTRUCTIONS` + `STAGE_FOCUS` 的 SHA-256，改了模板但忘记 bump 版本也会失效）、
   模型与推理强度、任务目标、合同正文与边界、完成条件描述、证据集合摘要、主代理材料
@@ -276,7 +286,8 @@ copilot_dispatch.py formal-review --state <state> --verdict pass \
 ### 独立性
 
 v8 起原生 Reviewer 已退役，正式 REVIEW 的独立意见只能来自 SOL 零工具单轮复核：材料由主
-代理一次性准备，请求体不含工具定义（`tool_choice="none"`），一次调用只发一次请求，模型
+代理一次性准备，请求体不含工具定义（`tool_choice="none"`），一次调用最多两次请求（默认
+模型一次 + 可归因故障时 Astra 接管一次），模型
 回显必须与请求一致。无法真实调用认知时，如实说明是“主代理自检”或“同一上下文复核”，
 不得标记为正式 REVIEW，也不得伪造认知结论。历史原生 Reviewer 结论只读保留，不参与新任务。
 

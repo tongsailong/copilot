@@ -237,7 +237,7 @@ class ProjectDocTests(unittest.TestCase):
     def test_agents_md_points_to_v8_architecture(self):
         doc = text(os.path.join(ROOT, "AGENTS.md"))
         self.assertIn("唯一远程调用是认知（CONSULT / PLAN / REVIEW）", doc)
-        # v9.14.0 起 AGENTS.md 写默认 SOL + Astra 显式可选，且不写自动回退。
+        # v9.15.0 起 AGENTS.md 写默认 SOL + Astra 显式可选且是唯一单次兜底目标。
         self.assertIn("gpt-6.2-sol", doc)
         self.assertIn("gpt-6.2-astra", doc)
         self.assertIn("COPILOT_COGNITION_MODEL", doc)

@@ -82,7 +82,7 @@ class ZeroToolTests(unittest.TestCase):
         self.assertEqual(payload["tool_choice"], "none")
         self.assertEqual(payload["reasoning"], {"effort": "high"})
         self.assertEqual(payload["model"], "gpt-6.2-sol")
-        # v9.14.0 起默认 SOL；Astra 保留为显式可选，不是自动回退目标。
+        # v9.15.0 起默认 SOL；Astra 既显式可选，也是唯一单次兜底目标（不是默认值）。
         self.assertEqual(CC.DEFAULT_MODEL, "gpt-6.2-sol")
         self.assertEqual(CC.MODEL, CC.DEFAULT_MODEL)
         self.assertEqual(CC.SUPPORTED_MODELS, ("gpt-6.2-sol", "gpt-6.2-astra"))
@@ -102,7 +102,7 @@ class ZeroToolTests(unittest.TestCase):
             with mock.patch.dict(os.environ, {CC.MODEL_ENV: bad}):
                 with self.assertRaises(CC.CognitionUsageError):
                     CC.resolve_model()
-        # 显式选择不改变默认值，也不构成失败回退。
+        # 显式选择不改变默认值；显式 Astra 自身失败也不反向回退。
         self.assertEqual(CC.DEFAULT_MODEL, "gpt-6.2-sol")
         self.assertNotIn("astra", CC.model_key())
 
@@ -413,6 +413,8 @@ class SingleRoundTests(unittest.TestCase):
     def test_same_materials_reuse_existing_review(self):
         state = {"sol_reviews": [{"status": "completed",
                                   "model": CC.DEFAULT_MODEL,
+                                  "requested_model": CC.DEFAULT_MODEL,
+                                  "actual_model": CC.DEFAULT_MODEL,
                                   "materials_sha256": "a" * 64,
                                   "review_id": "SR1"}]}
         decision = CC.single_round_decision(state, "a" * 64, mode="REVIEW")
@@ -426,6 +428,8 @@ class SingleRoundTests(unittest.TestCase):
     def test_second_review_requires_explicit_reason(self):
         state = {"sol_reviews": [{"status": "completed",
                                   "model": CC.DEFAULT_MODEL,
+                                  "requested_model": CC.DEFAULT_MODEL,
+                                  "actual_model": CC.DEFAULT_MODEL,
                                   "materials_sha256": "a" * 64}]}
         refused = CC.single_round_decision(state, "b" * 64, mode="REVIEW")
         self.assertEqual(refused["action"], "refuse")
@@ -447,6 +451,8 @@ class SingleRoundTests(unittest.TestCase):
         review_only = {
             "sol_reviews": [{"status": "completed", "mode": "REVIEW",
                              "model": CC.DEFAULT_MODEL,
+                             "requested_model": CC.DEFAULT_MODEL,
+                             "actual_model": CC.DEFAULT_MODEL,
                              "materials_sha256": "a" * 64,
                              "review_id": "SR1"}],
             "sol_advisories": [],
@@ -459,6 +465,8 @@ class SingleRoundTests(unittest.TestCase):
             **review_only,
             "sol_advisories": [{"status": "completed", "mode": "CONSULT",
                                 "model": CC.DEFAULT_MODEL,
+                                "requested_model": CC.DEFAULT_MODEL,
+                                "actual_model": CC.DEFAULT_MODEL,
                                 "materials_sha256": "b" * 64,
                                 "advisory_id": "SA1"}],
         }
@@ -829,6 +837,8 @@ class CliTests(unittest.TestCase):
         G.record_cognition_call(self.state, {
             "schema": CC.REVIEW_SCHEMA, "review_id": "CC" + "b" * 24,
             "model": CC.DEFAULT_MODEL, "model_key": CC.model_key(),
+            "requested_model": CC.DEFAULT_MODEL,
+            "actual_model": CC.DEFAULT_MODEL,
             "provider": CC.PROVIDER,
             "verdict": "pass", "summary": "ok", "findings": [],
             "unverified": [], "findings_count": {}, "completed_at": G.now_iso(),

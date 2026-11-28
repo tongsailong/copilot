@@ -52,14 +52,20 @@ REVIEW_SCHEMA = "copilot-cognition-review/v1"
 # 阶段复盘与收口判断；v1 记录继续只读兼容。
 THINK_SCHEMA = "copilot-cognition-think/v2"
 ADMISSION_SCHEMA = "copilot-cognition-admission/v1"
-# 模型身份只在这里定义：默认 SOL（v9.14.0 回切），Astra 保留为显式可选；
-# 没有任何自动回退、别名或静默切换。
+# 模型身份只在这里定义：默认 SOL（v9.14.0 回切），Astra 是注册表内的显式可选
+# 模型，也是默认模型发生可归因故障时唯一允许的单次兜底目标（v9.15.0）。
 PROVIDER = "codex"
 DEFAULT_MODEL = "gpt-6.2-sol"
-# 显式可选模型：只用于显式选择（环境变量或显式参数），不是回退目标。
+# 显式可选模型：可被显式选择，也是 `FALLBACK_MODEL` 的来源；注册表外的模型名拒绝发送。
 EXPLICIT_MODELS = ("gpt-6.2-astra",)
 SUPPORTED_MODELS = (DEFAULT_MODEL,) + EXPLICIT_MODELS
 MODEL = DEFAULT_MODEL
+# 单次自动兜底：默认模型的一次请求发生**可明确归因**的模型级/传输级故障时，
+# 用备用模型接管**同一次**认知调用（同一材料、模式、推理等级、零工具）。
+# 它不写默认模型、不切 Provider、不产生第三次尝试；显式选择备用模型时不反向回退。
+FALLBACK_MODEL = "gpt-6.2-astra"
+FALLBACK_ENV = "COPILOT_COGNITION_FALLBACK"
+MAX_MODEL_ATTEMPTS = 2
 # 显式模型选择通道：省略 `--model` 时代替默认值；未知模型名仍拒绝发送。
 MODEL_ENV = "COPILOT_COGNITION_MODEL"
 BASE_URL = "http://127.0.0.1:8317/v1"
@@ -312,6 +318,96 @@ _UPSTREAM_ERROR_CLASSES = {
     UPSTREAM_SERVER: CognitionUpstreamError,
     UPSTREAM_CLIENT: CognitionUpstreamClientError,
 }
+
+
+# ── 单次自动兜底判定（只判定，不发送请求）──────────────────────────────────
+# 允许回退：可以明确归因到“模型实例/上游服务/传输”的一次性故障——同一材料换一个
+# 已注册模型有机会得到有效回复。禁止回退：认证、账户额度、凭据冷却（共享 CPA
+# 通道，换模型同样失败）、请求构造错误（4xx）、用户取消与回答质量/格式问题
+# （这些没有 error_class，属于“回复不可用”而不是“通道不可用”）。
+FALLBACK_ERROR_CLASSES = frozenset({
+    UPSTREAM_OVERLOADED,      # server_is_overloaded / 529
+    UPSTREAM_STREAM_TIMEOUT,  # 408 / 流在 response.completed 之前断开
+    UPSTREAM_SERVER,          # 500 / 502 / 503 / 504 等 5xx
+    CLIENT_TIMEOUT,           # 客户端等待超时（结果未知，按不确定性记录）
+    NETWORK_ERROR,            # 连接失败 / 连接重置 / 传输中断
+    RESPONSE_INCOMPLETE,      # 响应截断、非完整、协议层损坏
+})
+# 模型身份不符：回复不可消费，换同一材料的备用模型再取一次是安全的。
+FALLBACK_ERROR_CODES = frozenset({"cognition_model_identity_mismatch"})
+# 429 必须区分模型级限流与账户级额度：只有模型级冷却换模型有意义。
+MODEL_LEVEL_RATE_LIMIT_CODES = frozenset({"model_cooldown"})
+NO_FALLBACK_ERROR_CLASSES = frozenset({
+    UPSTREAM_AUTH, UPSTREAM_CREDENTIAL_COOLING, UPSTREAM_CLIENT,
+})
+# 账户额度/支付与认证类错误即使被上游包进 5xx 外壳，也仍然是账户或凭据问题：
+# 换模型掩盖不了它们，只会多花一次调用。按结构化错误码与精确 token 判定。
+ACCOUNT_QUOTA_ERROR_CODES = frozenset({
+    "usage_limit_reached", "insufficient_quota", "quota_exceeded",
+    "billing_hard_limit_reached", "billing_not_active",
+})
+AUTH_ERROR_CODES = frozenset({
+    "invalid_api_key", "invalid_organization", "account_deactivated",
+})
+# 安全终止与用户取消：不是通道故障，换模型只会把同一拒绝再执行一次。
+TERMINAL_REFUSAL_ERROR_CODES = frozenset({
+    "content_policy_violation", "content_filter", "moderation_blocked",
+    "safety_blocked", "user_canceled", "cancelled_by_user",
+    "request_canceled",
+})
+
+
+def fallback_enabled() -> bool:
+    """兜底开关（运维例外用）：`COPILOT_COGNITION_FALLBACK=off` 关闭。"""
+    value = str(os.environ.get(FALLBACK_ENV) or "").strip().lower()
+    return value not in ("off", "0", "false", "no")
+
+
+def fallback_model(requested: str = "") -> str:
+    """本次请求在合格故障发生时接管的模型；不可回退时返回空串。
+
+    只有“实际请求的是默认模型且兜底未关闭”才成立：显式选择备用模型
+    （`COPILOT_COGNITION_MODEL`）时不再反向回退，避免绕圈。
+    """
+    if not fallback_enabled():
+        return ""
+    if resolve_model(requested) != DEFAULT_MODEL:
+        return ""
+    return FALLBACK_MODEL
+
+
+def fallback_decision(exc: object) -> dict:
+    """一次失败是否允许换模型重试一次；返回事实与理由，不产生授权。
+
+    `reason` 是稳定的机器可读原因（`allowed:*` / `denied:*`），直接进入调用记录，
+    供审计判断“这次为什么没有回退”，而不是只能看到一句自然语言。
+    """
+    error_class = str(getattr(exc, "error_class", "") or "")
+    error_code = str(getattr(exc, "code", "") or "")
+    upstream_code = str(getattr(exc, "upstream_code", "") or "")
+    facts = {"error_class": error_class, "error_code": error_code,
+             "upstream_code": upstream_code, "http_status":
+             getattr(exc, "http_status", None)}
+    if not isinstance(exc, CognitionError):
+        return {**facts, "allow": False, "reason": "denied:not-a-cognition-error"}
+    if error_class in NO_FALLBACK_ERROR_CLASSES:
+        return {**facts, "allow": False, "reason": f"denied:{error_class}"}
+    if error_class == UPSTREAM_RATE_LIMIT:
+        if upstream_code in MODEL_LEVEL_RATE_LIMIT_CODES:
+            return {**facts, "allow": True,
+                    "reason": f"allowed:{UPSTREAM_RATE_LIMIT}:{upstream_code}"}
+        # 账户额度耗尽、支付问题或无法归因的 429 一律不回退：换模型掩盖不了
+        # 账户/公共通道问题。
+        return {**facts, "allow": False,
+                "reason": "denied:account-quota-or-unknown-rate-limit"}
+    if error_class in FALLBACK_ERROR_CLASSES:
+        return {**facts, "allow": True, "reason": f"allowed:{error_class}"}
+    if error_code in FALLBACK_ERROR_CODES:
+        return {**facts, "allow": True, "reason": f"allowed:{error_code}"}
+    if not error_class:
+        # 解析/质量/参数类失败：换模型不会改善，且可能把质量问题掩盖成通道问题。
+        return {**facts, "allow": False, "reason": "denied:reply-quality-or-request"}
+    return {**facts, "allow": False, "reason": f"denied:{error_class}"}
 
 
 # ── 凭据（只返回值，绝不回显、绝不写日志） ─────────────────────────────────
@@ -587,9 +683,10 @@ def validate_effort(effort: str) -> str:
 def resolve_model(model: str = "") -> str:
     """模型解析：显式参数 > `COPILOT_COGNITION_MODEL` > 默认 SOL；拒绝注册表外模型。
 
-    显式通道只用于选择已注册模型（例如把认知临时切到 `gpt-6.2-astra`），
-    不构成失败回退：默认仍是 SOL，上游不可用时不会自动改选其他模型。
-    未知或历史模型名一律拒绝，避免把默认路由意外改到别的 Provider/模型。
+    显式通道用于选择已注册模型（例如把认知临时切到 `gpt-6.2-astra`）。默认仍是
+    SOL；SOL 发生可归因故障时由调用层用 `FALLBACK_MODEL` 接管**同一次**调用
+    （见 `fallback_decision`），不写默认值、不切换 Provider；显式选择 Astra 时
+    不存在反向回退。未知或历史模型名一律拒绝，避免把路由意外改到别的 Provider。
     """
     value = str(model or "").strip()
     if not value:
@@ -1115,7 +1212,8 @@ def classify_upstream_failure(status: int, payload: object) -> str:
     """把一次上游 HTTP 错误映射成稳定分类；只描述事实，不决定重试。
 
     顺序很重要：`auth_unavailable` 先于 5xx 判定，避免 CPA 冷却被当成认证失效；
-    408/`request_timeout` 先于过载判定，保留"流在完成前断开"的语义。
+    账户额度/认证/安全终止类结构化错误码先于 5xx 判定，避免被包在 502 里的账户或
+    终止语义触发换模型；408/`request_timeout` 先于过载判定，保留"流在完成前断开"的语义。
     """
     code = _payload_error_code(payload).lower()
     message = (_payload_error_message(payload)
@@ -1128,6 +1226,18 @@ def classify_upstream_failure(status: int, payload: object) -> str:
     if "auth_unavailable" in text or "no auth available" in text:
         # 凭据冷却 / 调度结果：不是认证失效，不得据此轮换凭据或换 Provider。
         return UPSTREAM_CREDENTIAL_COOLING
+    if code in ACCOUNT_QUOTA_ERROR_CODES or any(
+            token in text for token in ACCOUNT_QUOTA_ERROR_CODES):
+        # 被 5xx 外壳包裹的账户额度/支付错误仍是账户问题，不得换模型。
+        return UPSTREAM_RATE_LIMIT
+    if code in AUTH_ERROR_CODES or any(
+            token in text for token in AUTH_ERROR_CODES):
+        # 同理：包在 5xx 里的凭据/账户失效不是瞬时容量问题。
+        return UPSTREAM_AUTH
+    if code in TERMINAL_REFUSAL_ERROR_CODES or any(
+            token in text for token in TERMINAL_REFUSAL_ERROR_CODES):
+        # 安全终止/用户取消：请求本身被拒，换模型只会重复同一拒绝。
+        return UPSTREAM_CLIENT
     if status == 408 or code == "request_timeout" \
             or "stream disconnected before completion" in text \
             or "stream closed before response.completed" in text:
@@ -2198,6 +2308,32 @@ def completed_reviews(state: dict, records_key: str = "cognition_calls") -> list
     return [item for item in rows if item.get("status") == "completed"]
 
 
+def reuse_identity_problem(item: dict, target_model: str) -> str:
+    """记录是否可被 `target_model` 复用；返回空字符串表示身份可复用。
+
+    复用只认**实际产出模型**，不能只看请求模型：
+    - 请求模型与本次不一致 → 不跨模型复用（原有模型门）；
+    - 缺 `actual_model`（v9.14 及更早的历史记录）→ 无法确认身份，按未命中处理，
+      不猜测来源；
+    - `actual_model` 与 `requested_model` 不一致（兜底接管）→ 结论属于接管模型，
+      不能供下一次主模型请求复用；
+    - `fallback_used` 记录只保留审计、追踪、采纳与统计价值，不进入可复用缓存，
+      下一次主模型请求仍先尝试主模型。
+    """
+    requested = str(item.get("requested_model")
+                    or item.get("model") or "").strip()
+    actual = str(item.get("actual_model") or "").strip()
+    if not requested or requested != target_model:
+        return "requested-model-mismatch"
+    if not actual:
+        return "actual-model-unknown"
+    if actual != requested:
+        return "produced-by-fallback-model"
+    if item.get("fallback_used"):
+        return "fallback-result-not-reusable"
+    return ""
+
+
 def single_round_decision(state: dict, materials_sha256: str, *,
                           force: bool = False, reason: str = "",
                           trigger: str = "",
@@ -2207,9 +2343,14 @@ def single_round_decision(state: dict, materials_sha256: str, *,
 
     CONSULT / PLAN / REVIEW 各自独立判定，不会互相复用；记录统一存放在
     `cognition_calls`，历史 `sol_reviews` / `sol_advisories` 仍可只读复用。
-    **模型门**：只复用同一模型的已完成记录；默认 SOL 与显式 Astra 的结论互不复用，
-    历史旧模型结论也不会被当成当前默认模型的新响应（旧记录缺少 `model` 字段时一律
-    视为不可复用）。
+    **模型门**：复用按**请求模型与实际产出模型**双重隔离——记录里的
+    `requested_model`（缺省回退到 `model`）必须与本次请求模型一致，`actual_model`
+    必须存在且与之一致，且记录不是兜底产物（`fallback_used` 为假）。因此默认模型
+    请求发生兜底后得到的结论（`requested_model` 记默认模型、`model`/`actual_model`
+    记接管模型、`fallback_used=true`）**不会**被后续同一个默认模型请求复用：结论
+    仍可审计、追踪、采纳与统计，但下一次请求仍先尝试默认模型。显式选择备用模型的
+    请求不会复用默认请求的结论，缺少实际模型身份的历史记录一律视为不可复用（按
+    未命中处理，不猜测来源）。
     “单轮”约束的是同一认知对象只付一次费，不是调用次数上限：只要问题、阶段
     或材料构成新的认知对象，就可以按对应 trigger 继续调用。
     """
@@ -2217,7 +2358,7 @@ def single_round_decision(state: dict, materials_sha256: str, *,
     target_model = resolve_model(model)
     records = [item for item in completed_reviews(state, records_key)
                if record_mode(item) == resolved_mode
-               and str(item.get("model") or "") == target_model]
+               and not reuse_identity_problem(item, target_model)]
     same = [item for item in records
             if str(item.get("materials_sha256") or "") == materials_sha256]
     # `--force` 必须能覆盖复用命中：上下文/进度变了但主体键不变时（工作项、风险、

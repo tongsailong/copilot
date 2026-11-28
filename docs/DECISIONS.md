@@ -1304,6 +1304,36 @@
 - **未验证**：真实宿主会话内生命周期命令（`start`/`drive` 的 A/B/E 自动调用）全部走默认 SOL
   尚未做端到端复测；本次只做了一次诊断调用与非推理配置核对（见 `docs/STATUS.md`）。
 
+### SOL 主导 + Astra 单次故障兜底（v9.15.0，2026-11-28）
+
+- **决定**：默认认知模型仍是 `gpt-6.2-sol`；`gpt-6.2-astra` 新增第二个身份——
+  默认模型发生**可明确归因**的模型级/传输级故障时，唯一允许的**单次**自动兜底目标。
+  一次认知调用最多两次请求（默认模型一次 + Astra 接管一次），同一认知对象、同一 `codex`
+  Provider、同一材料/问题/推理等级/零工具约束，不写默认模型、不换 Provider、不产生第三次尝试。
+- **允许回退的故障**：连接失败、网络错误、连接重置、客户端超时、HTTP 408、
+  500/502/503/504、上游过载（`server_is_overloaded`）、模型级 429（仅
+  `upstream_code=model_cooldown`）、响应截断/不完整、协议损坏/无法解析、
+  模型身份或推理强度回显不符。
+- **禁止回退的故障**：HTTP 400/请求构造错误、401/403/认证失败、凭据冷却、账户额度/付费问题、
+  注册表外模型名、用户取消、安全拒答、回答质量不符（无 `error_class` 的失败一律拒绝，
+  标注 `denied:reply-quality-or-request`），以及显式选择 Astra 后的自身失败（不反向回退 SOL）。
+- **为何不做更大范围兜底**：无法归因的失败（尤其没有结构化 `error_class` 的）既可能是
+  请求构造问题也可能是内容拒答，切换模型既可能掩盖真实缺陷又会重复付费；因此按
+  fail-closed 只承认可归因类别。`COPILOT_COGNITION_FALLBACK=off` 可整体关闭兜底。
+- **可观测性**：成功与失败记录都带 `requested_model` / `actual_model` / `fallback_used` /
+  `fallback_reason` / `primary_error` / `fallback_error` / `attempt_count` / `attempt_trail`
+  （白名单投影：模型、状态、错误类别、HTTP 码、重试等待、响应 id、延迟、用量、回复摘要），
+  两次尝试各自的 trace 都保留；`fallback_denied` 区分 `unavailable:disabled` /
+  `unavailable:explicit-model` 与真实拒绝原因，不用“被拒”冒充“未尝试”。
+- **退避隔离**：退避窗口仍按 `provider:model`（错误类别）隔离；一次兜底调用里 SOL 失败 +
+  Astra 成功时，SOL 的窗口照样登记，避免每个任务都先打一次已知故障的默认模型；Astra 成功后
+  只清 Astra 自己的窗口。复用键按实际产出模型隔离，`model` 恒为实际模型。
+- **不改变边界**：默认模型、Provider、注册表、G1–G3、状态机、A 与 B/C/E 窗口调度、
+  零工具单轮、`cognition-accept` 的 advisory 性质都不变；兜底只是同一次调用内的传输层重试
+  （有且仅有一次、仅换模型不换 Provider），不构成第二认知通道。
+- **验证**：真实默认路径 SOL/PLAN/REVIEW 与隔离故障注入的结果记录在 `docs/STATUS.md`；
+  未做真实故障注入（不故意破坏 Provider/账户配置），该部分按隔离测试证明链路。
+
 ## 建议（未采纳）
 
 > 以下为 v5 时期记录，保留原文；其中涉及 `call_gpt.py`、SOL 预算或远程 REVIEW 的建议
