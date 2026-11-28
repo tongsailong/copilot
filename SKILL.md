@@ -1,6 +1,6 @@
 ---
 name: copilot
-description: "Copilot v9.13.1 轻量协作治理：任务承接、合同与完成条件、状态与证据登记、用户输入落地（inbox/`input`）、PARTIAL 强制续跑与调度领取、认知咨询（默认 gpt-6.2-astra，high，零工具单轮）。Copilot 只做治理，不实施工程、不替代技术决策；ZCode 原生 Agent 是唯一执行与技术决策主体，子代理按需。用户批准、授权与阻断解除必须经 `input --consume` 落到原任务（`U<n>` 输入事件 → decision + 对应 block 解除），钩子只记录不推断授权；Stop 在有待处置输入时强制先处置。PARTIAL 是连续执行状态而不是终点：只要仍有原始授权内的可执行工作，就必须派生、领取并继续；阻塞按工作项成立，单项缺授权不冻结整个任务。drive 把工作项领取落盘（短租约、按父会话归属）避免并发重复，回填/阻塞自动释放，并发下不重复派发同一工作项；drive 把下一步写入状态（`next_step`），SessionStart 与 UserPromptSubmit 只读提示未闭合任务。认知仅 advisory：按 T0–T3 认知等级与用户原始意图决定窗口——T0（显式简单类型且无信号/无高影响范围）0 调用；T1 只在启动 CONSULT；T2/T3 在启动 A、调查后 B、收口前 E 自动真实执行，重大事件追加 C；默认 risk=medium 不构成信号，docs/mechanical 不掩盖真实治理意图，意图缺失或无法分类时至少 T1；认知策略分两个作用域：命令行 --cognition / 环境变量只影响当次调用（不写任务级策略、不影响后续窗口），任务级策略只由 start 与 cognition-policy 持久化（默认 auto，每条命令最多执行 1 条义务），纯记录命令不隐式付费；认知采纳只是可选审计记录、不阻止收口；REVIEW 仅在用户明确要求时执行。G4 原生只读复核已退役，历史台账只读保留。"
+description: "Copilot v9.14.0 轻量协作治理：任务承接、合同与完成条件、状态与证据登记、用户输入落地（inbox/`input`）、PARTIAL 强制续跑与调度领取、认知咨询（默认 gpt-6.2-sol，Astra 可显式选择，high，零工具单轮）。Copilot 只做治理，不实施工程、不替代技术决策；ZCode 原生 Agent 是唯一执行与技术决策主体，子代理按需。用户批准、授权与阻断解除必须经 `input --consume` 落到原任务（`U<n>` 输入事件 → decision + 对应 block 解除），钩子只记录不推断授权；Stop 在有待处置输入时强制先处置。PARTIAL 是连续执行状态而不是终点：只要仍有原始授权内的可执行工作，就必须派生、领取并继续；阻塞按工作项成立，单项缺授权不冻结整个任务。drive 把工作项领取落盘（短租约、按父会话归属）避免并发重复，回填/阻塞自动释放，并发下不重复派发同一工作项；drive 把下一步写入状态（`next_step`），SessionStart 与 UserPromptSubmit 只读提示未闭合任务。认知仅 advisory：按 T0–T3 认知等级与用户原始意图决定窗口——T0（显式简单类型且无信号/无高影响范围）0 调用；T1 只在启动 CONSULT；T2/T3 在启动 A、调查后 B、收口前 E 自动真实执行，重大事件追加 C；默认 risk=medium 不构成信号，docs/mechanical 不掩盖真实治理意图，意图缺失或无法分类时至少 T1；认知策略分两个作用域：命令行 --cognition / 环境变量只影响当次调用（不写任务级策略、不影响后续窗口），任务级策略只由 start 与 cognition-policy 持久化（默认 auto，每条命令最多执行 1 条义务），纯记录命令不隐式付费；认知采纳只是可选审计记录、不阻止收口；REVIEW 仅在用户明确要求时执行。G4 原生只读复核已退役，历史台账只读保留。"
 when_to_use: >
   需要把多步骤工程任务纳入可追踪治理时：合同/完成条件需要固定、证据与审计需要绑定、
   长任务需要 PARTIAL 持续推进与上下文恢复、存在真实认知价值信号（架构取舍、多方案
@@ -8,7 +8,7 @@ when_to_use: >
   或只读查看历史调用与台账。简单、单步、低风险任务直接由 ZCode 原生完成，不进入本 Skill。
 ---
 
-# copilot：轻量协作治理（v9.13.1）
+# copilot：轻量协作治理（v9.14.0）
 
 Copilot 是运行在 ZCode 内的**协作治理层**，不是决策模型，也不是执行体。它负责把任务变成可
 追踪的合同、状态、证据与收口条件，并在任务没有真正完成时继续推进。
@@ -24,8 +24,9 @@ Copilot 是运行在 ZCode 内的**协作治理层**，不是决策模型，也�
 - **内置子代理（按需）**：`Explore` 只做独立只读调查；`general-purpose` 只承担边界清晰、
   可独立交付且并行收益明显的工作。二者都由主代理拆分、控制范围并集成结果。
 - **认知（默认认知引擎与用户要求的独立复核）**：经既有本机 CPA `127` 通道调用
-  `gpt-6.2-astra`（`reasoning.effort=high`，`standard` 模式），**零工具、单轮**地阅读主代理
-  一次性提交的精炼材料；没有第二模型、没有失败回退，也不因上游不可用而自动切换。
+  `gpt-6.2-sol`（`reasoning.effort=high`，`standard` 模式），**零工具、单轮**地阅读主代理
+  一次性提交的精炼材料；`gpt-6.2-astra` 只作为显式可选模型（`COPILOT_COGNITION_MODEL`），
+  没有第二认知通道、没有失败回退，也不因上游不可用而自动切换。
   **CONSULT** 是默认认知入口：理解目标与隐含需求、判断问题本质与关键矛盾、比较路线与
   取舍、提示风险与遗漏、给出调查方向与再咨询条件；**PLAN** 在调查之后给出方案比较、
   优先级与阶段目标；**REVIEW** 只在用户明确要求时输出结构化 findings。
@@ -675,9 +676,10 @@ verify 的结构化质量报告（`copilot-verify-result/v1`）走报告接入�
 - **治理边界**：结论写入 `cognition_calls`（`mode=CONSULT|PLAN`），不进入 Finding 台账、
   不改变完成条件、不影响 G1–G3；是否采纳、如何实施由 ZCode 主代理决定，并用
   `cognition-accept` 登记（可选记录）。
-- **模型与推理强度**：默认 `gpt-6.2-astra` + `reasoning.effort="high"`（`standard`），不按
+- **模型与推理强度**：默认 `gpt-6.2-sol` + `reasoning.effort="high"`（`standard`），不按
   角色降级、不静默回退；上游回显的 `model` / `reasoning.effort` / `reasoning.mode` 不一致
-  时拒绝消费（退出码 9）。通道只有一个模型，没有 `--model` 开关。
+  时拒绝消费（退出码 9）。`gpt-6.2-astra` 保留为显式可选（`COPILOT_COGNITION_MODEL=gpt-6.2-astra`
+  或显式参数），属显式配置而不是失败回退：SOL 不可用时不会自动改选 Astra。
 
 字段级契约、议程结构与材料模板见 `references/review.md`。
 
@@ -894,7 +896,12 @@ python3 -B scripts/efficiency_report.py --workspace <ws> [--workspace <ws2>] \
 
 ## 版本
 
-当前 **v9.13.1（认知策略作用域分离）**：命令级 `--cognition` 只影响当次调用，任务级策略
+当前 **v9.14.0（默认认知模型回切 SOL）**：一次真实诊断调用验证 `gpt-6.2-sol` 可用
+（HTTP 200、上游模型回显一致、`effort=high`、零工具、`SOL_CALL_OK`）后，默认认知模型由
+`gpt-6.2-astra` 回切为 `gpt-6.2-sol`；Astra 保留为显式可选（`COPILOT_COGNITION_MODEL`），
+不进入自动回退。认知窗口、调度策略、零工具单轮与 G1–G3 语义不变。
+
+上一版 **v9.13.1（认知策略作用域分离）**：命令级 `--cognition` 只影响当次调用，任务级策略
 只能经 `start` / `cognition-policy` 持久化，单次 `off` 不再静默后续 C/E 窗口。
 
 上一版 **v9.13.0（自主执行闭环与生命周期可靠性）**：用户回合成为可跟踪事实——Stop 与
@@ -934,8 +941,9 @@ v9.10.0（认知命名收敛与 SOL 退役）：命令与文件统一为 `cognit
 `cognition-plan` / `cognition-review` / `cognition-accept` / `cognition-schedule` /
 `cognition-stats`），旧 `sol-*` 命令与 `--sol` 别名已移除（解析阶段即拒绝，不保留跳转表）；
 状态里的 `sol_calls` / `sol_reviews` / `sol_advisories` / `sol_backoff` / `sol_schedule`
-只读兼容：不迁移、不回写。认知通道只有 `gpt-6.2-astra`（`reasoning.effort="high"`、
-`standard`、零工具单轮）：没有 `--model` 开关，也没有失败回退；退避窗口按
+只读兼容：不迁移、不回写。v9.10.0–v9.13.1 期间认知通道只有 `gpt-6.2-astra`
+（`reasoning.effort="high"`、`standard`、零工具单轮），没有 `--model` 开关，也没有失败回退；
+v9.14.0 起默认回切 `gpt-6.2-sol`，Astra 作为显式可选保留，退避窗口仍按
 `provider + model + error_class` 隔离，成功只清本模型。`evaluate` 的认知建议键为 `cognition`，
 知识交接用 `--target cognition`（旧 `sol` 归一）。
 
@@ -943,7 +951,7 @@ v9.9.0（Astra 默认引擎：模型身份入账）与 v9.8.0（多模态设计�
 有图/无图两种咨询模式）的细节见 `references/history.md`；命令级口径见
 `references/workflow.md`。
 
-**近期版本**：v9.13.1（认知策略作用域分离）、v9.13.0（自主执行闭环与生命周期可靠性）、v9.12.0（认知分级与自动执行）、
+**近期版本**：v9.14.0（默认认知模型回切 SOL，Astra 显式可选）、v9.13.1（认知策略作用域分离）、v9.13.0（自主执行闭环与生命周期可靠性）、v9.12.0（认知分级与自动执行）、
 v9.11.0（认知自动调度与调用率优化）、
 v9.10.0（认知命名收敛与 SOL 退役）、
 v9.9.0（Astra 默认认知引擎）、v9.7.1（认知记录与义务处置的终态闭环）、v9.7.0（认知主动调度与可选议程）、
@@ -952,7 +960,7 @@ v9.5.0（调度领取与阻塞边界）等条目的完整变更记录已迁入 `
 本文件只保留当前规则与跨版本不变量，不重复历史正文。
 
 **跨版本不变量**：G1–G3 与收口 fail-closed、`closure_readiness` 收口准入、PARTIAL 强制续跑、认知 advisory（CONSULT / PLAN / REVIEW 都不是门禁）、REVIEW 仅用户明确要求、G4 原生只读复核
-已正式退役、零工具单轮与唯一模型 `gpt-6.2-astra` + `reasoning.effort="high"`、
+已正式退役、零工具单轮与默认模型 `gpt-6.2-sol`（`gpt-6.2-astra` 仅显式可选）+ `reasoning.effort="high"`、
 Provider/模型/凭据与授权边界全部不变。
 
 历史版本（v9.7.1 及更早，含 v9.4.0 上下文引擎、v9.3.0 治理加固、v9.0.0 认知生命周期、

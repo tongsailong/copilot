@@ -52,7 +52,7 @@ import review_policy as RP  # noqa: E402
 import cognition_call as CC  # noqa: E402
 import cognition_schedule as SCH  # noqa: E402
 
-__version__ = "9.13.1"
+__version__ = "9.14.0"
 
 
 class CLIError(Exception):
@@ -1753,7 +1753,8 @@ def _run_cognition_channel(args, mode: str) -> int:
     if args.list:
         return _cognition_list(args, state, mode, cfg)
     # 模型在整条链路里只有一个值：请求、复用判定、退避查询与记录共用它。
-    model = CC.DEFAULT_MODEL
+    # 默认 SOL；显式选择（`COPILOT_COGNITION_MODEL`）在这里一次性固定。
+    model = CC.resolve_model()
     model_slot = CC.model_key(model)
     obligation = None
     obligation_id = str(getattr(args, "obligation_id", "") or "").strip()

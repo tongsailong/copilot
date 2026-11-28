@@ -9,12 +9,12 @@
 Copilot 是运行于 ZCode 内的**轻量协作治理 Skill**：负责任务承接、合同与完成条件、状态机、
 证据桥接、审计、PARTIAL 持续推进与 G1–G3 收口。ZCode 原生 Agent 是唯一的工程执行与技术
 决策主体；用户侧 ChatGPT 负责需求与产品层目标、交接与验收；认知（CONSULT / PLAN）按生命周期
-提供整体判断，用户明确要求时执行一次独立复核（REVIEW），均由 `gpt-6.2-astra` 零工具单轮调用
-完成。只有这一个认知模型：没有第二模型、没有 `--model` 切换、没有失败回退。
+提供整体判断，用户明确要求时执行一次独立复核（REVIEW），默认由 `gpt-6.2-sol` 零工具单轮调用
+完成（`gpt-6.2-astra` 仅作显式可选）。没有第二认知通道、没有 `--model` 切换、没有失败回退。
 
-当前基线 **v9.13.1**（认知策略作用域分离：命令级 `--cognition` 只影响当次调用，任务级策略
-只能由 `start --cognition` / `cognition-policy` 持久化；v9.13.0 的自主执行闭环不变）。与
-版本号无关、长期有效的关键约束：
+当前基线 **v9.14.0**（默认认知模型回切 SOL：一次真实 `gpt-6.2-sol` 诊断调用验证可用后，
+默认由 Astra 改为 SOL，Astra 经 `COPILOT_COGNITION_MODEL` 显式选择；v9.13.1 的认知策略
+作用域分离不变）。与版本号无关、长期有效的关键约束：
 
 - **执行与续跑**：任务必须经 `start` / `drive` 进入状态机；PARTIAL 不是终点，
   `continuation.required=true` 时必须继续派生/执行；阻塞按工作项成立，单项缺授权不冻结
@@ -101,7 +101,8 @@ Agent、认知（CONSULT / PLAN / REVIEW）、DesignWise。Executor 是 ZCode �
 ## 3. 模型路由规则
 
 - **唯一远程调用是认知（CONSULT / PLAN / REVIEW）**：只有 `scripts/cognition_call.py` 可以导入
-  网络客户端、读取本机 CPA 凭据与模型名（唯一 `gpt-6.2-astra`）；`governance.py`、
+  网络客户端、读取本机 CPA 凭据与模型名（默认 `gpt-6.2-sol`，`gpt-6.2-astra` 仅显式可选，
+  模型常量只在 `cognition_call.py` 定义）；`governance.py`、
   `copilot_dispatch.py`、`copilot_auto.py`、`native_bridge.py`、`native_agent.py` 不得导入
   网络客户端或已退役的认知模块（`call_gpt` / `review_ledger` / `reply_protocol`）。认知只
   接收主代理材料、一次请求、零工具（请求体无 `tools`/`functions`，`tool_choice="none"`）、
@@ -120,6 +121,9 @@ Agent、认知（CONSULT / PLAN / REVIEW）、DesignWise。Executor 是 ZCode �
   Agent 自报模型名不算证据。
 - **主代理换模型后必须复查**：确认 Executor/Reviewer 仍为 `inherit` 且实际路由一致。
   Agent Profile 在进程/会话启动时缓存，配置修改后须新会话或新进程验证。
+- **认知模型选择**：默认 `gpt-6.2-sol`；`gpt-6.2-astra` 只经 `COPILOT_COGNITION_MODEL`
+  （或显式参数）选择，属显式配置而不是失败回退——SOL 失败不会自动改选 Astra，注册表外
+  的模型名一律拒绝发送。换默认模型须用户明确授权，并按 `docs/DECISIONS.md` 记录理由与证据。
 - 不修改 Provider、模型路由与 CPA 配置；相关变更须用户单独授权。
 
 ## 4. 工程执行规则
