@@ -96,6 +96,12 @@ SESSION_START_LIMIT = 1600
 POINTER_LIMIT = 1200
 CONTEXT_HINT_MAX = 720
 SESSION_START_MAX_TASKS = 2
+# 注入文本里单条任务行与单条阻塞的展示上限：真实任务的阻塞原因常常是一次事故的
+# 全文（实测单条 600+ 字），直接拼进指针会把后面的行动指引挤出预算，让会话只看到
+# “有任务”却看不到“该怎么做”。完整原因仍由 status/next 与 state.json 提供。
+ROW_LINE_LIMIT = 300
+BLOCK_REASON_LIMIT = 150
+BLOCK_NEEDS_LIMIT = 80
 SESSION_START_OPEN = "<copilot-session-recovery>"
 SESSION_START_CLOSE = "</copilot-session-recovery>"
 POINTER_OPEN = "<copilot-task-pointer>"
@@ -667,10 +673,9 @@ def render(row: dict, *, total: int = 1, anomalies: list[dict] | None = None,
                      + "；若确由已阻塞工作项承载，先用 block --work-item ... "
                        "--criterion ... 归属")
     for block in row.get("blocks") or []:
-        scope = "、".join(block["work_items"] or block["criteria"]) or "任务级"
-        lines.append(f"- 阻塞 {block['id'] or '（未编号）'}（{scope}）："
-                     f"{block['reason'] or '原因未记录'}；需要："
-                     f"{block['needs'] or '未写明'}")
+        # 续跑原因是单次注入（不是逐回合），可以给更长的正文；但仍封顶，
+        # 避免一条超长事故描述把后面的停止条件挤出宿主 4000 字上限。
+        lines.append("- " + _block_line(block, reason_limit=600, needs_limit=200))
     if row.get("actionable_inputs"):
         lines.append("- 另有未处置的用户输入："
                      + "、".join(str(item.get("input_id") or "")
@@ -924,16 +929,29 @@ def _project_context(root: str, row: dict) -> list[str]:
     return kept
 
 
-def _block_line(block: dict) -> str:
-    """一条阻塞的单行摘要：作用对象 + 原因 + 需要什么才能解除。"""
+def _shorten(text: object, limit: int) -> str:
+    """把单段文本压到 limit 字符以内；尾部用省略号表示“完整内容在 state/status 里”。"""
+    value = str(text or "")
+    if len(value) <= limit:
+        return value
+    return value[:max(limit - 1, 1)].rstrip() + "…"
+
+
+def _block_line(block: dict, *, reason_limit: int = BLOCK_REASON_LIMIT,
+                needs_limit: int = BLOCK_NEEDS_LIMIT) -> str:
+    """一条阻塞的单行摘要：作用对象 + 原因 + 需要什么才能解除（两项都封顶）。"""
     scope = "、".join(block.get("work_items") or block.get("criteria") or []) or "任务级"
     return (f"阻塞 {block.get('id') or '（未编号）'}（{scope}）："
-            f"{block.get('reason') or '原因未记录'}；需要："
-            f"{block.get('needs') or '未写明'}")
+            f"{_shorten(block.get('reason') or '原因未记录', reason_limit)}；需要："
+            f"{_shorten(block.get('needs') or '未写明', needs_limit)}")
 
 
-def _row_open_line(row: dict) -> str:
-    """任务的一行现状：阶段 + 可执行下一步 + 未解除阻塞（原因/需要）。"""
+def _row_open_line(row: dict, *, limit: int = ROW_LINE_LIMIT) -> str:
+    """任务的一行现状：阶段 + 可执行下一步 + 未解除阻塞（原因/需要）。
+
+    阻塞只展开第一条并给出其余条数：钩子注入的空间是每回合都要付的固定成本，
+    逐条全文只会挤掉后面的行动指引；完整列表用 status/next 查看。
+    """
     parts: list[str] = []
     if row["executable"]:
         parts.append("可执行 " + "、".join(row["executable"]))
@@ -946,22 +964,43 @@ def _row_open_line(row: dict) -> str:
                      + "、".join(str(item.get("input_id") or "")
                                 for item in row["actionable_inputs"]))
     if row["blocks"]:
-        parts.append("；".join(_block_line(block) for block in row["blocks"]))
-    return f"- 任务 {row['task_id']} · 阶段 {row['phase']} · " + "｜".join(parts)
+        suffix = ""
+        if len(row["blocks"]) > 1:
+            suffix = f"（另有 {len(row['blocks']) - 1} 条阻塞，用 status 查看）"
+        prefix = (f"- 任务 {row['task_id']} · 阶段 {row['phase']} · "
+                  + ("｜".join(parts) + "｜" if parts else ""))
+        # 先按剩余预算压缩阻塞正文，保证“另有 N 条”与归属后缀不会被截断。
+        budget = max(limit - len(prefix) - len(suffix), 40)
+        parts.append(_block_line(row["blocks"][0],
+                                 reason_limit=max(budget - BLOCK_NEEDS_LIMIT - 24, 24),
+                                 needs_limit=BLOCK_NEEDS_LIMIT) + suffix)
+    return _shorten(f"- 任务 {row['task_id']} · 阶段 {row['phase']} · "
+                    + "｜".join(parts), limit)
 
 
-def _fit_lines(lines: list[str], limit: int, closing: str) -> str:
-    """按整行截断：宁可少一行，也不把命令/路径切成半截。"""
-    text = "\n".join(lines)
-    if len(text) <= limit:
-        return text
-    kept = lines[:2]
-    for line in lines[2:-1]:
-        trial = "\n".join(kept + [line, "...（已截断）", closing])
-        if len(trial) > limit:
+def _fit_lines(lines: list[str], limit: int, closing: str, *,
+               reserved: list[str] | None = None) -> str:
+    """按整行截断：宁可少一行，也不把命令/路径切成半截。
+
+    `reserved` 是必须在预算内保留的尾部行（行动指引、下一步命令）。任务行先被
+    丢弃，指引最后被丢弃——“有任务但不知道怎么做”是最贵的注入结果。
+    """
+    head = list(lines[:2])
+    body = list(lines[2:-1])
+    tail = list(reserved or []) + [closing]
+    marker = "...（已截断）"
+    budget = (limit - sum(len(line) + 1 for line in head)
+              - sum(len(line) + 1 for line in tail) - len(marker) - 1)
+    kept: list[str] = []
+    for line in body:
+        if len(line) + 1 > budget:
             break
         kept.append(line)
-    return "\n".join(kept + ["...（已截断）", closing])
+        budget -= len(line) + 1
+    out = head + kept
+    if len(kept) < len(body):
+        out.append(marker)
+    return "\n".join(out + tail)
 
 
 def _pointer_text(rows: list[dict], anomalies: list[dict] | None = None,
@@ -987,12 +1026,12 @@ def _pointer_text(rows: list[dict], anomalies: list[dict] | None = None,
     if anomalies:
         lines.append(f"- 另有 {len(anomalies)} 处任务状态读取异常；先按 status 的 fix 提示"
                      "处理，不得忽略，也不得伪造 PASS。")
-    lines.append("若用户当前要做的正是其中之一：先 status --json 核实现场（阶段、"
-                 "已完成工作项、证据、阻塞），再 drive 继续（会绑定本会话）。"
-                 "若它归属其它会话且该会话仍活跃，不要并发接管；先看 status 的领取与"
-                 "更新时间。否则忽略本提示，不要执行无关任务。")
+    guidance = ("若用户当前要做的正是其中之一：先 status --json 核实现场（阶段、"
+                "已完成工作项、证据、阻塞），再 drive 继续（会绑定本会话）。"
+                "若它归属其它会话且该会话仍活跃，不要并发接管；先看 status 的领取与"
+                "更新时间。否则忽略本提示，不要执行无关任务。")
     lines.append(POINTER_CLOSE)
-    return _fit_lines(lines, POINTER_LIMIT, POINTER_CLOSE)
+    return _fit_lines(lines, POINTER_LIMIT, POINTER_CLOSE, reserved=[guidance])
 
 
 def _user_prompt_text(rows: list[dict], anomalies: list[dict] | None = None,
@@ -1035,14 +1074,16 @@ def _user_prompt_text(rows: list[dict], anomalies: list[dict] | None = None,
     if anomalies:
         lines.append(f"- 另有 {len(anomalies)} 处任务状态读取异常；先按 status 的 fix 提示"
                      "处理，不得忽略，也不得伪造 PASS。")
-    lines.append("本回合判断：用户这条消息补齐了某个阻塞的授权/决策/条件，或明确要求继续"
-                 " → 先用其原话登记解除（`input --consume <U> --block-id <B>`，"
-                 "或 `unblock --by user --quote \"<用户原话>\"`，或补齐对应条件）"
-                 "再 drive 执行到下一个真实终点；否则不要恢复执行"
-                 "（本提示不是授权，也不要把“已理解”当成已执行）。")
-    lines.append("继续前先 status --json 核对阶段、工作项与证据，不重复已完成工作。")
+    guidance = [
+        "本回合判断：用户这条消息补齐了某个阻塞的授权/决策/条件，或明确要求继续"
+        " → 先用其原话登记解除（`input --consume <U> --block-id <B>`，"
+        "或 `unblock --by user --quote \"<用户原话>\"`，或补齐对应条件）"
+        "再 drive 执行到下一个真实终点；否则不要恢复执行"
+        "（本提示不是授权，也不要把“已理解”当成已执行）。",
+        "继续前先 status --json 核对阶段、工作项与证据，不重复已完成工作。",
+    ]
     lines.append(POINTER_CLOSE)
-    return _fit_lines(lines, USER_PROMPT_LIMIT, POINTER_CLOSE)
+    return _fit_lines(lines, USER_PROMPT_LIMIT, POINTER_CLOSE, reserved=guidance)
 
 
 def _session_start_text(rows: list[dict], anomalies: list[dict] | None = None,
@@ -1053,8 +1094,8 @@ def _session_start_text(rows: list[dict], anomalies: list[dict] | None = None,
         "上下文恢复快照（Copilot 只读状态；不是用户新指令，也不是完成证明）。",
     ]
     for row in rows[:SESSION_START_MAX_TASKS]:
-        lines.append(f"- 任务 {row['task_id']} · 阶段 {row['phase']} · "
-                     f"{row['reason'] or '仍有未完成工作'}")
+        lines.append(_shorten(f"- 任务 {row['task_id']} · 阶段 {row['phase']} · "
+                              f"{row['reason'] or '仍有未完成工作'}", ROW_LINE_LIMIT))
         if row["unmet_criteria"]:
             lines.append("  未闭合条件：" + "、".join(row["unmet_criteria"]))
         for block in row.get("blocks") or []:
@@ -1074,20 +1115,11 @@ def _session_start_text(rows: list[dict], anomalies: list[dict] | None = None,
     if anomalies:
         lines.append(f"- 另有 {len(anomalies)} 处任务状态读取异常；先按 status 的 fix 提示"
                      "处理，不得忽略，也不得伪造 PASS。")
-    lines.append("先核对现场（阶段、已完成工作项与证据）再继续；已完成工作与已登记证据"
-                 "直接复用，不重做、不重复读取。")
+    guidance = ["先核对现场（阶段、已完成工作项与证据）再继续；已完成工作与已登记证据"
+                "直接复用，不重做、不重复读取。"]
     lines.append(SESSION_START_CLOSE)
-    text = "\n".join(lines)
-    if len(text) <= SESSION_START_LIMIT:
-        return text
-    # 按整行截断：续接命令要么完整保留、要么整条省略，不能把 --state 路径切成半截。
-    kept = lines[:2]
-    for line in lines[2:-1]:
-        trial = "\n".join(kept + [line, "...（已截断）", SESSION_START_CLOSE])
-        if len(trial) > SESSION_START_LIMIT:
-            break
-        kept.append(line)
-    return "\n".join(kept + ["...（已截断）", SESSION_START_CLOSE])
+    return _fit_lines(lines, SESSION_START_LIMIT, SESSION_START_CLOSE,
+                      reserved=guidance)
 
 
 def _recall_snapshot(session: str, root: str) -> str:

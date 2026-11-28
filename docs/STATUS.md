@@ -30,6 +30,59 @@ UserPromptSubmit 三条钩子仍指向运行时 `copilot_stop_guard.py`；未建
 Provider / 模型 / CPA 配置。交付期间代码未改动，故未机械重跑全量测试（CI 已在最终合并代码上
 跑满 1134 项）。
 
+## 生产力复盘与两项优化（2026-11-28）
+
+依据：用户《Copilot 生产力导向复盘与优化升级》（任务 ID `copilot-productivity-review-upgrade-2026-11-28`）
+与后续《Copilot v9.13.1 生产力优化验证与正式交付》（任务 ID
+`copilot-productivity-validation-release-2026-11-28`）。两项优化不产生新机制，版本号保持
+v9.13.1（不做“只改版本号”的重构）；交付按仓库保护规则走 PR + CI。
+
+**真实现场（可核实）**：HEAD `d626e05`、分支 `main`、工作区干净；113 个 Git 跟踪文件；
+运行时 `--check` 缺失 0 / 不同 0（另有 1 个非分发文件 `hm.txt`）、`--verify-baseline` 通过
+（baseline 28）；Stop / SessionStart / UserPromptSubmit 三条钩子均指向运行时
+`copilot_stop_guard.py`。11-22~11-28 在 7 个应用项目共 108 个任务（99 个已收口）、861 条完成
+条件、1100 条证据、63 次认知调用、36 条阻塞；阻塞原因全部是真实外部条件（切用户后的 USB
+授权、需装包才能看的广告素材、友盟付费/T+1 数据、用户登录），不是误报。
+
+**改动 1：Hook 注入文本预算（可观察的上下文损失）**。旧 `_fit_lines` 按整行丢弃，长阻塞原因
+（实测单条 600+ 字）会把后面的行动指引一起挤掉——实测同一工作区 1288 字符被截到 728 字符，
+第二个任务行与“若用户当前要做的正是其中之一…”全部丢失，会话只看到“有任务”、看不到“怎么做”。
+现在：`_shorten`/`_block_line` 给单条阻塞原因与 needs 封顶（`ROW_LINE_LIMIT=300`、
+`BLOCK_REASON_LIMIT=150`、`BLOCK_NEEDS_LIMIT=80`），任务行只展开第一条阻塞并注明“另有 N 条
+阻塞，用 status 查看”；`_fit_lines` 增加 `reserved` 尾部（指引/下一步命令最后才丢，仍超限时按
+块截断而非整段丢弃）。同一工作区现在 851 字符、两行任务与指引齐全、无截断标记。
+
+**改动 2：`record`/`criterion` 内联证据（最密集的治理成本）**。真实使用里每核销一条完成条件
+都要 `evidence --add` + `criterion --evidence` 两次 CLI（11-23 起证据 671 次、条件 226 次）。
+现在 `record`/`criterion` 支持 `--file`/`--text`/`--capture-cmd`（+`--kind`/`--note`/
+`--evidence-id`），一次调用完成登记与引用，与 `--evidence` 同时给时合并；顺序上先校验工作项/
+条件存在再登记证据，证据与回填在**同一次保存**中生效（`record_action_state` 同上，新增
+`record_criterion_state`），命令失败时状态不留证据记录；`--capture-cmd` 的覆盖保护与
+`evidence --add` 一致。`cmd_evidence` 的采集路径抽成共享 `_capture_evidence`，没有第二套实现。
+
+**验证**：活动测试 **1149 项 OK**（98.714 s，含新增 12 项：`HookTextBudgetTests` 5 项、
+`InlineEvidenceCliTests` 7 项）；legacy 853 项在本树与 `d626e05` 裸检出（`git archive` 导出）
+**逐条相同**（failures 99 / errors 47 / skipped 32，146 个失败项集合 sha1 两边一致
+`726c6d68…`），无新增回归；运行时 `--apply` 写入 5 个文件后 `--check` 缺失 0 / 不同 0，
+`--baseline` 重建为 28 项并通过 `--verify-baseline`；5 个改动文件（`SKILL.md`、
+`references/workflow.md`、`scripts/copilot_dispatch.py`、`scripts/copilot_stop_guard.py`、
+`scripts/governance.py`）源码与运行时 SHA-256 一致；`--version` 仍为 `9.13.1`；Stop /
+SessionStart（`startup|resume|compact`）/ UserPromptSubmit 三条钩子命令未改动，仍指向运行时
+`copilot_stop_guard.py`；运行时副本实测内联证据 + `evidence --list` 正常。
+
+**真实宿主验证（v9.13.1 交付前，2026-11-28）**：真实 ZCode 宿主（headless CLI 与应用会话，
+同一运行时）实测——startup 指针在 3 任务/1 任务工作区注入，5 任务各带长阻塞时指针 851 字符、
+两行任务与指引齐全且不出现截断标记（旧实现同现场跌到 728 字符并丢失指引）；resume / compact
+注入恢复快照（含可粘贴续接命令与“先核对现场”）；Stop 在 `RUNNING/execute/bound` 下 exit 2
+强制续跑、`capture-required:BLOCKED:1` 采集门与 `input-pending:1` 输入门均按预期阻断；
+**应用（GUI）新会话**实测收到 SessionStart 指针——宿主日志 `hook.session_start_context.resolved`
+`result=written`、`telemetry.inputOrigin=desktop`，rollout 系统消息含
+`SessionStart hook additional context: #1 <copilot-task-pointer>`。GUI 侧的 resume / compact
+注入只在 headless 生命周期验证，**GUI resume/compact 未验证**。内联证据在真实宿主跑通
+（`record` 内联文本、`criterion` 内联核销）；CLI 级 35 项逐条核对全部 PASS（含失败原子性：
+回填被拒时 `save_seq` 不变且不留证据记录）。未建 Tag / Release，未改 Provider / 模型 / CPA /
+宿主权限。
+
 ## 认知策略作用域分离与 C/E 生命周期验收（2026-11-26，v9.13.1）
 
 依据：用户《Copilot v9.13.0 后续修复：认知策略作用域与 C/E 生命周期验收》。v9.13.0 交付的

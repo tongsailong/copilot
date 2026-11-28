@@ -76,7 +76,8 @@ start（合同 + 完成条件 + 风险 + 任务类型 + 后端 + 原始意图；
   → [T2/T3，调查后] cognition-plan B（方案比较/优先级/阶段目标；自动执行）
   → drive（本地求值：PASS 收口 / BLOCKED 停下 / 打印工作单）
   → ZCode 执行（主代理或原生子代理）
-  → ingest / record / criterion / evidence（回填真实结果与原始证据）
+  → ingest / record / criterion（回填真实结果；`--file/--text/--capture-cmd` 内联登记证据，
+    一次调用完成“登记 + 引用”，不必先单独 `evidence --add`）
   → [重大事件] cognition-consult C 动态追加；主代理自主采纳/调整/否决
   → [T2/T3，最终工程验证完成后、收口前] cognition-consult E（综合判断）→ ZCode 最终验收 → 收口
   → [仅用户明确要求] cognition-review 一次（REVIEW 独立复核）
@@ -339,7 +340,9 @@ BLOCKED 表示**不能正常收口或继续受阻动作**，不表示无法记�
 ## 证据与审计
 
 - **先登记，后引用**：`evidence --add` 登记文件/内联文本/命令采集，记录 SHA-256、大小、
-  路径与任务归属；`record` / `criterion` 只能引用本任务已登记且未归档的证据。
+  路径与任务归属；`record` / `criterion` 只能引用本任务已登记且未归档的证据。核销条件时
+  更省的做法是内联登记：`criterion --id C1 --status met --text/--file/--capture-cmd …`
+  一次完成登记与引用（`record` 同样支持），默认优先这种写法。
 - **Recall 证据**：`Recall: hit` 把同轮实际 Read 的卡路径登记为文件证据；`zero-hit` 把
   有界检索命令/输出登记为 `--capture-cmd`；`skipped` 在 report/note 写明原因。回执文字
   本身不是召回证据。

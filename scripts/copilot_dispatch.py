@@ -184,6 +184,82 @@ def _evidence_ids(values: list[str] | None) -> list[str]:
     return out
 
 
+def _merge_ids(existing: list[str], added: list[str]) -> list[str]:
+    out = list(existing)
+    for item in added:
+        if item not in out:
+            out.append(item)
+    return out
+
+
+def _inline_sources(args) -> list[str]:
+    """`--file/--text/--capture-cmd` 里实际给出的来源（按 evidence 子命令同义）。"""
+    sources = []
+    if getattr(args, "file", ""):
+        sources.append("file")
+    if getattr(args, "text", None) is not None:
+        sources.append("text")
+    if getattr(args, "capture_cmd", ""):
+        sources.append("capture_cmd")
+    return sources
+
+
+def _capture_evidence(state: dict, path: str, eid: str, command: str,
+                      note: str = "") -> dict:
+    """经 bridge_evidence 采集命令输出并登记为证据；返回 evidence entry。"""
+    capture_dir = os.path.join(os.path.dirname(os.path.abspath(path)), "evidence")
+    os.makedirs(capture_dir, exist_ok=True)
+    out_path = os.path.join(capture_dir, f"{eid}.md")
+    cmd = [sys.executable, "-B", os.path.join(HERE, "bridge_evidence.py"),
+           "--cmd", command, "--out", out_path,
+           "--cwd", os.getcwd(), "--goal", f"任务 {state.get('task_id')} 证据 {eid}"]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise CLIError(f"证据采集失败（exit {proc.returncode}）："
+                       f"{(proc.stderr or proc.stdout).strip()[:1000]}")
+    return G.register_evidence(state, eid, kind="capture", file_path=out_path,
+                               note=note, capture_cmd=command)
+
+
+def _apply_inline_evidence(state: dict, path: str, args, *, target) -> list[dict]:
+    """把 `--file/--text/--capture-cmd` 写进内存状态，返回证据记录；不落盘、不打印。
+
+    每核销一条完成条件原本要两次 CLI（`evidence --add` + `criterion --evidence`），这是
+    最密集的治理成本。合并成一次调用时，证据与回填必须在**同一次保存**里生效：先校验
+    目标（工作项/条件）确实存在，再登记证据；回填本身仍由治理层失败关闭，命令失败时
+    状态不会留下一条与该命令绑定的证据记录。
+    """
+    sources = _inline_sources(args)
+    if not sources:
+        return []
+    if len(sources) > 1:
+        raise CLIError("内联证据 --file/--text/--capture-cmd 只能选一个。")
+    if target is not None:
+        target(state)
+    eid = (getattr(args, "evidence_id", "") or "").strip() or G.next_evidence_id(state)
+    note = getattr(args, "note", "") or ""
+    kind = (getattr(args, "kind", "") or "").strip()
+    if sources[0] == "capture_cmd":
+        if any(str(e.get("id") or "") == eid for e in state.get("evidence") or []):
+            # 与 `evidence --add --capture-cmd` 同一约束：重采会覆盖已登记文件。
+            raise CLIError(f"证据 {eid} 已登记或已归档；--capture-cmd 会覆盖证据文件。"
+                           "请用 --evidence-id 指定新的 id。")
+        entry = _capture_evidence(state, path, eid, args.capture_cmd, note)
+    elif sources[0] == "file":
+        entry = G.register_evidence(state, eid, kind=kind or "file",
+                                    file_path=args.file, note=note)
+    else:
+        entry = G.register_evidence(state, eid, kind=kind or "text",
+                                    text=args.text, note=note)
+    return [entry]
+
+
+def _print_inline_entries(entries: list[dict]) -> None:
+    for entry in entries:
+        print(f"{entry['id']} 已登记（内联）：{entry['kind']} size={entry['size']} "
+              f"sha256={entry['sha256'][:16]}…")
+
+
 def _state_path(args) -> str:
     value = getattr(args, "state", "") or os.environ.get("COPILOT_STATE", "")
     value = str(value).strip()
@@ -935,13 +1011,20 @@ def cmd_plan(args) -> int:
 
 
 def cmd_record(args) -> int:
-    action = G.record_action(
-        _state_path(args), args.id, args.status, result=args.result or "",
-        evidence_ids=_evidence_ids(args.evidence))
+    path = _state_path(args)
+    state = G.load_state(path)
+    inline = _apply_inline_evidence(state, path, args,
+                                    target=lambda s: G._by_id(s, args.id))
+    action = G.record_action_state(
+        state, args.id, args.status, result=args.result or "",
+        evidence_ids=_merge_ids(_evidence_ids(args.evidence),
+                                [entry["id"] for entry in inline]))
+    G.save_state(path, state)
+    _print_inline_entries(inline)
     print(f"{action['id']} → {action['status']}"
           + (f"；证据 {', '.join(action['evidence_ids'])}"
              if action["evidence_ids"] else ""))
-    return _print_continuation(_state_path(args), args)
+    return _print_continuation(path, args)
 
 
 def cmd_rerun(args) -> int:
@@ -952,13 +1035,20 @@ def cmd_rerun(args) -> int:
 
 
 def cmd_criterion(args) -> int:
-    criterion = G.record_criterion(
-        _state_path(args), args.id, args.status,
-        evidence_ids=_evidence_ids(args.evidence))
+    path = _state_path(args)
+    state = G.load_state(path)
+    inline = _apply_inline_evidence(state, path, args,
+                                    target=lambda s: G._criterion(s, args.id))
+    criterion = G.record_criterion_state(
+        state, args.id, args.status,
+        evidence_ids=_merge_ids(_evidence_ids(args.evidence),
+                                [entry["id"] for entry in inline]))
+    G.save_state(path, state)
+    _print_inline_entries(inline)
     print(f"{criterion['criterion_id']} → {criterion['status']}"
           + (f"；证据 {', '.join(r['id'] for r in criterion['evidence_refs'])}"
              if criterion["evidence_refs"] else ""))
-    return _print_continuation(_state_path(args), args)
+    return _print_continuation(path, args)
 
 
 def cmd_judgment(args) -> int:
@@ -1231,19 +1321,7 @@ def cmd_evidence(args) -> int:
     if args.capture_cmd:
         if args.file or args.text is not None:
             raise CLIError("--capture-cmd 不能与 --file/--text 同时使用。")
-        capture_dir = os.path.join(os.path.dirname(os.path.abspath(path)), "evidence")
-        os.makedirs(capture_dir, exist_ok=True)
-        out_path = os.path.join(capture_dir, f"{eid}.md")
-        cmd = [sys.executable, "-B", os.path.join(HERE, "bridge_evidence.py"),
-               "--cmd", args.capture_cmd, "--out", out_path,
-               "--cwd", os.getcwd(), "--goal", f"任务 {state.get('task_id')} 证据 {eid}"]
-        proc = subprocess.run(cmd, capture_output=True, text=True)
-        if proc.returncode != 0:
-            raise CLIError(f"证据采集失败（exit {proc.returncode}）："
-                           f"{(proc.stderr or proc.stdout).strip()[:1000]}")
-        entry = G.register_evidence(state, eid, kind="capture",
-                                    file_path=out_path, note=args.note or "",
-                                    capture_cmd=args.capture_cmd)
+        entry = _capture_evidence(state, path, eid, args.capture_cmd, args.note or "")
     elif args.file:
         entry = G.register_evidence(state, eid, kind=args.kind or "file",
                                     file_path=args.file, note=args.note or "")
@@ -2865,6 +2943,20 @@ def build_parser() -> argparse.ArgumentParser:
         # 纯登记/报告命令默认 advise：记录事实不得隐式产生付费调用。
         parser.set_defaults(cognition_default=default)
 
+    def _add_inline_evidence(parser) -> None:
+        """回填与证据合并成一次调用：`record`/`criterion` 直接登记新证据。"""
+        parser.add_argument("--file", default="",
+                            help="内联登记文件证据（等价于 evidence --add --file）")
+        parser.add_argument("--text", default=None,
+                            help="内联登记文本证据（等价于 evidence --add --text）")
+        parser.add_argument("--capture-cmd", default="",
+                            help="内联执行命令并采集输出为证据（等价于 evidence --add "
+                                 "--capture-cmd）")
+        parser.add_argument("--kind", default="", help="内联证据类型；默认 file/text")
+        parser.add_argument("--note", default="", help="内联证据备注")
+        parser.add_argument("--evidence-id", default="",
+                            help="内联证据 id；省略则自动取下一个 E 编号")
+
     p = sub.add_parser("start", help="创建任务合同与状态")
     p.add_argument("--state", required=True)
     p.add_argument("--goal", required=True)
@@ -2924,7 +3016,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--id", required=True)
     p.add_argument("--status", required=True, choices=G.STATUSES)
     p.add_argument("--result", default="")
-    p.add_argument("--evidence", action="append", default=[])
+    p.add_argument("--evidence", action="append", default=[],
+                   help="已登记证据 id（逗号分隔或重复传入）")
+    _add_inline_evidence(p)
     p.set_defaults(func=cmd_record)
     _add_cognition_policy(p, default=REGISTRATION_POLICY)
 
@@ -2939,7 +3033,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--state", required=True)
     p.add_argument("--id", required=True)
     p.add_argument("--status", required=True, choices=G.CRITERION_STATUSES)
-    p.add_argument("--evidence", action="append", default=[])
+    p.add_argument("--evidence", action="append", default=[],
+                   help="已登记证据 id（逗号分隔或重复传入）")
+    _add_inline_evidence(p)
     p.set_defaults(func=cmd_criterion)
     _add_cognition_policy(p, default=REGISTRATION_POLICY)
 
