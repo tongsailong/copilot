@@ -41,6 +41,7 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
@@ -52,7 +53,7 @@ import review_policy as RP  # noqa: E402
 import cognition_call as CC  # noqa: E402
 import cognition_schedule as SCH  # noqa: E402
 
-__version__ = "9.14.0"
+__version__ = "9.15.0"
 
 
 class CLIError(Exception):
@@ -1550,15 +1551,303 @@ def _load_pending_result(task_dir: str, digest: str,
     return value
 
 
+def _attempt_facts(model: str, status: str, latency_ms: int, *, exc=None,
+                   result: dict | None = None) -> dict:
+    """一次模型尝试的脱敏事实（成功或失败），供调用记录与审计追溯。
+
+    两次尝试必须分别可读：各自的模型身份、追踪 ID 与错误，不能只保留最后一次的
+    结果，否则“到底哪一次失败、哪一次接管”无法从记录本身判断。
+    """
+    facts = {"model": model, "model_key": CC.model_key(model),
+             "provider": CC.PROVIDER, "status": status,
+             "latency_ms": int(latency_ms)}
+    if result is not None:
+        facts.update({
+            "request_id": str(result.get("request_id") or ""),
+            "trace_id": str(result.get("trace_id") or ""),
+            "response_id": str(result.get("response_id") or ""),
+            "request_attempted": bool(result.get("request_attempted")),
+            "send_observed": str(result.get("send_observed") or ""),
+            "usage": result.get("usage"),
+            "reply_sha256": str(result.get("reply_sha256") or ""),
+        })
+    if exc is not None:
+        facts.update({
+            "error": str(getattr(exc, "code", "") or ""),
+            "error_class": str(getattr(exc, "error_class", "") or ""),
+            "http_status": getattr(exc, "http_status", None),
+            "retry_after": getattr(exc, "retry_after", None),
+            "retry_after_raw": str(getattr(exc, "retry_after_raw", "") or ""),
+            "upstream_code": str(getattr(exc, "upstream_code", "") or ""),
+            "request_id": str(getattr(exc, "request_id", "") or ""),
+            "trace_id": str(getattr(exc, "trace_id", "") or ""),
+            "request_attempted": bool(getattr(exc, "request_attempted", True)),
+            "send_observed": str(getattr(exc, "send_observed", "unknown")),
+            "detail": str(getattr(exc, "detail", "") or "")[:500],
+        })
+    return facts
+
+
+def _sum_usage(trail: list[dict]) -> dict | None:
+    """链路上所有尝试的数值用量之和；没有任何用量时返回 None（不补零）。"""
+    totals: dict = {}
+    for item in trail:
+        usage = item.get("usage")
+        if not isinstance(usage, dict):
+            continue
+        for key, value in usage.items():
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                totals[key] = totals.get(key, 0) + value
+    return totals or None
+
+
+def _run_model_chain(*, state_path: str, prompt: str, digest: str, mode: str,
+                     args, audit_log: str, stage: str,
+                     images: list[dict] | None, chain: list[str]) -> tuple[dict | None, int]:
+    """按 `chain` 顺序尝试模型：主模型一次，备用模型至多一次。
+
+    - 只有 `CC.fallback_decision` 允许的故障才切换模型；认证、账户额度、请求
+      构造与回答质量问题一律不回退，避免用换模型掩盖真实问题。
+    - 备用模型处于该模型自己的退避窗口时不发注定失败的请求，只记录跳过原因。
+    - 两次尝试同属一个认知对象：材料、模式、推理等级与零工具约束完全相同，
+      只有模型不同；结果记录同时保留两次请求的追踪 ID。
+    """
+    call = {
+        "REVIEW": CC.run_review,
+        "PLAN": CC.run_plan,
+        "CONSULT": CC.run_consult,
+        "THINK": CC.run_consult,
+    }.get(mode, CC.run_consult)
+    requested = chain[0]
+    trail: list[dict] = []
+    primary_exc = None
+    primary_decision: dict = {}
+    # 链上没有备用模型时，要能区分“显式选了别的模型（不反向回退）”与
+    # “兜底被运维关闭”，而不是把 allowed 的故障误记成 denied。
+    if len(chain) > 1:
+        fallback_unavailable = ""
+    elif not CC.fallback_enabled():
+        fallback_unavailable = "disabled"
+    else:
+        fallback_unavailable = "explicit-model"
+    started = time.monotonic()
+    for index, attempt_model in enumerate(chain):
+        if index > 0:
+            backoff = G.cognition_backoff_status(
+                G.load_state(state_path), model=CC.model_key(attempt_model))
+            if backoff.get("active"):
+                trail.append({
+                    "model": attempt_model,
+                    "model_key": CC.model_key(attempt_model),
+                    "provider": CC.PROVIDER, "status": "skipped",
+                    "reason": "backoff-window",
+                    "latency_ms": 0,
+                    "fallback_skip": _backoff_text(backoff),
+                })
+                print(f"认知{mode}：备用模型 {attempt_model} 处于退避窗口"
+                      f"（{_backoff_text(backoff)}），本次不发起兜底请求；"
+                      "主模型失败已如实记录。", file=sys.stderr)
+                break
+        attempt_started = time.monotonic()
+        try:
+            attempt = call(prompt, audit_log=audit_log,
+                           max_output_tokens=args.max_output_tokens,
+                           timeout=args.timeout, images=images or None,
+                           model=attempt_model)
+        except CC.CognitionError as exc:
+            latency = int((time.monotonic() - attempt_started) * 1000)
+            decision = CC.fallback_decision(exc)
+            trail.append(_attempt_facts(attempt_model, "failed", latency, exc=exc))
+            if index == 0:
+                primary_exc, primary_decision = exc, decision
+                if len(chain) > 1 and decision.get("allow"):
+                    trail[-1]["fallback"] = {
+                        "used": True, "model": chain[1],
+                        "reason": decision["reason"]}
+                    print(f"认知{mode}：{attempt_model} 失败 [{exc.code}]"
+                          f"（{decision['reason']}）；按单次兜底改用 "
+                          f"{chain[1]} 重取同一材料（不重试原模型、不再找第三个模型）。",
+                          file=sys.stderr)
+                    continue
+            return _record_chain_failure(
+                state_path=state_path, mode=mode, args=args, digest=digest,
+                stage=stage, chain=chain, trail=trail, exc=exc,
+                decision=decision, primary_exc=primary_exc,
+                primary_decision=primary_decision,
+                fallback_unavailable=fallback_unavailable,
+                total_ms=int((time.monotonic() - started) * 1000))
+        latency = int((time.monotonic() - attempt_started) * 1000)
+        trail.append(_attempt_facts(attempt_model, "completed", latency,
+                                    result=attempt))
+        usage_total = _sum_usage(trail)
+        enriched = {
+            **attempt,
+            "requested_model": requested,
+            "actual_model": attempt_model,
+            # `model` 始终是**实际**产出结论的模型：兜底结果不得冒充主模型结果。
+            "model": attempt_model,
+            "model_key": CC.model_key(attempt_model),
+            "fallback_used": index > 0,
+            "fallback_reason": (str((trail[0].get("fallback") or {}).get("reason") or "")
+                                if index > 0 else ""),
+            "primary_error": trail[0] if index > 0 else None,
+            "fallback_error": None,
+            "attempt_count": len(trail),
+            "attempts": len(trail),
+            "attempt_trail": trail,
+            "latency_total_ms": int((time.monotonic() - started) * 1000),
+            "usage_total": usage_total,
+            "usage": usage_total if usage_total else attempt.get("usage"),
+        }
+        if index > 0:
+            print(f"认知{mode}：{attempt_model} 接管成功"
+                  f"（主模型 {requested} 失败，fallback_reason="
+                  f"{enriched['fallback_reason'] or '-'}；"
+                  f"attempts={len(trail)}，总耗时 "
+                  f"{enriched['latency_total_ms']} ms）。", file=sys.stderr)
+        return enriched, 0
+    # 链路在真正发出备用请求之前结束（退避窗口跳过）：主失败仍然必须登记。
+    return _record_chain_failure(
+        state_path=state_path, mode=mode, args=args, digest=digest,
+        stage=stage, chain=chain, trail=trail, exc=primary_exc,
+        decision=primary_decision, primary_exc=primary_exc,
+        primary_decision=primary_decision,
+        fallback_unavailable=fallback_unavailable,
+        total_ms=int((time.monotonic() - started) * 1000))
+
+
+def _record_chain_failure(*, state_path: str, mode: str, args, digest: str,
+                          stage: str, chain: list[str], trail: list[dict],
+                          exc, decision: dict, primary_exc,
+                          primary_decision: dict,
+                          fallback_unavailable: str = "",
+                          total_ms: int) -> tuple[None, int]:
+    """登记一次认知失败（主模型失败；备用未执行、被跳过或也失败）。
+
+    失败记录保留两次请求各自的追踪 ID 与错误；`fallback_used` / `fallback_denied`
+    / `fallback_skipped` / `fallback_exhausted` 区分四种真实结局，不把“没有回退”
+    写成“回退失败”，也不在双失败时伪造成功记录。
+    """
+    failed = [item for item in trail if item.get("status") == "failed"]
+    final = failed[-1] if failed else _attempt_facts(str(chain[0]), "failed", 0,
+                                                     exc=exc)
+    score = dict(primary_decision or {})
+    fallback_attempted = len(failed) > 1
+    exhausted = fallback_attempted
+    skipped = any(item.get("status") == "skipped" for item in trail)
+    requested = chain[0]
+    last_model = str(final.get("model") or requested)
+    detail_parts = []
+    if exhausted:
+        detail_parts.append(
+            f"主模型 {requested} 与备用模型 {last_model} 均失败"
+            f"（{final.get('detail') or ''}）；未再尝试第三个模型、未切换 Provider。")
+    else:
+        detail_parts.append(str(getattr(exc, "detail", "") or ""))
+        if score:
+            detail_parts.append(f"未自动兜底：{score.get('reason') or '-'}。")
+    if skipped:
+        skip_row = next(item for item in trail if item.get("status") == "skipped")
+        detail_parts.append(
+            f"备用模型 {skip_row.get('model')} 因"
+            f"（{skip_row.get('fallback_skip') or '退避窗口'}）未发起请求。")
+    detail = " ".join(part for part in detail_parts if part)
+    error_code = str(getattr(exc, "code", "") or "cognition_error")
+    if fallback_attempted or skipped:
+        denied = ""
+    elif fallback_unavailable:
+        denied = f"unavailable:{fallback_unavailable}"
+    else:
+        denied = str(score.get("reason") or "")
+    record = G.record_cognition_call_failure(
+        state_path, mode=mode, error_code=error_code, detail=detail,
+        materials_sha256=digest, model=last_model, provider=CC.PROVIDER,
+        requested_model=requested, actual_model=last_model,
+        obligation_id=str(getattr(args, "obligation_id", "") or ""),
+        dispatch=_dispatch_label(args), stage=stage,
+        request_attempted=bool(final.get("request_attempted", True)),
+        send_observed=str(final.get("send_observed") or "unknown"),
+        http_status=(final.get("http_status")
+                     if isinstance(final.get("http_status"), int) else None),
+        retry_after=(final.get("retry_after")
+                     if isinstance(final.get("retry_after"), (int, float)) else None),
+        retry_after_raw=str(final.get("retry_after_raw") or ""),
+        upstream_code=str(final.get("upstream_code") or ""),
+        error_class=str(final.get("error_class") or ""),
+        request_id=str(final.get("request_id") or ""),
+        trace_id=str(final.get("trace_id") or ""),
+        fallback_used=fallback_attempted,
+        fallback_denied=denied,
+        fallback_skipped="backoff-window" if skipped else "",
+        fallback_exhausted=exhausted,
+        attempt_trail=trail, attempt_count=len(trail) or 1)
+    label = CC.ERROR_CLASS_LABEL.get(str(record.get("error_class") or ""), "")
+    facts = [f"模型 {last_model}"]
+    if final.get("http_status"):
+        facts.append(f"HTTP {final.get('http_status')}")
+    if record.get("error_class"):
+        facts.append(f"分类 {record.get('error_class')}"
+                     + (f"（{label}）" if label else ""))
+    if record.get("retry_after"):
+        facts.append(f"Retry-After {record['retry_after']:g}s")
+    if final.get("upstream_code"):
+        facts.append(f"上游 code {final.get('upstream_code')}")
+    if final.get("trace_id"):
+        facts.append(f"trace {final.get('trace_id')}")
+    if exhausted:
+        facts.append(f"主模型 trace {trail[0].get('trace_id') or '-'}")
+    print(f"认知{mode} 失败 [{error_code}]"
+          + (f" {' · '.join(facts)}" if facts else "")
+          + f"：{detail}", file=sys.stderr)
+    if mode == "REVIEW":
+        print("已记录真实失败原因，未自动重试、未切换 Provider；"
+              "独立复核未完成，如实报告，不伪造结论。", file=sys.stderr)
+        return None, int(getattr(exc, "exit_code", 1) or 1)
+    print("已记录真实失败原因，未自动重试、未切换 Provider；"
+          "认知不可用不阻断工程推进：主代理按现有判断继续，"
+          "新增关键信息后可人工重新发起。", file=sys.stderr)
+    if getattr(args, "json", False):
+        _print({
+            "schema": "copilot-cognition-cognitive-degraded/v1",
+            "status": "unavailable",
+            "action": "continue",
+            "mode": mode,
+            "provider": CC.PROVIDER,
+            "model": last_model,
+            "requested_model": requested,
+            "actual_model": last_model,
+            "error": error_code,
+            "error_class": record.get("error_class"),
+            "http_status": record.get("http_status"),
+            "retry_after": record.get("retry_after"),
+            "retry_after_raw": record.get("retry_after_raw"),
+            "upstream_code": record.get("upstream_code"),
+            "fallback_used": fallback_attempted,
+            "fallback_denied": record.get("fallback_denied") or "",
+            "fallback_skipped": record.get("fallback_skipped") or "",
+            "fallback_exhausted": exhausted,
+            "attempt_count": record.get("attempt_count"),
+            "attempt_trail": trail,
+            "latency_total_ms": total_ms,
+            "detail": record.get("detail"),
+            "materials_sha256": digest,
+        })
+    return None, 0
+
+
 def _invoke_cognition_once(*, state_path: str, task_dir: str, prompt: str,
                      digest: str, mode: str, args, audit_log: str,
                      audit_subdir: str,
                      stage: str = "",
                      images: list[dict] | None = None,
                      model: str = "") -> tuple[dict | None, int]:
-    """共享的一次调用路径：pending 恢复 → 一次请求 → 落可恢复结果。
+    """共享的一次调用路径：pending 恢复 → 一次认知调用（至多一次兜底）→ 落可恢复结果。
 
     返回 `(result, exit_code)`；result 为 None 表示失败且已打印真实原因。
+
+    认知调用链：主模型一次请求；只有可明确归因的模型级/传输级故障才由备用模型
+    接管一次（同一材料、同一问题、同一推理等级、零工具），任何时候都不会有第三次
+    尝试、不切换 Provider、不修改默认模型。
 
     CONSULT / PLAN 是默认认知引擎（`THINK` 只是归一为 CONSULT 的历史别名）：
     失败时只记录并降级（返回 0），主代理按已有信息继续，认知不可用不构成工程
@@ -1572,86 +1861,17 @@ def _invoke_cognition_once(*, state_path: str, task_dir: str, prompt: str,
         print("发现已取得、尚未登记完成的认知结果：直接恢复登记，"
               "不重复发起请求。", file=sys.stderr)
     else:
-        try:
-            call = {
-                "REVIEW": CC.run_review,
-                "PLAN": CC.run_plan,
-                "CONSULT": CC.run_consult,
-                "THINK": CC.run_consult,
-            }.get(mode, CC.run_consult)
-            result = call(
-                prompt, audit_log=audit_log,
-                max_output_tokens=args.max_output_tokens,
-                timeout=args.timeout, images=images or None,
-                model=CC.resolve_model(model))
-        except CC.CognitionError as exc:
-            error_class = str(getattr(exc, "error_class", "") or "")
-            http_status = getattr(exc, "http_status", None)
-            retry_after = getattr(exc, "retry_after", None)
-            retry_after_raw = str(getattr(exc, "retry_after_raw", "") or "")
-            resolved_model = CC.resolve_model(model)
-            G.record_cognition_call_failure(
-                state_path, mode=mode, error_code=exc.code, detail=exc.detail,
-                materials_sha256=digest, model=resolved_model,
-                provider=CC.PROVIDER,
-                obligation_id=str(getattr(args, "obligation_id", "") or ""),
-                dispatch=_dispatch_label(args),
-                stage=stage,
-                request_attempted=bool(getattr(exc, "request_attempted", True)),
-                send_observed=str(getattr(exc, "send_observed", "unknown")),
-                http_status=http_status if isinstance(http_status, int) else None,
-                retry_after=(retry_after
-                             if isinstance(retry_after, (int, float)) else None),
-                retry_after_raw=retry_after_raw,
-                upstream_code=str(getattr(exc, "upstream_code", "") or ""),
-                error_class=error_class,
-                request_id=str(getattr(exc, "request_id", "") or ""),
-                trace_id=str(getattr(exc, "trace_id", "") or ""))
-            label = CC.ERROR_CLASS_LABEL.get(error_class, "")
-            facts = [f"模型 {resolved_model}"]
-            if http_status:
-                facts.append(f"HTTP {http_status}")
-            if error_class:
-                facts.append(f"分类 {error_class}"
-                            + (f"（{label}）" if label else ""))
-            if retry_after:
-                facts.append(f"Retry-After {retry_after:g}s"
-                             + (f"（原始 {retry_after_raw}）"
-                                if retry_after_raw not in ("", f"{retry_after:g}")
-                                else ""))
-            if getattr(exc, "upstream_code", ""):
-                facts.append(f"上游 code {exc.upstream_code}")
-            if getattr(exc, "trace_id", ""):
-                facts.append(f"trace {exc.trace_id}")
-            print(f"认知{mode} 失败 [{exc.code}]"
-                  + (f" {' · '.join(facts)}" if facts else "")
-                  + f"：{exc.detail or ''}", file=sys.stderr)
-            if mode == "REVIEW":
-                print("已记录真实失败原因，未自动重试、未切换 Provider；"
-                      "独立复核未完成，如实报告，不伪造结论。",
-                      file=sys.stderr)
-                return None, exc.exit_code
-            print("已记录真实失败原因，未自动重试、未切换 Provider；"
-                  "认知不可用不阻断工程推进：主代理按现有判断继续，"
-                  "新增关键信息后可人工重新发起。", file=sys.stderr)
-            if getattr(args, "json", False):
-                _print({
-                    "schema": "copilot-cognition-cognitive-degraded/v1",
-                    "status": "unavailable",
-                    "action": "continue",
-                    "mode": mode,
-                    "provider": CC.PROVIDER,
-                    "model": resolved_model,
-                    "error": exc.code,
-                    "error_class": error_class,
-                    "http_status": http_status,
-                    "retry_after": retry_after,
-                    "retry_after_raw": retry_after_raw,
-                    "upstream_code": str(getattr(exc, "upstream_code", "") or ""),
-                    "detail": exc.detail,
-                    "materials_sha256": digest,
-                })
-            return None, 0
+        requested = CC.resolve_model(model)
+        chain = [requested]
+        candidate = CC.fallback_model(requested)
+        if candidate and candidate != requested:
+            chain.append(candidate)
+        result, code = _run_model_chain(
+            state_path=state_path, prompt=prompt, digest=digest, mode=mode,
+            args=args, audit_log=audit_log, stage=stage,
+            images=images or None, chain=chain)
+        if result is None:
+            return None, code
         # 远程已成功：先落一份可恢复结果，再写状态。状态/审计落盘失败时，
         # 下一次同材料调用直接恢复这份结果，不会再次付费。
         # pending 以 subject 摘要命名，必须显式保存该键；`materials_sha256`
@@ -1721,13 +1941,16 @@ def _cognition_reuse_or_refuse(decision: dict, args, mode: str, cfg: dict, *,
     if decision["action"] != "reuse":
         return None
     existing = decision["review"]
+    reused_model = str(existing.get("model") or model)
     if record and state_path:
         # 复用命中只登记事实：它说明这次本可以不复用（=多一次付费），
         # 不证明结论正确，也不改变任务状态与门禁。
         try:
-            G.record_cognition_reuse(state_path, mode=mode, model=model,
-                               model_key=CC.model_key(model), subject=subject,
-                               stage=stage)
+            G.record_cognition_reuse(state_path, mode=mode, model=reused_model,
+                               model_key=CC.model_key(reused_model), subject=subject,
+                               stage=stage,
+                               requested_model=str(existing.get("requested_model")
+                                                   or model))
         except Exception as exc:  # noqa: BLE001 — 观测失败不影响复用结果
             print(f"提示：复用命中未登记（{exc}）；本次仍未发起请求。",
                   file=sys.stderr)
@@ -1736,6 +1959,10 @@ def _cognition_reuse_or_refuse(decision: dict, args, mode: str, cfg: dict, *,
     else:
         detail = (f"verdict={existing.get('verdict')}" if mode == "REVIEW"
                   else f"mode={existing.get('mode')}")
+        if reused_model and reused_model != model:
+            # 防御性披露：正常路径下复用要求 requested_model 与 actual_model
+            # 都与本次请求模型一致（兜底记录不复用），因此这里不应命中。
+            detail += f" · 实际模型 {reused_model}（本次请求模型 {model}）"
         print(f"认知{cfg['label']}已完成：{G.cognition_call_id(existing)} {detail}")
         print(decision["note"])
     return 0
@@ -2027,6 +2254,16 @@ def _run_cognition_channel(args, mode: str) -> int:
             "prompt_version": CC.PROMPT_VERSION,
             "evidence_digest": CC.evidence_digest(state),
             "model": result["model"],
+            # 请求模型与实际产出模型分开记录：Astra 兜底接管时两者不同，
+            # 记录必须如实反映“谁答的”，也要保留“本来问的是谁”。
+            "requested_model": result.get("requested_model") or result["model"],
+            "actual_model": result.get("actual_model") or result["model"],
+            "fallback_used": bool(result.get("fallback_used")),
+            "fallback_reason": str(result.get("fallback_reason") or ""),
+            "primary_error": result.get("primary_error"),
+            "fallback_error": result.get("fallback_error"),
+            "attempt_count": int(result.get("attempt_count") or 1),
+            "attempt_trail": result.get("attempt_trail") or [],
             "model_key": CC.model_key(result["model"]),
             "provider": result.get("provider") or CC.PROVIDER,
             "model_resolved": result.get("model_resolved"),
@@ -2058,7 +2295,9 @@ def _run_cognition_channel(args, mode: str) -> int:
             "raw_write_error": raw_error,
             "usage": result.get("usage"),
             "usage_available": result.get("usage_available"),
+            "usage_total": result.get("usage_total"),
             "latency_ms": result.get("latency_ms"),
+            "latency_total_ms": result.get("latency_total_ms"),
             "summary": (result.get("summary")
                         or result.get("judgment") or ""),
             "unverified": result.get("unverified") or [],
@@ -2066,7 +2305,7 @@ def _run_cognition_channel(args, mode: str) -> int:
             "audit_error": result.get("audit_error") or "",
             "recovered_from_pending": result.get("recovered_from_pending", False),
             "zero_tool": True,
-            "attempts": 1,
+            "attempts": int(result.get("attempt_count") or 1),
             "completed_at": result.get("completed_at"),
         }
         if mode == "REVIEW":
@@ -2115,6 +2354,11 @@ def _run_cognition_channel(args, mode: str) -> int:
         elif mode == "REVIEW":
             counts = record.get("findings_count") or {}
             print(f"认知复核完成：{record_id} verdict={record['verdict']}")
+            if record.get("fallback_used"):
+                print(f"兜底：主模型 {record.get('requested_model')} 失败"
+                      f"（{record.get('fallback_reason') or '-'}），"
+                      f"由 {record.get('actual_model')} 接管；"
+                      f"attempts={record.get('attempt_count')}")
             print("findings：" + "，".join(
                 f"{key}={counts.get(key, 0)}"
                 for key in ("blocking", "major", "minor", "info")))
@@ -2130,6 +2374,11 @@ def _run_cognition_channel(args, mode: str) -> int:
             label = cfg["label"]
             print(f"认知{mode}（{label}）完成：{record_id}"
                   + (f" stage={record.get('stage')}" if record.get("stage") else ""))
+            if record.get("fallback_used"):
+                print(f"兜底：主模型 {record.get('requested_model')} 失败"
+                      f"（{record.get('fallback_reason') or '-'}），"
+                      f"由 {record.get('actual_model')} 接管；"
+                      f"attempts={record.get('attempt_count')}")
             print(f"核心判断：{record.get('judgment') or '(无)'}")
             if record.get("goal_understanding"):
                 print(f"目标理解：{record['goal_understanding']}")

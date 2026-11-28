@@ -35,6 +35,8 @@ def review_record(sha: str = "a" * 64, **overrides) -> dict:
     record = {
         "schema": CC.REVIEW_SCHEMA,
         "model": CC.MODEL,
+        "requested_model": CC.MODEL,
+        "actual_model": CC.MODEL,
         "reasoning_effort": "high",
         "materials_sha256": "m" * 64,
         "reply_sha256": sha,

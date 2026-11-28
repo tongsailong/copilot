@@ -5064,20 +5064,59 @@ def record_cognition_call(path: str, call: dict, *, mode: str = "",
             _history(state, "cognition_backoff_cleared",
                      {"reason": "cognition_call_completed",
                       "call_id": record["call_id"], "model_key": key})
+    # 兜底链上的主模型失败同样是上游事实：即使备用模型成功，主模型的过载/冷却
+    # 窗口也要登记，否则下一次会立刻再打一遍同一主模型。成功只清除**本次实际
+    # 产出模型**自己的窗口，不影响这里记入的其它模型失败窗口。
+    attempt_rows = [item for item in record.get("attempt_trail") or []
+                    if isinstance(item, dict)
+                    and item.get("status") == "failed"]
+    windows = []
+    for item in attempt_rows:
+        item_key = str(item.get("model_key") or "")
+        if item_key and item_key == key:
+            continue
+        derived = _cognition_backoff_from_failure(
+            {**item, "call_id": record["call_id"]})
+        if not derived:
+            continue
+        stored = store_model_backoff(state, derived)
+        if not stored:
+            continue
+        windows.append({"until": derived["until"],
+                        "seconds": derived["seconds"],
+                        "reason": derived["reason"],
+                        "error_class": str(item.get("error_class") or ""),
+                        "model": str(item.get("model") or ""),
+                        "model_key": stored})
+        _history(state, "cognition_backoff_set", {
+            "until": derived["until"],
+            "seconds": derived["seconds"],
+            "reason": derived["reason"],
+            "error_class": str(item.get("error_class") or ""),
+            "retry_after": derived.get("retry_after"),
+            "model_key": stored,
+        })
+    if windows:
+        record["attempt_backoffs"] = windows
     save_state(path, state)
     return record
 
 
 def record_cognition_reuse(path: str, *, mode: str = "", model: str = "",
                      model_key: str = "", subject: str = "",
-                     stage: str = "") -> dict:
-    """登记一次“复用已有结论、未重复付费”的事实（观测用，不改变任务状态）。"""
+                     stage: str = "", requested_model: str = "") -> dict:
+    """登记一次“复用已有结论、未重复付费”的事实（观测用，不改变任务状态）。
+
+    `model` 是既有结论的**实际**产出模型，`requested_model` 是本次本要请求的模型：
+    被复用的结论若来自兜底模型，两者不同，复用不得被记成主模型结论。
+    """
     state = load_state(path)
     entry = {
         "ts": now_iso(),
         "mode": str(mode or "CONSULT").upper(),
         "model": str(model or ""),
         "model_key": str(model_key or ""),
+        "requested_model": str(requested_model or model or ""),
         "subject": str(subject or "")[:64],
         "stage": str(stage or "")[:40],
     }
@@ -5565,6 +5604,30 @@ def acceptance_quality(calls: list[dict]) -> dict:
     }
 
 
+_ATTEMPT_FACT_KEYS = (
+    "model", "model_key", "provider", "status", "reason", "error", "error_class",
+    "http_status", "retry_after", "retry_after_raw", "upstream_code",
+    "request_id", "trace_id", "latency_ms", "request_attempted", "send_observed",
+    "fallback", "fallback_skip", "usage", "reply_sha256",
+)
+
+
+def _attempt_fact_public(item: dict) -> dict:
+    """逐次尝试事实的白名单投影：只保留可审计字段，不带任何材料正文。"""
+    out = {}
+    for key in _ATTEMPT_FACT_KEYS:
+        value = item.get(key)
+        if value in (None, "", {}, []):
+            continue
+        if isinstance(value, dict):
+            value = {k: v for k, v in value.items()
+                     if v not in (None, "", {}, [])}
+            if not value:
+                continue
+        out[key] = value
+    return out
+
+
 def record_cognition_call_failure(path: str, *, mode: str = "CONSULT",
                             error_code: str = "", detail: str = "",
                             materials_sha256: str = "",
@@ -5579,12 +5642,25 @@ def record_cognition_call_failure(path: str, *, mode: str = "CONSULT",
                             upstream_code: str = "",
                             error_class: str = "",
                             request_id: str = "",
-                            trace_id: str = "") -> dict:
+                            trace_id: str = "",
+                            requested_model: str = "",
+                            actual_model: str = "",
+                            fallback_used: bool = False,
+                            fallback_denied: str = "",
+                            fallback_skipped: str = "",
+                            fallback_exhausted: bool = False,
+                            attempt_trail: list[dict] | None = None,
+                            attempt_count: int = 0) -> dict:
     """登记一次失败的认知调用；失败不改变任务阶段，也不阻断主代理继续。
 
     除错误码外保留原始 HTTP 状态、上游 code、Retry-After 与 trace 标识，供后续
     任务直接从既有证据判断是上游过载、流中断、凭据冷却、认证还是客户端超时，
     不需要重新复现。`error_class` 为空时按错误码推断（历史调用方兼容）。
+
+    单次兜底要求把两次尝试分别留证：`attempt_trail` 是逐次尝试的脱敏事实（模型、
+    追踪 ID、HTTP 状态、错误分类），`fallback_used` / `fallback_denied` /
+    `fallback_skipped` / `fallback_exhausted` 区分“没有回退”“回退了也失败”“因
+    退避窗口跳过”三种真实结局，不把任何一种写成模糊的“失败”。
     """
     state = load_state(path)
     resolved = str(mode or "CONSULT").upper()
@@ -5630,6 +5706,19 @@ def record_cognition_call_failure(path: str, *, mode: str = "CONSULT",
         "model_key": (f"{provider}:{model}" if provider and model else ""),
         "created_at": now_iso(),
     }
+    # 主/备模型与逐次尝试：成功记录与失败记录同一口径，统计不需要按模式猜测。
+    if requested_model or actual_model or fallback_used:
+        record["requested_model"] = str(requested_model or model or "")
+        record["actual_model"] = str(actual_model or model or "")
+        record["fallback_used"] = bool(fallback_used)
+        record["fallback_denied"] = str(fallback_denied or "")[:120]
+        record["fallback_skipped"] = str(fallback_skipped or "")[:120]
+        record["fallback_exhausted"] = bool(fallback_exhausted)
+        record["attempt_count"] = int(attempt_count or 1)
+        if attempt_trail:
+            record["attempt_trail"] = [
+                _attempt_fact_public(item) for item in attempt_trail
+                if isinstance(item, dict)]
     # 失败也结算到义务：义务转为 failed（带真实错误码），不重试、不换 Provider。
     if obligation_id:
         record["obligation_id"] = str(obligation_id)
@@ -5659,24 +5748,45 @@ def record_cognition_call_failure(path: str, *, mode: str = "CONSULT",
     # 窗口按 provider:model 隔离：一个模型的过载不会冻结另一个模型。
     # 没有模型身份的失败记录**不登记窗口**：历史单例 `sol_backoff` 只读保留，
     # 不再写入，避免在 v9.10 继续产生旧格式数据。
-    backoff = _cognition_backoff_from_failure(record)
-    if backoff:
+    #
+    # 兜底链路要按**每一次失败的尝试**分别登记：主模型过载不应让备用模型也进
+    # 冷却，反之亦然；否则下一次会误跳过本来可用的模型。
+    attempts = [item for item in (attempt_trail or [])
+                if isinstance(item, dict) and item.get("status") == "failed"]
+    backoff_sources = attempts or [record]
+    windows = []
+    for item in backoff_sources:
+        source = {**record, **item} if item is not record else record
+        source.setdefault("provider", provider)
+        source["call_id"] = record["call_id"]
+        backoff = _cognition_backoff_from_failure(source)
+        if not backoff:
+            continue
         key = store_model_backoff(state, backoff)
-        if key:
-            record["backoff"] = {"until": backoff["until"],
-                                 "seconds": backoff["seconds"],
-                                 "reason": backoff["reason"],
-                                 "model_key": key}
-            _history(state, "cognition_backoff_set", {
-                "until": backoff["until"],
-                "seconds": backoff["seconds"],
-                "reason": backoff["reason"],
-                "error_class": record["error_class"],
-                "retry_after": record["retry_after"],
-                "model_key": key,
-            })
-        else:
+        if not key:
             record["backoff_skipped"] = "missing-model-identity"
+            continue
+        windows.append({"until": backoff["until"],
+                        "seconds": backoff["seconds"],
+                        "reason": backoff["reason"],
+                        "error_class": str(item.get("error_class")
+                                           or record["error_class"]),
+                        "retry_after": backoff.get("retry_after"),
+                        "model": str(item.get("model") or model),
+                        "model_key": key})
+        _history(state, "cognition_backoff_set", {
+            "until": backoff["until"],
+            "seconds": backoff["seconds"],
+            "reason": backoff["reason"],
+            "error_class": str(item.get("error_class") or record["error_class"]),
+            "retry_after": backoff.get("retry_after"),
+            "model_key": key,
+        })
+    if windows:
+        # `backoff` 保留为最后一条（最终失败那次的）窗口，兼容既有读取方；
+        # `attempt_backoffs` 是逐模型的完整事实。
+        record["backoff"] = windows[-1]
+        record["attempt_backoffs"] = windows
     save_state(path, state)
     return record
 

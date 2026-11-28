@@ -10,11 +10,17 @@ Copilot 是运行于 ZCode 内的**轻量协作治理 Skill**：负责任务承�
 证据桥接、审计、PARTIAL 持续推进与 G1–G3 收口。ZCode 原生 Agent 是唯一的工程执行与技术
 决策主体；用户侧 ChatGPT 负责需求与产品层目标、交接与验收；认知（CONSULT / PLAN）按生命周期
 提供整体判断，用户明确要求时执行一次独立复核（REVIEW），默认由 `gpt-6.2-sol` 零工具单轮调用
-完成（`gpt-6.2-astra` 仅作显式可选）。没有第二认知通道、没有 `--model` 切换、没有失败回退。
+完成（`gpt-6.2-astra` 可经 `COPILOT_COGNITION_MODEL` 显式选择，也是默认模型发生**可明确
+归因**的模型级/传输级故障时唯一的单次兜底目标）。没有第二认知通道、没有 `--model` 切换；
+兜底只有一次、同一认知对象、不写默认模型、不切 Provider、不产生第三次尝试。
 
-当前基线 **v9.14.0**（默认认知模型回切 SOL：一次真实 `gpt-6.2-sol` 诊断调用验证可用后，
-默认由 Astra 改为 SOL，Astra 经 `COPILOT_COGNITION_MODEL` 显式选择；v9.13.1 的认知策略
-作用域分离不变）。与版本号无关、长期有效的关键约束：
+当前基线 **v9.15.0**（SOL 主导认知 + Astra 单次兜底：可归因故障由 Astra 接管同一次调用并
+如实记录 `requested_model` / `actual_model` / `fallback_used` / `primary_error` /
+`attempt_count`；认证、凭据冷却、账户额度、请求构造 4xx、安全终止/用户取消、回答质量不回退
+（账户/认证/终止类结构化错误码被包进 5xx 外壳时同样按禁止类归类）；显式 Astra 不
+反向回退，退避与复用按模型隔离（兜底结论不复用；缺 `actual_model` 的旧记录按未命中）。
+v9.14.0 的默认模型回切 SOL 与 v9.13.1 的认知策略作用域分离不变）。与版本号无关、长期有效的
+关键约束：
 
 - **执行与续跑**：任务必须经 `start` / `drive` 进入状态机；PARTIAL 不是终点，
   `continuation.required=true` 时必须继续派生/执行；阻塞按工作项成立，单项缺授权不冻结
@@ -101,14 +107,15 @@ Agent、认知（CONSULT / PLAN / REVIEW）、DesignWise。Executor 是 ZCode �
 ## 3. 模型路由规则
 
 - **唯一远程调用是认知（CONSULT / PLAN / REVIEW）**：只有 `scripts/cognition_call.py` 可以导入
-  网络客户端、读取本机 CPA 凭据与模型名（默认 `gpt-6.2-sol`，`gpt-6.2-astra` 仅显式可选，
-  模型常量只在 `cognition_call.py` 定义）；`governance.py`、
+  网络客户端、读取本机 CPA 凭据与模型名（默认 `gpt-6.2-sol`，`gpt-6.2-astra` 显式可选且是
+  唯一兜底目标，模型常量只在 `cognition_call.py` 定义）；`governance.py`、
   `copilot_dispatch.py`、`copilot_auto.py`、`native_bridge.py`、`native_agent.py` 不得导入
   网络客户端或已退役的认知模块（`call_gpt` / `review_ledger` / `reply_protocol`）。认知只
-  接收主代理材料、一次请求、零工具（请求体无 `tools`/`functions`，`tool_choice="none"`）、
-  `reasoning.effort="high"`，不自动重试、不换 Provider、不自动二审、不静默降级模型或推理强度。
+  接收主代理材料、一次请求（外加至多一次 Astra 兜底接管）、零工具（请求体无
+  `tools`/`functions`，`tool_choice="none"`）、`reasoning.effort="high"`，不自动重试、
+  不换 Provider、不自动二审、不静默降级模型或推理强度。
   上游回显 `model` / `reasoning.effort` / `reasoning.mode` 与请求不一致时拒绝消费。
-  认知失败只如实记录并降级，不切换其他模型、不换 Provider、不重试。
+  认知失败只如实记录并降级（可归因故障由 Astra 接管一次），不继续切换其他模型、不换 Provider。
 - **退避按模型隔离**：窗口键为 `provider + model + error_class`（`state.model_backoff`），成功只清
   本模型；旧 `state.sol_backoff` 单例只读兼容，不写新值、不继承给新默认模型。
 - **Executor / Reviewer 继承主代理**：Profile 中省略 `model` 或写 `model: inherit`，
@@ -121,9 +128,11 @@ Agent、认知（CONSULT / PLAN / REVIEW）、DesignWise。Executor 是 ZCode �
   Agent 自报模型名不算证据。
 - **主代理换模型后必须复查**：确认 Executor/Reviewer 仍为 `inherit` 且实际路由一致。
   Agent Profile 在进程/会话启动时缓存，配置修改后须新会话或新进程验证。
-- **认知模型选择**：默认 `gpt-6.2-sol`；`gpt-6.2-astra` 只经 `COPILOT_COGNITION_MODEL`
-  （或显式参数）选择，属显式配置而不是失败回退——SOL 失败不会自动改选 Astra，注册表外
-  的模型名一律拒绝发送。换默认模型须用户明确授权，并按 `docs/DECISIONS.md` 记录理由与证据。
+- **认知模型选择**：默认 `gpt-6.2-sol`；`gpt-6.2-astra` 可经 `COPILOT_COGNITION_MODEL`
+  （或显式参数）选择，也是默认模型发生可明确归因的模型级/传输级故障时**唯一**的单次兜底
+  目标（认证/额度/请求构造/质量问题不回退，显式 Astra 不反向回退，
+  `COPILOT_COGNITION_FALLBACK=off` 可关闭）。注册表外的模型名一律拒绝发送。换默认模型或
+  改变兜底策略须用户明确授权，并按 `docs/DECISIONS.md` 记录理由与证据。
 - 不修改 Provider、模型路由与 CPA 配置；相关变更须用户单独授权。
 
 ## 4. 工程执行规则
@@ -185,8 +194,10 @@ Agent、认知（CONSULT / PLAN / REVIEW）、DesignWise。Executor 是 ZCode �
   G1–G3，也不得被当作工程决策；采纳结论用 `cognition-accept` 登记。
 - 正式 REVIEW 仅在用户明确授权时登记；授权在同一任务合同内持续有效，不得成为普通开发
   门禁，也不得用自检冒充。
-- 认知一次调用只发一次请求：失败（429/5xx/超时/网络/截断/格式/模型身份/推理强度或模式
-  不符）如实记录，不自动重试、不换 Provider、不派原生 Reviewer 顶替。CONSULT / PLAN
+- 认知一次调用最多两次请求：默认模型一次，发生可明确归因的模型级/传输级故障时由
+  Astra 接管一次（同一材料/问题/推理等级/零工具），否则失败（429/5xx/超时/网络/截断/
+  格式/模型身份/推理强度或模式不符）如实记录，不自动重试、不换 Provider、不派原生
+  Reviewer 顶替。CONSULT / PLAN
   失败按 `status=unavailable` 降级，主代理继续；REVIEW 失败返回真实非零退出码，只有用户
   明确要求完成独立复核时才按 BLOCKED 报告。
 - 不跳过 G1–G3、收口与证据校验；未过门不得标记 CLOSED 或 PASS。测试默认使用本地夹具，
