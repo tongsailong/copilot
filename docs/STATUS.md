@@ -77,6 +77,27 @@ Provider / 模型 / CPA 配置。交付期间代码未改动，故未机械重�
 - **未验证**：真实宿主生命周期命令（A/B/E 自动调用）全部走默认 SOL 的端到端复测未做；
   配置生效核对用非推理方式完成，没有为"再证明一次"额外付费。
 
+### v9.14.0 正式交付（2026-11-28）
+
+- **提交 → PR → 合并**：提交 `4051f7a`（15 文件 +209/−93）→ 分支
+  `feat/copilot-v9.14.0-sol-default` → PR #27 → CI run `46098929749`（Python 3.10 `Ran 1150
+  tests` OK skipped=1 / 49.3 s；3.12 `Ran 1150 tests` OK skipped=1 / 41.7 s）→
+  `mergeStateStatus=CLEAN` 后 Squash 合并为 main **`22340b7`**（Ruleset `main-protection`
+  27797379 `enforcement=active`、`bypass_actors=[]`，未绕过）；`git diff 4051f7a 22340b7` 为空
+  （squash 树与已验 CI 的分支头一致），远端功能分支已随合并删除。
+- **三方一致**：本地 `HEAD` / `origin/main` / GitHub `commits/main` / `ls-remote` 均为
+  `22340b7`，ahead/behind `0 0`，工作区 clean（`.copilot-tasks/` 为忽略目录）。
+- **运行时**（以合并后 main 为唯一来源）：`--apply` 写入 **0** 个文件（工作区内容与合并结果
+  相同）、`--check` 缺失 0 / 不同 0（28 受管，`hm.txt` 未受管理保留）、`--verify-baseline`
+  通过；28/28 受管文件 manifest ↔ 运行时 ↔ 源码 SHA-256 逐条一致；新进程 `--version` =
+  `9.14.0`、`DEFAULT_MODEL` = `gpt-6.2-sol`、`resolve_model()` = `gpt-6.2-sol`、显式 Astra
+  仍解析正确、`effort=high` / `mode=standard` 不变；Stop / SessionStart / UserPromptSubmit
+  三条钩子仍指向 `~/.zcode/skills/copilot/scripts/copilot_stop_guard.py`，未改宿主配置。
+- **测试口径**：CI 双版本各 1 150 项 OK（skipped=1，runner 环境差异）；本地活动 1 150 项 OK、
+  定向 127 项 OK；`legacy/tests` 853 项中 146 项非通过与既有基线一致（未触及 `legacy/`）。
+- **边界**：未改 Provider / CPA / 模型路由 / 无关项目；本任务未发起新的推理调用
+  （唯一真实调用仍是上面记录的 2026-11-28 诊断调用）；未 force push、未改写历史、未建 Tag/Release。
+
 ## 生产力复盘与两项优化（2026-11-28）
 
 依据：用户《Copilot 生产力导向复盘与优化升级》（任务 ID `copilot-productivity-review-upgrade-2026-11-28`）
