@@ -5,9 +5,10 @@
 > `gpt-6.2-sol` 与 `--model` 已移除，认知只剩 `gpt-6.2-astra` 单一模型。历史段落里的
 > 旧名只作事实与审计记录，不代表当前角色、模型、命令或默认配置。
 
-更新：2026-11-26 CST。本文件只记录现场可核实的事实；规划与未完成事项单独标注。
+更新：2026-11-28 CST。本文件只记录现场可核实的事实；规划与未完成事项单独标注。
 当前版本：v9.13.1（认知策略作用域分离，**已交付 `main` `d4f171b`**，与 v9.13.0
-自主执行闭环与生命周期可靠性同批入库）；v9.12.0
+自主执行闭环与生命周期可靠性同批入库；后续 `d626e05` 结构重构与 `7faf803` 生产力两项优化
+均在 v9.13.1 内，未升版本）；v9.12.0
 （认知分级与自动执行，已交付 `main` `109119f`）；v9.11.0（认知自动调度与
 调用率优化，已交付 `main`）；v9.10.0（认知命名收敛与
 SOL 退役，已交付 `main`）；v9.9.0（Astra 默认认知引擎迁移与调用效率优化，已交付 `main`）；
@@ -29,6 +30,15 @@ main 三方（本地 / `origin/main` / `ls-remote`）同为 `b83cf33`（0/0）�
 UserPromptSubmit 三条钩子仍指向运行时 `copilot_stop_guard.py`；未建 Tag / Release，未改
 Provider / 模型 / CPA 配置。交付期间代码未改动，故未机械重跑全量测试（CI 已在最终合并代码上
 跑满 1134 项）。
+
+**正式交付（2026-11-28）**：生产力两项优化（Hook 注入文本预算、`record`/`criterion` 内联证据）
+已入库——提交 `a98ff9f`（9 文件，+490/−88）经 PR #25 squash 合并为 main `7faf803`；CI Python
+3.10 / 3.12 各 **1149 项 OK（skipped=1）**（54.4 s / 54.5 s）；本地 / `origin/main` / GitHub API
+三方同为 `7faf803`（ahead/behind 0/0），功能分支 `fix/productivity-overhead-2026-11-28` 已随
+合并删除，工作区干净；运行时 `--apply` 写入 0 个文件（此前已同步）、`--check` 缺失 0 / 不同 0、
+`--verify-baseline` 通过（baseline 28），28 个受管理文件源码与运行时 SHA-256 逐条一致，
+`copilot_dispatch.py --version` = `9.13.1`，Stop / SessionStart / UserPromptSubmit 三条钩子仍指向
+运行时 `copilot_stop_guard.py`；未建 Tag / Release，未改 Provider / 模型 / CPA 配置。
 
 ## 生产力复盘与两项优化（2026-11-28）
 
