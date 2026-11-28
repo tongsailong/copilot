@@ -10,8 +10,9 @@
 > 默认配置。
 
 更新：2026-11-28 CST。本文件只记录现场可核实的事实；规划与未完成事项单独标注。
-当前版本：v9.15.0（SOL 主导 + Astra 单次故障兜底；**源码与运行时已改，尚未提交**，见
-「SOL 主导与 Astra 单次兜底」节）；上一版 v9.14.0（默认认知模型回切 SOL，**已交付 `main`
+当前版本：v9.15.0（SOL 主导 + Astra 单次故障兜底 + 认知缓存模型身份隔离，**已交付 `main`
+`a7245b2`**〔功能提交 `0404586`，PR #29〕，见「SOL 主导与 Astra 单次兜底」节）；上一版
+v9.14.0（默认认知模型回切 SOL，**已交付 `main`
 `22340b7`**，记录 PR #28 `47bdc20`）；v9.13.1（认知策略作用域分离，**已交付 `main`
 `d4f171b`**，与 v9.13.0 自主执行闭环与生命周期可靠性同批入库；后续 `d626e05` 结构重构与
 `7faf803` 生产力两项优化均在 v9.13.1 内，未升版本）；v9.12.0
@@ -46,7 +47,24 @@ Provider / 模型 / CPA 配置。交付期间代码未改动，故未机械重�
 `copilot_dispatch.py --version` = `9.13.1`，Stop / SessionStart / UserPromptSubmit 三条钩子仍指向
 运行时 `copilot_stop_guard.py`；未建 Tag / Release，未改 Provider / 模型 / CPA 配置。
 
-## 认知缓存模型身份隔离（2026-11-28，v9.15.0 工作区；未提交）
+**正式交付（2026-11-28，v9.15.0）**：SOL 主认知 + Astra 单次兜底与认知缓存模型身份隔离已入库——
+功能提交 `0404586`（21 文件，+1741/−203，含新增 `tests/test_cognition_fallback.py` 39 项）经
+PR #29 `https://github.com/tongsailong/copilot/pull/29` squash 合并为 main
+`a7245b2aa3a7a3a252da493f9acdb1c5a73785dc`（合并时间 `2026-11-28T04:34:58Z`）；CI（run
+46108039154）Python 3.10（50 s）/ 3.12（1 m 5 s）各 **1189 项 OK（skipped=1）**且
+`--verify-baseline` 通过；Ruleset 27797379 `main-protection` 生效、required checks 双版本、
+无 bypass、未 Force Push、未改写历史；本地 / `origin/main` / GitHub API 三方同为 `a7245b2`
+（ahead/behind 0/0），功能分支 `fix/copilot-v915-fallback-cache-isolation` 已随合并删除，工作区
+干净；运行时 `--apply` 写入 0 个文件、`--check` 缺失 0 / 不同 0、`--verify-baseline` 通过
+（baseline 28），28/28 受管理文件源码与运行时 SHA-256 逐条一致；新进程核对
+`copilot_dispatch.py --version` = `9.15.0`、`DEFAULT_MODEL=gpt-6.2-sol`、
+`FALLBACK_MODEL=gpt-6.2-astra`、`MAX_MODEL_ATTEMPTS=2`、`effort/mode=high/standard`、
+`reuse_identity_problem` 已加载且三态正确（正常复用空串、兜底记录 `produced-by-fallback-model`、
+缺 `actual_model` 记 `actual-model-unknown`），Stop / SessionStart / UserPromptSubmit 三条钩子
+仍指向运行时 `copilot_stop_guard.py`；未建 Tag / Release，未改 Provider / 模型路由 / CPA /
+凭据 / 宿主 Hook 配置，未额外发起真实模型调用。
+
+## 认知缓存模型身份隔离（2026-11-28，v9.15.0；已交付 `main` `a7245b2`）
 
 - **问题**：v9.15.0 的兜底记录（`requested_model=gpt-6.2-sol`、`actual_model=gpt-6.2-astra`、
   `fallback_used=true`）会被下一次同材料、同模式的默认 SOL 请求当作**自己的**结论复用，
@@ -81,7 +99,8 @@ Provider / 模型 / CPA 配置。交付期间代码未改动，故未机械重�
   （baseline 28），28/28 受管文件源码与运行时 SHA-256 逐条一致，版本仍为 `9.15.0`。
 - **未验证 / 限制**：真实 SOL 故障下“兜底后下一次 SOL 重新尝试”未端到端实测（禁止故意破坏
   真实配置制造故障）；`review_policy.covered` 仍按“存在认知判断”计覆盖率（兜底结论也算覆盖，
-  与模型身份无关，本轮不改）；真实宿主会话内 A/B/E 全链路未复测；改动**未提交、未推送**。
+  与模型身份无关，本轮不改）；真实宿主会话内 A/B/E 全链路未复测；改动已随 PR #29 交付
+  `main` `a7245b2`。
 - **收口（E 窗口 + G1–G3）**：A CONSULT `SCaefcd759693c6f21ce9662bd`（42.9 s / 5 653 tok）、
   B PLAN `SC0d7b55de4ad58d233016d4d8`（43.9 s / 7 280 tok）、E 收口 CONSULT
   `SCc6ececaa25624137a43a89d8` 与验证摘要更新后重开的 `SCe6d7df50c6c2d74aa62c11de`
@@ -92,7 +111,7 @@ Provider / 模型 / CPA 配置。交付期间代码未改动，故未机械重�
   **CLOSED / PASS**（verdict=pass，最终验证摘要 `4a8de8a2ef63c645`）。本节收口记录为收口后
   追加的文档事实，未触及代码与测试。
 
-## SOL 主导与 Astra 单次兜底（2026-11-28，v9.15.0 工作区；未提交）
+## SOL 主导与 Astra 单次兜底（2026-11-28，v9.15.0；已交付 `main` `a7245b2`）
 
 - **决定**：默认认知模型仍是 `gpt-6.2-sol`；`gpt-6.2-astra` 新增第二个身份——默认模型发生
   **可明确归因**的模型级/传输级故障时唯一允许的单次兜底目标。一次认知调用最多两次请求
@@ -115,9 +134,10 @@ Provider / 模型 / CPA 配置。交付期间代码未改动，故未机械重�
   `fallback_reason` / `primary_error` / `fallback_error` / `attempt_count` / `attempt_trail` /
   `latency_total_ms` / `usage_total`；`model` 恒为**实际产出模型**，两次尝试各自 trace 都保留；
   失败尝试也进入各自模型的退避窗口（SOL 失败 + Astra 成功时 SOL 仍冷却）。
-- **验证证据**（本工作区代码，未提交）：
-  - 定向：`tests/test_cognition_fallback.py` **31 项 OK**（覆盖 SOL 成功单次、502/503/超时/
-    模型级 429/身份不符允许回退、401/403/账户额度/400/质量问题拒绝、双模型失败即停且两条
+- **验证证据**（本节采集于交付前的工作区；代码已随 PR #29 进入 `main` `a7245b2`）：
+  - 定向：`tests/test_cognition_fallback.py` **31 项 OK**（该节采集时点；随缓存身份隔离补测后为
+    39 项），覆盖 SOL 成功单次、502/503/超时/模型级 429/身份不符允许回退、401/403/账户额度/
+    400/质量问题拒绝、双模型失败即停且两条
     trace、5xx 外壳内账户/认证/安全终止拒绝、真 5xx 仍允许、SOL 退避阻止重复、Astra 自身
     退避跳过、显式 Astra 无反向回退、环境开关关闭、复用模型双向隔离、REVIEW 回退、统计）；
     `test_astra_migration` 24、`test_cognition_reliability` 57、`test_cognition_lifecycle` 45、
@@ -157,7 +177,7 @@ Provider / 模型 / CPA 配置。交付期间代码未改动，故未机械重�
   `satisfied/closed`、未终结 0、漏调 0。
 - **未验证 / 限制**：真实 SOL→Astra 路由切换未实测（禁止故意破坏真实配置制造故障）；客户端
   超时后上游是否实际执行不可知（记录保持 `unknown`）；真实宿主会话内 A/B/E 全自动链路未复测；
-  本次改动**未提交、未推送**（本轮未授权）。
+  本次改动已随 PR #29 交付 `main` `a7245b2`。
 
 
 - **决定依据（一次真实调用）**：2026-11-28T02:09:29Z 以现有认知入口（`cognition_call.build_payload`
