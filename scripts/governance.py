@@ -2024,9 +2024,9 @@ def _sync_criterion_work_items(state: dict, cid: str) -> list[str]:
     return changed
 
 
-def record_criterion(path: str, cid: str, status: str, *,
-                     evidence_ids: list[str] | None = None) -> dict:
-    state = load_state(path)
+def record_criterion_state(state: dict, cid: str, status: str, *,
+                           evidence_ids: list[str] | None = None) -> dict:
+    """在内存状态里核销完成条件，不落盘；调用方负责与其它写入一次保存。"""
     # 条件核销仍要求本任务已登记证据；BLOCKED 只表示外部条件未满足，
     # 不阻止记录已经完成的核销动作。收口仍会被 block 单独拒绝。
     _assert_open(state, "核销完成条件", allow_blocked=True)
@@ -2052,6 +2052,13 @@ def record_criterion(path: str, cid: str, status: str, *,
     _history(state, "criterion_recorded", {"criterion_id": cid, "status": status,
                                            "evidence_ids": [r["id"] for r in refs]})
     _sync_criterion_work_items(state, cid)
+    return criterion
+
+
+def record_criterion(path: str, cid: str, status: str, *,
+                     evidence_ids: list[str] | None = None) -> dict:
+    state = load_state(path)
+    criterion = record_criterion_state(state, cid, status, evidence_ids=evidence_ids)
     save_state(path, state)
     return criterion
 

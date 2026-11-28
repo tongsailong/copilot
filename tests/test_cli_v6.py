@@ -248,6 +248,123 @@ class LegacyCliTests(unittest.TestCase):
         self.assertIn("legacy-status", proc.stderr)
 
 
+class InlineEvidenceCliTests(unittest.TestCase):
+    """`record`/`criterion` 内联登记证据：每条件一次 CLI 而不是两次。
+
+    真实使用里每核销一条完成条件都要 `evidence --add` + `criterion --evidence`
+    两次调用；内联形式把两步合成一步，同时保留失败关闭：目标不存在时不留下无主证据。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = self.tmp.name
+        self.state = os.path.join(self.dir, "state.json")
+        contract = os.path.join(self.dir, "contract.md")
+        with open(contract, "w", encoding="utf-8") as fh:
+            fh.write("## 完成条件\n- 结果可复核\n")
+        proc = F.run_cli("copilot_dispatch.py", "start", "--state", self.state,
+                         "--goal", "内联证据", "--contract-file", contract,
+                         "--test-policy", '{"required": false}')
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def run_dispatch(self, *args: str):
+        return F.run_cli("copilot_dispatch.py", *args)
+
+    def state_data(self) -> dict:
+        return read_json(self.state)
+
+    def test_criterion_registers_text_evidence_in_one_call(self):
+        proc = self.run_dispatch("criterion", "--state", self.state, "--id", "C1",
+                                 "--status", "met", "--text", "单测 12 项通过")
+        self.assertIn(proc.returncode, (0, 10), proc.stderr)
+        self.assertIn("C1 → met", proc.stdout)
+        data = self.state_data()
+        self.assertEqual(len(data["evidence"]), 1)
+        entry = data["evidence"][0]
+        self.assertEqual(entry["kind"], "text")
+        criterion = data["contract"]["criteria"][0]
+        self.assertEqual(criterion["status"], "met")
+        self.assertEqual([ref["id"] for ref in criterion["evidence_refs"]],
+                         [entry["id"]])
+        self.assertEqual(entry["id"], "E1")
+
+    def test_record_registers_capture_evidence_in_one_call(self):
+        plan = write_json(os.path.join(self.dir, "plan.json"), PLAN)
+        self.assertIn(self.run_dispatch("plan", "--state", self.state,
+                                        "--plan", plan).returncode, (0, 10))
+        proc = self.run_dispatch("record", "--state", self.state, "--id", "A1",
+                                 "--status", "done", "--result", "产出结果文件",
+                                 "--capture-cmd", "printf 'hello\\n'")
+        self.assertIn(proc.returncode, (0, 10), proc.stderr)
+        data = self.state_data()
+        entry = data["evidence"][0]
+        self.assertEqual(entry["kind"], "capture")
+        captured = os.path.join(self.dir, "evidence", entry["id"] + ".md")
+        self.assertEqual(entry["path_hint"], captured)
+        with open(captured, "r", encoding="utf-8") as fh:
+            self.assertIn("hello", fh.read())
+        self.assertEqual(data["actions"][0]["evidence_ids"], [entry["id"]])
+
+    def test_inline_evidence_merges_with_existing_ids(self):
+        first = self.run_dispatch("evidence", "--state", self.state, "--add",
+                                  "--id", "E1", "--text", "第一次")
+        self.assertEqual(first.returncode, 0, first.stderr)
+        proc = self.run_dispatch("criterion", "--state", self.state, "--id", "C1",
+                                 "--status", "met", "--evidence", "E1",
+                                 "--text", "第二次", "--evidence-id", "E2")
+        self.assertIn(proc.returncode, (0, 10), proc.stderr)
+        criterion = self.state_data()["contract"]["criteria"][0]
+        self.assertEqual([ref["id"] for ref in criterion["evidence_refs"]],
+                         ["E1", "E2"])
+
+    def test_failed_record_does_not_persist_inline_evidence(self):
+        # 证据与回填在同一次保存里生效：回填被治理层拒绝时不能留下证据记录。
+        plan = write_json(os.path.join(self.dir, "plan.json"), PLAN)
+        self.assertIn(self.run_dispatch("plan", "--state", self.state,
+                                        "--plan", plan).returncode, (0, 10))
+        before = self.state_data()["save_seq"]
+        proc = self.run_dispatch("record", "--state", self.state, "--id", "A1",
+                                 "--status", "done", "--text", "不该留下")
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("必须说明实际结果", proc.stderr)
+        self.assertNotIn("已登记（内联）", proc.stdout)
+        data = self.state_data()
+        self.assertEqual(data["save_seq"], before)
+        self.assertEqual(data.get("evidence") or [], [])
+        self.assertEqual(data["actions"][0]["status"], "pending")
+
+    def test_unknown_target_registers_no_evidence(self):
+        proc = self.run_dispatch("criterion", "--state", self.state, "--id", "C9",
+                                 "--status", "met", "--text", "x")
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("不存在完成条件", proc.stderr)
+        self.assertEqual(self.state_data().get("evidence") or [], [])
+
+    def test_conflicting_sources_are_rejected(self):
+        path = os.path.join(self.dir, "out.txt")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("x")
+        proc = self.run_dispatch("criterion", "--state", self.state, "--id", "C1",
+                                 "--status", "met", "--text", "x", "--file", path)
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("只能选一个", proc.stderr)
+        self.assertEqual(self.state_data().get("evidence") or [], [])
+
+    def test_capture_cannot_overwrite_registered_evidence(self):
+        first = self.run_dispatch("criterion", "--state", self.state, "--id", "C1",
+                                  "--status", "met", "--capture-cmd", "printf one")
+        self.assertIn(first.returncode, (0, 10), first.stderr)
+        second = self.run_dispatch("criterion", "--state", self.state, "--id", "C1",
+                                   "--status", "met", "--capture-cmd", "printf two",
+                                   "--evidence-id", "E1")
+        self.assertEqual(second.returncode, 2)
+        self.assertIn("会覆盖证据文件", second.stderr)
+        with open(os.path.join(self.dir, "evidence", "E1.md"), "r",
+                  encoding="utf-8") as fh:
+            self.assertIn("one", fh.read())
+
+
 class NativeCliTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

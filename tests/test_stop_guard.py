@@ -27,6 +27,7 @@ if SCRIPTS not in sys.path:
 
 import governance as G  # noqa: E402
 import context_engine as CE  # noqa: E402
+import copilot_stop_guard as GUARD_MODULE  # noqa: E402
 
 GUARD = os.path.join(SCRIPTS, "copilot_stop_guard.py")
 DISPATCH = os.path.join(SCRIPTS, "copilot_dispatch.py")
@@ -986,6 +987,93 @@ class UserPromptHookTests(StopGuardBase):
                                          "prompt": "继续"}))
         self.assertEqual(before, {path: read_bytes(path) for path in tracked},
                          "用户回合提示不得写状态或绑定文件")
+
+
+class HookTextBudgetTests(StopGuardBase):
+    """注入文本预算：任务行可以压缩，行动指引不能被挤掉。
+
+    真实任务的阻塞原因常常是一次事故的全文（实测单条 600+ 字）。旧实现把全文拼进
+    指针/逐回合提示，`_fit_lines` 按整行丢弃时会把后面的“该怎么做”一起丢掉——会话只
+    看到“有任务”，看不到下一步。这里锁定：长阻塞下指引仍在，且不超上限。
+    """
+
+    LONG_REASON = ("真机不可用：设备在切换用户后重新枚举为 18d1:4ee7，节点权限 "
+                   "root:root，需重新授权；") * 12
+    LONG_NEEDS = "用户决定：提供第二台设备，或明确授权重置用户数据（当前均禁止）。"
+
+    def run_session_start(self, *, source: str = "resume"):
+        return self.run_guard(args=["session-start"],
+                              payload={"cwd": self.workspace, "source": source})
+
+    def injected(self, proc) -> str:
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        return json.loads(proc.stdout)["hookSpecificOutput"]["additionalContext"]
+
+    def add_blocked_task(self, name: str, *, blocks: int = 1) -> str:
+        task_dir = os.path.join(self.workspace, ".copilot-tasks", name)
+        os.makedirs(task_dir, exist_ok=True)
+        state_path = os.path.join(task_dir, "state.json")
+        G.start_state(state_path, goal=f"阻塞任务 {name}", contract=CONTRACT,
+                      test_policy={"required": False}, workspace=self.workspace)
+        G.plan_state(state_path, PLAN)
+        for index in range(blocks):
+            G.add_block(state_path, f"{self.LONG_REASON}#{index}", self.LONG_NEEDS,
+                        work_items=["A2"], criteria=["C2"])
+        return state_path
+
+    def test_pointer_keeps_guidance_under_long_block_reasons(self):
+        # 三个未绑定任务都带长阻塞：指针只展开前两个，但必须保留指引与折叠行。
+        for name in ("b0", "b1", "b2"):
+            self.add_blocked_task(name, blocks=2)
+        os.unlink(os.path.join(self.task_dir, "session.json"))
+        text = self.injected(self.run_session_start(source="startup"))
+        self.assertIn("<copilot-task-pointer>", text)
+        self.assertIn("若用户当前要做的正是其中之一", text)
+        self.assertIn("另有 2 个未闭合任务", text)
+        self.assertNotIn("已截断", text)
+        self.assertLessEqual(len(text), 1200)
+
+    def test_user_prompt_keeps_guardrail_under_long_block_reasons(self):
+        for index in range(2):
+            G.add_block(self.state_path, f"{self.LONG_REASON}#{index}",
+                        self.LONG_NEEDS, work_items=["A2"], criteria=["C2"])
+        proc = self.run_guard(args=["user-prompt"],
+                              payload={"cwd": self.workspace,
+                                       "session_id": SESSION,
+                                       "prompt": "继续"})
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        text = json.loads(proc.stdout)["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("本回合判断", text)
+        self.assertIn("继续前先 status --json", text)
+        self.assertLessEqual(len(text), 1800)
+
+    def test_session_start_keeps_resume_command_under_long_block_reasons(self):
+        G.add_block(self.state_path, self.LONG_REASON, self.LONG_NEEDS,
+                    work_items=["A2"], criteria=["C2"])
+        text = self.injected(self.run_session_start(source="resume"))
+        self.assertIn("可粘贴续接命令", text)
+        self.assertIn(self.state_path, text)
+        self.assertIn("先核对现场", text)
+        self.assertLessEqual(len(text), 1600)
+
+    def test_row_line_caps_block_text_and_states_extra_blocks(self):
+        state_path = self.add_blocked_task("b3", blocks=3)
+        state = G.load_state(state_path)
+        rows, _ = GUARD_MODULE.collect(self.workspace, session="",
+                                       include_open=True, include_pending=True)
+        row = [item for item in rows if item["task_id"] == state["task_id"]][0]
+        line = GUARD_MODULE._row_open_line(row)
+        self.assertLessEqual(len(line), GUARD_MODULE.ROW_LINE_LIMIT)
+        self.assertIn("另有 2 条阻塞", line)
+        self.assertIn("需要：", line)
+
+    def test_fit_lines_keeps_reserved_tail(self):
+        lines = ["<open>", "头", "x" * 400, "y" * 400, "</open>"]
+        text = GUARD_MODULE._fit_lines(lines, 300, "</open>", reserved=["指引"])
+        self.assertIn("指引", text)
+        self.assertIn("</open>", text)
+        self.assertIn("已截断", text)
+        self.assertLessEqual(len(text), 300)
 
 
 if __name__ == "__main__":

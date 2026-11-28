@@ -54,9 +54,9 @@ python3 -B scripts/copilot_dispatch.py <子命令> --state <state.json> [参数]
 | `intent` | 补录/更正用户原始任务意图（默认拒绝覆盖，`--replace` 才重写并留 history）；输出按新意图计算的等级与窗口 | `--text` 或 `--file`、`--replace` |
 | `plan` | 登记 ZCode 本地计划 | `--plan <plan.json>`（或 stdin）、`--source` |
 | `status` / `next` | 查看阶段、工作项、门禁、下一步与认知建议 | `--json` |
-| `record` | 回填工作项结果 | `--id`、`--status`、`--result`、`--evidence E1`（可重复） |
+| `record` | 回填工作项结果 | `--id`、`--status`、`--result`、`--evidence E1`（可重复）；可内联登记新证据：`--file` / `--text` / `--capture-cmd` + `--kind`/`--note`/`--evidence-id`（省略自动取下一个 E 编号） |
 | `rerun` | 把已终结工作项重开为 pending（修复后重新验证） | `--id`、`--reason`；旧结果保留在 `rerun_history` |
-| `criterion` | 核销完成条件 | `--id C1`、`--status pending\|met\|not_met`、`--evidence`（`met` 必填） |
+| `criterion` | 核销完成条件 | `--id C1`、`--status pending\|met\|not_met`、`--evidence`（`met` 必填，可与内联证据同时给）；内联登记新证据（同上）——一次调用完成“登记证据 + 核销”，省掉单独的 `evidence --add` |
 | `judgment` | 记录自我判断（仅审计） | `--status pass\|partial\|blocked`、`--summary`、`--evidence` |
 | `evidence` | 登记 / 归档 / 列出证据 | `--add`、`--file`、`--text`、`--capture-cmd`、`--drop --id`、`--list`、`--next-id` |
 | `report` | 登记执行报告，或接入 verify 结构化质量报告 | `--summary`（可与下一项同用）、`--verify-report <报告文件>`、`--blocked`、`--reason`；PWW 自动登记用户接受条件 |
@@ -108,6 +108,11 @@ python3 -B scripts/copilot_dispatch.py <子命令> --state <state.json> [参数]
 
 - **先登记再引用**：`record` / `criterion` / `judgment` 的 `--evidence` 必须引用本任务
   已登记、未归档的证据 id（`E1`、`E2`…），否则拒绝。
+- **一次调用登记并引用**：`record` / `criterion` 支持内联证据
+  `--file` / `--text` / `--capture-cmd`（另可加 `--kind` / `--note` / `--evidence-id`，
+  省略则自动取下一个 E 编号），与 `--evidence` 同时给时按“显式 id + 新登记 id”合并。
+  这是核销完成条件的默认写法：先校验工作项/条件确实存在，再登记证据，目标 id 写错时
+  不会留下无主证据；采集冲突规则与 `evidence --add` 相同。
 - `--file`：登记普通文件，记录绝对路径、大小与 SHA-256。
 - `--text`：登记内联文本（小片段说明），同样计算摘要。
 - `--capture-cmd "<shell 命令>"`：经 `bridge_evidence.py` 采集，输出写入
@@ -257,11 +262,12 @@ python3 -B scripts/copilot_auto.py drive --state T/state.json    # 退出码 10 
 python3 -B scripts/copilot_dispatch.py evidence --state T/state.json --add \
   --capture-cmd "python3 -B -m unittest discover -s tests -p 'test_*.py'"
 
-# 5. 回填工作项与条件
+# 5. 回填工作项与条件。证据可内联登记（--file/--text/--capture-cmd）：一次调用
+#    同时完成“登记证据 + 引用”，不必先跑一条 evidence --add。
 python3 -B scripts/copilot_dispatch.py record --state T/state.json --id A1 \
   --status done --result "实际结果" --evidence E1
 python3 -B scripts/copilot_dispatch.py criterion --state T/state.json --id C1 \
-  --status met --evidence E1
+  --status met --text "C1 复核结论：…（文本证据直接内联）"
 
 # 6. 收口
 python3 -B scripts/copilot_auto.py drive --state T/state.json    # PASS → 0
