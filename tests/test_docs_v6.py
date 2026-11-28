@@ -2,7 +2,7 @@
 """v8.4 文档契约：Skill 入口、references、SOL THINK/REVIEW 与项目文档与代码一致。
 
 这些断言保护“SOL 只提供认知输入、不是决策通道”，以及 v8.4 的关键运行契约
-（本地治理、PARTIAL 持续推进、正式 REVIEW opt-in、默认 gpt-6.2-astra + high、零工具单轮、
+（本地治理、PARTIAL 持续推进、正式 REVIEW opt-in、默认 gpt-6.2-sol（Astra 显式可选）+ high、零工具单轮、
 THINK advisory 不入门禁、REVIEW 仅用户要求、G4 退役）。
 """
 from __future__ import annotations
@@ -79,12 +79,12 @@ class SkillEntryTests(unittest.TestCase):
         # 认知只是建议：不得恢复决策通道或 DECIDE。
         self.assertNotIn("SOL 决策通道已退役。", self.doc)
         self.assertNotIn('"DECIDE"', self.doc)
-        # v9.10.0 起只剩一个认知模型：旧模型名只允许出现在“已移除”说明里，
-        # 模型升级必须写进当前版本说明，并且不得残留旧模型为现行默认配置。
+        # v9.14.0 起默认认知模型是 SOL，Astra 只保留为显式可选；
+        # 更早的历史模型名不得再被写成现行配置。
+        self.assertIn("gpt-6.2-sol", self.doc)
         self.assertIn("gpt-6.2-astra", self.doc)
-        for line in self.doc.splitlines():
-            if "gpt-6.2-sol" in line:
-                self.assertIn("已移除", line)
+        self.assertIn("COPILOT_COGNITION_MODEL", self.doc)
+        self.assertNotIn("gpt-6.1-sol", self.doc)
         self.assertNotIn("仅显式兼容", self.doc)
         self.assertIn("reasoning.effort=\"high\"", self.doc)
         self.assertIn("--cognition", self.doc)
@@ -153,9 +153,10 @@ class ReferenceTests(unittest.TestCase):
         self.assertIn("cognition-consult", o["workflow.md"])
         self.assertIn("sol_reviews", o["review.md"])
         self.assertIn("sol_advisories", o["review.md"])
+        # v9.14.0 起参考文档写默认 SOL + Astra 显式可选；不得残留更早模型名。
+        self.assertIn("gpt-6.2-sol", o["review.md"])
         self.assertIn("gpt-6.2-astra", o["review.md"])
-        # v9.10.0 只剩单一认知模型；旧模型不得再出现在当前参考文档里。
-        self.assertNotIn("gpt-6.2-sol", o["review.md"])
+        self.assertNotIn("gpt-6.1-sol", o["review.md"])
         self.assertIn("单轮", o["review.md"])
         self.assertIn("零工具", o["review.md"])
         self.assertIn("已正式退役", o["review.md"])
@@ -236,9 +237,10 @@ class ProjectDocTests(unittest.TestCase):
     def test_agents_md_points_to_v8_architecture(self):
         doc = text(os.path.join(ROOT, "AGENTS.md"))
         self.assertIn("唯一远程调用是认知（CONSULT / PLAN / REVIEW）", doc)
+        # v9.14.0 起 AGENTS.md 写默认 SOL + Astra 显式可选，且不写自动回退。
+        self.assertIn("gpt-6.2-sol", doc)
         self.assertIn("gpt-6.2-astra", doc)
-        # v9.10.0 只剩一个认知模型：AGENTS.md 不得再写旧模型或模型切换。
-        self.assertNotIn("gpt-6.2-sol", doc)
+        self.assertIn("COPILOT_COGNITION_MODEL", doc)
         self.assertIn("PARTIAL 不是终点", doc)
         self.assertIn("legacy/tests", doc)
         self.assertIn("native_review_retired", doc)

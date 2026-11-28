@@ -7,7 +7,7 @@
 
 - **普通自检**：ZCode 自己做，不登记为复核，不构成任何门禁依据。
 - **认知 CONSULT（默认认知入口）**：按 T1–T3 认知等级在启动、升级型事件与收口前一次性调用
-  `gpt-6.2-astra`（零工具、单轮、high），输出目标理解、问题本质、路线与取舍、风险、调查方向
+  `gpt-6.2-sol`（零工具、单轮、high），输出目标理解、问题本质、路线与取舍、风险、调查方向
   与再咨询条件；结论是认知输入，不是门禁。T0 不产生调用。
 - **认知 PLAN（调查后的规划判断）**：T2/T3 任务在形成现场事实后调用，输出方案比较、优先级、
   阶段目标与验收关注点；最终技术方案仍由 ZCode 决定。
@@ -72,8 +72,9 @@
 
 ### 模型与推理强度
 
-- 默认统一 `gpt-6.2-astra`（Responses API `/v1/responses`，既有本机 CPA `127` 出口）；
-  通道只有这一个模型：没有 `--model` 开关、没有别名、没有失败回退或自动切换。
+- 默认 `gpt-6.2-sol`（Responses API `/v1/responses`，既有本机 CPA `127` 出口）；
+  `gpt-6.2-astra` 只作为显式可选（`COPILOT_COGNITION_MODEL` 或显式参数），没有 `--model`
+  开关、没有别名，也没有失败回退或自动切换：SOL 不可用不会改选 Astra。
 - 请求、回显校验、审计与 `cognition_calls` 记录都带 `provider` 与 `model_key`（`codex:<model>`）；
   复用只命中同模型记录，缺模型归属的历史记录不被当成新模型响应。
 - 所有模式统一 `reasoning.effort="high"`、`reasoning.mode="standard"`：不按角色降级，
@@ -103,7 +104,7 @@ python3 -B scripts/copilot_dispatch.py cognition-plan --state <state.json> \
   `understanding|planning|development|stage|closure` 之一。
 - 材料只包含目标、当前基线、已确认事实、关键问题与约束、已尝试方案及结果、证据摘要；
   上限 120,000 字符（提示阈值 60,000），超限拒绝而不是静默截断。
-- 零工具、单轮、默认 `gpt-6.2-astra` + `high`，与 REVIEW 使用同一通道与同一安全约束。
+- 零工具、单轮、默认 `gpt-6.2-sol` + `high`（Astra 显式可选），与 REVIEW 使用同一通道与同一安全约束。
 - `--dry-run` 校验请求（模式、阶段、模型、推理强度、零工具、材料预算）；
   `--list` 只读查看记录；`--knowledge-file handoff.json` 追加知识交接块。
 

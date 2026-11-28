@@ -1,9 +1,11 @@
 # DECISIONS
 
-> **术语说明（v9.10.0，2026-11-25）**：本文件保留历史原文。SOL 术语与 `sol_*` 文件名、`sol-*`
-> 命令名、`sol_calls`/`sol_reuses`/`sol_schedule` 状态键已统一为“认知 / cognition”，
-> `gpt-6.2-sol` 与 `--model` 已移除，认知只剩 `gpt-6.2-astra` 单一模型。历史段落里的
-> 旧名只作事实与审计记录，不代表当前角色、模型、命令或默认配置。
+> **术语与模型状态（v9.14.0，2026-11-28）**：本文件保留历史原文。SOL 术语与 `sol_*` 文件名、
+> `sol-*` 命令名、`sol_calls`/`sol_reuses`/`sol_schedule` 状态键已统一为“认知 / cognition”；
+> v9.10.0 曾移除 `gpt-6.2-sol` 与 `--model`、只保留 `gpt-6.2-astra`，v9.14.0 经一次真实
+> 诊断调用验证后用 `gpt-6.2-sol` 恢复为默认模型，`gpt-6.2-astra` 保留为显式可选
+> （`COPILOT_COGNITION_MODEL`），仍没有 `--model` 开关与自动回退。历史段落里的旧名
+> 只作事实与审计记录，不代表当前角色、模型、命令或默认配置。
 
 已确认 = 当前执行依据；建议 = 尚未采纳，需要用户授权；待决 = 需要业务或授权决定。
 本文件不把建议或规划写成既成事实。
@@ -1281,6 +1283,26 @@
   `docs/STATUS.md`「新会话加载与策略恢复验收」）。
 - **未验证**：`legacy/tests` 历史回归未跑（只验证 v5 历史契约）；业务项目侧未参与（本版本只改
   Copilot 自身）。
+
+### 认知默认模型回切 SOL（v9.14.0，2026-11-28）
+
+- **决定**：Copilot 默认认知模型由 `gpt-6.2-astra` 改为 `gpt-6.2-sol`；`gpt-6.2-astra` 保留为
+  **显式可选**（`COPILOT_COGNITION_MODEL=gpt-6.2-astra` 或显式 `model` 参数），不是回退目标。
+  唯一模型常量仍是 `scripts/cognition_call.py` 的 `DEFAULT_MODEL` / `SUPPORTED_MODELS`；
+  认知窗口、调度、零工具单轮、`reasoning.effort="high"`、G1–G3 与授权边界全部不变。
+- **依据（一次真实调用）**：2026-11-28 以现有认知入口（`build_payload` + `_post_once`，注册表
+  在本进程内临时放宽）发出一次 `gpt-6.2-sol` 请求：HTTP 200、上游 `model` 回显
+  `gpt-6.2-sol`、`reasoning.effort=high`/`mode=standard` 回显一致、`status=completed`、
+  输出仅 `message` 条目（零工具）、回复 `SOL_CALL_OK`、2.08 s / 95 tokens、无重试无回退，
+  CPA trace `20261128100929-06382ea5e66fe2f7-01a21fea-2a31-7bec-8a00-54d3d5648e2c`。
+  这推翻 2026-11-25 的 502 `server_is_overloaded` 单点结论：当时是阶段容量问题，不是永久不可用。
+- **不构成回退**：显式选择只在解析阶段生效（显式参数 > `COPILOT_COGNITION_MODEL` > 默认）；
+  上游失败仍只如实记录并降级，不换模型、不换 Provider、不重试；注册表外模型名拒绝发送。
+  默认 SOL 与显式 Astra 的复用键不同（`codex:<model>`），互不复用结论。
+- **与 v9.10.0 的关系**：v9.10.0「SOL 退役」指命令名与状态键收敛，不是模型能力永久淘汰；
+  本次回切只换默认值与显式选择通道，不恢复 `sol-*` 命令、`--model` 开关或 `sol_*` 写路径。
+- **未验证**：真实宿主会话内生命周期命令（`start`/`drive` 的 A/B/E 自动调用）全部走默认 SOL
+  尚未做端到端复测；本次只做了一次诊断调用与非推理配置核对（见 `docs/STATUS.md`）。
 
 ## 建议（未采纳）
 

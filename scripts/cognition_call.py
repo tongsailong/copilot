@@ -12,10 +12,12 @@ Copilot 的认知通道只承担**认知**，不承担决策或执行：
   CONSULT / PLAN 失败按可降级处理（`copilot_dispatch.py cognition-consult|cognition-plan`
   记录后返回 0，主代理继续），REVIEW 失败仍显式失败，因为它是用户明确要求的
   独立结论。
-* **模型与推理强度是硬门**：默认 `gpt-6.2-astra` + `reasoning.effort="high"`；
+* **模型与推理强度是硬门**：默认 `gpt-6.2-sol` + `reasoning.effort="high"`
+  （`gpt-6.2-astra` 保留为显式可选，`COPILOT_COGNITION_MODEL` 或显式参数指定）；
   上游 `model` 回显必须与本次请求完全一致，`reasoning.effort` / `reasoning.mode`
   回显也必须与请求一致（`standard`）；任何不一致都拒绝消费（退出码 9），
   不允许静默降级到 `medium`/`low` 或其他模型；模型名不在注册表内时拒绝发送。
+  模型选择是显式配置，不是失败回退：`gpt-6.2-sol` 不可用时不会自动改选 Astra。
 * **三种模式**：CONSULT 是默认认知引擎，任务启动、执行期新证据、阶段复盘与
   收口都能按需发出一次判断；PLAN 在调查之后给出方案比较与规划判断；REVIEW
   只在用户明确要求时做独立复核，输出结构化 findings。三者都是 advisory：
@@ -50,11 +52,16 @@ REVIEW_SCHEMA = "copilot-cognition-review/v1"
 # 阶段复盘与收口判断；v1 记录继续只读兼容。
 THINK_SCHEMA = "copilot-cognition-think/v2"
 ADMISSION_SCHEMA = "copilot-cognition-admission/v1"
-# 模型身份只在这里定义：认知通道只有一个模型（Astra），没有任何回退或别名。
+# 模型身份只在这里定义：默认 SOL（v9.14.0 回切），Astra 保留为显式可选；
+# 没有任何自动回退、别名或静默切换。
 PROVIDER = "codex"
-DEFAULT_MODEL = "gpt-6.2-astra"
-SUPPORTED_MODELS = (DEFAULT_MODEL,)
+DEFAULT_MODEL = "gpt-6.2-sol"
+# 显式可选模型：只用于显式选择（环境变量或显式参数），不是回退目标。
+EXPLICIT_MODELS = ("gpt-6.2-astra",)
+SUPPORTED_MODELS = (DEFAULT_MODEL,) + EXPLICIT_MODELS
 MODEL = DEFAULT_MODEL
+# 显式模型选择通道：省略 `--model` 时代替默认值；未知模型名仍拒绝发送。
+MODEL_ENV = "COPILOT_COGNITION_MODEL"
 BASE_URL = "http://127.0.0.1:8317/v1"
 ENDPOINT = "/responses"
 REASONING_EFFORT = "high"
@@ -578,16 +585,21 @@ def validate_effort(effort: str) -> str:
 
 
 def resolve_model(model: str = "") -> str:
-    """模型解析：空值 → 默认 Astra；拒绝注册表外的任何模型名。
+    """模型解析：显式参数 > `COPILOT_COGNITION_MODEL` > 默认 SOL；拒绝注册表外模型。
 
-    未知或历史模型名一律拒绝，避免把默认路由意外改到别的 Provider/模型；
-    认知通道只有一个模型，不存在兼容别名、回退或静默切换。
+    显式通道只用于选择已注册模型（例如把认知临时切到 `gpt-6.2-astra`），
+    不构成失败回退：默认仍是 SOL，上游不可用时不会自动改选其他模型。
+    未知或历史模型名一律拒绝，避免把默认路由意外改到别的 Provider/模型。
     """
-    value = str(model or "").strip() or DEFAULT_MODEL
+    value = str(model or "").strip()
+    if not value:
+        value = str(os.environ.get(MODEL_ENV, "") or "").strip()
+    if not value:
+        value = DEFAULT_MODEL
     if value not in SUPPORTED_MODELS:
         raise CognitionUsageError(
             "cognition_model_unsupported",
-            f"模型 {model!r} 不在支持列表（{', '.join(SUPPORTED_MODELS)}）；"
+            f"模型 {value!r} 不在支持列表（{', '.join(SUPPORTED_MODELS)}）；"
             f"默认模型是 {DEFAULT_MODEL}，未发送请求。")
     return value
 
@@ -810,7 +822,7 @@ def _payload_input(materials: str, images: list[dict] | None) -> object:
 
 
 def build_payload(materials: str, *, mode: str = "CONSULT",
-                  model: str = MODEL, effort: str = REASONING_EFFORT,
+                  model: str = "", effort: str = REASONING_EFFORT,
                   max_output_tokens: int | None = DEFAULT_MAX_OUTPUT_TOKENS,
                   instructions: str = "",
                   images: list[dict] | None = None) -> dict:
@@ -1556,7 +1568,7 @@ def _usage_summary(usage: object) -> dict | None:
 
 
 def run_cognition(materials: str, *, mode: str = "CONSULT", audit_log: str = "",
-            model: str = MODEL, effort: str = REASONING_EFFORT,
+            model: str = "", effort: str = REASONING_EFFORT,
             max_output_tokens: int | None = DEFAULT_MAX_OUTPUT_TOKENS,
             timeout: float = DEFAULT_TIMEOUT,
             transport=None, api_key: str | None = None,
@@ -2195,8 +2207,9 @@ def single_round_decision(state: dict, materials_sha256: str, *,
 
     CONSULT / PLAN / REVIEW 各自独立判定，不会互相复用；记录统一存放在
     `cognition_calls`，历史 `sol_reviews` / `sol_advisories` 仍可只读复用。
-    **模型门**：只复用同一模型的已完成记录；历史旧模型结论不会被当成 Astra 的
-    新响应（旧记录缺少 `model` 字段时一律视为不可复用）。
+    **模型门**：只复用同一模型的已完成记录；默认 SOL 与显式 Astra 的结论互不复用，
+    历史旧模型结论也不会被当成当前默认模型的新响应（旧记录缺少 `model` 字段时一律
+    视为不可复用）。
     “单轮”约束的是同一认知对象只付一次费，不是调用次数上限：只要问题、阶段
     或材料构成新的认知对象，就可以按对应 trigger 继续调用。
     """

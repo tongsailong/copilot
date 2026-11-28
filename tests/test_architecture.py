@@ -88,10 +88,12 @@ class RemoteReviewBoundaryTests(unittest.TestCase):
     def test_cognition_is_advisory_only_with_three_modes(self):
         text = source(NETWORK_MODULE)
         self.assertIn("tool_choice", text)
-        # 认知通道只有一个模型：Astra。旧模型名不得出现在活动模块里。
-        self.assertIn('DEFAULT_MODEL = "gpt-6.2-astra"', text)
-        self.assertNotIn("gpt-6.2-sol", text)
+        # 认知默认模型是 SOL（v9.14.0 回切），Astra 只作为显式可选保留；
+        # 更早的历史模型名不得出现在活动模块里。
+        self.assertIn('DEFAULT_MODEL = "gpt-6.2-sol"', text)
+        self.assertIn('EXPLICIT_MODELS = ("gpt-6.2-astra",)', text)
         self.assertNotIn("gpt-6.1-sol", text)
+        self.assertNotIn("gpt-6.0-sol", text)
         self.assertIn('CALL_MODES = ("CONSULT", "PLAN", "REVIEW")', text)
         # THINK 只作为历史别名读取，不再出现在活动模式集合里。
         self.assertIn('LEGACY_MODES = ("THINK",)', text)

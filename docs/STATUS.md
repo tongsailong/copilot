@@ -1,12 +1,15 @@
 # STATUS
 
-> **术语说明（v9.10.0，2026-11-25）**：本文件保留历史原文。SOL 术语与 `sol_*` 文件名、`sol-*`
-> 命令名、`sol_calls`/`sol_reuses`/`sol_schedule` 状态键已统一为“认知 / cognition”，
-> `gpt-6.2-sol` 与 `--model` 已移除，认知只剩 `gpt-6.2-astra` 单一模型。历史段落里的
-> 旧名只作事实与审计记录，不代表当前角色、模型、命令或默认配置。
+> **术语与模型状态（v9.14.0，2026-11-28）**：本文件保留历史原文。SOL 术语与 `sol_*` 文件名、
+> `sol-*` 命令名、`sol_calls`/`sol_reuses`/`sol_schedule` 状态键已统一为“认知 / cognition”；
+> v9.10.0 曾移除 `gpt-6.2-sol` 与 `--model`、只保留 `gpt-6.2-astra`；v9.14.0 经一次真实
+> 诊断调用验证后把 `gpt-6.2-sol` 恢复为默认模型，`gpt-6.2-astra` 保留为显式可选
+> （`COPILOT_COGNITION_MODEL`），仍没有 `--model` 开关与自动回退。历史段落里的旧名
+> 只作事实与审计记录，不代表当前角色、模型、命令或默认配置。
 
 更新：2026-11-28 CST。本文件只记录现场可核实的事实；规划与未完成事项单独标注。
-当前版本：v9.13.1（认知策略作用域分离，**已交付 `main` `d4f171b`**，与 v9.13.0
+当前版本：v9.14.0（默认认知模型回切 SOL，交付记录见「默认认知模型回切 SOL」节）；
+上一版 v9.13.1（认知策略作用域分离，**已交付 `main` `d4f171b`**，与 v9.13.0
 自主执行闭环与生命周期可靠性同批入库；后续 `d626e05` 结构重构与 `7faf803` 生产力两项优化
 均在 v9.13.1 内，未升版本）；v9.12.0
 （认知分级与自动执行，已交付 `main` `109119f`）；v9.11.0（认知自动调度与
@@ -39,6 +42,40 @@ Provider / 模型 / CPA 配置。交付期间代码未改动，故未机械重�
 `--verify-baseline` 通过（baseline 28），28 个受管理文件源码与运行时 SHA-256 逐条一致，
 `copilot_dispatch.py --version` = `9.13.1`，Stop / SessionStart / UserPromptSubmit 三条钩子仍指向
 运行时 `copilot_stop_guard.py`；未建 Tag / Release，未改 Provider / 模型 / CPA 配置。
+
+## 默认认知模型回切 SOL（2026-11-28，v9.14.0）
+
+- **决定依据（一次真实调用）**：2026-11-28T02:09:29Z 以现有认知入口（`cognition_call.build_payload`
+  + `_post_once`，仅在本进程内把注册表临时放宽到 `gpt-6.2-sol`）向
+  `http://127.0.0.1:8317/v1/responses` 发出**一次**请求：HTTP 200、上游 `model` 回显
+  `gpt-6.2-sol`、`reasoning={"effort":"high","mode":"standard"}` 回显一致、`status=completed`、
+  `incomplete_details=null`、输出条目只有 `message`（零工具）、回复 `SOL_CALL_OK`（11 字符）、
+  2,081 ms / 95 tokens（input 88、output 7、reasoning 0）、无重试、无模型回退。
+  CPA trace `20261128100929-06382ea5e66fe2f7-01a21fea-2a31-7bec-8a00-54d3d5648e2c`，
+  上游 `response_id` `resp_0155846821c7d639016b0a37da76a087d0bd07a692392a70d3`；
+  CPA 未回 `X-Request-Id`，`request_id` 为空（如实记录，不补造）。
+- **现场核实**：源码与运行时同为 v9.13.1（`git HEAD` `377b2ec`，工作区起点干净）；
+  `--check` 缺失 0 / 不同 0；CPA `cli-proxy-api`（pid 3075790）监听 `127.0.0.1:8317` 约 12.3 h；
+  `GET /v1/models` 返回 23 个模型，包含 `gpt-6.2-sol` 与 `gpt-6.2-astra`；默认模型唯一来源是
+  `scripts/cognition_call.py`（`DEFAULT_MODEL`/`SUPPORTED_MODELS`，派发路径此前硬绑
+  `CC.DEFAULT_MODEL`）；`server_is_overloaded` 仍归 `upstream_overloaded`，单次失败只登记并降级。
+- **改动**：`DEFAULT_MODEL="gpt-6.2-sol"`、`SUPPORTED_MODELS=("gpt-6.2-sol",
+  "gpt-6.2-astra")`、新增 `MODEL_ENV="COPILOT_COGNITION_MODEL"` 显式选择通道；`resolve_model`
+  改为「显式参数 > 环境变量 > 默认」；`build_payload`/`run_cognition` 的 `model` 默认值改为
+  `""`（否则默认在定义期绑定，"显式选择"不会生效）；派发路径改用 `CC.resolve_model()`。
+- **验证**：定向 `tests.test_architecture` + `tests.test_cognition_review` +
+  `tests.test_astra_migration` + `tests.test_docs_v6` 127 项 OK；全量活动测试 `tests/`
+  **1 150 项 OK**（94.6 s，文档契约按新不变量更新：默认 SOL、Astra 显式可选、`gpt-6.1-sol`
+  等旧名拒绝）；`legacy/tests` 853 项中 99 failures + 47 errors + 32 skipped = 146 项非通过，
+  与既有基线计数一致（未触及 `legacy/` 代码）；`sync_runtime --apply` 写入 5 个文件、
+  `--check` 缺失 0 / 不同 0、`--verify-baseline` 通过（baseline 28）；
+  新进程核对运行时 `--version` = `9.14.0`、`DEFAULT_MODEL` = `gpt-6.2-sol`、
+  `resolve_model()` = `gpt-6.2-sol`、显式 Astra 与环境变量均解析正确、`gpt-6.1-sol` 仍被拒绝。
+- **交付与改动范围**：本轮改动落在 15 个跟踪文件（约 +200/−90），含
+  `manifests/source-baseline.sha256` 重建；正式提交、PR、合并与运行时同步记录见
+  「v9.14.0 正式交付」一节的交付记录。
+- **未验证**：真实宿主生命周期命令（A/B/E 自动调用）全部走默认 SOL 的端到端复测未做；
+  配置生效核对用非推理方式完成，没有为"再证明一次"额外付费。
 
 ## 生产力复盘与两项优化（2026-11-28）
 

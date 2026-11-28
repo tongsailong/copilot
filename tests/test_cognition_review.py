@@ -75,17 +75,36 @@ def response(text: str, *, model: str = CC.MODEL, status: str = "completed",
 
 class ZeroToolTests(unittest.TestCase):
     def test_payload_has_no_tool_definitions(self):
-        payload = CC.build_payload("材料")
+        with mock.patch.dict(os.environ, {CC.MODEL_ENV: ""}):
+            payload = CC.build_payload("材料")
         self.assertNotIn("tools", payload)
         self.assertNotIn("functions", payload)
         self.assertEqual(payload["tool_choice"], "none")
         self.assertEqual(payload["reasoning"], {"effort": "high"})
-        self.assertEqual(payload["model"], "gpt-6.2-astra")
-        # 认知通道只有一个模型：Astra。旧模型既不是默认，也不再是兼容别名。
-        self.assertEqual(CC.DEFAULT_MODEL, "gpt-6.2-astra")
+        self.assertEqual(payload["model"], "gpt-6.2-sol")
+        # v9.14.0 起默认 SOL；Astra 保留为显式可选，不是自动回退目标。
+        self.assertEqual(CC.DEFAULT_MODEL, "gpt-6.2-sol")
         self.assertEqual(CC.MODEL, CC.DEFAULT_MODEL)
-        self.assertEqual(CC.SUPPORTED_MODELS, (CC.DEFAULT_MODEL,))
+        self.assertEqual(CC.SUPPORTED_MODELS, ("gpt-6.2-sol", "gpt-6.2-astra"))
         self.assertFalse(hasattr(CC, "LEGACY_MODEL"))
+
+    def test_explicit_model_selection_is_not_fallback(self):
+        # 显式选择：显式参数 > 环境变量 > 默认；未知模型名仍然拒绝发送。
+        with mock.patch.dict(os.environ, {CC.MODEL_ENV: ""}):
+            self.assertEqual(CC.resolve_model(), "gpt-6.2-sol")
+        self.assertEqual(CC.resolve_model("gpt-6.2-astra"), "gpt-6.2-astra")
+        with mock.patch.dict(os.environ, {CC.MODEL_ENV: "gpt-6.2-astra"}):
+            self.assertEqual(CC.resolve_model(), "gpt-6.2-astra")
+            # 显式参数优先于环境变量。
+            self.assertEqual(CC.resolve_model("gpt-6.2-sol"), "gpt-6.2-sol")
+            self.assertEqual(CC.build_payload("材料")["model"], "gpt-6.2-astra")
+        for bad in ("gpt-6.2-sol-x", "gpt-6.1-sol", "gpt-6.2-unknown"):
+            with mock.patch.dict(os.environ, {CC.MODEL_ENV: bad}):
+                with self.assertRaises(CC.CognitionUsageError):
+                    CC.resolve_model()
+        # 显式选择不改变默认值，也不构成失败回退。
+        self.assertEqual(CC.DEFAULT_MODEL, "gpt-6.2-sol")
+        self.assertNotIn("astra", CC.model_key())
 
     def test_payload_omits_unsupported_sampling_params(self):
         payload = CC.build_payload("材料")

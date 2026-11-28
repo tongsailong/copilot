@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""v9.9：Astra 默认认知引擎迁移、调用效率、模型级退避隔离与响应完整性。
+"""v9.9：认知默认模型迁移、调用效率、模型级退避隔离与响应完整性。
 
 覆盖四组要求：
-- A 迁移：所有默认入口都是 `gpt-6.2-astra` + high + standard + 零工具；SOL 只
-  作为显式兼容模型，不做自动回退，历史 SOL 结论不被当成 Astra 的新响应。
+- A 迁移：默认入口是 `gpt-6.2-sol` + high + standard + 零工具（v9.14.0 回切）；
+  `gpt-6.2-astra` 只作为显式可选模型，不做自动回退，历史结论不被当成新模型的响应。
 - B 效率：纯登记/报告命令不隐式付费调用；复用命中可观测；复用键含 task_id。
 - C 隔离：退避窗口按 provider+model+error_class 隔离，互不冻结。
 - D 完整性：incomplete / max_output_tokens 不算成功，24000 预算不下调。
@@ -56,43 +56,47 @@ def think_result(mode: str = "CONSULT", model: str = "") -> dict:
 
 
 # ── A. 默认入口迁移 ────────────────────────────────────────────────────────
-# 历史模型已退役：这里只用字符串验证"历史窗口不得冻结 Astra"，
-# 而不是重新引入可用模型别名。
-HISTORICAL_MODEL = "gpt-6.2-sol"
-HISTORICAL_KEY = "codex:gpt-6.2-sol"
+# v9.14.0 起默认是 SOL，Astra 转为显式可选；更早的历史模型名一律拒绝。
+HISTORICAL_MODEL = "gpt-6.1-sol"
+HISTORICAL_KEY = "codex:gpt-6.1-sol"
 
 class DefaultModelMigrationTests(unittest.TestCase):
-    def test_payload_defaults_to_astra_high_zero_tool(self):
-        payload = CC.build_payload("材料")
-        self.assertEqual(payload["model"], "gpt-6.2-astra")
+    def test_payload_defaults_to_sol_high_zero_tool(self):
+        with mock.patch.dict(os.environ, {CC.MODEL_ENV: ""}):
+            payload = CC.build_payload("材料")
+        self.assertEqual(payload["model"], "gpt-6.2-sol")
         self.assertEqual(payload["reasoning"], {"effort": "high"})
         self.assertEqual(payload["tool_choice"], "none")
         self.assertNotIn("tools", payload)
         self.assertNotIn("functions", payload)
-        self.assertEqual(CC.DEFAULT_MODEL, "gpt-6.2-astra")
+        self.assertEqual(CC.DEFAULT_MODEL, "gpt-6.2-sol")
         self.assertEqual(CC.MODEL, CC.DEFAULT_MODEL)
         self.assertEqual(CC.PROVIDER, "codex")
 
-    def test_every_mode_defaults_to_astra(self):
+    def test_every_mode_defaults_to_sol(self):
         for mode in CC.CALL_MODES:
             with self.subTest(mode=mode):
-                payload = CC.build_payload("材料", mode=mode)
-                self.assertEqual(payload["model"], "gpt-6.2-astra")
+                with mock.patch.dict(os.environ, {CC.MODEL_ENV: ""}):
+                    payload = CC.build_payload("材料", mode=mode)
+                self.assertEqual(payload["model"], "gpt-6.2-sol")
                 self.assertEqual(payload["reasoning"], {"effort": "high"})
                 self.assertEqual(payload["tool_choice"], "none")
 
-    def test_only_astra_model_is_accepted(self):
-        self.assertEqual(CC.resolve_model(""), CC.DEFAULT_MODEL)
+    def test_default_and_explicit_model_registry(self):
+        with mock.patch.dict(os.environ, {CC.MODEL_ENV: ""}):
+            self.assertEqual(CC.resolve_model(""), CC.DEFAULT_MODEL)
+            self.assertEqual(CC.model_key(), "codex:gpt-6.2-sol")
         self.assertEqual(CC.resolve_model(CC.DEFAULT_MODEL), CC.DEFAULT_MODEL)
-        self.assertEqual(CC.model_key(), "codex:gpt-6.2-astra")
-        for rejected in (HISTORICAL_MODEL, "gpt-6.1-sol", "gpt-6.0-fake"):
+        # Astra 只作为显式选择存在，不是默认值，也不是回退目标。
+        self.assertEqual(CC.resolve_model("gpt-6.2-astra"), "gpt-6.2-astra")
+        for rejected in (HISTORICAL_MODEL, "gpt-6.2-sol-x", "gpt-6.0-fake"):
             with self.subTest(model=rejected):
                 with self.assertRaises(CC.CognitionUsageError) as ctx:
                     CC.resolve_model(rejected)
                 self.assertEqual(ctx.exception.code,
                                  "cognition_model_unsupported")
 
-    def test_legacy_cognition_record_is_not_reused_as_astra(self):
+    def test_legacy_cognition_record_is_not_reused_as_current_model(self):
         state = {"cognition_calls": [
             {"status": "completed", "mode": "CONSULT",
              "model": HISTORICAL_MODEL, "materials_sha256": "a" * 64},
